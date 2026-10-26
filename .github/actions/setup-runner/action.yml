@@ -1,0 +1,59 @@
+name: setup-runner
+description: Prepare a GitHub-hosted runner to act like the cwe-bench VM (Docker, Harbor + its patches, Claude Code, keys).
+inputs:
+  deepseek_key: { required: true }
+  mimo_key: { required: false, default: "" }
+  claude_version: { required: false, default: "2.1.302" }              # = VM on 2026-10-22
+  harbor_version: { required: false, default: "0.23.1.dev202609170426" } # = VM on 2026-10-22
+  gate_slots: { required: false, default: "4" }                         # Harbor runs at once (VM: 60 on 64 CPUs)
+runs:
+  using: composite
+  steps:
+    - name: Free disk, Docker on the larger disk
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+          /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft 2>/dev/null || true
+        docker image prune -af >/dev/null 2>&1 || true
+        rf=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+        mf=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9); mf=${mf:-0}
+        dr=/var/lib/docker; [ "$mf" -gt "$rf" ] && dr=/mnt/docker
+        sudo mkdir -p "$dr"
+        # same settings as the VM's /etc/docker/daemon.json (common/README.md "VM host settings")
+        printf '{"data-root":"%s","default-address-pools":[{"base":"172.16.0.0/12","size":24}],"shutdown-timeout":60}\n' "$dr" \
+          | sudo tee /etc/docker/daemon.json >/dev/null
+        sudo systemctl restart docker
+        echo "docker root $(docker info --format '{{.DockerRootDir}}'); free / ${rf}G /mnt ${mf}G; $(nproc) cpus; $(free -g | awk '/Mem/{print $2}')G ram"
+
+    - name: Harbor (with the VM patches) and Claude Code
+      shell: bash
+      env:
+        CLAUDE_VERSION: ${{ inputs.claude_version }}
+        HARBOR_VERSION: ${{ inputs.harbor_version }}
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+        # python 3.13: the harbor patch scripts expect .../tools/harbor/lib/python3.13/...
+        "$HOME/.local/bin/uv" tool install -q --python 3.13 "harbor==$HARBOR_VERSION"
+        bash common/trial/harbor/patch_teardown.sh >/dev/null 2>&1 || true   # its old gate_one_ds part is a no-op now
+        rm -f common/gate/gate_one_ds.sh.bak-*
+        bash common/trial/harbor/patch_probe_timeout.sh
+        D=$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker.py
+        grep -q 'if "down" in full_command' "$D" || { echo "harbor patch A missing"; exit 1; }
+        grep -q 'timeout=300' "$D" || { echo "harbor patch B missing"; exit 1; }
+        curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/claude" --version; "$HOME/.local/bin/harbor" --version
+
+    - name: Project paths, keys, runner-sized caps
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_key }}
+        MIMO_API_KEY: ${{ inputs.mimo_key }}
+      run: |
+        # BUILD-PROMPTs name the VM root /home/mara/cwe-bench: point it at this checkout.
+        sudo mkdir -p /home/mara && sudo chown "$(id -u):$(id -g)" /home/mara
+        ln -sfn "$GITHUB_WORKSPACE" /home/mara/cwe-bench
+        mkdir -p "$HOME/.tb-graders/cwe/work" && ln -sfn "$HOME/.tb-graders" /home/mara/.tb-graders
+        [ -n "$DEEPSEEK_API_KEY" ] || { echo "secret DEEPSEEK_API_KEY is not set"; exit 1; }
+        ( umask 077; printf 'DEEPSEEK_API_KEY=%s\nMIMO_API_KEY=%s\n' "$DEEPSEEK_API_KEY" "$MIMO_API_KEY" > "$HOME/.tb-graders/cwe/models.env" )
+        { echo "GATE_GLOBAL_SLOTS=${{ inputs.gate_slots }}"; echo "GATE_TASK_SLOTS=1"; echo "CI_MARK_FILE=/tmp/ci_mark"; } >> "$GITHUB_ENV"

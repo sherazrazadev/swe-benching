@@ -1,0 +1,64 @@
+name: run-trial
+description: One trial run (one task, one model, one run number) through common/trial/trial.py, packed as an artifact.
+inputs:
+  slug: { required: true }
+  model: { required: true }
+  run: { required: true }
+  build_run: { required: false, default: "" }   # run id holding the build-<slug> artifact; empty = task as in this checkout
+  deepseek_key: { required: true }
+  mimo_key: { required: false, default: "" }
+  token: { required: true }
+runs:
+  using: composite
+  steps:
+    - name: Get the built task from the build artifact
+      if: inputs.build_run != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: build-${{ inputs.slug }}
+        path: /tmp/build-art
+        run-id: ${{ inputs.build_run }}
+        github-token: ${{ inputs.token }}
+
+    - name: Restore it and check it is sound
+      shell: bash
+      env: { SLUG: "${{ inputs.slug }}" }
+      run: |
+        if [ -d /tmp/build-art ]; then python3 -I common/ci/ci.py collect /tmp/build-art; fi
+        [ -f "build/$SLUG/.sound" ] || { echo "$SLUG is not sound (no build/$SLUG/.sound): not trialled"; exit 1; }
+        [ -f "tasks/$SLUG/task.toml" ] || { echo "no tasks/$SLUG/task.toml"; exit 1; }
+        sleep 1; touch "$CI_MARK_FILE"; sleep 1
+
+    - name: Trial
+      shell: bash
+      env:
+        SLUG: ${{ inputs.slug }}
+        MODEL: ${{ inputs.model }}
+        RUN: ${{ inputs.run }}
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_key }}
+        MIMO_API_KEY: ${{ inputs.mimo_key }}
+      run: |
+        # One run (plus trial.py's own single retry on a no-result run). Verdicts are made later from all runs.
+        set +e
+        timeout 330m python3 -I common/trial/trial.py "$SLUG" --models "$MODEL" --first-run "$RUN" --max-runs 1 --no-verdict
+        echo "trial.py exit $? (2 = incomplete: no graded result)"
+        tail -3 "build/$SLUG/runs_$MODEL.log" 2>/dev/null || true
+
+    - name: Pack
+      if: always()
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_key }}
+        MIMO_API_KEY: ${{ inputs.mimo_key }}
+      run: |
+        mkdir -p /tmp/out
+        if [ -f "$CI_MARK_FILE" ]; then python3 -I common/ci/ci.py pack trial "${{ inputs.slug }}" \
+          "/tmp/out/trial-${{ inputs.slug }}-${{ inputs.model }}-r${{ inputs.run }}.tgz" --model "${{ inputs.model }}" --run "${{ inputs.run }}"; fi
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trial-${{ inputs.slug }}-${{ inputs.model }}-r${{ inputs.run }}
+        path: /tmp/out/*.tgz
+        retention-days: 30
+        if-no-files-found: warn

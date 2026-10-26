@@ -1,0 +1,107 @@
+name: trial
+# Trials of sound tasks on GitHub-hosted runners, one job per (task, model, run).
+# Run 1 of every model first; runs 2..N only for tasks no model solved in run 1 (a solve already rejects the task).
+# Verdicts are not made here: collect the artifacts and use common/trial/trial.py's records + common/audit/audit_results.py.
+on:
+  workflow_dispatch:
+    inputs:
+      slugs: { description: "comma-separated task slugs (each needs build/<slug>/.sound)", required: true }
+      models: { description: "models", default: "deepseek,mimo" }
+      runs: { description: "runs per model", default: "3" }
+      build_run: { description: "run id of a 'build' run holding build-<slug> artifacts (empty = tasks as committed)", default: "" }
+      max_parallel: { description: "runners at once", default: "7" }
+      collect: { description: "push results to branch runs/<run id>", type: boolean, default: true }
+  workflow_call:
+    inputs:
+      slugs: { type: string, required: true }
+      models: { type: string, default: "deepseek,mimo" }
+      runs: { type: string, default: "3" }
+      build_run: { type: string, default: "" }
+      max_parallel: { type: string, default: "7" }
+      collect: { type: boolean, default: false }
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs: { m: "${{ steps.p.outputs.m }}" }
+    steps:
+      - id: p
+        env: { SLUGS: "${{ inputs.slugs }}", MODELS: "${{ inputs.models }}" }
+        run: |
+          m=$(python3 -c 'import json,os; sp=lambda v:[x for x in os.environ[v].replace(" ",",").split(",") if x]
+          print(json.dumps([{"slug":s,"model":m,"run":1} for s in sp("SLUGS") for m in sp("MODELS")]))')
+          echo "m=$m" >> "$GITHUB_OUTPUT"; echo "$m"
+
+  run1:
+    needs: plan
+    if: needs.plan.outputs.m != '[]'
+    name: trial ${{ matrix.slug }} ${{ matrix.model }} r${{ matrix.run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: { include: "${{ fromJSON(needs.plan.outputs.m) }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-runner
+        with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}" }
+      - uses: ./.github/actions/run-trial
+        with:
+          slug: ${{ matrix.slug }}
+          model: ${{ matrix.model }}
+          run: ${{ matrix.run }}
+          build_run: ${{ inputs.build_run }}
+          deepseek_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          mimo_key: ${{ secrets.MIMO_API_KEY }}
+          token: ${{ github.token }}
+
+  plan2:
+    needs: run1
+    if: always() && needs.run1.result != 'skipped' && fromJSON(inputs.runs) > 1
+    runs-on: ubuntu-24.04
+    outputs: { m: "${{ steps.p.outputs.m }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "trial-*-r1", path: /tmp/r1 }
+      - id: p
+        run: |
+          m=$(python3 -I common/ci/ci.py next /tmp/r1 --models "${{ inputs.models }}" --runs "${{ inputs.runs }}")
+          echo "m=$m" >> "$GITHUB_OUTPUT"; echo "$m"
+
+  rest:
+    needs: plan2
+    if: always() && needs.plan2.result == 'success' && needs.plan2.outputs.m != '[]'
+    name: trial ${{ matrix.slug }} ${{ matrix.model }} r${{ matrix.run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: { include: "${{ fromJSON(needs.plan2.outputs.m) }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-runner
+        with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}" }
+      - uses: ./.github/actions/run-trial
+        with:
+          slug: ${{ matrix.slug }}
+          model: ${{ matrix.model }}
+          run: ${{ matrix.run }}
+          build_run: ${{ inputs.build_run }}
+          deepseek_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          mimo_key: ${{ secrets.MIMO_API_KEY }}
+          token: ${{ github.token }}
+
+  collect:
+    needs: [run1, rest]
+    if: always() && inputs.collect && needs.run1.result != 'skipped'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/collect
+        with: { build_run: "${{ inputs.build_run }}", token: "${{ github.token }}" }
