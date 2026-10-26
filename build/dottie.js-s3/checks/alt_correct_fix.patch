@@ -1,0 +1,116 @@
+--- a/dottie.js
++++ b/dottie.js
+@@ -3,6 +3,14 @@
+ 
+   // Weird IE shit, objects do not have hasOwn, but the prototype does...
+   var hasOwnProp = Object.prototype.hasOwnProperty;
++
++  // Store a caller-supplied value as an own data property, never through an inherited
++  // accessor such as the prototype setter.
++  var defineOwn = function (object, key, value) {
++    Object.defineProperty(object, key, {
++      value: value, writable: true, enumerable: true, configurable: true
++    });
++  };
+ 
+   var reverseDupArray = function (array) {
+     var result = new Array(array.length);
+@@ -86,12 +94,12 @@
+         !hasOwnProp.call(current, piece)
+         || current[piece] === undefined
+         || ((typeof current[piece] !== 'object' || current[piece] === null) && options && options.force === true)) {
+-        current[piece] = {};
++        defineOwn(current, piece, {});
+       }
+ 
+       if (index == (length - 1)) {
+         // Set final value
+-        current[piece] = value;
++        defineOwn(current, piece, value);
+       } else {
+         // We do not overwrite existing path pieces by default
+         if (typeof current[piece] !== 'object' || current[piece] === null) {
+@@ -104,7 +112,7 @@
+     }
+ 
+     // Is there any case when this is relevant? It's also the last line in the above for-loop
+-    current[piece] = value;
++    defineOwn(current, piece, value);
+   };
+ 
+   // Set default nested value
+@@ -122,13 +130,16 @@
+     var current = object;
+ 
+     for (var index = 0; index < pieces.length; index++) {
++      if (!hasOwnProp.call(current, pieces[index])) {
++        return;
++      }
+       current = current[pieces[index]];
+-      if (current === null || current === undefined) {
++      if (current === null || typeof current !== 'object') {
+         return;
+       }
+     }
+ 
+-    if (current !== null && typeof current === 'object') {
++    if (current !== null && typeof current === 'object' && hasOwnProp.call(current, last)) {
+       delete current[last];
+     }
+   };
+@@ -165,11 +176,11 @@
+         for (var index = 0; index < piecesLength; index++) {
+           piece = pieces[index];
+           if (index != (piecesLength - 1) && !current.hasOwnProperty(piece)) {
+-            current[piece] = {};
++            defineOwn(current, piece, {});
+           }
+ 
+           if (index == (piecesLength - 1)) {
+-            current[piece] = object[key];
++            defineOwn(current, piece, object[key]);
+           }
+ 
+           current = current[piece];
+@@ -178,7 +189,7 @@
+           }
+         }
+       } else {
+-        transformed[key] = object[key];
++        defineOwn(transformed, key, object[key]);
+       }
+     }
+ 
+@@ -200,10 +211,10 @@
+         var piece = pieces[index];
+ 
+         if (index == (pieces.length - 1)) {
+-          current[piece] = flat[key];
++          defineOwn(current, piece, flat[key]);
+         } else {
+-          if (typeof current[piece] !== 'object' || current[piece] === null) {
+-            current[piece] = {};
++          if (!hasOwnProp.call(current, piece) || typeof current[piece] !== 'object' || current[piece] === null) {
++            defineOwn(current, piece, {});
+           }
+           current = current[piece];
+         }
+@@ -221,13 +232,15 @@
+       var key = keys[index];
+       var value = source[key];
+ 
++      if (key === '__proto__') { defineOwn(target, key, value); continue; }
++
+       if (Object.prototype.toString.call(value) === "[object Object]") {
+-        if (Object.prototype.toString.call(target[key]) !== "[object Object]") {
+-          target[key] = {};
++        if (!hasOwnProp.call(target, key) || Object.prototype.toString.call(target[key]) !== "[object Object]") {
++          defineOwn(target, key, {});
+         }
+         Dottie.merge(target[key], value);
+       } else {
+-        target[key] = value;
++        defineOwn(target, key, value);
+       }
+     }
+ 

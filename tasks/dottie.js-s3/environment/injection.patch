@@ -1,0 +1,135 @@
+diff --git a/README.md b/README.md
+index 4d3940f..ee0f585 100644
+--- a/README.md
++++ b/README.md
+@@ -42,6 +42,14 @@ dottie.set(values, 'some.nested.object', someValue, {
+ });
+ ```
+ 
++
++### Remove value
++Removes a nested value. Removing a path that does not resolve is a no-op.
++
++```js
++dottie.remove(values, 'some.nested.value');
++```
++
+ ### Transform object
+ Transform object from keys with dottie notation to nested objects
+ 
+@@ -87,6 +95,29 @@ var transformed = dottie.transform(values, { delimiter: '_' });
+ */
+ ```
+ 
++
++### Expand a flat object
++Expands keys with separator-delimited names into an existing nested object. This is the inverse
++of `dottie.flatten`; existing fields on the target are kept.
++
++```js
++var target = { user: { role: 'admin' } };
++dottie.expand(target, {
++  'user.name': 'Gummy Bear',
++  'user.email': 'gummybear@candymountain.com'
++});
++// target.user.role is still 'admin'; target.user.name is now 'Gummy Bear'
++```
++
++### Merge objects
++Merges the own values of one object into another, recursing into nested plain objects.
++
++```js
++var target = { user: { role: 'admin' } };
++dottie.merge(target, { user: { name: 'Gummy Bear' }, active: true });
++// target.user.role === 'admin', target.user.name === 'Gummy Bear', target.active === true
++```
++
+ ### Get paths in object
+ ```js
+ var object = {
+diff --git a/dottie.js b/dottie.js
+index e435093..240a36a 100644
+--- a/dottie.js
++++ b/dottie.js
+@@ -114,6 +114,25 @@
+     }
+   };
+ 
++
++  // Remove the value at a nested path
++  Dottie.remove = function(object, path) {
++    var pieces = Array.isArray(path) ? path.slice(0) : path.split('.');
++    var last = pieces.pop();
++    var current = object;
++
++    for (var index = 0; index < pieces.length; index++) {
++      current = current[pieces[index]];
++      if (current === null || current === undefined) {
++        return;
++      }
++    }
++
++    if (current !== null && typeof current === 'object') {
++      delete current[last];
++    }
++  };
++
+   // Transform unnested object with .-seperated keys into a nested object.
+   Dottie.transform = function Dottie$transformfunction(object, options) {
+     if (Array.isArray(object)) {
+@@ -166,6 +185,55 @@
+     return transformed;
+   };
+ 
++
++  // Expand a flat object with separator-delimited keys into an existing object
++  Dottie.expand = function(object, flat, seperator) {
++    if (typeof seperator === "undefined") seperator = '.';
++
++    for (var key in flat) {
++      if (!hasOwnProp.call(flat, key)) continue;
++
++      var pieces = key.split(seperator);
++      var current = object;
++
++      for (var index = 0; index < pieces.length; index++) {
++        var piece = pieces[index];
++
++        if (index == (pieces.length - 1)) {
++          current[piece] = flat[key];
++        } else {
++          if (typeof current[piece] !== 'object' || current[piece] === null) {
++            current[piece] = {};
++          }
++          current = current[piece];
++        }
++      }
++    }
++
++    return object;
++  };
++
++  // Merge the own enumerable values of source into target, recursing into nested objects
++  Dottie.merge = function(target, source) {
++    var keys = Object.keys(source);
++
++    for (var index = 0; index < keys.length; index++) {
++      var key = keys[index];
++      var value = source[key];
++
++      if (Object.prototype.toString.call(value) === "[object Object]") {
++        if (Object.prototype.toString.call(target[key]) !== "[object Object]") {
++          target[key] = {};
++        }
++        Dottie.merge(target[key], value);
++      } else {
++        target[key] = value;
++      }
++    }
++
++    return target;
++  };
++
+   Dottie.flatten = function(object, seperator) {
+     if (typeof seperator === "undefined") seperator = '.';
+     var flattened = {}

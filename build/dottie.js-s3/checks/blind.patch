@@ -1,0 +1,112 @@
+diff -ruN pristine/dottie.js app/dottie.js
+--- a/dottie.js	2026-10-26 20:21:44.000000000 +0000
++++ b/dottie.js	2026-10-26 20:33:34.053395140 +0000
+@@ -4,6 +4,34 @@
+   // Weird IE shit, objects do not have hasOwn, but the prototype does...
+   var hasOwnProp = Object.prototype.hasOwnProperty;
+ 
++  // Property names that can reach or rewire a prototype. `__proto__` is the prototype accessor
++  // in every position. A non-final `constructor`/`prototype` pair can walk to one through
++  // inheritance. A final name is ordinary data unless assigning it would itself set a prototype,
++  // which only `__proto__` does.
++  var isPrototypeName = function (part, finalPart) {
++    var name = String(part);
++    return name === '__proto__'
++      || (!finalPart && (name === 'constructor' || name === 'prototype'));
++  };
++
++  // Resolve a path part to the property name once, so the name that is checked is exactly the
++  // name that is later used. Symbols are left alone: they never name a string prototype key.
++  var propertyName = function (part) {
++    return typeof part === 'symbol' ? part : String(part);
++  };
++
++  // Does any part of a path name a prototype? Parts are compared by the property name the
++  // engine will build from them, not by their raw type or text.
++  var touchesPrototype = function (parts) {
++    var last = parts.length - 1;
++    for (var index = 0; index <= last; index++) {
++      if (isPrototypeName(parts[index], index === last)) {
++        return true;
++      }
++    }
++    return false;
++  };
++
+   var reverseDupArray = function (array) {
+     var result = new Array(array.length);
+     var index  = array.length;
+@@ -71,7 +99,11 @@
+ 
+   // Set nested value
+   Dottie.set = function(object, path, value, options) {
+-    var pieces = Array.isArray(path) ? path : path.split('.'), current = object, piece, length = pieces.length;
++    var pieces = Array.isArray(path) ? path.map(propertyName) : path.split('.'), current = object, piece, length = pieces.length;
++
++    if (touchesPrototype(pieces)) {
++      return;
++    }
+ 
+     if (typeof current !== 'object') {
+         throw new Error('Parent is not an object.');
+@@ -117,7 +149,10 @@
+ 
+   // Remove the value at a nested path
+   Dottie.remove = function(object, path) {
+-    var pieces = Array.isArray(path) ? path.slice(0) : path.split('.');
++    var pieces = Array.isArray(path) ? path.map(propertyName) : path.split('.');
++    if (touchesPrototype(pieces)) {
++      return;
++    }
+     var last = pieces.pop();
+     var current = object;
+ 
+@@ -159,6 +194,9 @@
+ 
+       if (key.indexOf(options.delimiter) !== -1) {
+         pieces = key.split(options.delimiter);
++        if (touchesPrototype(pieces)) {
++          continue;
++        }
+         piecesLength = pieces.length;
+         current = transformed;
+ 
+@@ -178,6 +216,9 @@
+           }
+         }
+       } else {
++        if (isPrototypeName(key, true)) {
++          continue;
++        }
+         transformed[key] = object[key];
+       }
+     }
+@@ -194,6 +235,9 @@
+       if (!hasOwnProp.call(flat, key)) continue;
+ 
+       var pieces = key.split(seperator);
++      if (touchesPrototype(pieces)) {
++        continue;
++      }
+       var current = object;
+ 
+       for (var index = 0; index < pieces.length; index++) {
+@@ -221,8 +265,17 @@
+       var key = keys[index];
+       var value = source[key];
+ 
++      // Assigning to `__proto__` on an ordinary object runs the prototype setter instead of
++      // creating an own field, so this key can never be copied.
++      if (key === '__proto__') {
++        continue;
++      }
++
+       if (Object.prototype.toString.call(value) === "[object Object]") {
+-        if (Object.prototype.toString.call(target[key]) !== "[object Object]") {
++        // Only recurse into an object the target already owns; an inherited one belongs to
++        // something else and writing through it would reach outside this object.
++        var existing = hasOwnProp.call(target, key) ? target[key] : undefined;
++        if (Object.prototype.toString.call(existing) !== "[object Object]") {
+           target[key] = {};
+         }
+         Dottie.merge(target[key], value);
