@@ -1,0 +1,173 @@
+diff --git a/doc/components_2.md b/doc/components_2.md
+index 353d6801..10004eff 100644
+--- a/doc/components_2.md
++++ b/doc/components_2.md
+@@ -29,3 +29,23 @@ The `MJML` engine will then replace your included files before starting the rend
+ <aside class="notice">
+ Note that the file must be a file with a `.mjml` extension
+ </aside>
++
++### Static partials
++
++Static assets can be embedded verbatim, without being parsed as MJML, by setting
++`type` to `css` or `html`. The path is resolved the same way as for an MJML
++partial, relative to the document that contains the `mj-include` element.
++
++```xml
++<!-- main.mjml -->
++<mjml>
++  <mj-body>
++    <mj-include path="./theme.css" type="css" />
++    <mj-include path="./banner.html" type="html" />
++  </mj-body>
++</mjml>
++```
++
++A `css` partial is wrapped in a `<style>` element; an `html` partial is inserted
++as it is written in the file.
++
+diff --git a/packages/mjml-parser-xml/src/helpers/rawInclude.js b/packages/mjml-parser-xml/src/helpers/rawInclude.js
+new file mode 100644
+index 00000000..9cfde1bb
+--- /dev/null
++++ b/packages/mjml-parser-xml/src/helpers/rawInclude.js
+@@ -0,0 +1,14 @@
++import fs from 'fs'
++import path from 'path'
++
++// Reads a static partial (css or html) that is embedded verbatim instead of being
++// parsed as MJML. The path is relative to the directory of the including document.
++export default function readRawInclude(cwd, file) {
++  const partialPath = path.resolve(cwd, file)
++
++  try {
++    return { content: fs.readFileSync(partialPath, 'utf8'), partialPath }
++  } catch (e) {
++    return { error: e, partialPath }
++  }
++}
+diff --git a/packages/mjml-parser-xml/src/index.js b/packages/mjml-parser-xml/src/index.js
+index f755ffd9..18da3565 100644
+--- a/packages/mjml-parser-xml/src/index.js
++++ b/packages/mjml-parser-xml/src/index.js
+@@ -11,6 +11,7 @@ import flow from 'lodash/fp/flow'
+ 
+ import cleanNode from './helpers/cleanNode'
+ import convertBooleansOnAttrs from './helpers/convertBooleansOnAttrs'
++import readRawInclude from './helpers/rawInclude'
+ import setEmptyAttributes from './helpers/setEmptyAttributes'
+ 
+ const indexesForNewLine = xml => {
+@@ -157,6 +158,42 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+     cur = curBeforeInclude
+   }
+ 
++  const handleCssHtmlInclude = (file, attrs, line) => {
++    const { content, error, partialPath } = readRawInclude(cwd, file)
++
++    if (error) {
++      cur.children.push({
++        line,
++        file,
++        absoluteFilePath: path.resolve(cwd, actualPath),
++        parent: cur,
++        tagName: 'mj-raw',
++        content: `<!-- mj-include fails to read file : ${file} at ${partialPath} -->`,
++        children: [],
++        errors: [
++          {
++            type: 'include',
++            params: { file, partialPath },
++          },
++        ],
++      })
++
++      return
++    }
++
++    cur.children.push({
++      line,
++      file: actualPath,
++      absoluteFilePath: path.resolve(cwd, actualPath),
++      parent: cur,
++      tagName: 'mj-raw',
++      content:
++        attrs.type === 'css' ? `<style type="text/css">${content}</style>` : content,
++      children: [],
++      errors: [],
++    })
++  }
++
+   const parser = new htmlparser.Parser(
+     {
+       onopentag: (name, attrs) => {
+@@ -181,8 +218,12 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+ 
+         if (name === 'mj-include') {
+           if (ignoreIncludes) return
+-          
++
+           inInclude = true
++          if (attrs.type === 'css' || attrs.type === 'html') {
++            handleCssHtmlInclude(decodeURIComponent(attrs.path), attrs, line)
++            return
++          }
+           handleInclude(decodeURIComponent(attrs.path), line)
+           return
+         }
+diff --git a/packages/mjml-raw/README.md b/packages/mjml-raw/README.md
+index 99a614ec..966c9ae9 100644
+--- a/packages/mjml-raw/README.md
++++ b/packages/mjml-raw/README.md
+@@ -19,6 +19,19 @@ If placed inside `<mj-head>`, its content will be added at the end of the `<head
+   </a>
+ </p>
+ 
++Instead of writing the raw HTML inside the tag, you can point the optional `src`
++attribute at a local file. Its contents are inserted verbatim, relative to the
++directory the compiler is run from.
++
++```xml
++<mjml>
++  <mj-body>
++    <mj-raw src="./snippets/banner.html"></mj-raw>
++  </mj-body>
++</mjml>
++```
++
++
+ 
+ If you use mj-raw to add templating language, and use the `minify` option, you might get a `Parsing error`, especially when using the `<` character. You can tell the minifier to ignore some content by wrapping it between two `<!-- htmlmin:ignore -->` tags.
+ 
+diff --git a/packages/mjml-raw/src/index.js b/packages/mjml-raw/src/index.js
+index ea9778af..71c2c02f 100644
+--- a/packages/mjml-raw/src/index.js
++++ b/packages/mjml-raw/src/index.js
+@@ -1,10 +1,27 @@
++import fs from 'fs'
++import path from 'path'
++
+ import { BodyComponent } from 'mjml-core'
+ 
+ export default class MjRaw extends BodyComponent {
+   static endingTag = true
+   static rawElement = true
+ 
++  static allowedAttributes = {
++    src: 'string',
++  }
++
+   render() {
++    const src = this.getAttribute('src')
++
++    if (src) {
++      try {
++        return fs.readFileSync(path.resolve(process.cwd(), src), 'utf8')
++      } catch (e) {
++        return `<!-- mj-raw fails to read file : ${src} -->`
++      }
++    }
++
+     return this.getContent()
+   }
+ }

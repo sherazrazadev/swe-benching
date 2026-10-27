@@ -1,0 +1,268 @@
+diff -ruN pristine/packages/mjml-core/src/index.js app/packages/mjml-core/src/index.js
+--- a/packages/mjml-core/src/index.js	2026-10-27 14:03:56.000000000 +0000
++++ b/packages/mjml-core/src/index.js	2026-10-27 14:37:04.827842071 +0000
+@@ -1,4 +1,5 @@
+ import { find, get, identity, map, omit, reduce, isObject, each } from 'lodash'
++import fs from 'fs'
+ import path from 'path'
+ import juice from 'juice'
+ import { html as htmlBeautify } from 'js-beautify'
+@@ -157,6 +158,20 @@
+   const mjBody = find(mjml.children, { tagName: 'mj-body' })
+   const mjHead = find(mjml.children, { tagName: 'mj-head' })
+ 
++  // Directory that contains the compiled document. Components that read files on
++  // their own (mj-raw src) need it to know which files they may reach.
++  const documentRoot = (() => {
++    const resolved = path.resolve(filePath)
++
++    try {
++      return fs.lstatSync(resolved).isDirectory()
++        ? resolved
++        : path.dirname(resolved)
++    } catch (e) {
++      return path.dirname(resolved)
++    }
++  })()
++
+   const processing = (node, context, parseMJML = identity) => {
+     if (!node) {
+       return
+@@ -235,6 +250,7 @@
+   }
+ 
+   const bodyHelpers = {
++    documentRoot,
+     addMediaQuery(className, { parsedWidth, unit }) {
+       globalDatas.mediaQueries[
+         className
+@@ -253,6 +269,7 @@
+   }
+ 
+   const headHelpers = {
++    documentRoot,
+     add(attr, ...params) {
+       if (Array.isArray(globalDatas[attr])) {
+         globalDatas[attr].push(...params)
+diff -ruN pristine/packages/mjml-parser-xml/src/helpers/pathContainment.js app/packages/mjml-parser-xml/src/helpers/pathContainment.js
+--- a/packages/mjml-parser-xml/src/helpers/pathContainment.js	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/mjml-parser-xml/src/helpers/pathContainment.js	2026-10-27 14:36:45.748330326 +0000
+@@ -0,0 +1,41 @@
++import fs from 'fs'
++import path from 'path'
++
++// Canonical form of a path. Links are followed before any comparison is made, so a
++// link that lives inside the allowed tree but points outside it is seen for what it
++// is. When the final component is missing we canonicalise the parent instead: a
++// simply absent file must keep behaving like it always has ("fails to read") while
++// its containing directory is still checked.
++const canonicalize = target => {
++  try {
++    return fs.realpathSync(target)
++  } catch (e) {
++    try {
++      return path.join(
++        fs.realpathSync(path.dirname(target)),
++        path.basename(target),
++      )
++    } catch (parentError) {
++      return null
++    }
++  }
++}
++
++// True when `target` is exactly `root` or lies below it.
++export default function isWithinDirectory(root, target) {
++  const canonicalRoot = canonicalize(root)
++  const canonicalTarget = canonicalize(target)
++
++  if (!canonicalRoot || !canonicalTarget) {
++    return false
++  }
++
++  const relative = path.relative(canonicalRoot, canonicalTarget)
++
++  return (
++    relative === '' ||
++    (relative !== '..' &&
++      !relative.startsWith(`..${path.sep}`) &&
++      !path.isAbsolute(relative))
++  )
++}
+diff -ruN pristine/packages/mjml-parser-xml/src/index.js app/packages/mjml-parser-xml/src/index.js
+--- a/packages/mjml-parser-xml/src/index.js	2026-10-27 14:03:58.000000000 +0000
++++ b/packages/mjml-parser-xml/src/index.js	2026-10-27 14:39:35.031865215 +0000
+@@ -11,6 +11,7 @@
+ 
+ import cleanNode from './helpers/cleanNode'
+ import convertBooleansOnAttrs from './helpers/convertBooleansOnAttrs'
++import isWithinDirectory from './helpers/pathContainment'
+ import readRawInclude from './helpers/rawInclude'
+ import setEmptyAttributes from './helpers/setEmptyAttributes'
+ 
+@@ -38,6 +39,7 @@
+     filePath = '.',
+     actualPath = '.',
+     ignoreIncludes = false,
++    documentRoot,
+     preprocessors = [],
+   } = options
+ 
+@@ -66,10 +68,45 @@
+   const findTag = (tagName, tree) => find(tree.children, { tagName })
+   const lineIndexes = indexesForNewLine(xml)
+ 
++  // The boundary is the directory of the document being compiled, not the directory
++  // of whichever partial is being parsed: include paths resolve against `cwd`, but a
++  // nested parse must not shrink the tree it is allowed to reach. The root travels
++  // with the options so every depth compares against the same directory.
++  const includeRoot = documentRoot
++    ? path.resolve(documentRoot)
++    : path.resolve(cwd)
++
++  const refuseInclude = (file, line, partialPath) => {
++    if (!cur) {
++      return
++    }
++
++    cur.children.push({
++      line,
++      file,
++      absoluteFilePath: path.resolve(cwd, actualPath),
++      parent: cur,
++      tagName: 'mj-raw',
++      content: `<!-- mj-include refused : ${file} is outside the document directory -->`,
++      children: [],
++      errors: [
++        {
++          type: 'include-denied',
++          params: { file, partialPath },
++        },
++      ],
++    })
++  }
++
+   const handleInclude = (file, line) => {
+     const partialPath = path.resolve(cwd, file)
+     const curBeforeInclude = cur
+ 
++    if (!isWithinDirectory(includeRoot, partialPath)) {
++      refuseInclude(file, line, partialPath)
++      return
++    }
++
+     if (find(cur.includedIn, { file: partialPath }))
+       throw new Error(`Circular inclusion detected on file : ${partialPath}`)
+ 
+@@ -109,6 +146,7 @@
+         ...options,
+         filePath: partialPath,
+         actualPath: partialPath,
++        documentRoot: includeRoot,
+       },
+       [
+         ...cur.includedIn,
+@@ -159,7 +197,14 @@
+   }
+ 
+   const handleCssHtmlInclude = (file, attrs, line) => {
+-    const { content, error, partialPath } = readRawInclude(cwd, file)
++    const partialPath = path.resolve(cwd, file)
++
++    if (!isWithinDirectory(includeRoot, partialPath)) {
++      refuseInclude(file, line, partialPath)
++      return
++    }
++
++    const { content, error, partialPath: readPath } = readRawInclude(cwd, file)
+ 
+     if (error) {
+       cur.children.push({
+@@ -168,12 +213,12 @@
+         absoluteFilePath: path.resolve(cwd, actualPath),
+         parent: cur,
+         tagName: 'mj-raw',
+-        content: `<!-- mj-include fails to read file : ${file} at ${partialPath} -->`,
++        content: `<!-- mj-include fails to read file : ${file} at ${readPath} -->`,
+         children: [],
+         errors: [
+           {
+             type: 'include',
+-            params: { file, partialPath },
++            params: { file, partialPath: readPath },
+           },
+         ],
+       })
+diff -ruN pristine/packages/mjml-raw/src/helpers/pathContainment.js app/packages/mjml-raw/src/helpers/pathContainment.js
+--- a/packages/mjml-raw/src/helpers/pathContainment.js	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/mjml-raw/src/helpers/pathContainment.js	2026-10-27 14:36:46.798358491 +0000
+@@ -0,0 +1,39 @@
++import fs from 'fs'
++import path from 'path'
++
++// Canonical form of a path, with links followed so that a link placed inside the
++// allowed tree cannot be used to reach a file outside it. A missing final component
++// is canonicalised through its parent, keeping "file does not exist" behaviour.
++const canonicalize = target => {
++  try {
++    return fs.realpathSync(target)
++  } catch (e) {
++    try {
++      return path.join(
++        fs.realpathSync(path.dirname(target)),
++        path.basename(target),
++      )
++    } catch (parentError) {
++      return null
++    }
++  }
++}
++
++// True when `target` is exactly `root` or lies below it.
++export default function isWithinDirectory(root, target) {
++  const canonicalRoot = canonicalize(root)
++  const canonicalTarget = canonicalize(target)
++
++  if (!canonicalRoot || !canonicalTarget) {
++    return false
++  }
++
++  const relative = path.relative(canonicalRoot, canonicalTarget)
++
++  return (
++    relative === '' ||
++    (relative !== '..' &&
++      !relative.startsWith(`..${path.sep}`) &&
++      !path.isAbsolute(relative))
++  )
++}
+diff -ruN pristine/packages/mjml-raw/src/index.js app/packages/mjml-raw/src/index.js
+--- a/packages/mjml-raw/src/index.js	2026-10-27 14:03:58.000000000 +0000
++++ b/packages/mjml-raw/src/index.js	2026-10-27 14:36:59.279693268 +0000
+@@ -3,6 +3,8 @@
+ 
+ import { BodyComponent } from 'mjml-core'
+ 
++import isWithinDirectory from './helpers/pathContainment'
++
+ export default class MjRaw extends BodyComponent {
+   static endingTag = true
+   static rawElement = true
+@@ -15,8 +17,16 @@
+     const src = this.getAttribute('src')
+ 
+     if (src) {
++      const target = path.resolve(process.cwd(), src)
++      const root =
++        (this.context && this.context.documentRoot) || process.cwd()
++
++      if (!isWithinDirectory(root, target)) {
++        return `<!-- mj-raw refused : ${src} is outside the document directory -->`
++      }
++
+       try {
+-        return fs.readFileSync(path.resolve(process.cwd(), src), 'utf8')
++        return fs.readFileSync(target, 'utf8')
+       } catch (e) {
+         return `<!-- mj-raw fails to read file : ${src} -->`
+       }

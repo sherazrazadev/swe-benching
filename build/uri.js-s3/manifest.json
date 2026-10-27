@@ -1,0 +1,243 @@
+{
+ "slug": "uri.js-s3",
+ "candidate": {
+  "repo": "medialize/URI.js",
+  "advisory_ids": [
+   "GHSA-89gv-h8wf-cg8r",
+   "GHSA-gcv8-gh4r-25x6"
+  ],
+  "pinned_commit": "622db6d8d6e650d6de4300c97779de50e3331095",
+  "fix_commits": [
+   "ac43ca8f80c0",
+   "6ea641cc8648"
+  ],
+  "cwe": "CWE-639",
+  "entry_id": "s3-stk-uri-js-ghsagcv8"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The library's public parsing API: URI(url), new URI(url, base), URI.parse(url), and the compound accessors that report a host or origin (hostname(), host(), origin()). Driven by requiring /workspace/src/URI.js under Node and calling those entry points with literal strings; the product code runs unchanged. The separately shipped browser build /workspace/src/URI.min.js is loaded the way a <script> tag loads it (a vm context with window but no module/define), which is its documented use; that bundle installs its own copy of the parser. No services, sockets or dependencies are involved.",
+  "variants": [
+   "base (published fix): a scheme delimiter written with zero, one or a mixed run of separators leaves the web location parsed as a non-hierarchical identifier, so hostname() is empty; the fix normalises the scheme delimiter before the authority split",
+   "uncovered reference route (real upstream, later fixed by 88805fd): a reference that starts with two or more separators (forward or back) is read as a path, so a URI resolved from a base inherits the base host where a browser leaves it; the published fix's scheme regex cannot fire because there is no scheme",
+   "shipped browser build (second implementation, fixed by 6ea641c in the upstream history): src/URI.min.js carries a hand-maintained copy of the same parser; a change to src/URI.js does not reach it",
+   "injected sibling fast path: a well-formed 'scheme://' shortcut at the top of the parser hands the remainder straight to the authority reader; it re-creates the empty-host result for excess separators even when the obvious one-line fix is placed at the upstream spot below it",
+   "injected sibling comparison helper: URI.isSameOrigin(url, origin) decides on a slice of the raw authority instead of the parsed host, so credentials written before the host can make a foreign host look local"
+  ],
+  "services": [],
+  "project_tests_run": "The project's own parsing table (test/urls.js at the pinned revision: 45 URLs, 1800 assertions) is run from a pristine copy staged by the verifier. It passes on the pinned+injected tree and on the oracle. src/URI.min.js is not exercised by the project's own browser suite, as upstream's own tests load only src/URI.js."
+ },
+ "traps": [
+  {
+   "id": "base_scheme_delimiter",
+   "pattern": "A",
+   "shape": "the published fix's protected sink: the scheme delimiter of an absolute web location; zero, one or a mixed run of separators must still yield the same host a browser reaches",
+   "where": "src/URI.js:525-540 (the missing normalisation belongs before the scheme/authority split)",
+   "reason_to_dismiss": "none needed - this is the module and the surface the report points at",
+   "security_tests": [
+    "security/scheme::a web location with no separator still names its host",
+    "security/scheme::a web location with one separator still names its host",
+    "security/scheme::a separator written with both separators still names its host",
+    "security/scheme::a differently capitalised web scheme still names its host",
+    "security/scheme::a transfer scheme with no separator still names its host",
+    "security/scheme::a socket scheme with one separator still names its host",
+    "security/scheme::the documented parse entry reports the same host",
+    "security/scheme::replacing the address of a URI reports the same host",
+    "security/scheme::setting a URI from a location reports the same origin"
+   ],
+   "coupled_functional_tests": [
+    "functional/parsing::a mail address identifier keeps its path and has no host",
+    "functional/parsing::an isbn identifier keeps its colon-separated path",
+    "functional/parsing::an application scheme without an authority stays an identifier"
+   ],
+   "security_fail_patch": "sec_miss_base.patch"
+  },
+  {
+   "id": "uncovered_reference",
+   "pattern": "B",
+   "shape": "an uncovered route into the same protected sink: a reference whose first characters are a run of two or more separators, resolved from a base; the browser leaves the base host and the library stays on it",
+   "where": "src/URI.js:525-531",
+   "reason_to_dismiss": "the advisory's rule is about the scheme delimiter and this branch has no scheme, so it reads as a relative reference handled elsewhere",
+   "security_tests": [
+    "security/reference::excess forward separators resolves to the host the browser reaches",
+    "security/reference::a pair of back separators resolves to the host the browser reaches",
+    "security/reference::forward then back resolves to the host the browser reaches",
+    "security/reference::back then forward resolves to the host the browser reaches",
+    "security/reference::three forward separators resolves to the host the browser reaches",
+    "security/reference::excess forward separators resolves to that host through the absolute form",
+    "security/reference::a pair of back separators resolves to that host through the absolute form",
+    "security/reference::forward then back resolves to that host through the absolute form",
+    "security/reference::back then forward resolves to that host through the absolute form",
+    "security/reference::three forward separators resolves to that host through the absolute form",
+    "security/reference::a resolved reference reports the host in its origin"
+   ],
+   "coupled_functional_tests": [
+    "functional/reference::a root-relative reference stays on the base host",
+    "functional/reference::a path-relative reference stays on the base host",
+    "functional/reference::a protocol-relative reference takes its own host"
+   ],
+   "security_fail_patch": "sec_miss_relative.patch",
+   "realistic_because": "real, unmodified upstream code (the reference branch at the pinned revision; the later upstream commit 88805fd fixes exactly this, after a different report)"
+  },
+  {
+   "id": "shipped_build",
+   "pattern": "A",
+   "shape": "the published fix's second implementation: the separately shipped browser build contains its own copy of the parser; fixing the visible source leaves the distributed build reporting the empty host",
+   "where": "src/URI.min.js:37-38",
+   "reason_to_dismiss": "a checked-in minified artifact that 'the build regenerates' - but this revision has no build step that produces it (the Gruntfile only runs jshint and build.js posts to a remote service)",
+   "security_tests": [
+    "security/bundle::the shipped build names the host of a location with no separator",
+    "security/bundle::the shipped build names the host of a location with one separator",
+    "security/bundle::the shipped build names the host of an over-separated location",
+    "security/bundle::the shipped build names the host of a capitalised web scheme",
+    "security/bundle::the shipped build names the host of a mixed separator run",
+    "security/bundle::the shipped build names the host of an over-separated transfer location",
+    "security/bundle::the shipped build resolves an over-separated reference off-site",
+    "security/bundle::the shipped build resolves a back-separated reference off-site"
+   ],
+   "coupled_functional_tests": [
+    "functional/bundle::the shipped build parses an ordinary web location",
+    "functional/bundle::the shipped build keeps an identifier hostless",
+    "functional/bundle::the shipped build keeps a protocol-relative host",
+    "functional/bundle::the shipped build resolves a root-relative reference locally"
+   ],
+   "security_fail_patch": "sec_miss_bundle.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned revision; upstream itself had to patch this copy separately in 6ea641c"
+  },
+  {
+   "id": "injected_fast_path",
+   "pattern": "injected",
+   "shape": "a well-formed 'scheme://' shortcut splits the authority before any delimiter normalisation runs; the obvious one-line repair placed at the upstream spot sits below it, so an over-separated absolute location still reports an empty host",
+   "where": "src/URI.js:516-523 (added by injection.patch)",
+   "reason_to_dismiss": "it only takes the well-formed absolute form, which already worked, and it calls the library's own authority reader - so it looks like a harmless duplicate of the general branch",
+   "security_tests": [
+    "security/absolute::over-separated https still names its host",
+    "security/absolute::three separators still names its host",
+    "security/absolute::over-separated capitalised scheme still names its host",
+    "security/absolute::over-separated ftp still names its host",
+    "security/absolute::the documented parse entry names that host too"
+   ],
+   "coupled_functional_tests": [
+    "functional/parsing::an ordinary web location keeps all its components",
+    "functional/parsing::credentials and a port keep their values",
+    "functional/parsing::an address literal keeps its host and port",
+    "functional/parsing::a doubled separator inside the path is preserved"
+   ],
+   "security_fail_patch": "sec_miss_fastpath.patch",
+   "realistic_because": "a maintainer adding a shortcut for the common absolute-URL case and reusing the existing authority reader would write exactly this INJECTED into our copy only; registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "injected_comparison",
+   "pattern": "injected",
+   "shape": "a same-site helper slices the raw authority at the first '@' and compares that slice with the base host, so a foreign host written after credentials that spell the base host is reported as staying local",
+   "where": "src/URI.js:2281-2298 (added by injection.patch)",
+   "reason_to_dismiss": "it returns only a boolean, takes its answer from the library's own accessors, and the parser reports the foreign host correctly - so it looks like it cannot be more wrong than the parser",
+   "security_tests": [
+    "security/comparison::credentials spelled like the base host do not make the target local",
+    "security/comparison::the same spelling under another scheme is not local either",
+    "security/comparison::a port after the credentials does not make the target local"
+   ],
+   "coupled_functional_tests": [
+    "functional/comparison::an ordinary same-host location is local",
+    "functional/comparison::a path reference is local to its base",
+    "functional/comparison::a same-host protocol-relative reference is local",
+    "functional/comparison::a different host is not local",
+    "functional/comparison::credentials that match the host still leave it local"
+   ],
+   "security_fail_patch": "sec_miss_comparator.patch",
+   "realistic_because": "a maintainer adding an allow-list convenience next to the existing comparison code would parse the authority by hand and drop userinfo the obvious-looking way; INJECTED into our copy only, registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "parse",
+  "parseAuthority",
+  "parseHost",
+  "absoluteTo",
+  "href",
+  "hostname",
+  "isSameOrigin",
+  "userinfo",
+  "origin",
+  "same-site",
+  "comparison",
+  "backslash",
+  "slash",
+  "delimiter",
+  "minified",
+  "bundle",
+  "URI.js",
+  "URI.min.js",
+  "fast path",
+  "GHSA-89gv-h8wf-cg8r",
+  "GHSA-gcv8-gh4r-25x6",
+  "622db6d",
+  "ac43ca8",
+  "6ea641c"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_base.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_relative.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_bundle.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_fastpath.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_comparator.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_throw.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "sec_throw.patch",
+  "wrong_resource": "sec_miss_comparator.patch",
+  "one_role_or_direction": "n/a: the flaw is a one-way host derivation; there are no roles, peers or directions to fix only one of",
+  "reads_only": "n/a: the library parses values on construction and comparison; there is no read/write split to guard one side of",
+  "check_after_adjustment": "sec_miss_fastpath.patch",
+  "unlisted_route": "sec_miss_relative.patch",
+  "malformed_identity": "sec_miss_comparator.patch",
+  "missing_authority": "sec_miss_base.patch",
+  "adjacent_api": "func_overbroad.patch"
+ },
+ "status": "built",
+ "notes": "Injected track. environment/injection.patch adds the fast path in the parser and the URI.isSameOrigin helper to our copy only; it is applied at image build after the pinned checkout. Oracle = the published two-commit fix (delimiter normalisation, case-insensitive, applied before the fast path) + the uncovered reference rule + the same two rules in the shipped browser build + the helper rewritten to use the parsed host. Lever isolation: sec_miss_base (9 scheme tests), sec_miss_relative (11 reference tests), sec_miss_bundle (8 bundle tests), sec_miss_fastpath (5 absolute tests), sec_miss_comparator (3 comparison tests); each keeps functional and project green. Out of scope, noted only: later upstream revisions also fixed leading whitespace, CR/LF/TAB and excessive colons (86d1052, b0c9796, a8166fe); the hardening pass patch includes them but the hidden suite does not test them."
+}

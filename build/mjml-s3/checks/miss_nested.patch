@@ -1,0 +1,197 @@
+diff --git a/packages/mjml-core/src/index.js b/packages/mjml-core/src/index.js
+index 9bc466aa..1931eb05 100644
+--- a/packages/mjml-core/src/index.js
++++ b/packages/mjml-core/src/index.js
+@@ -82,6 +82,7 @@ export default function mjml2html(mjml, options = {}) {
+     keepComments,
+     minify = false,
+     minifyOptions = {},
++    ignoreIncludes = false,
+     juiceOptions = {},
+     juicePreserveTags = null,
+     skeleton = defaultSkeleton,
+@@ -101,6 +102,7 @@ export default function mjml2html(mjml, options = {}) {
+       components,
+       filePath,
+       actualPath,
++      ignoreIncludes,
+       preprocessors,
+     })
+   }
+diff --git a/packages/mjml-parser-xml/src/index.js b/packages/mjml-parser-xml/src/index.js
+index 18da3565..1cfdfe35 100644
+--- a/packages/mjml-parser-xml/src/index.js
++++ b/packages/mjml-parser-xml/src/index.js
+@@ -38,6 +38,7 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+     filePath = '.',
+     actualPath = '.',
+     ignoreIncludes = false,
++    projectRoot,
+     preprocessors = [],
+   } = options
+ 
+@@ -66,10 +67,71 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+   const findTag = (tagName, tree) => find(tree.children, { tagName })
+   const lineIndexes = indexesForNewLine(xml)
+ 
++  // The containment root is the directory of the compiled document. It is passed
++  // down to nested parses, which otherwise resolve their own include paths from
++  // the directory of the partial they are parsing.
++  const root = projectRoot ? path.resolve(projectRoot) : path.resolve(cwd)
++
++  const isPathAllowed = absolutePath => {
++    try {
++      const rootPath = fs.realpathSync(root)
++      let targetPath
++
++      try {
++        targetPath = fs.realpathSync(absolutePath)
++      } catch (e) {
++        // A missing target cannot be disclosed; keep the usual "fails to read"
++        // node when its containing directory is inside the root.
++        targetPath = path.join(
++          fs.realpathSync(path.dirname(absolutePath)),
++          path.basename(absolutePath),
++        )
++      }
++
++      const relative = path.relative(rootPath, targetPath)
++
++      return (
++        relative === '' ||
++        (relative !== '..' &&
++          !relative.startsWith(`..${path.sep}`) &&
++          !path.isAbsolute(relative))
++      )
++    } catch (e) {
++      return false
++    }
++  }
++
++  const denyInclude = line => {
++    if (!cur) {
++      return
++    }
++
++    cur.children.push({
++      line,
++      file: actualPath,
++      absoluteFilePath: path.resolve(cwd, actualPath),
++      parent: cur,
++      tagName: 'mj-raw',
++      content: '<!-- mj-include denied -->',
++      children: [],
++      errors: [
++        {
++          type: 'include-denied',
++          params: {},
++        },
++      ],
++    })
++  }
++
+   const handleInclude = (file, line) => {
+     const partialPath = path.resolve(cwd, file)
+     const curBeforeInclude = cur
+ 
++    if (!includedIn.length && !isPathAllowed(partialPath)) {
++      denyInclude(line)
++      return
++    }
++
+     if (find(cur.includedIn, { file: partialPath }))
+       throw new Error(`Circular inclusion detected on file : ${partialPath}`)
+ 
+@@ -109,6 +171,7 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+         ...options,
+         filePath: partialPath,
+         actualPath: partialPath,
++        projectRoot: root,
+       },
+       [
+         ...cur.includedIn,
+@@ -159,7 +222,14 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+   }
+ 
+   const handleCssHtmlInclude = (file, attrs, line) => {
+-    const { content, error, partialPath } = readRawInclude(cwd, file)
++    const partialPath = path.resolve(cwd, file)
++
++    if (!isPathAllowed(partialPath)) {
++      denyInclude(line)
++      return
++    }
++
++    const { content, error, partialPath: readPath } = readRawInclude(cwd, file)
+ 
+     if (error) {
+       cur.children.push({
+@@ -168,12 +238,12 @@ export default function MJMLParser(xml, options = {}, includedIn = []) {
+         absoluteFilePath: path.resolve(cwd, actualPath),
+         parent: cur,
+         tagName: 'mj-raw',
+-        content: `<!-- mj-include fails to read file : ${file} at ${partialPath} -->`,
++        content: `<!-- mj-include fails to read file : ${file} at ${readPath} -->`,
+         children: [],
+         errors: [
+           {
+             type: 'include',
+-            params: { file, partialPath },
++            params: { file, partialPath: readPath },
+           },
+         ],
+       })
+diff --git a/packages/mjml-raw/src/index.js b/packages/mjml-raw/src/index.js
+index 71c2c02f..362789f3 100644
+--- a/packages/mjml-raw/src/index.js
++++ b/packages/mjml-raw/src/index.js
+@@ -3,6 +3,33 @@ import path from 'path'
+ 
+ import { BodyComponent } from 'mjml-core'
+ 
++const isPathAllowed = absolutePath => {
++  try {
++    const root = fs.realpathSync(process.cwd())
++    let target
++
++    try {
++      target = fs.realpathSync(absolutePath)
++    } catch (e) {
++      target = path.join(
++        fs.realpathSync(path.dirname(absolutePath)),
++        path.basename(absolutePath),
++      )
++    }
++
++    const relative = path.relative(root, target)
++
++    return (
++      relative === '' ||
++      (relative !== '..' &&
++        !relative.startsWith(`..${path.sep}`) &&
++        !path.isAbsolute(relative))
++    )
++  } catch (e) {
++    return false
++  }
++}
++
+ export default class MjRaw extends BodyComponent {
+   static endingTag = true
+   static rawElement = true
+@@ -15,8 +42,14 @@ export default class MjRaw extends BodyComponent {
+     const src = this.getAttribute('src')
+ 
+     if (src) {
++      const target = path.resolve(process.cwd(), src)
++
++      if (!isPathAllowed(target)) {
++        return '<!-- mj-raw denied -->'
++      }
++
+       try {
+-        return fs.readFileSync(path.resolve(process.cwd(), src), 'utf8')
++        return fs.readFileSync(target, 'utf8')
+       } catch (e) {
+         return `<!-- mj-raw fails to read file : ${src} -->`
+       }
