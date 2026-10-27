@@ -1,0 +1,62 @@
+{
+ "trial": "jenkins-s3__or2tVRU",
+ "task": "jenkins-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T05:34:14+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.6 (6/10 security, 14/14 functional). Three of the four security failures are the model's own misses under a fair grader: its denylist leaves out ResourceDomainRootAction$Redirection and $InternalResourceRequest, though the instruction says request-routing objects must never be recreated. Its element-type check also erases a type variable to its bound, so the generic group property keeps AttackType. The fourth failure, pluginWrapperIsNotRecreated, is questionable. The model deliberately refuses every hudson.Plugin subtype, so Plugin$DummyImpl is dropped. The test requires that Plugin$DummyImpl be kept as a 'legitimate plugin element', which the instruction never says and arguably contradicts: property 2 bans objects that exist only to describe, load or manage a plugin. A fair score would be about 0.7 rather than 0.6. The verdict (not solved, model-failed) stands either way.",
+  "items": [
+   {
+    "test": "bench.SecurityGenericGroupTypeTest::unrelatedTypeInGroupEntriesIsNotKept",
+    "outcome": "fail",
+    "model_behaviour": "Its DescribableList/CopyOnWriteList converters get the element type from the field's generic signature through RobustCollectionConverter.getTypeArgument, which returns Types.erasure(...) (changes.patch:358-376). For DescribableGroupViewProperty<T>, T erases to its bound, Describable. AttackType implements Describable, so the check accepts and keeps it. The patch never resolves the type variable against the concrete class (bench.Group binds T to Entry).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::requestRedirectionIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "The prohibited-class list in XStream2 (changes.patch:~599-624) covers hudson.Plugin*, PluginManager, UpdateCenter, org.kohsuke.stapler.* and jenkins.security.stapler.*, but not jenkins.security.ResourceDomainRootAction$Redirection. The model did see ResourceDomainRootAction in a grep result (transcript.md:44) and never guarded it, so the redirection object was recreated in an Object-typed field.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::internalResourceRequestIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "Same gap as above: ResourceDomainRootAction$InternalResourceRequest, a request-routing object, is not on the denylist and has no readResolve guard, so it was recreated. The instruction names this category directly ('an object that exists only to route or dispatch a request').",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::pluginWrapperIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "The model refuses creation of any Plugin.class.isAssignableFrom(type) and of anything under the hudson.Plugin prefix (changes.patch:599, 620-624; instantiateNewInstance and BlacklistedTypesConverter throw ConversionException). That blocks PluginWrapper, the security goal, but also the outer hudson.Plugin$DummyImpl. RobustReflectionConverter tolerates field errors, so the document is most likely accepted (2xx) with payload == null. The test then fails at assertTrue(payload instanceof Plugin, 'the legitimate plugin element must still be applied'). The instruction never calls a Plugin instance a legitimate configuration value. Property 2 says objects that exist only to 'describe, load or manage a plugin' must not be created even under a field that admits them. Plugin$DummyImpl is a placeholder that represents a plugin, so refusing it is a reasonable, stricter reading. The reference fix passes only because it guards PluginWrapper alone (readResolve). Inferred, not observed: the grader's stdout tail is empty.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows only local inspection of /workspace sources and the project's own tests. There is no access to /tests or .htests, no bench.* hidden-test names, and no web, curl, wget or github fetches. There is no netguard.log. The model's design (denylist plus element-type prechecks, snapshot/restore) differs from the upstream fix (readResolve guards), so it shows no sign of being copied.",
+  "evidence": [
+   "evidence/grading/results.json: 4 security failures (GenericGroup, Redirection, InternalResourceRequest, PluginWrapper); all 14 functional pass; reward 0.6",
+   "evidence/run.json: tool_calls_during_grading [] and agent_events_after_end 0, so there is no timing or infra issue; exception_info null",
+   "evidence/final-code/changes.patch:358-376 getTypeArgument returns Types.erasure(Types.getTypeArgument(base, index, Object.class)), with no type-variable resolution against the runtime class (cf. fix.patch extractElementType)",
+   "evidence/final-code/changes.patch:~599-605 PROHIBITED_PREFIXES lists 'hudson.Plugin', 'org.kohsuke.stapler.', 'jenkins.security.stapler.' and nothing for ResourceDomainRootAction",
+   "evidence/final-code/changes.patch:~620-624 isProhibitedFromConfiguration returns true for Plugin.class.isAssignableFrom(type), which blocks Plugin$DummyImpl",
+   "evidence/tests/security/SecurityRoutingObjectsTest.java pluginWrapperIsNotRecreated: assertTrue(property.payload instanceof Plugin, \"the legitimate plugin element must still be applied\")",
+   "evidence/instruction.md property 2: 'never recreate ... an object that exists only to route or dispatch a request, or to describe, load or manage a plugin ... even when it is supplied under a field whose declared type would otherwise admit it'",
+   "evidence/solution/fix.patch: guards only PluginWrapper, Redirection and InternalResourceRequest via readResolve; resolves type variables in extractElementType",
+   "evidence/build-notes.md: the upstream-only fix scores 0.6, and each lever's test fails independently, so the suite discriminates as designed except for the Plugin-kept assertion",
+   "evidence/transcript.md:583-603 final summary: the model deliberately denylisted 'plugin machinery (Plugin, PluginManager, PluginWrapper, ...)'"
+  ],
+  "recommended_action": "Keep the run as model-failed (not solved). Fix SecurityRoutingObjectsTest.pluginWrapperIsNotRecreated so that it accepts a fix that also refuses the Plugin placeholder: assert only that no PluginWrapper is recreated (payload == null, or a Plugin whose getWrapper() is null). Alternatively, state in the instruction that Plugin instances themselves are legitimate values. Then re-verdict. This run's partial reward would likely become 0.7, and the solved/unsolved outcome stays the same."
+ }
+}

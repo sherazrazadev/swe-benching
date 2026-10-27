@@ -1,0 +1,102 @@
+{
+ "trial": "avideo-s3__uCwwNTX",
+ "task": "avideo-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T02:03:48+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.0 is the model's own shortfall. It never fixed the logged-in top-up route processPayment.json.php, even after its own grep surfaced it, and that is a clean security fail against the stated invariant. Its other changes also broke legitimate payments. It turned the webhook signature check from fail-open into fail-closed but kept the pinned verifySignature, which hex-decodes the key, so genuine notifications signed with the configured key, which today credit through the lookup fallback, now get a 401. It also gated approval on getTransactionDetails' case-sensitive isApproved, so a settled payment reported in lower case is no longer credited. Both breakages are hidden-contract traps (key format, status casing), so confidence is medium rather than high.",
+  "items": [
+   {
+    "test": "SecForgottenRouteTest::testWalletTopUpEndpointDoesNotCreditWithoutAPayment",
+    "outcome": "fail",
+    "model_behaviour": "Did not touch plugin/AuthorizeNet/processPayment.json.php (changed_files.tsv lists only silentPost, webhook, webhookSubscription, AuthorizeNet.php plus its own test). Its grep showed 'processPayment.json.php:24: $walletPlugin->addBalance($users_id, $amount, ...)' (transcript.md ~line 120), but its final summary still says all credit paths go through the trusted path.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationCreditsTheGatewayPayment",
+    "outcome": "fail",
+    "model_behaviour": "The new authenticateWebhookNotification() calls the unchanged verifySignature, which hex2bin-decodes the key (fix.patch:22-28 shows the pinned code). The harness signs with the raw configured key (AnetHarness::sign), so the result is 401 'invalid signature'. Before the change this notification credited through the lookup fallback. The fixture status 'settledsuccessfully' would also fail the case-sensitive isApproved.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithoutBodyFieldsUsesTheTransactionRecord",
+    "outcome": "fail",
+    "model_behaviour": "Same as above: the raw-key HMAC is rejected by the hex-decoding verifier and returns 401.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithCamelCaseStatusCredits",
+    "outcome": "fail",
+    "model_behaviour": "Fails only on the signature: the transaction status is camelCase and the claimed values match the record, so the 401 from the hex-key verifier is the sole cause.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuinePaymentForAnotherAccountCreditsThatAccount",
+    "outcome": "fail",
+    "model_behaviour": "Fails only on the signature: the hex-key verifier returns 401 for a correctly signed notification.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncRecurringTest::testCorrectlySignedRecurringNotificationCredits",
+    "outcome": "fail",
+    "model_behaviour": "webhookSubscription.php now calls authenticateWebhookNotification and inherits the same hex-key mismatch, so it returns 401. The lower-case status would also fail its approval gate.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncRecurringTest::testRecurringNotificationCreditsItsOwnAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same hex-key signature rejection on the recurring endpoint, returning 401.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncLegacyPostTest::testMatchingLegacyPostCreditsThePayment",
+    "outcome": "fail",
+    "model_behaviour": "silentPost now uses confirmed['isApproved'] from getTransactionDetails, whose check is case-sensitive: in_array($status, ['capturedPendingSettlement','settledSuccessfully'], true) (transcript line 131). The fixture's 'settledsuccessfully' is therefore read as not approved, and the endpoint returns 'not approved' with no credit. The model's own lower-case fallback in paymentFactsFromTransaction never runs because isApproved is always set. Before the change, this post credited. The sibling test with camelCase 60000000003 passed. The lower-case fixture is synthetic (build-notes: 'not a live-API observation'), but the repo's own analyser lowercases, and the instruction requires that settled payments accepted today keep crediting.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "SecNotificationTest::testNotificationWhenNoSignatureKeyIsConfiguredDoesNotCredit",
+    "outcome": "pass",
+    "model_behaviour": "When no key is configured, authenticateWebhookNotification deliberately returns ok. The test passes only because the body's users_id 7 and amount 1000 disagree with the record (400 'does not match'). An unsigned notification whose values match the record would still be accepted with an empty key, so the empty-key fail-open (build lever T2) is not actually closed.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   }
+  ],
+  "lookup_or_leak": "None found. The agent read only the project's own /workspace/tests (Unit/Security files unrelated to AuthorizeNet) and never touched the hidden suites. It made no network or upstream lookups and did its verification with self-written mock runners in /tmp. It briefly created /workspace/videos/configuration.php as a stub and then deleted it. run.json shows no tool calls during the grading window, and agent_end (02:02:23) falls before grading started (02:03:02).",
+  "evidence": [
+   "grading/results.json: security 6/7 (only WalletTopUp fails), functional 2/9, reward 0.0",
+   "final-code/changed_files.tsv: processPayment.json.php not modified",
+   "transcript.md: grep output lists 'processPayment.json.php:24: $walletPlugin->addBalance($users_id, $amount, ...)' yet the route is left open",
+   "solution/fix.patch:22-28: pinned verifySignature uses ctype_xdigit + hex2bin($signatureKeyHex); the reference switches to the raw key",
+   "tests/support/AnetHarness.php sign(): 'sha512=' . hash_hmac('sha512', $rawBody, $signatureKey) using the raw key",
+   "final-code/changes.patch: authenticateWebhookNotification() calls the unchanged self::verifySignature and returns 401 when invalid; webhook.php and webhookSubscription.php now hard-fail on it",
+   "transcript.md:131: getTransactionDetails isApproved = in_array($status, ['capturedPendingSettlement','settledSuccessfully'], true), which is case-sensitive and was left unchanged",
+   "instruction.md: 'A notification that is correctly authenticated with the configured key still credits its payment' and 'Every legitimate notification the integration accepts today is still accepted'",
+   "build-notes.md: the hex-key and casing traps are deliberate coupled levers (ff-hexkey, ff-casing); the lower-case status is 'not a live-API observation'",
+   "transcript.md: the model's E2E runs mocked the AuthorizeNet class, so the real HMAC verification was never exercised"
+  ],
+  "recommended_action": "Keep reward 0.0 as model-failed. The missed top-up route alone is a clear genuine security fail. Task owners may want to make the key-format and status-casing contracts more visible, since they are hidden contracts that make the functional score depend on Authorize.Net domain knowledge. They should also add a security case where an unsigned notification with an empty key and values matching the record is refused, so the T2 fail-open is actually tested."
+ }
+}

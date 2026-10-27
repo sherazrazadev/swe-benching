@@ -1,0 +1,84 @@
+{
+ "trial": "avideo-s3__3Y9TR98",
+ "task": "avideo-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T04:13:18+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "instruction-ambiguity",
+  "confidence": "medium",
+  "summary": "All 7 security tests pass. All 6 functional failures have one cause: the hidden tests sign notifications with HMAC-SHA512 keyed by the raw ASCII signature key, but the repo's existing verifySignature hex-decodes the key (hex2bin). The model correctly made the signature check mandatory and kept the repo's hex scheme, so every genuinely signed test notification was rejected with 401. The instruction never says the key handling is wrong or which HMAC keying counts as 'correctly authenticated with the configured key'. The build notes admit this is a hidden lever ('the pinned code hex-decodes the key, so a correct fix must fix both the gate and the key handling'). Apart from that, the model's fix takes account, amount and approval from the provider record and looks correct, so the 0.0 measures undisclosed provider domain knowledge rather than the security fix.",
+  "items": [
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationCreditsTheGatewayPayment",
+    "outcome": "fail",
+    "model_behaviour": "webhook.php now returns 401 when parsed['signatureValid'] is false. verifySignature still keys the HMAC with hex2bin(signatureKey), as the pinned code did, while the test signs with the raw key (AnetHarness::sign: hash_hmac('sha512', body, key)). The signature therefore never matches and nothing is credited.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithoutBodyFieldsUsesTheTransactionRecord",
+    "outcome": "fail",
+    "model_behaviour": "Same cause: rejected with 401 by the raw-key vs hex-decoded-key mismatch. The model's code would otherwise credit from txnInfo (users_id 42, 5.00).",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithCamelCaseStatusCredits",
+    "outcome": "fail",
+    "model_behaviour": "Same signature-keying cause. The model's isTransactionApproved() lowercases the status, so the camel-case status itself would have been handled.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuinePaymentForAnotherAccountCreditsThatAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same signature-keying cause (401 before lookup).",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testCorrectlySignedRecurringNotificationCredits",
+    "outcome": "fail",
+    "model_behaviour": "webhookSubscription.php now enforces parsed['signatureValid'] (401), which uses the same hex-decoded key, so the raw-key-signed test body is refused.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testRecurringNotificationCreditsItsOwnAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same as above: refused with 401 because of the key-encoding mismatch.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "SecNotificationTest::testAuthenticNotificationCannotChooseAnotherAccountOrAmount",
+    "outcome": "pass",
+    "model_behaviour": "For this model the pass is vacuous: the 'authentic' raw-key-signed request is rejected with 401, and assertOnlyGatewayCredit accepts no credit. Reading the code shows the model credits only txnInfo users_id and amount, and its own end-to-end check (transcript ~line 247) credited users_id=7, amount=5 despite payload 999/9999, so the property does hold.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   }
+  ],
+  "lookup_or_leak": "None found. The agent read only the repo's own /workspace/tests (unrelated existing PHPUnit tests), never the hidden suites. Its only curl calls went to its own local PHP server at 127.0.0.1:8765. There was no web or upstream lookup.",
+  "evidence": [
+   "grading/results.json: all 7 security tests pass; the 4 FuncNotificationTest genuine-credit tests and both FuncRecurringTest tests fail; reward 0.0",
+   "tests/support/AnetHarness.php:175-179 'HMAC-SHA512 over the raw body, keyed with the configured signature key as sent' -> hash_hmac('sha512', $rawBody, $signatureKey)",
+   "solution/fix.patch:27-35 the reference fix replaces hex2bin($signatureKeyHex) with the raw key ('The Signature Key is used as a raw ASCII string in the HMAC \u2014 not hex-decoded')",
+   "build-notes.md:98-100 'Genuine notifications signed with the raw configured key still verify (the pinned code hex-decodes the key, so a correct fix must fix both the gate and the key handling)'; build-notes.md:153 'ff-hexkey' check is designed to break functional tests",
+   "instruction.md: says only 'A notification that is correctly authenticated with the configured key still credits its payment'; there is no mention of key encoding or of the existing verifier being wrong",
+   "final-code/changes.patch:348-360 the model keeps the ctype_xdigit/hex-decoded key path and only makes header lookup case-insensitive; changes.patch:185-190 and 106-111 make the signature mandatory (401) in webhook.php and webhookSubscription.php",
+   "transcript.md:247 the model's own e2e check used a hex KEY with the existing scheme: forged/no-sig -> 401, signed forged values -> credited provider users_id=7 amount=5",
+   "run.json: tool_calls_during_grading empty and no exception, so there was no harness or timeout issue"
+  ],
+  "recommended_action": "Do not count this 0.0 as a model failure. Either say in the instruction that the configured signature key is used as-is (not hex-decoded) for the notification HMAC, matching the provider, or accept both keyings in the functional tests. Then re-run. With that one change, the model's fix appears likely to score 1.0."
+ }
+}

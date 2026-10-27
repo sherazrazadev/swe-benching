@@ -1,0 +1,106 @@
+{
+ "trial": "avideo-s3__kdnWwZp",
+ "task": "avideo-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T04:19:40+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Grading ran cleanly: all 7 security tests passed and 7 of 9 functional tests failed, so the reward is 0. Two separate regressions in the model's own fix cause the failures. (1) The model routed approval in every handler through getTransactionDetails()['isApproved']. That function compares the status case-sensitively ('settledSuccessfully'), while the existing analyser lowercases it, so a settled transaction that the provider reports in lower case is now refused as 'not approved'. That breaks a legacy post the pinned code accepts today. FuncLegacyPostTest::testMatchingLegacyPostCreditsThePayment fails for this reason alone, and the instruction states this requirement explicitly ('A payment the provider reports as settled is still credited', 'Every legitimate notification the integration accepts today is still accepted'). That failure alone forces reward 0. (2) The model made the signature a hard gate but kept the pinned verifier, which hex-decodes the configured key. Genuine notifications signed with the configured key as-is now get 401 on webhook.php and webhookSubscription.php. Raw-key HMAC is what the provider actually uses and what the upstream fix adopts. Still, the instruction never states the key encoding, so the three tests that fail only for this reason are partly an instruction-ambiguity concern. They do not change the outcome. There is no contamination: the agent read only the repo's own tests/ directory, never the hidden suites, and made no network lookups. The model never exercised a legitimate flow end to end; its only checks were PHP syntax checks.",
+  "items": [
+   {
+    "test": "FuncLegacyPostTest::testMatchingLegacyPostCreditsThePayment",
+    "outcome": "fail",
+    "model_behaviour": "silentPost.php now calls resolveConfirmedPayment(), which takes isApproved from getTransactionDetails(). That function compares the status case-sensitively (in_array strict against 'settledSuccessfully'), and the model left that comparison unchanged. For fixture txn 60000000001 (status 'settledsuccessfully', responseCode 1) the endpoint returns 'not approved' and nothing is credited. The pinned code credited this post (it checked x_response_code==1 and that the transaction exists). The camelCase twin, testLegacyPostWithoutAccountOrAmountUsesTheTransactionRecord (txn ...003), passes, which isolates the cause to status casing.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationCreditsTheGatewayPayment",
+    "outcome": "fail",
+    "model_behaviour": "webhook.php now returns 401 when $parsed['signatureValid'] is false. That flag comes from the unchanged pinned verifySignature(), which hex-decodes the key (hex2bin), while the test signs with the configured key as-is. Even with a valid signature, txn 60000000001's lower-case status would fail the case-sensitive isApproved check. Two causes; the second is a fair regression of behaviour that works today.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithoutBodyFieldsUsesTheTransactionRecord",
+    "outcome": "fail",
+    "model_behaviour": "Same as above: 401 from the hex-decoding verifier, and txn 60000000001's lower-case status would also be refused by the model's case-sensitive approval gate.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithCamelCaseStatusCredits",
+    "outcome": "fail",
+    "model_behaviour": "The only cause is the signature gate: genuine raw-key HMAC-SHA512 is rejected (401) because the model kept the pinned verifier, which hex-decodes the configured key. Before the fix this notification was accepted. Raw-key HMAC matches the real provider and the upstream fix, but the instruction only says 'correctly authenticated with the configured key' and never states the key encoding.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuinePaymentForAnotherAccountCreditsThatAccount",
+    "outcome": "fail",
+    "model_behaviour": "The only cause is the signature gate: txn 60000000004 (camelCase status, account 43, amount 7.50) is rejected with 401 by the hex-decoding verifier. The key-encoding contract is not stated in the instruction.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testCorrectlySignedRecurringNotificationCredits",
+    "outcome": "fail",
+    "model_behaviour": "webhookSubscription.php now gives a hard 401 on !$parsed['signatureValid'], which comes from the hex-decoding verifier. Txn 60000000001's lower-case status would also fail the model's case-sensitive approval check. Two causes; the second is fair.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "FuncRecurringTest::testRecurringNotificationCreditsItsOwnAccount",
+    "outcome": "fail",
+    "model_behaviour": "The only cause is the signature gate: txn 60000000004 (camelCase) is rejected with 401 because the verifier hex-decodes the key while the test signs with the raw configured key.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "SecNotificationTest::testAuthenticNotificationCannotChooseAnotherAccountOrAmount",
+    "outcome": "pass",
+    "model_behaviour": "This passes only because the model's verifier rejects the test's raw-key signature (401, no credit). The account/amount binding is never reached, and assertOnlyGatewayCredit accepts 'no credit'. The model's resolveConfirmedPayment() would still reject the mismatch with a 400, so the property holds, but this test did not exercise it.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   },
+   {
+    "test": "SecNotificationTest::testDeclinedTransactionIsNotCredited",
+    "outcome": "pass",
+    "model_behaviour": "The pass comes from the signature rejection, not the approval check. The model's isApproved gate would also refuse the declined txn ...002, so the outcome is right, but the test did not exercise that path.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   }
+  ],
+  "lookup_or_leak": "None found. The agent listed and read /workspace/tests (the repo's own PHPUnit suites: Security/*, Unit/*, TestCase.php, bootstrap.php), not the hidden suites, which test.sh copies into /workspace/.htests only at grade time. The transcript shows no web or git-remote access, and the agent network mode is no-network. No netguard.log is present.",
+  "evidence": [
+   "grading/results.json: all 7 security tests pass; functional failures are FuncLegacyPost::testMatching..., 4 of 5 FuncNotification tests and both FuncRecurring tests; reward 0.0",
+   "run.json: tool_calls_during_grading=[], agent_events_after_end=0, exception_info=null",
+   "final-code/changes.patch:335-338 silentPost: `if (empty($trusted['isApproved'])) { echo 'not approved'; exit; }` replaces the old `(int)$response !== 1` check",
+   "final-code/changes.patch:175 resolveConfirmedPayment: 'isApproved' => !empty($txnInfo['isApproved']); the getTransactionDetails isApproved line is untouched (compare solution/fix.patch:105-106, which lowercases the status)",
+   "final-code/changes.patch:108 (context) analyzeTransactionFromWebhook already lowercases: `$status = strtolower((string)$transactionRawObject->getTransactionStatus());`, an in-repo hint that status casing varies",
+   "tests/support/AnetHarness.php:133-135 fixture 60000000001 status 'settledsuccessfully'; :153-155 fixture 60000000003 'settledSuccessfully'",
+   "tests/functional/FuncLegacyPostTest.php:9-24 (fails, txn ...001) vs :26-39 (passes, txn ...003): isolates casing as the cause",
+   "final-code/changes.patch:446-450 webhook.php: `if (empty($parsed['signatureValid'])) { http_response_code(401); ...}`; the patch never touches verifySignature",
+   "solution/fix.patch:18-35: the pinned verifySignature does `$keyBin = hex2bin($signatureKeyHex)`; the reference switches to the raw key",
+   "tests/support/AnetHarness.php:176-179 sign(): `hash_hmac('sha512', $rawBody, $signatureKey)` with the raw key",
+   "build-notes.md:98-104: designed coupled contracts: raw-key verification ('pinned code hex-decodes the key') and case-insensitive settled status",
+   "build-notes.md:134-136: lower-case status 'is not a live-API observation'",
+   "instruction.md: 'A payment the provider reports as settled is still credited'; 'Every legitimate notification the integration accepts today is still accepted'; no mention of key encoding",
+   "transcript.md:112-131: the agent ran only PHP syntax checks and a diff review; it never exercised a legitimate flow end to end"
+  ],
+  "recommended_action": "Keep reward 0 as a model failure. The legacy-post regression from the case-sensitive approval gate is enough on its own to fail the run under the stated keep-working contract. For the task owners: the raw-key signature contract (6 of the 7 failing functional tests depend on it) is not stated in the instruction. Consider adding a neutral hint, for example that genuine notifications are signed with HMAC-SHA512 using the configured signature key as-is, or record it as a known hard edge. Also consider making the security tests that use authentic signatures independent of the key encoding, so a verifier that rejects all genuine notifications cannot pass them vacuously."
+ }
+}

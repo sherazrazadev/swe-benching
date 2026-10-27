@@ -1,0 +1,93 @@
+{
+ "trial": "avideo-s3__VMFWmhM",
+ "task": "avideo-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T04:06:10+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "instruction-ambiguity",
+  "confidence": "medium",
+  "summary": "All 7 security tests pass. The reward is 0.0 only because 6 functional tests fail, and all 6 send a notification that the harness signs with the configured key used as a raw string (AnetHarness.php:176-179). The model made the repo's existing signature verifier a hard gate but did not change how that verifier handles the key: it still requires a hex key and hex-decodes it (ctype_xdigit/hex2bin, kept in changes.patch:15). So every raw-key-signed 'genuine' notification gets a 401 and credits nothing. The instruction only says a notification 'correctly authenticated with the configured key still credits'. It never says the key is used raw, and that contradicts the repo's own verifier. Only provider-protocol knowledge (the upstream fix comment 'used as a raw ASCII string \u2014 not hex-decoded') tells you otherwise. The task author built this in on purpose as the 'ff-hexkey' trap (build-notes.md). The model's binding to the gateway record and its route coverage look sound, so the 0.0 measures one unstated external convention, not the quality of the fix.",
+  "items": [
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationCreditsTheGatewayPayment",
+    "outcome": "fail",
+    "model_behaviour": "webhook.php now returns 401 when parsed['signatureValid'] is empty (changes.patch:645-650). verifySignature still hex-decodes the configured key, so the harness's raw-key HMAC never matches. The notification is refused and nothing is credited.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithoutBodyFieldsUsesTheTransactionRecord",
+    "outcome": "fail",
+    "model_behaviour": "Same root cause: the raw-key signature fails the hex-key verifier and gets a 401. The model's fallback to the gateway record (getConfirmedPayment, then analysis overrides) is never reached.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithCamelCaseStatusCredits",
+    "outcome": "fail",
+    "model_behaviour": "The model did make the status check case-insensitive (strtolower in getTransactionDetails, changes.patch:237-238), but the request is refused at the signature gate first because of the key-encoding mismatch.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuinePaymentForAnotherAccountCreditsThatAccount",
+    "outcome": "fail",
+    "model_behaviour": "Raw-key-signed notification refused with a 401 by the hex-decoding verifier; no credit.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testCorrectlySignedRecurringNotificationCredits",
+    "outcome": "fail",
+    "model_behaviour": "webhookSubscription.php now enforces parsed['signatureValid'] with a 401 (changes.patch:469-475), which is the right fix for the injected sibling. But it uses the same hex-decoding verifier, so the raw-key-signed notification is refused.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testRecurringNotificationCreditsItsOwnAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same as the previous recurring test: refused at the signature gate because of the key encoding.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "SecNotificationTest::testAuthenticNotificationCannotChooseAnotherAccountOrAmount",
+    "outcome": "pass",
+    "model_behaviour": "Passes only because the 'authentic' raw-key-signed request is rejected by the signature gate (no credit is allowed by assertOnlyGatewayCredit). The model's code that binds the credit to the gateway record is never exercised.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   },
+   {
+    "test": "SecNotificationTest::testDeclinedTransactionIsNotCredited",
+    "outcome": "pass",
+    "model_behaviour": "Passes because the signed request is refused at the signature gate, so the gateway-approval logic is never reached in this run.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "lenient-test"
+   }
+  ],
+  "lookup_or_leak": "None found. The agent explored only /workspace. The /workspace/tests files it read (transcript.md:48-57) are the repo's own PHPUnit tests, not the hidden suites. It made no network or upstream lookups, and run.json shows no tool calls during the grading window (agent_events_after_end: 0).",
+  "evidence": [
+   "tests/support/AnetHarness.php:175-179 \u2014 'HMAC-SHA512 over the raw body, keyed with the configured signature key as sent': hash_hmac('sha512', $rawBody, $signatureKey)",
+   "final-code/changes.patch:15 \u2014 verifier still begins 'if (empty($signatureKeyHex) || !ctype_xdigit($signatureKeyHex) ...'; the hex2bin line is untouched (the model only changed the header lookup)",
+   "solution/fix.patch:46,58-60 \u2014 reference: 'The Signature Key is used as a raw ASCII string in the HMAC \u2014 not hex-decoded', removes hex2bin",
+   "build-notes.md 'Coupled must-keep-working behaviour' \u2014 'the pinned code hex-decodes the key, so a correct fix must fix both the gate and the key handling'; checks list 'ff-hexkey' as a patch designed to break functional tests",
+   "instruction.md \u2014 'A notification that is correctly authenticated with the configured key still credits its payment.' Nothing about the key's encoding or the HMAC scheme",
+   "final-code/changes.patch:645-650 (webhook.php) and 469-475 (webhookSubscription.php) \u2014 new 401 hard gate on signatureValid",
+   "grading/results.json \u2014 7/7 security pass; every functional test that sends a signed notification fails (6/6); the unsigned silentPost functional tests and the ignored-event test pass, which fits a signature-only cause",
+   "grading/test-stdout.tail.txt is empty, so the failing tests' assertion messages are not available; the cause is inferred from the code paths",
+   "transcript.md:84-241 \u2014 the model never questioned the key encoding; its local harness exercised only the analysis logic"
+  ],
+  "recommended_action": "Do not count this 0.0 as a model failure. Either change the instruction so it pins the provider's signing scheme (e.g. 'the configured Signature Key is used as-is as the HMAC-SHA512 key, as Authorize.Net does'), or drop or decouple the functional assertions that depend only on key encoding. Then rerun. Separately, the authentic/declined security tests should require a credit (or a check on approval) in a scenario where the signature actually verifies, so a gate that rejects everything signed cannot pass them vacuously."
+ }
+}

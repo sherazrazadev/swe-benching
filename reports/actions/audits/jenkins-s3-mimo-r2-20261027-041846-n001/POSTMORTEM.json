@@ -1,0 +1,70 @@
+{
+ "trial": "jenkins-s3__DwmAaHB",
+ "task": "jenkins-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T06:31:55+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.0 reflects the model's work. The model's fix (DeclaredTypeFilter after field conversion, a name/prefix-based MachineryTypes blocklist limited to org.kohsuke.stapler.*, jenkins.security.stapler.* and hudson.Plugin*, and a RefusedXmlException that remaps refusals to 400) left three security routes open. Redirection and InternalResourceRequest (jenkins.security.ResourceDomainRootAction$*) are not in its blocklist. Its type filter erases the type variable T of a generic base-class DescribableList to its bound, so an unrelated Describable passes. The fix also broke the project's own functional test RobustReflectionConverterTest::testRestInterfaceFailure. That test passed on the vulnerable tree and with the oracle, and the model changed exactly its path (AbstractItem.updateByXml error handling). The model only ran the core-module RobustReflectionConverterTest, never the test-module one. A single functional failure forces reward 0 under the threshold scoring. One security item (pluginWrapperIsNotRecreated) is borderline: the model refused hudson.Plugin itself, and the instruction does not clearly say whether a Plugin object counts as plugin-handling machinery. That item does not change the outcome. The agent timed out at 7200 s with no tool calls inside the grading window (run.json timing), so the graded code equals the harvested code. No contamination was found.",
+  "items": [
+   {
+    "test": "bench.SecurityGenericGroupTypeTest::unrelatedTypeInGroupEntriesIsNotKept",
+    "outcome": "fail",
+    "model_behaviour": "DeclaredTypeFilter.typeArgument() takes Types.erasure of the field's declared type argument. For bench.Group extends DescribableGroupViewProperty<Entry>, the field is DescribableList<T, Descriptor<T>> on the generic base, so T erases to its bound Describable, and bench.AttackType (a Describable) is kept. The model never inspected DescribableGroupViewProperty (absent from the transcript) and did not resolve type variables against the concrete class.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::requestRedirectionIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "MachineryTypes only blocks the org.kohsuke.stapler., jenkins.security.stapler. and hudson.Plugin prefixes plus a few exact names. jenkins.security.ResourceDomainRootAction$Redirection matches none of them, so it is recreated under the Object-typed payload field and the 2xx path's assertNull(payload) fails.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::internalResourceRequestIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "Same gap as above: jenkins.security.ResourceDomainRootAction$InternalResourceRequest is not in the model's blocklist, so it is recreated. The instruction explicitly names request-routing/dispatch objects.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::pluginWrapperIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "The model blocks every class whose name starts with 'hudson.Plugin' (and Plugin subclasses) in XStream2 realClass, in MachineryTypesConverter and in RobustReflectionConverter. That refuses hudson.Plugin$DummyImpl itself, not just its PluginWrapper. The field error is non-fatal, so the property is applied with payload null and a 2xx status, and the test's assertTrue(payload instanceof Plugin) fails. The reference instead blocks only PluginWrapper via readResolve. Whether a Plugin instance is an object that 'exists only to describe, load or manage a plugin' is arguable, so this item is borderline. The test accepts a clean 4xx refusal, but it rejects a 2xx that drops the Plugin.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": true,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "hudson.util.RobustReflectionConverterTest::testRestInterfaceFailure",
+    "outcome": "fail",
+    "model_behaviour": "This is the project's own existing test (REST config.xml POST with a critical-field violation must fail, and the configuration must not be updated or saved). It passed on the vulnerable tree and with the oracle (build-notes.md:16,26). The model rewrote the error path it exercises: AbstractItem.updateByXml now wraps IOExceptions in RefusedXmlException, whose generateResponse forwards to the 'error' view, and the patch also changes converter behaviour. The model only ran the core-module RobustReflectionConverterTest (transcript ~line 405), not this test-module class. The exact assertion is unknown because test-stdout.tail.txt is empty, but this is a regression of existing behaviour, which the instruction forbids ('Everything that works today must keep working exactly as today').",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows only local exploration of /workspace and /opt/m2, local compiles and core-module test runs. It shows no access to /tests or .htests, no references to bench.* hidden test classes, and no network fetches. The agent ran with no network (task.toml [agent] network_mode = no-network). The fix is original: a name blocklist plus a post-conversion filter, not the upstream readResolve approach.",
+  "evidence": [
+   "evidence/grading/results.json: 4 security fails (GenericGroup, Redirection, InternalResourceRequest, PluginWrapper), 1 functional fail (RobustReflectionConverterTest::testRestInterfaceFailure); reward 0.0",
+   "evidence/tests/score.py:61-62: any functional failure gives reward 0.0",
+   "evidence/final-code/changes.patch MachineryTypes: FORBIDDEN_NAME_PREFIXES = {\"org.kohsuke.stapler.\", \"jenkins.security.stapler.\", \"hudson.Plugin\"}; no ResourceDomainRootAction entry",
+   "evidence/final-code/changes.patch DeclaredTypeFilter.typeArgument: Types.erasure(Types.getTypeArgument(baseType, index, Object.class)); no type-variable resolution against result.getClass()",
+   "evidence/tests/harness/Group.java:8 'class Group extends DescribableGroupViewProperty<Entry>'; build-notes.md:9 describes the T erasure lever",
+   "evidence/solution/fix.patch: extractElementType resolves TypeVariable via runtimeClass; readResolve guards on Redirection, InternalResourceRequest and PluginWrapper only (Plugin itself kept)",
+   "evidence/tests/security/SecurityRoutingObjectsTest.java:76-79 requires payload instanceof Plugin on the 2xx path",
+   "evidence/build-notes.md:16 nop passes all 14 functional tests; :18,26 oracle and alt-fix pass 24/24",
+   "evidence/run.json timing: agent_end 06:24:36, tool_calls_during_grading [] (graded code is final harvested code); AgentTimeoutError at 7200 s",
+   "evidence/transcript.md:552-555 run ends while the agent was still writing its own unit tests"
+  ],
+  "recommended_action": "Keep reward 0.0 as a model-failed result. As an optional task-quality follow-up, consider stating whether a hudson.Plugin instance itself counts as plugin-handling machinery, or let pluginWrapperIsNotRecreated accept a 2xx with payload dropped. This would not change this trial's outcome."
+ }
+}

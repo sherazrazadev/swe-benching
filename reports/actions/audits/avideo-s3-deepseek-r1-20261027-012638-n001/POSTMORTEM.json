@@ -1,0 +1,77 @@
+{
+ "trial": "avideo-s3__T97dX8d",
+ "task": "avideo-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T01:40:02+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T13:37:35+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "instruction-ambiguity",
+  "confidence": "medium",
+  "summary": "The model's fix passed all 7 security tests and the legacy-post and ignored-event functional tests. All 6 failures are signed-notification tests (webhook.php and webhookSubscription.php). The harness signs with HMAC-SHA512 using the configured key as a raw string, but the pinned code hex-decodes the key (hex2bin) and the model kept that while making the signature mandatory. The instruction says only 'correctly authenticated with the configured key' and never says how the key is encoded. The model searched the repo for signature examples and found only the hex2bin implementation. The build notes show this was a deliberate hidden contract ('ff-hexkey' check: 'a correct fix must fix both the gate and the key handling'). Raw-key HMAC matches how Authorize.Net webhooks really work, so this is a real flaw in the model's fix. But the decisive requirement is an unstated key-encoding convention that the codebase itself contradicts, so reward 0.0 mostly measures that detail rather than the security work.",
+  "items": [
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationCreditsTheGatewayPayment",
+    "outcome": "fail",
+    "model_behaviour": "webhook.php now returns 401 unless parsed['signatureValid']; verifySignature still computes hash_hmac('sha512', body, hex2bin(key)) (changes.patch:266-273), so a body signed with the raw key (AnetHarness.php:176-179) is rejected and nothing is credited.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithoutBodyFieldsUsesTheTransactionRecord",
+    "outcome": "fail",
+    "model_behaviour": "Same cause: the raw-key signature fails the hex2bin-keyed check, so the request gets 401. The model's record-first account/amount logic (changes.patch:137-149) never runs.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuineNotificationWithCamelCaseStatusCredits",
+    "outcome": "fail",
+    "model_behaviour": "Same cause: rejected at the signature gate. The model did lowercase the gateway status (changes.patch:565,590), so the casing part of this test would probably have passed.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncNotificationTest::testGenuinePaymentForAnotherAccountCreditsThatAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same cause: the raw-key-signed notification gets 401, so the 7.50 credit to account 43 never happens.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testCorrectlySignedRecurringNotificationCredits",
+    "outcome": "fail",
+    "model_behaviour": "webhookSubscription.php now enforces parsed['signatureValid'] (changes.patch:654-661) with the same hex2bin-keyed verifier, so the raw-key-signed recurring notification is refused.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "FuncRecurringTest::testRecurringNotificationCreditsItsOwnAccount",
+    "outcome": "fail",
+    "model_behaviour": "Same cause as the other recurring test: refused at the hex2bin-keyed signature check.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows the agent reading only the project's own /workspace/tests (Security/Unit suites unrelated to AuthorizeNet), the plugin sources and the vendor Authorize.Net SDK. It made no web requests and never accessed the hidden suites or AnetHarness. Its own signature check used a hex test key (transcript.md:156), which matches its hex2bin assumption.",
+  "evidence": [
+   "evidence/grading/results.json: all 7 security tests pass; the 6 failures are exactly the X-ANET-Signature-signed webhook/recurring functional tests; testUnrelatedEventIsIgnoredWithoutCredit (returned before the signature gate) and both FuncLegacyPostTest tests pass",
+   "evidence/tests/support/AnetHarness.php:175-179: 'HMAC-SHA512 over the raw body, keyed with the configured signature key as sent' -> hash_hmac('sha512', $rawBody, $signatureKey)",
+   "evidence/final-code/changes.patch:266-273: model keeps $keyBin = hex2bin($signatureKeyHex); hash_hmac('sha512', $rawBody, $keyBin)",
+   "evidence/final-code/changes.patch:93-97: webhook.php now returns 401 'invalid signature' when signatureValid is false",
+   "evidence/instruction.md: 'A notification that is correctly authenticated with the configured key still credits its payment.' Nothing says how the key is encoded",
+   "evidence/build-notes.md:98-100: 'the pinned code hex-decodes the key, so a correct fix must fix both the gate and the key handling'; :152-153 'ff-hexkey' patch deliberately breaks functional tests",
+   "evidence/solution/fix.patch: reference replaces hex2bin with the raw key: hash_hmac('sha512', $rawBody, $signatureKey), compared lowercase",
+   "evidence/transcript.md:158-159: model grepped the repo for 'ANET-Signature|sha512=' and found only the existing hex2bin implementation; there is no in-repo signal for raw-key use",
+   "evidence/run.json: no exception and no tool calls during the grading window; test-stdout.tail.txt is empty but results.json is complete"
+  ],
+  "recommended_action": "Do not count this 0.0 as a clean model failure. Either state the signature scheme in the instruction (e.g. 'the provider signs the body with HMAC-SHA512 using the signature key exactly as configured') or drop the hex-vs-raw key encoding from the functional contract, then regrade or rerun. If the task is kept as is, tag the result as 'failed only on an unstated key-encoding convention': the security work itself passed all 7 security tests."
+ }
+}

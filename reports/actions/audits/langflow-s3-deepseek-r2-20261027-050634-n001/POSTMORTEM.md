@@ -1,0 +1,30 @@
+# Post-run audit: langflow-s3__kLHKeSs
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.7857.
+
+**Trustworthy:** True  **Attribution:** model-failed  **Confidence:** medium
+
+The model fixed the reported MCP read, both listings, the stored-path preview and backend storage containment. It missed two stated requirements: the project-scoped server still serves the caller's account-level files, and the lfx standalone storage has no containment (the model inspected it and left it alone). It also never looked at the copy route. Its storage-layer check does block the escaping write, but the route lets the ValueError through as an unhandled 500 instead of a client-error refusal, and under the test's ASGI transport that crashes the test. That third item is borderline: if it were credited, the reward would be 12/14 = 0.857 rather than 11/14 = 0.7857. Either way the task is not solved, and 'not solved' is a fair result.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| security.test_mcp_project_account_level_read::test_account_level_file_is_refused_on_project_server | fail | genuine-fail | True | True |
+| security.test_lfx_storage_containment::test_standalone_storage_contains_names | fail | genuine-fail | True | True |
+| security.test_copy_destination_containment::test_destination_outside_namespace_is_refused_without_side_effect | fail | genuine-fail | True | True |
+
+**Lookup or leak:** None found. The verifier ran in separate mode (task.toml: environment_mode='separate'), so the hidden tests were not in the agent container. The transcript shows the agent running only the repo's own src/backend/tests suites and ad-hoc scripts. There is no web or upstream lookup, the agent network_mode is 'no-network', and there is no netguard.log. No tool calls fell inside the grading window (run.json timing.tool_calls_during_grading=[]).
+
+**Evidence:**
+- grading/results.json: 11/14 security pass, 35/35 functional pass, reward 0.7857 = 11/14
+- final-code/changes.patch mcp_utils.py _resolve_resource_namespace: '# Account-level files are stored under the user's own id. if namespace_id == user_id: return namespace_id' runs before the project_uuid check
+- instruction.md: 'Where a request is scoped to part of the caller's own material, only that part may be returned.'
+- instruction.md: 'No identifier or file name passed in may make the product reach, create, or change a stored file outside the container that identifier names'
+- transcript.md:78 agent diffed lfx vs backend local.py; transcript.md:84 checked the storage factory; lfx file not in changed_files.tsv
+- final-code/changes.patch local.py copy_file: 'await self._validate_file_access(flow_id, new_name)' raises ValueError; v2/files.py copy route not modified
+- solution/fix.patch copy_file route: 'except ValueError as exc: raise HTTPException(status_code=400 ...)'
+- tests/support/harness.py:203-205 AsyncClient(transport=ASGITransport(app=manager.app)) uses default raise_app_exceptions; test_copy_destination_containment.py:15 asserts status_code >= 400
+- instruction.md Contracts: 'A refusal is a client error that returns no file content and changes no stored file. Any error status or protocol error is acceptable'
+- solution/fix.patch is consistent with the instruction and tests: project_id is not None refuses the user bucket, lfx _validated_path, copy maps to 400; build-notes.md reports oracle 49/49
+- grading/test-stdout.tail.txt is empty, so the copy failure mechanism is inferred from the code and not seen in a traceback
+
+**Recommended action:** Keep the run as model-failed (not solved). The project-scope and lfx misses are real, stated requirements that the model skipped. For the copy test, consider making the harness tolerant: use ASGITransport(raise_app_exceptions=False) or catch exceptions in w.copy and treat them as a refusal while still checking for the side effect. Or tighten the test so it asserts 400 <= status < 500, to match 'A refusal is a client error'. As written, a 500 is accepted by the assertion but crashes the harness, so the test's intent is unclear. A rescore under a tolerant harness would give 12/14 = 0.857.

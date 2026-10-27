@@ -22,11 +22,16 @@ Outcome (per task, from the trial records; the official verdict is still audit_r
 
 Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-9; this is what is shared):
     FINAL BREAKER  fairness READY and every failing run audited trustworthy (the model's own failure)
-    NEEDS FIX      fairness NOT_READY or an audit found a test / instruction / harness fault (GUIDE step 10)
+    NEEDS FIX      fairness NOT_READY or an audit found a test or instruction fault (GUIDE step 10: fairfix)
+    NEEDS RE-RUN   no fault, but a model has fewer than 3 trustworthy failing runs (a run was excluded for an
+                   infra/provider problem): trial that model again
+    NEEDS HUMAN DECISION  all of the above pass, but the fairness review left a question for a person
+                   (answer it in build/<slug>/HUMAN-DECISION.md: DECISION: KEEP / REPAIR / DROP)
     PENDING        an audit or the fairness review is missing or errored
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -125,9 +130,10 @@ def record(results, run, batch, utc, gh_repo):
 
 
 def audit_of(job):
-    """Newest recorded audit (POSTMORTEM.json) of a trial job, or None."""
-    pms = sorted((JOBS / job).glob("*/postmortem-*/POSTMORTEM.json"))
-    return json.loads(pms[-1].read_text()) if pms else None
+    """Newest recorded audit (POSTMORTEM.json) of a trial job, or None: from the Harbor job folder, or the copy
+    kept in reports/actions/audits/<job>/ (record-verdict saves one there)."""
+    pms = sorted((JOBS / job).glob("*/postmortem-*/POSTMORTEM.json")) or sorted((REP / "audits" / job).glob("POSTMORTEM*.json"))
+    return json.loads(pms[-1].read_text()).get("verdict") if pms else None
 
 
 def verdict(slug):
@@ -144,17 +150,22 @@ def verdict(slug):
             audits.append({"model": m, "job": r["job"], "reward": r["reward"], "trustworthy": a.get("trustworthy"),
                            "attribution": a.get("attribution", "not audited"), "confidence": a.get("confidence", ""),
                            "summary": a.get("summary", "")})
-    bad = [a for a in audits if a["trustworthy"] is False or a["attribution"] not in ("model-failed", "not audited")]
+    fault = [a for a in audits if a["trustworthy"] is False and a["attribution"] in ("test-fault", "instruction-ambiguity")]
     missing = [a for a in audits if a["trustworthy"] is None]
-    if fv.startswith("NOT_READY") or bad:
+    short = [m for m in MODELS if sum(a["model"] == m and a["trustworthy"] is True for a in audits) < 3]
+    if fv.startswith("NOT_READY") or fault:
         final = "NEEDS FIX"
-    elif fv.startswith("READY") and audits and not missing:
-        final = "FINAL BREAKER"
-    else:
+    elif missing or not fv.startswith("READY"):
         final = "PENDING"
+    elif short:
+        final = "NEEDS RE-RUN"
+    else:
+        final = "NEEDS HUMAN DECISION" if "human question open" in fv else "FINAL BREAKER"
     fair = b / "FAIRNESS.md"
-    return {"slug": slug, "final": final, "fairness": fv, "audits": audits,
-            "fairness_md": fair.read_text() if fair.is_file() else ""}
+    md = fair.read_text() if fair.is_file() else ""
+    question = next((l.split(":", 1)[1].strip() for l in md.splitlines() if l.lower().startswith(("human review:", "**human review:**"))), "")
+    return {"slug": slug, "final": final, "fairness": fv, "audits": audits, "rerun": short,
+            "human_question": question.strip("* "), "fairness_md": md}
 
 
 def record_verdict(items, gh_repo):
@@ -170,14 +181,24 @@ def record_verdict(items, gh_repo):
                f"- {row['cwe']}, {row['language']}, {row['repo']}", f"- Batch {row['batch']}, {links(row['run'], gh_repo)}",
                f"- Trials: DeepSeek {row['deepseek']} / MiMo {row['mimo']} (no run at 1.0)", "",
                f"## Fairness review: {v['fairness']}", "",
+               *([f"**Question for a person:** {v['human_question']}", ""] if v.get("human_question") else []),
+               *([f"**Re-run needed:** {', '.join(v['rerun'])} has fewer than 3 trustworthy failing runs.", ""]
+                 if v["final"] == "NEEDS RE-RUN" else []),
                f"Full review: [{v['slug']}-FAIRNESS.md]({v['slug']}-FAIRNESS.md)" if v["fairness_md"] else "No review written.", "",
                f"## Audits of the failing runs ({row['audits']})", "", "| Model | Reward | Trustworthy | Attribution | Auditor's summary |",
                "|---|---|---|---|---|"]
-        out += [f"| {a['model']} | {a['reward']:g} | {a['trustworthy']} | {a['attribution']} ({a['confidence']}) | "
+        out += [f"| [{a['model']}](../audits/{a['job']}/POSTMORTEM.md) | {a['reward']:g} | {a['trustworthy']} | {a['attribution']} ({a['confidence']}) | "
                 f"{a['summary'].replace('|', '/').replace(chr(10), ' ')} |" for a in v["audits"]]
         (REP / "verdicts" / f"{v['slug']}.md").write_text("\n".join(out) + "\n")
         if v["fairness_md"]:
             (REP / "verdicts" / f"{v['slug']}-FAIRNESS.md").write_text(v["fairness_md"])
+    for pm in JOBS.glob("*/*/postmortem-*/POSTMORTEM.json"):     # keep the audits next to the reports
+        job = pm.parent.parent.parent.name
+        if any(job == a["job"] for v in items for a in v["audits"]):
+            d = REP / "audits" / job
+            d.mkdir(parents=True, exist_ok=True)
+            for f in ("POSTMORTEM.json", "POSTMORTEM.md"):
+                shutil.copy2(pm.parent / f, d / f)
     write_rows(rows)
     for n in batches:
         write_batch(int(n), [r for r in rows if r["batch"] == n], [], gh_repo)
@@ -225,8 +246,10 @@ def write_readme(rows, gh_repo):
            "**Accepted** = gate sound and both models failed all 3 runs (no run at 1.0). Each accepted task then gets "
            "the final verdict steps: an audit of every failing run (Claude Opus, `common/audit/postmortem.py`) and the "
            "fairness review (DeepSeek, `pipelines/sibling/9-fairness`). **FINAL BREAKER** = fairness READY and every "
-           "failing run audited trustworthy: these are the tasks to share. **NEEDS FIX** = a fault was found (fairfix, "
-           "GUIDE step 10). **PENDING** = a step has not finished.", "",
+           "failing run audited trustworthy: these are the tasks to share. **NEEDS HUMAN DECISION** = the same, but the "
+           "fairness review asked a person a question (answer in `build/<slug>/HUMAN-DECISION.md`). **NEEDS FIX** = a "
+           "fault was found (fairfix, GUIDE step 10). **NEEDS RE-RUN** = no fault, but a run was excluded (provider/infra) "
+           "so a model needs another trial. **PENDING** = a step has not finished.", "",
            f"## Totals ({len(latest)} tasks)", "", "| " + " | ".join(o for o in order if total[o]) + " |",
            "|" + "---|" * len([o for o in order if total[o]]), "| " + " | ".join(str(total[o]) for o in order if total[o]) + " |", "",
            "## Batches", "", "| Batch | Started | Tasks | Accepted | Rejected | Unsound / gate | Build failed | Other | Runs |",
