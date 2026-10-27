@@ -1,0 +1,116 @@
+diff -ruN a/proxy/http_headers.go b/proxy/http_headers.go
+--- a/proxy/http_headers.go	2026-10-26 23:08:26.000000000 +0000
++++ b/proxy/http_headers.go	2026-10-26 23:28:49.367556654 +0000
+@@ -25,7 +25,9 @@
+ 	}
+ }
+ 
+-var protectHeaders = map[string]bool{
++// defaultProtectedHeaders are the headers every proxy sets on the upstream
++// request. They are never client scoped, even if the client says so.
++var defaultProtectedHeaders = map[string]bool{
+ 	"Forwarded":          true,
+ 	"X-Forwarded-For":    true,
+ 	"X-Forwarded-Host":   true,
+@@ -35,6 +37,30 @@
+ 	"X-Real-Ip":          true,
+ }
+ 
++// protectedHeaderSet returns the canonical names of the headers which the
++// proxy sets on an upstream request: the defaults, the names taken from the
++// proxy configuration and the additional names for this request. Keeping
++// these names out of the client's Connection header stops the reverse proxy
++// from treating the proxy's own values as hop-by-hop headers and dropping
++// them before the request reaches the backend.
++func protectedHeaderSet(cfg config.Proxy, extra ...string) map[string]bool {
++	names := make(map[string]bool, len(defaultProtectedHeaders)+len(extra)+3)
++	for name := range defaultProtectedHeaders {
++		names[name] = true
++	}
++	for _, name := range []string{cfg.ClientIPHeader, cfg.TLSHeader, cfg.RequestID} {
++		if name != "" {
++			names[textproto.CanonicalMIMEHeaderKey(name)] = true
++		}
++	}
++	for _, name := range extra {
++		if name != "" {
++			names[textproto.CanonicalMIMEHeaderKey(name)] = true
++		}
++	}
++	return names
++}
++
+ // addHeaders adds/updates headers in request
+ //
+ // * add/update `Forwarded` header
+@@ -43,6 +69,13 @@
+ // * ClientIPHeader != "": Set header with that name to <remote ip>
+ // * TLS connection: Set header with name from `cfg.TLSHeader` to `cfg.TLSHeaderValue`
+ func addHeaders(r *http.Request, cfg config.Proxy, stripPath string) error {
++	return addHeadersWithProtected(r, protectedHeaderSet(cfg), cfg, stripPath)
++}
++
++// addHeadersWithProtected is addHeaders with an explicit set of protected
++// header names. The caller uses it when it knows about further header names
++// which the proxy sets for this request, such as a target configured header.
++func addHeadersWithProtected(r *http.Request, protected map[string]bool, cfg config.Proxy, stripPath string) error {
+ 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+ 	if err != nil {
+ 		return errors.New("cannot parse " + r.RemoteAddr)
+@@ -53,7 +86,7 @@
+ 	for _, s := range r.Header.Values("Connection") {
+ 		for p := range strings.SplitSeq(s, ",") {
+ 			p = strings.TrimSpace(p)
+-			if !protectHeaders[textproto.CanonicalMIMEHeaderKey(p)] {
++			if !protected[textproto.CanonicalMIMEHeaderKey(p)] {
+ 				conHeaders = append(conHeaders, p)
+ 			}
+ 		}
+diff -ruN a/proxy/http_proxy.go b/proxy/http_proxy.go
+--- a/proxy/http_proxy.go	2026-10-26 23:08:29.000000000 +0000
++++ b/proxy/http_proxy.go	2026-10-26 23:28:59.273666988 +0000
+@@ -77,6 +77,18 @@
+ 	Config config.Proxy
+ }
+ 
++// protectedHeaders returns the header names the proxy sets on the upstream
++// request for t. It is derived from the proxy configuration and the target so
++// that a proxy which an embedding program constructs directly protects its
++// values as well, without the program having to register them.
++func (p *HTTPProxy) protectedHeaders(t *route.Target) map[string]bool {
++	var extra string
++	if t != nil {
++		extra = t.RequestHeaderName
++	}
++	return protectedHeaderSet(p.Config, extra)
++}
++
+ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if p.Lookup == nil {
+ 		panic("no lookup function")
+@@ -172,11 +184,7 @@
+ 		}
+ 	}
+ 
+-	// The websocket handshake is written to the backend verbatim, so keep the
+-	// connection tokens the client sent before the proxy normalises them.
+-	wsConnTokens := r.Header.Values("Connection")
+-
+-	if err := addHeaders(r, p.Config, t.StripPath); err != nil {
++	if err := addHeadersWithProtected(r, p.protectedHeaders(t), p.Config, t.StripPath); err != nil {
+ 		http.Error(w, "cannot parse "+r.RemoteAddr, http.StatusInternalServerError)
+ 		return
+ 	}
+@@ -185,6 +193,12 @@
+ 		r.Header.Set(t.RequestHeaderName, t.RequestHeaderValue)
+ 	}
+ 
++	// The websocket handshake is written to the backend verbatim rather than
++	// through the reverse proxy, so remember which client scoped headers still
++	// have to be removed from it. The proxy's own header names were already
++	// taken out of the Connection header above and are therefore not in here.
++	wsConnTokens := r.Header.Values("Connection")
++
+ 	addResponseHeaders(w, r, p.Config)
+ 
+ 	upgrade, accept := r.Header.Get("Upgrade"), r.Header.Get("Accept")

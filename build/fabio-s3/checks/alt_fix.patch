@@ -1,0 +1,65 @@
+diff --git a/proxy/http_proxy.go b/proxy/http_proxy.go
+index 307e3102..73a8d4a7 100644
+--- a/proxy/http_proxy.go
++++ b/proxy/http_proxy.go
+@@ -8,6 +8,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
+@@ -77,6 +78,25 @@ type HTTPProxy struct {
+ 	Config config.Proxy
+ }
+ 
++// clientProtectedHeaders returns the names whose values the proxy sets for this
++// request and which the client must not mark as connection scoped.
++func (p *HTTPProxy) clientProtectedHeaders(t *route.Target) map[string]bool {
++	set := make(map[string]bool, len(protectHeaders)+4)
++	for name := range protectHeaders {
++		set[name] = true
++	}
++	names := []string{p.Config.ClientIPHeader, p.Config.TLSHeader, p.Config.RequestID}
++	if t != nil {
++		names = append(names, t.RequestHeaderName)
++	}
++	for _, name := range names {
++		if name != "" {
++			set[textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))] = true
++		}
++	}
++	return set
++}
++
+ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if p.Lookup == nil {
+ 		panic("no lookup function")
+@@ -172,6 +192,26 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 	}
+ 
++	// Keep the values the proxy sets out of the client's connection annotations,
++	// so the reverse proxy does not remove them on the way to the backend.
++	protected := p.clientProtectedHeaders(t)
++	if lines := r.Header.Values("Connection"); len(lines) > 0 {
++		var kept []string
++		for _, line := range lines {
++			for tok := range strings.SplitSeq(line, ",") {
++				tok = strings.TrimSpace(tok)
++				if tok == "" || protected[textproto.CanonicalMIMEHeaderKey(tok)] {
++					continue
++				}
++				kept = append(kept, tok)
++			}
++		}
++		r.Header.Del("Connection")
++		if len(kept) > 0 {
++			r.Header.Set("Connection", strings.Join(kept, ", "))
++		}
++	}
++
+ 	// The websocket handshake is written to the backend verbatim, so keep the
+ 	// connection tokens the client sent before the proxy normalises them.
+ 	wsConnTokens := r.Header.Values("Connection")

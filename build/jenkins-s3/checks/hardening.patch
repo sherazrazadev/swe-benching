@@ -1,0 +1,228 @@
+diff --git a/core/src/main/java/hudson/PluginWrapper.java b/core/src/main/java/hudson/PluginWrapper.java
+index a77df0d..1129e8f 100644
+--- a/core/src/main/java/hudson/PluginWrapper.java
++++ b/core/src/main/java/hudson/PluginWrapper.java
+@@ -1431,6 +1431,11 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
+         return null;
+     }
+ 
++    private Object readResolve() {
++        LOGGER.log(Level.WARNING, "Blocked deserialization of PluginWrapper for security reasons", new Exception("stack trace"));
++        throw new SecurityException("Blocked deserialization of PluginWrapper for security reasons");
++    }
++
+     private static final Logger LOGGER = Logger.getLogger(PluginWrapper.class.getName());
+ 
+     /**
+diff --git a/core/src/main/java/hudson/util/CopyOnWriteList.java b/core/src/main/java/hudson/util/CopyOnWriteList.java
+index 77bc05b..39644f0 100644
+--- a/core/src/main/java/hudson/util/CopyOnWriteList.java
++++ b/core/src/main/java/hudson/util/CopyOnWriteList.java
+@@ -25,6 +25,7 @@
+ package hudson.util;
+ 
+ import com.thoughtworks.xstream.XStreamException;
++import com.thoughtworks.xstream.converters.ConversionException;
+ import com.thoughtworks.xstream.converters.Converter;
+ import com.thoughtworks.xstream.converters.MarshallingContext;
+ import com.thoughtworks.xstream.converters.UnmarshallingContext;
+@@ -32,6 +33,7 @@ import com.thoughtworks.xstream.converters.collections.AbstractCollectionConvert
+ import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+ import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+ import com.thoughtworks.xstream.mapper.Mapper;
++import edu.umd.cs.findbugs.annotations.CheckForNull;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -177,8 +179,26 @@ public class CopyOnWriteList<E> implements Iterable<E> {
+      * {@link Converter} implementation for XStream.
+      */
+     public static final class ConverterImpl extends AbstractCollectionConverter {
++        /**
++         * When available, this field holds the declared element type of the CopyOnWriteList being deserialized.
++         */
++        private final @CheckForNull Class<?> elementType;
++
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        /**
++         * Creates a converter that will validate the types of list elements during deserialization.
++         * <p>Elements with invalid types will be omitted from deserialized lists and may result in an
++         * {@link hudson.diagnosis.OldDataMonitor} warning.
++         *
++         * @param mapper the XStream mapper
++         * @param elementType the expected element type, or null to skip type checking
++         */
++        ConverterImpl(Mapper mapper, Class<?> elementType) {
+             super(mapper);
++            this.elementType = elementType;
+         }
+ 
+         @Override
+@@ -201,7 +221,17 @@ public class CopyOnWriteList<E> implements Iterable<E> {
+                 reader.moveDown();
+                 try {
+                     Object item = readItem(reader, context, items);
+-                    items.add(item);
++                    if (elementType != null && item != null && !elementType.isInstance(item)) {
++                        var exception = new ConversionException("Invalid type for CopyOnWriteList element");
++                        // c.f. TreeUnmarshaller.addInformationTo
++                        exception.add("required-type", elementType.getName());
++                        exception.add("class", item.getClass().getName());
++                        exception.add("converter-type", getClass().getName());
++                        reader.appendErrors(exception);
++                        RobustReflectionConverter.addErrorInContext(context, exception);
++                    } else {
++                        items.add(item);
++                    }
+                 } catch (CriticalXStreamException e) {
+                     throw e;
+                 } catch (XStreamException | LinkageError e) {
+diff --git a/core/src/main/java/hudson/util/DescribableList.java b/core/src/main/java/hudson/util/DescribableList.java
+index f31ac37..81a1aaf 100644
+--- a/core/src/main/java/hudson/util/DescribableList.java
++++ b/core/src/main/java/hudson/util/DescribableList.java
+@@ -278,13 +278,22 @@ public class DescribableList<T extends Describable<T>, D extends Descriptor<T>>
+         CopyOnWriteList.ConverterImpl copyOnWriteListConverter;
+ 
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        ConverterImpl(Mapper mapper, Class<?> elementType) {
+             super(mapper);
+-            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper());
++            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper(), elementType);
+         }
+ 
+         @Override
+         public boolean canConvert(Class type) {
+             // handle subtypes in case the onModified method is overridden.
++            return canConvertRobust(type);
++        }
++
++        static boolean canConvertRobust(Class<?> type) {
++            // Unlike PersistedList.ConverterImpl, this converter is manually registered in XStream2, so subtypes use it.
+             return DescribableList.class.isAssignableFrom(type);
+         }
+ 
+diff --git a/core/src/main/java/hudson/util/PersistedList.java b/core/src/main/java/hudson/util/PersistedList.java
+index 4e8ccdb..e7222e8 100644
+--- a/core/src/main/java/hudson/util/PersistedList.java
++++ b/core/src/main/java/hudson/util/PersistedList.java
+@@ -266,8 +266,12 @@ public class PersistedList<T> extends AbstractList<T> {
+         CopyOnWriteList.ConverterImpl copyOnWriteListConverter;
+ 
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        ConverterImpl(Mapper mapper, Class<?> elementType) {
+             super(mapper);
+-            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper());
++            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper(), elementType);
+         }
+ 
+         @Override
+diff --git a/core/src/main/java/hudson/util/RobustReflectionConverter.java b/core/src/main/java/hudson/util/RobustReflectionConverter.java
+index af1a9f2..c4255ad 100644
+--- a/core/src/main/java/hudson/util/RobustReflectionConverter.java
++++ b/core/src/main/java/hudson/util/RobustReflectionConverter.java
+@@ -49,7 +49,9 @@ import hudson.model.Saveable;
+ import hudson.security.ACL;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Type;
++import java.lang.reflect.TypeVariable;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -457,11 +459,44 @@ public class RobustReflectionConverter implements Converter {
+                 converter = new RobustCollectionConverter(mapper, reflectionProvider, field.getGenericType());
+             } else if (new RobustMapConverter(mapper).canConvert(type)) {
+                 converter = new RobustMapConverter(mapper, field.getGenericType());
++            } else if (DescribableList.ConverterImpl.canConvertRobust(type)) {
++                converter = new DescribableList.ConverterImpl(mapper, extractElementType(result.getClass(), field, DescribableList.class));
++            } else if (type == CopyOnWriteList.class) {
++                converter = new CopyOnWriteList.ConverterImpl(mapper, extractElementType(result.getClass(), field, CopyOnWriteList.class));
++            } else if (PersistedList.class.isAssignableFrom(type)) {
++                converter = new PersistedList.ConverterImpl(mapper, extractElementType(result.getClass(), field, PersistedList.class));
+             }
+         }
+         return context.convertAnother(result, type, converter);
+     }
+ 
++    /**
++     * Extracts the element type from a generic list type, resolving type variables
++     * against the concrete class of the object being deserialized.
++     * For example, given {@code DescribableList<Foo, Descriptor<Foo>>}, returns {@code Foo.class}.
++     */
++    private Class<?> extractElementType(Class<?> runtimeClass, Field field, Class<?> listClass) {
++        Type genericType = field.getGenericType();
++        if (genericType == null || !listClass.isAssignableFrom(Types.erasure(genericType))) {
++            return null;
++        }
++        var baseType = Types.getBaseClass(genericType, listClass);
++        // Get the first type argument (the element type T)
++        var typeArg = Types.getTypeArgument(baseType, 0, Object.class);
++        if (typeArg instanceof TypeVariable<?> variable
++                && variable.getGenericDeclaration() instanceof Class<?> declaration) {
++            int index = Arrays.asList(declaration.getTypeParameters()).indexOf(variable);
++            if (index >= 0 && declaration.isAssignableFrom(runtimeClass)) {
++                Type concreteDeclaration = Types.getBaseClass(runtimeClass, declaration);
++                Type resolved = Types.getTypeArgument(concreteDeclaration, index, Object.class);
++                if (resolved != null && !(resolved instanceof TypeVariable)) {
++                    typeArg = resolved;
++                }
++            }
++        }
++        return Types.erasure(typeArg);
++    }
++
+     private void writeValueToImplicitCollection(
+             HierarchicalStreamReader reader,
+             UnmarshallingContext context,
+diff --git a/core/src/main/java/hudson/util/XStream2.java b/core/src/main/java/hudson/util/XStream2.java
+index 774008e..925bcea 100644
+--- a/core/src/main/java/hudson/util/XStream2.java
++++ b/core/src/main/java/hudson/util/XStream2.java
+@@ -312,7 +312,7 @@ public class XStream2 extends XStream {
+         addImmutableType(Result.class, false);
+ 
+         // http://www.openwall.com/lists/oss-security/2017/04/03/4
+-        denyTypes(new Class[] { void.class, Void.class });
++        denyTypes(new Class[] { void.class, Void.class, java.lang.ProcessBuilder.class });
+ 
+         registerConverter(new RobustCollectionConverter(getMapper(), getReflectionProvider()), 10);
+         registerConverter(new RobustMapConverter(getMapper()), 10);
+diff --git a/core/src/main/java/jenkins/security/ResourceDomainRootAction.java b/core/src/main/java/jenkins/security/ResourceDomainRootAction.java
+index e38ccdb..2ffd1ad 100644
+--- a/core/src/main/java/jenkins/security/ResourceDomainRootAction.java
++++ b/core/src/main/java/jenkins/security/ResourceDomainRootAction.java
+@@ -153,6 +153,11 @@ public class ResourceDomainRootAction implements UnprotectedRootAction {
+             String url = Jenkins.get().getRootUrl() + this.url + restOfPath;
+             rsp.sendRedirect(302, url);
+         }
++
++        private Object readResolve() {
++            LOGGER.log(Level.WARNING, "Blocked deserialization of Redirection for security reasons", new Exception("stack trace"));
++            throw new SecurityException("Blocked deserialization of Redirection for security reasons");
++        }
+     }
+ 
+     public String getRedirectUrl(@NonNull Token token, @NonNull String restOfPath) {
+@@ -272,6 +277,11 @@ public class ResourceDomainRootAction implements UnprotectedRootAction {
+         public String toString() {
+             return "[" + super.toString() + ", authentication=" + authenticationName + "; key=" + browserUrl + "]";
+         }
++
++        private Object readResolve() {
++            LOGGER.log(Level.WARNING, "Blocked deserialization of InternalResourceRequest for security reasons", new Exception("stack trace"));
++            throw new SecurityException("Blocked deserialization of InternalResourceRequest for security reasons");
++        }
+     }
+ 
+     public static class Token {

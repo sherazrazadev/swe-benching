@@ -1,0 +1,255 @@
+diff -ruN pristine/core/src/main/java/hudson/PluginWrapper.java app/core/src/main/java/hudson/PluginWrapper.java
+--- a/core/src/main/java/hudson/PluginWrapper.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/hudson/PluginWrapper.java	2026-10-27 00:25:14.181918941 +0000
+@@ -1431,6 +1431,11 @@
+         return null;
+     }
+ 
++    private Object readResolve() {
++        LOGGER.log(Level.WARNING, "Refusing to recreate a plugin descriptor from configuration", new Exception("stack trace"));
++        throw new SecurityException("Blocked deserialization of PluginWrapper");
++    }
++
+     private static final Logger LOGGER = Logger.getLogger(PluginWrapper.class.getName());
+ 
+     /**
+diff -ruN pristine/core/src/main/java/hudson/util/CopyOnWriteList.java app/core/src/main/java/hudson/util/CopyOnWriteList.java
+--- a/core/src/main/java/hudson/util/CopyOnWriteList.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/hudson/util/CopyOnWriteList.java	2026-10-27 00:51:13.968207922 +0000
+@@ -25,6 +25,7 @@
+ package hudson.util;
+ 
+ import com.thoughtworks.xstream.XStreamException;
++import com.thoughtworks.xstream.converters.ConversionException;
+ import com.thoughtworks.xstream.converters.Converter;
+ import com.thoughtworks.xstream.converters.MarshallingContext;
+ import com.thoughtworks.xstream.converters.UnmarshallingContext;
+@@ -32,6 +33,7 @@
+ import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+ import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+ import com.thoughtworks.xstream.mapper.Mapper;
++import edu.umd.cs.findbugs.annotations.CheckForNull;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -177,8 +179,25 @@
+      * {@link Converter} implementation for XStream.
+      */
+     public static final class ConverterImpl extends AbstractCollectionConverter {
++        /**
++         * Declared element type of the list being read, or {@code null} when unknown.
++         *
++         * <p>When set, elements that are not instances of this type are left out of the
++         * deserialized list rather than being kept.
++         */
++        private final @CheckForNull Class<?> elementType;
++
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        /**
++         * @param elementType the element type declared by the field holding the list, or
++         *                    {@code null} to accept any deserializable value
++         */
++        ConverterImpl(Mapper mapper, @CheckForNull Class<?> elementType) {
+             super(mapper);
++            this.elementType = elementType;
+         }
+ 
+         @Override
+@@ -201,7 +220,11 @@
+                 reader.moveDown();
+                 try {
+                     Object item = readItem(reader, context, items);
+-                    items.add(item);
++                    if (elementType != null && item != null && !elementType.isInstance(item)) {
++                        rejectItem(reader, context, item);
++                    } else {
++                        items.add(item);
++                    }
+                 } catch (CriticalXStreamException e) {
+                     throw e;
+                 } catch (XStreamException | LinkageError e) {
+@@ -212,6 +235,20 @@
+ 
+             return new CopyOnWriteList(items, true);
+         }
++
++        /**
++         * Records an out-of-type element as a recoverable read error so that it is dropped
++         * instead of being kept, while the rest of the document still loads.
++         */
++        private void rejectItem(HierarchicalStreamReader reader, UnmarshallingContext context, Object item) {
++            ConversionException error = new ConversionException("Invalid type for " + CopyOnWriteList.class.getSimpleName() + " element");
++            // c.f. TreeUnmarshaller.addInformationTo
++            error.add("required-type", elementType.getName());
++            error.add("class", item.getClass().getName());
++            error.add("converter-type", getClass().getName());
++            reader.appendErrors(error);
++            RobustReflectionConverter.addErrorInContext(context, error);
++        }
+     }
+ 
+ }
+diff -ruN pristine/core/src/main/java/hudson/util/DescribableList.java app/core/src/main/java/hudson/util/DescribableList.java
+--- a/core/src/main/java/hudson/util/DescribableList.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/hudson/util/DescribableList.java	2026-10-27 00:51:14.305213570 +0000
+@@ -278,8 +278,16 @@
+         CopyOnWriteList.ConverterImpl copyOnWriteListConverter;
+ 
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        /**
++         * @param elementType the element type declared by the field holding this list, or
++         *                    {@code null} to accept any deserializable value
++         */
++        ConverterImpl(Mapper mapper, Class<?> elementType) {
+             super(mapper);
+-            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper());
++            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper(), elementType);
+         }
+ 
+         @Override
+diff -ruN pristine/core/src/main/java/hudson/util/PersistedList.java app/core/src/main/java/hudson/util/PersistedList.java
+--- a/core/src/main/java/hudson/util/PersistedList.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/hudson/util/PersistedList.java	2026-10-27 00:51:14.618218820 +0000
+@@ -266,8 +266,16 @@
+         CopyOnWriteList.ConverterImpl copyOnWriteListConverter;
+ 
+         public ConverterImpl(Mapper mapper) {
++            this(mapper, null);
++        }
++
++        /**
++         * @param elementType the element type declared by the field holding this list, or
++         *                    {@code null} to accept any deserializable value
++         */
++        ConverterImpl(Mapper mapper, Class<?> elementType) {
+             super(mapper);
+-            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper());
++            copyOnWriteListConverter = new CopyOnWriteList.ConverterImpl(mapper(), elementType);
+         }
+ 
+         @Override
+diff -ruN pristine/core/src/main/java/hudson/util/RobustReflectionConverter.java app/core/src/main/java/hudson/util/RobustReflectionConverter.java
+--- a/core/src/main/java/hudson/util/RobustReflectionConverter.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/hudson/util/RobustReflectionConverter.java	2026-10-27 00:25:02.023706954 +0000
+@@ -48,7 +48,9 @@
+ import hudson.model.Saveable;
+ import hudson.security.ACL;
+ import java.lang.reflect.Field;
++import java.lang.reflect.GenericDeclaration;
+ import java.lang.reflect.Type;
++import java.lang.reflect.TypeVariable;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -457,11 +459,78 @@
+                 converter = new RobustCollectionConverter(mapper, reflectionProvider, field.getGenericType());
+             } else if (new RobustMapConverter(mapper).canConvert(type)) {
+                 converter = new RobustMapConverter(mapper, field.getGenericType());
++            } else if (DescribableList.class.isAssignableFrom(type)) {
++                converter = new DescribableList.ConverterImpl(mapper, declaredElementType(result, field, DescribableList.class));
++            } else if (type == CopyOnWriteList.class) {
++                converter = new CopyOnWriteList.ConverterImpl(mapper, declaredElementType(result, field, CopyOnWriteList.class));
++            } else if (PersistedList.class.isAssignableFrom(type)) {
++                converter = new PersistedList.ConverterImpl(mapper, declaredElementType(result, field, PersistedList.class));
+             }
+         }
+         return context.convertAnother(result, type, converter);
+     }
+ 
++    /**
++     * Determines the declared element type of a list-valued field so that the list converter
++     * can refuse elements of any other type.
++     *
++     * <p>Generic declarations are read from the field signature and, when the element type is a
++     * type variable, resolved against the concrete class of the object being deserialized. This
++     * matters for a field declared on a generic superclass (for example
++     * {@code DescribableList<T, ...> entries} on a base class bound to a concrete entry type by
++     * its subclass); reading the signature alone would erase {@code T} to its bound.
++     *
++     * @return the element type, or {@code null} when the field carries no usable declaration and
++     *         its elements should therefore not be constrained
++     */
++    private static Class<?> declaredElementType(Object result, Field field, Class<?> listType) {
++        Type fieldType = field.getGenericType();
++        if (fieldType == null || !listType.isAssignableFrom(Types.erasure(fieldType))) {
++            return null;
++        }
++        Type baseType = Types.getBaseClass(fieldType, listType);
++        if (baseType == null) {
++            return null;
++        }
++        Type elementType = resolveTypeVariable(Types.getTypeArgument(baseType, 0, Object.class), result.getClass());
++        return Types.erasure(elementType);
++    }
++
++    /**
++     * Replaces a type variable with the type argument supplied for it by the concrete class,
++     * when one can be found. Any other type, and a type variable that cannot be resolved, is
++     * returned unchanged.
++     */
++    private static Type resolveTypeVariable(Type type, Class<?> runtimeType) {
++        if (!(type instanceof TypeVariable<?> variable)) {
++            return type;
++        }
++        GenericDeclaration declaration = variable.getGenericDeclaration();
++        if (!(declaration instanceof Class<?> declaringClass) || !declaringClass.isAssignableFrom(runtimeType)) {
++            return type;
++        }
++        TypeVariable<?>[] parameters = declaringClass.getTypeParameters();
++        int index = -1;
++        for (int i = 0; i < parameters.length; i++) {
++            if (parameters[i].equals(variable)) {
++                index = i;
++                break;
++            }
++        }
++        if (index < 0) {
++            return type;
++        }
++        Type concreteType = Types.getBaseClass(runtimeType, declaringClass);
++        if (concreteType == null) {
++            return type;
++        }
++        Type resolved = Types.getTypeArgument(concreteType, index, Object.class);
++        if (resolved == null || resolved instanceof TypeVariable) {
++            return type;
++        }
++        return resolved;
++    }
++
+     private void writeValueToImplicitCollection(
+             HierarchicalStreamReader reader,
+             UnmarshallingContext context,
+diff -ruN pristine/core/src/main/java/jenkins/security/ResourceDomainRootAction.java app/core/src/main/java/jenkins/security/ResourceDomainRootAction.java
+--- a/core/src/main/java/jenkins/security/ResourceDomainRootAction.java	2026-10-26 23:19:51.000000000 +0000
++++ b/core/src/main/java/jenkins/security/ResourceDomainRootAction.java	2026-10-27 00:25:11.824877717 +0000
+@@ -153,6 +153,11 @@
+             String url = Jenkins.get().getRootUrl() + this.url + restOfPath;
+             rsp.sendRedirect(302, url);
+         }
++
++        private Object readResolve() {
++            LOGGER.log(Level.WARNING, "Refusing to recreate a request redirect from configuration", new Exception("stack trace"));
++            throw new SecurityException("Blocked deserialization of Redirection");
++        }
+     }
+ 
+     public String getRedirectUrl(@NonNull Token token, @NonNull String restOfPath) {
+@@ -272,6 +277,11 @@
+         public String toString() {
+             return "[" + super.toString() + ", authentication=" + authenticationName + "; key=" + browserUrl + "]";
+         }
++
++        private Object readResolve() {
++            LOGGER.log(Level.WARNING, "Refusing to recreate a request-routing object from configuration", new Exception("stack trace"));
++            throw new SecurityException("Blocked deserialization of InternalResourceRequest");
++        }
+     }
+ 
+     public static class Token {

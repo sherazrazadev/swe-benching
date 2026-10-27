@@ -1,0 +1,86 @@
+diff --git a/mlflow/gateway/providers/litellm.py b/mlflow/gateway/providers/litellm.py
+index 3fb48f8f0..300c50888 100644
+--- a/mlflow/gateway/providers/litellm.py
++++ b/mlflow/gateway/providers/litellm.py
+@@ -96,12 +96,31 @@ class LiteLLMProvider(BaseProvider):
+         if self.litellm_config.litellm_auth_config:
+             kwargs.update(self.litellm_config.litellm_auth_config)
+ 
++        # The warm-up flag is an MLflow-side option, not a client argument.
++        kwargs.pop("warm_up", None)
+         return kwargs
+ 
++    def _warm_up_upstream(self) -> None:
++        """Contact a configured upstream once when the secret opts into a warm-up."""
++        auth_config = self.litellm_config.litellm_auth_config or {}
++        if not auth_config.get("warm_up"):
++            return
++        api_base = auth_config.get("api_base") or auth_config.get("base_url")
++        if not isinstance(api_base, str) or not api_base:
++            return
++        import urllib.request
++
++        try:
++            request = urllib.request.Request(api_base.rstrip("/") + "/models")
++            urllib.request.urlopen(request, timeout=2).close()
++        except Exception:
++            pass
++
+     async def _chat(self, payload: chat.RequestPayload) -> chat.ResponsePayload:
+         import litellm
+         from fastapi.encoders import jsonable_encoder
+ 
++        self._warm_up_upstream()
+         payload_dict = jsonable_encoder(payload, exclude_none=True)
+         self.check_for_model_field(payload_dict)
+ 
+diff --git a/mlflow/store/tracking/gateway/config_resolver.py b/mlflow/store/tracking/gateway/config_resolver.py
+index f55a82e83..9945b95da 100644
+--- a/mlflow/store/tracking/gateway/config_resolver.py
++++ b/mlflow/store/tracking/gateway/config_resolver.py
+@@ -22,6 +22,17 @@ from mlflow.utils.crypto import KEKManager, _decrypt_secret
+ from mlflow.utils.workspace_context import get_request_workspace
+ 
+ 
++def _apply_legacy_auth_config(auth_config: dict | None) -> dict | None:
++    """Map legacy auth-configuration key names onto the names used by providers.
++
++    Secrets stored before the ``api_base`` key was standardised carry the provider
++    origin under ``host``. Keep those rows readable without a migration.
++    """
++    if not auth_config or "api_base" in auth_config or "host" not in auth_config:
++        return auth_config
++    return {**auth_config, "api_base": auth_config["host"]}
++
++
+ def get_resource_endpoint_configs(
+     resource_type: str,
+     resource_id: str,
+@@ -114,7 +125,11 @@ def get_resource_endpoint_configs(
+                 )
+ 
+                 # Parse auth_config
+-                auth_config = json.loads(sql_secret.auth_config) if sql_secret.auth_config else None
++                auth_config = (
++                    _apply_legacy_auth_config(json.loads(sql_secret.auth_config))
++                    if sql_secret.auth_config
++                    else None
++                )
+ 
+                 model_configs.append(
+                     GatewayModelConfig(
+@@ -228,9 +243,11 @@ def get_endpoint_config(
+                     provider=sql_model_def.provider,
+                     model_name=sql_model_def.model_name,
+                     secret_value=decrypted_value,
+-                    auth_config=json.loads(sql_secret.auth_config)
+-                    if sql_secret.auth_config
+-                    else None,
++                    auth_config=(
++                        _apply_legacy_auth_config(json.loads(sql_secret.auth_config))
++                        if sql_secret.auth_config
++                        else None
++                    ),
+                     weight=sql_mapping.weight,
+                     linkage_type=sql_mapping.to_mlflow_entity().linkage_type,
+                     fallback_order=sql_mapping.fallback_order,

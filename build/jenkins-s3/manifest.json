@@ -1,0 +1,202 @@
+{
+ "slug": "jenkins-s3",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "25731",
+  "advisory_ids": [
+   "GHSA-G2XQ-2V27-4RH3",
+   "BIT-JENKINS-2026-53435",
+   "CVE-2026-53435"
+  ],
+  "repo": "jenkinsci/jenkins",
+  "pinned_commit": "38673e2e791fa767c4548c27f116f1bddcfbceec",
+  "fix_commits": [
+   "d739f6a6266d8cd6c225d94f2f927b549d7b46e5",
+   "345a3190a49d1ac96c4ff1c2e9eef4102c8d63f6"
+  ],
+  "pattern_fit": "A+B",
+  "O9_family": "CWE-502 deserialization of untrusted data (config.xml type confusion)"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "HTTP XML configuration-document submission (POST /view/{name}/config.xml, POST /job/{name}/config.xml, POST /computer/{name}/config.xml) reaching XStream2 unmarshalling of the submitted document into the live object",
+  "sites": [
+   "view property collection (DescribableList) - the reported path",
+   "job element collections (builders/publishers/triggers/buildWrappers, DescribableList)",
+   "agent node properties (DescribableList)",
+   "job property collection (CopyOnWriteList) - real upstream route the published fix does not cover",
+   "injected generic group property (DescribableList declared through a type variable)",
+   "injected persisted settings property (PersistedList) - real upstream converter gap made config-reachable",
+   "plugin wrapper and internal request-routing objects inside an untyped field of a legitimate element"
+  ],
+  "variants": [
+   "view.properties: unrelated Describable of the declared element type's hierarchy -> retained at pinned (10/10 security tests fail on pinned)",
+   "job builders: element name form and class-attribute form -> retained at pinned",
+   "job properties: copy-on-write list -> retained at pinned and under the published fix",
+   "agent nodeProperties -> retained at pinned",
+   "generic group entries: type variable erases to its bound -> retained under the published fix",
+   "persisted settings: PersistedList converter carries no element type -> retained under the published fix",
+   "Redirection: routing object recreated under the published fix; InternalResourceRequest and PluginWrapper are blocked by the published fix"
+  ],
+  "services": [],
+  "project_tests_run": "mvn -o -pl test -Dtest=RobustReflectionConverterTest (3 tests) and mvn -o -pl core -Dtest=DescribableListTest (2 tests) pass at the pinned commit and after the oracle fix",
+  "gate": {
+   "static": "passed",
+   "nop": "passed (10/10 security fail, 14/14 functional pass)",
+   "oracle": "passed (3 runs, reward 1.0 each, identical)",
+   "patches": "passed (10 checks: 5 security_fail, 2 functional_fail, 1 security_fail crash, hardening 1.0, alternative fix 1.0; blind deferred to the post-build blind-fix step)"
+  }
+ },
+ "leak_terms": [
+  "CVE-2026-53435",
+  "GHSA-G2XQ-2V27-4RH3",
+  "BIT-JENKINS-2026-53435",
+  "SECURITY-3707",
+  "XStream",
+  "XStream2",
+  "RobustReflectionConverter",
+  "DescribableList",
+  "CopyOnWriteList",
+  "PersistedList",
+  "PluginWrapper",
+  "InternalResourceRequest",
+  "Redirection",
+  "readResolve",
+  "InternalResourceRequest",
+  "DescribableGroupViewProperty",
+  "ManagedSettingsProperty"
+ ],
+ "patch_checks": [
+  {
+   "patch": "upstream_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_copyonwrite.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_generic.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_persisted.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_redirection.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "overbroad_exact_class.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_correct_fix.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "n/a: no authorization or proxy-resource decision exists; the property is element-type confinement over submitted configuration data",
+  "one_role_or_direction": "n/a: there are no roles or request directions; the same unmarshalling path serves every configuring actor",
+  "reads_only": "n/a: configuration is written and read through one unmarshalling path; there is no separate read-side guard to miss",
+  "check_after_adjustment": "n/a: no normalisation, offset, clamp or unit conversion is applied to the submitted values before or after the check",
+  "unlisted_route": "upstream_only.patch",
+  "malformed_identity": "n/a: element identity is the XML class selection; the element name form and the class-attribute form both reach the same converter and both are tested",
+  "missing_authority": "n/a: no authority, secret or role lookup is involved in this property",
+  "adjacent_api": "overbroad_exact_class.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-copyonwrite-config-collection",
+   "pattern": "B (real, unmodified upstream)",
+   "shape": "A job property collection is backed by a copy-on-write list whose associated converter never receives the field's declared element type, so a class named in the document is instantiated and kept; the published fix only wires the element type into describable lists.",
+   "where": "core/src/main/java/hudson/util/CopyOnWriteList.java:181; field core/src/main/java/hudson/model/Job.java:200",
+   "security_tests": [
+    "tests/security/SecurityCopyOnWriteJobPropertiesTest.java::unrelatedTypeInJobPropertiesIsNotKept"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/FunctionalJobElementsTest.java::legitimateJobElementsBind",
+    "tests/functional/FunctionalJobElementsTest.java::jobWithoutCollectionsStillLoads"
+   ],
+   "security_fail_patch": "missing_copyonwrite.patch",
+   "realistic_because": "real, unmodified upstream code; the field's own comment says it should have been a DescribableList but now it is too late, so a solver can dismiss it as an unrelated legacy field.",
+   "reason_to_dismiss": "The source itself calls the field a legacy shape, and it is not a describable list, so the reported fix's new branch does not cover it."
+  },
+  {
+   "id": "T2-generic-type-variable",
+   "pattern": "injected sibling (how-type)",
+   "shape": "A describable-list field is declared on a generic base class as DescribableList<T, Descriptor<T>> and bound to a concrete entry type by the configured subclass; taking the element type from the field signature erases T to its declared bound, so every Describable passes the check.",
+   "where": "core/src/main/java/hudson/model/DescribableGroupViewProperty.java:16",
+   "security_tests": [
+    "tests/security/SecurityGenericGroupTypeTest.java::unrelatedTypeInGroupEntriesIsNotKept"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/FunctionalGenericGroupTest.java::legitimateGroupEntryBinds"
+   ],
+   "security_fail_patch": "missing_generic.patch",
+   "realistic_because": "newly added product code in a shape Jenkins already uses (generic base classes for extension points); the field is genuinely typed and a maintainer would not see an erasure problem.",
+   "reason_to_dismiss": "The field looks correctly typed and the naive extraction returns a non-null broad type (Describable), so every existing check silently accepts."
+  },
+  {
+   "id": "T3-persisted-list-config-collection",
+   "pattern": "injected sibling (how-type)",
+   "shape": "A job property holds a persisted list of plain settings; the persisted-list converter delegates to the copy-on-write converter with no element type, and the published fix's branch only recognizes describable lists, so any class named in the document is kept.",
+   "where": "core/src/main/java/hudson/model/ManagedSettingsProperty.java:16; converter core/src/main/java/hudson/util/PersistedList.java:265",
+   "security_tests": [
+    "tests/security/SecurityPersistedSettingsTypeTest.java::unrelatedTypeInPersistedSettingsIsNotKept"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/FunctionalPersistedSettingsTest.java::legitimateSettingBinds"
+   ],
+   "security_fail_patch": "missing_persisted.patch",
+   "realistic_because": "newly added product code in the existing persisted-list style (used for non-describable values); later upstream work closes exactly this converter gap, so a maintainer fixing only the reported branch leaves real code behind.",
+   "reason_to_dismiss": "PersistedList is internal plumbing (update-centre and fingerprint data), and the field is not a DescribableList, so the reported fix's branch skips it."
+  },
+  {
+   "id": "T4-routing-objects",
+   "pattern": "A+B (real, unmodified upstream)",
+   "shape": "Objects whose only job is to route or dispatch a request, or to describe a plugin, are reachable through an untyped field of an otherwise legitimate configuration element; an element-type check cannot help, so the objects themselves must refuse to be recreated.",
+   "where": "core/src/main/java/jenkins/security/ResourceDomainRootAction.java:143 (Redirection, the route the published fix does not cover); core/src/main/java/jenkins/security/ResourceDomainRootAction.java:271 and core/src/main/java/hudson/PluginWrapper.java:1434 (the two the published fix guards)",
+   "security_tests": [
+    "tests/security/SecurityRoutingObjectsTest.java::requestRedirectionIsNotRecreated",
+    "tests/security/SecurityRoutingObjectsTest.java::internalResourceRequestIsNotRecreated",
+    "tests/security/SecurityRoutingObjectsTest.java::pluginWrapperIsNotRecreated"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/FunctionalPayloadTest.java::legitimatePayloadBinds",
+    "tests/functional/FunctionalPayloadTest.java::absentPayloadStaysAbsent"
+   ],
+   "security_fail_patch": "missing_redirection.patch",
+   "realistic_because": "real, unmodified upstream code; the missed helper is a sibling routing class created by the same token-decoding method as one the published fix already guards.",
+   "reason_to_dismiss": "The missed helper only yields an open redirect, so against the impersonation and code-execution impact in the report it looks out of scope."
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle, patches)",
+ "notes": "Track: injected. Two injected sibling classes (generic group base, persisted settings property) are applied to the pinned tree by environment/injection.patch; the published fix never touches either. The oracle additionally wires the element type into copy-on-write and persisted-list fields, resolves type variables against the concrete configured class, and guards the remaining routing helper. Security tests drive real HTTP configuration-document endpoints on an in-process Jenkins controller; functional tests keep legitimate values binding and run the project's own affected-area tests. Local proof before the gate: pinned 10/10 security fail and 12/12 functional pass; oracle 10/10 security and 12/12 functional pass."
+}

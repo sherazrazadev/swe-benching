@@ -1,0 +1,349 @@
+{
+ "slug": "fabio-s3",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17456",
+  "advisory_ids": [
+   "GHSA-FQ95-V8XC-JM3V",
+   "CVE-2026-62987",
+   "GO-2026-6566"
+  ],
+  "repo": "fabiolb/fabio",
+  "pinned_commit": "b88860fcc564b680bba5e920d70d8d511bb483b4",
+  "fix_commits": [
+   "240526a8004077edad4fb96d25b382bfc3901357"
+  ],
+  "trust_decision": {
+   "summary": "Whether a header name listed by the client in the Connection header is treated as proxy-protected (kept out of the hop-by-hop list, so the value fabio set survives to the upstream) or as client-managed hop-by-hop (dropped); decided per request in addHeaders against a fixed package-level map that never includes the operator-configured ClientIPHeader/TLSHeader/RequestID names.",
+   "evidence": [
+    "proxy/http_headers.go:56",
+    "proxy/http_headers.go:28-36",
+    "proxy/http_headers.go:70-74",
+    "proxy/http_headers.go:151-157",
+    "proxy/http_proxy.go:85-91",
+    "main.go:226-241"
+   ]
+  },
+  "landing_point": {
+   "where": "proxy/http_headers.go:28-36",
+   "why": "An engineer reading only the summary finds the Connection token filter and the protected-name map literal that decides membership."
+  },
+  "fix_sites": [
+   {
+    "where": "main.go:186-241",
+    "entry_point": "fabio startup: every configured http/https listen entry calls newHTTPProxy, which builds the HTTPProxy without any protected-header set",
+    "module_kind": "binary composition root (package main)"
+   },
+   {
+    "where": "proxy/http_headers.go:28-36",
+    "entry_point": "fabio HTTP/HTTPS listener -> proxy.HTTPProxy.ServeHTTP",
+    "module_kind": "library package (proxy)"
+   },
+   {
+    "where": "proxy/http_headers.go:45-60",
+    "entry_point": "proxy.HTTPProxy.ServeHTTP -> addHeaders; also addHeaders-level API used by the package's own tests",
+    "module_kind": "library package (proxy)"
+   },
+   {
+    "where": "proxy/http_proxy.go:44-78",
+    "entry_point": "public API: exported proxy.HTTPProxy struct, constructed directly by embedders and by the project's integration tests",
+    "module_kind": "exported library API"
+   },
+   {
+    "where": "proxy/http_proxy.go:175",
+    "entry_point": "proxy.HTTPProxy.ServeHTTP -> addHeaders(r, p.ProtectHeaders, p.Config, t.StripPath)",
+    "module_kind": "library package (proxy)"
+   }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+   "kind": "defaults_or_merge_route",
+   "where": "main.go:186-241"
+  },
+  "O3_reason_to_dismiss": "The filtering logic and the map are both inside proxy/http_headers.go, so the proxy package looks like the whole fix; main.go only wires startup config.",
+  "O5_coupled_behaviour": {
+   "what": "Client-named hop-by-hop headers must still be stripped from the upstream request, while Upgrade must survive into the forwarded Connection header for websocket handshakes. An over-broad fix that protects every Connection token, or that deletes Connection outright, breaks one of these two.",
+   "where": "proxy/http_headers.go:51-65"
+  },
+  "O6_input_shapes": [
+   "single Connection token naming a configured header",
+   "multiple tokens in one Connection line mixed with legitimate hop-by-hop names",
+   "multiple Connection header lines",
+   "arbitrary operator-chosen header names and case variants",
+   "the same configured name applied on TLS vs plain requests and the RequestID set on every request"
+  ],
+  "O7_producer": {
+   "kind": "config_loader",
+   "where": "config/load.go:149-152",
+   "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+   {
+    "where": "proxy/http_proxy.go:80-91",
+    "sibling": "A second construction path for the same handler (exported proxy.HTTPProxy built directly) where a caller-supplied protect set is absent, so the default protected names stop being protected unless the handler merges its own defaults.",
+    "why_realistic": "The published fix adds exactly this caller-supplied field and leaves it nil for direct constructors; the pinned tests already construct &HTTPProxy{Config: ...} with no way to pass a set."
+   },
+   {
+    "where": "proxy/ws_handler.go:55",
+    "sibling": "A second writer of the outgoing request: the websocket path hijacks the connection and re-serialises the request with r.Write, bypassing the reverse proxy's hop-by-hop handling.",
+    "why_realistic": "A maintainer adding hop-by-hop handling to the raw handshake would put the filter in the ws writer."
+   },
+   {
+    "where": "proxy/grpc_handler.go:52-58",
+    "sibling": "A parallel trust-header surface for the grpc listener.",
+    "why_realistic": "Same config block serves grpc; but HTTP/2 has no Connection header, so no equivalent mechanism."
+   }
+  ],
+  "O9_family": "trust-boundary / spoofed-header family (CWE-290 / CWE-348): proxy-trusted request headers are removable by the client so the upstream sees no trusted value",
+  "O9_dos": false,
+  "O10_build": {
+   "language": "Go",
+   "toolchain": "go 1.26.2",
+   "services": [],
+   "offline_after_build": true,
+   "project_tests": "proxy/http_headers_test.go, proxy/http_integration_test.go, proxy/ws_integration_test.go"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+   "j_multi_site": 1,
+   "j_sites_touched": "main.go, proxy/http_headers.go, proxy/http_proxy.go",
+   "j_sibling_sites": "no",
+   "j_cause_other_layer": 1,
+   "j_defence_ineffective": 1,
+   "j_overbroad_breaks_legit": 1,
+   "j_tempting_wrong_fix": "Add the three common literal names to the protected map; that passes an example written with those names but leaves every other operator-configured name strippable, and a set built only in main.go leaves direct proxy constructors unprotected."
+  },
+  "out_of_scope_notes": [
+   "route/access_rules.go:42-63 makes allow/deny decisions from the client-supplied X-Forwarded-For before addHeaders runs; a separate trust question, not pursued.",
+   "When listen proxyproto is enabled, serve/proxy_proto trust a client-supplied PROXY protocol header; documented LB-trust assumption, outside this advisory."
+  ],
+  "unverified": [
+   "Buildability inferred from go.mod and the httptest-only proxy tests; verified locally with go 1.26.2 during the build."
+  ]
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "An HTTP request through the proxy whose Connection header names a header the proxy adds (operator-configured client address, request id, TLS indicator) causes the backend to receive the request without that value. Reproduced on the pinned+injected tree through (a) the exported proxy constructed by an embedding program, (b) a TLS listener, (c) the websocket handshake writer, (d) a target-configured value, and (e) the rebuilt fabio service with static routes and proxy.header.* options.",
+  "variants": [
+   "single Connection token naming the configured client-address header",
+   "mixed Connection tokens plus legitimate connection-scoped names",
+   "multiple Connection header lines",
+   "TLS listener with the configured TLS header",
+   "exported HTTPProxy constructed directly with no caller-supplied set",
+   "websocket handshake through the raw handshake writer",
+   "target-configured upstream header named in Connection",
+   "rebuilt service driven through its own listener with proxy.header.* flags"
+  ],
+  "sites": [
+   "proxy/http_headers.go:28-36 (protect map)",
+   "proxy/http_headers.go:45-57 (Connection token filter)",
+   "proxy/http_proxy.go:80-208 (ServeHTTP set construction, ws handoff, target header)",
+   "proxy/ws_handler.go:24-139 (raw handshake writer)",
+   "route/route.go:79-83 and route/target.go:75-80 (target-configured header)",
+   "main.go:186-241 (service composition root)"
+  ],
+  "routes": [
+   "embedded proxy",
+   "plain and TLS listeners",
+   "websocket handshake",
+   "target-configured value",
+   "fabio service composition root"
+  ],
+  "services": [],
+  "project_tests_run": "proxy/http_headers_test.go (unit), proxy/http_integration_test.go and proxy/ws_integration_test.go (offline, httptest/loopback only) pass at the pinned commit, at the pinned+injected baseline, and under the reference fix."
+ },
+ "leak_terms": [
+  "protectHeaders",
+  "DefaultProtectHeaders",
+  "addHeaders",
+  "addHeadersWithSet",
+  "HTTPProxy",
+  "ProtectHeaders",
+  "ServeHTTP",
+  "newWSHandler",
+  "removeHandshakeHeaders",
+  "handshakeHeaders",
+  "RequestHeaderName",
+  "RequestHeaderValue",
+  "proxy.header.clientip",
+  "proxy.header.tls",
+  "proxy.header.requestid",
+  "X-Client-Ip",
+  "X-Forwarded-Ssl",
+  "X-Request-Id",
+  "GHSA-FQ95-V8XC-JM3V",
+  "CVE-2026-62987",
+  "GO-2026-6566",
+  "240526a8",
+  "b88860fc"
+ ],
+ "patch_checks": [
+  {
+   "patch": "shallow_literal_names.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "defaults_only.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "miss_ws.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "miss_target.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "partial_configured.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "miss_canonical.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "panic_attack.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "published_shape.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "protect_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "delete_connection.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "panic_attack.patch",
+  "wrong_resource": "n/a: there is no per-resource authorization decision; the protected thing is the set of values the proxy adds to one forwarded request, so no neighbouring resource can be authorised instead",
+  "one_role_or_direction": "partial_configured.patch",
+  "reads_only": "n/a: there are no read and write operations; every tested path forwards a single request",
+  "check_after_adjustment": "n/a: no offset, clamp or normalisation is applied to the client input before the trust decision; the alternative fix places the protection earlier in the request path and scores 1.0 (alt_fix.patch)",
+  "unlisted_route": "miss_target.patch",
+  "malformed_identity": "miss_canonical.patch",
+  "missing_authority": "defaults_only.patch",
+  "adjacent_api": "published_shape.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "reported route (Pattern A): operator-configured trust headers are missing from the fixed protected-name set, so a Connection token naming one makes the reverse proxy delete the value",
+   "where": "proxy/http_headers.go:28-36 and proxy/http_headers.go:45-57",
+   "security_tests": [
+    "tests/security/proxy/sec_headers_test.go::TestSecClientIPHeaderCannotBeSuppressed",
+    "...::TestSecRequestIDSurvivesMixedConnectionTokens",
+    "...::TestSecTLSHeaderCannotBeSuppressed",
+    "...::TestSecMultipleConnectionLines"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/proxy/fun_headers_test.go::TestFunConfiguredValuesWithoutClientInstructions",
+    "...::TestFunClientConnectionHeadersStillRemoved"
+   ],
+   "security_fail_patch": "shallow_literal_names.patch",
+   "realistic_because": "real, unmodified upstream code: the published advisory is exactly this gap"
+  },
+  {
+   "id": "T2",
+   "shape": "defaults route / absent protection (Pattern A/B): a proxy constructed directly by an embedding program has no caller-supplied protection set, so a fix that only wires the set in the service leaves these requests completely unprotected",
+   "where": "proxy/http_proxy.go:80-208",
+   "security_tests": [
+    "tests/security/proxy/sec_headers_test.go::TestSecEmbeddedProxyProtectsItsValues"
+   ],
+   "coupled_functional_tests": [
+    "tests/pristine/proxy/http_integration_test.go::TestProxyProducesCorrectXForwardedSomethingHeader",
+    "tests/functional/proxy/fun_headers_test.go::TestFunDefaultForwardingHeaders"
+   ],
+   "security_fail_patch": "defaults_only.patch",
+   "realistic_because": "real, unmodified upstream code: the exported struct is constructed directly by the project's own integration tests and by embedders; the published fix leaves the caller-supplied set nil there and the project's own test catches the regression"
+  },
+  {
+   "id": "T3",
+   "shape": "second implementation (injected sibling): the websocket handshake writer honours the client's original Connection tokens and removes those headers from the handshake it writes itself, after the shared header preparation has set them",
+   "where": "proxy/ws_handler.go:24-139 and proxy/http_proxy.go:177-208",
+   "security_tests": [
+    "tests/security/proxy/sec_websocket_test.go::TestSecWebsocketHandshakeKeepsAddedValues"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/proxy/fun_websocket_test.go::TestFunWebsocketHandshakeKeepsWorking",
+    "tests/pristine/proxy/ws_integration_test.go::TestProxyWSUpstream"
+   ],
+   "security_fail_patch": "miss_ws.patch",
+   "realistic_because": "injected sibling a maintainer could have left: the reverse proxy's hop-by-hop handling does not apply to the raw handshake write, so a filter there is plausible; the fix never touches it"
+  },
+  {
+   "id": "T4",
+   "shape": "producer off the check's path (injected sibling): a value configured on the target is added to the upstream request by the proxy, but the name never reaches the header-protection decision, which only looks at the service configuration",
+   "where": "route/route.go:79-83, route/target.go:75-80, proxy/http_proxy.go:184-186",
+   "security_tests": [
+    "tests/security/proxy/sec_target_test.go::TestSecConfiguredTargetHeaderCannotBeSuppressed"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/proxy/fun_target_test.go::TestFunConfiguredTargetValueKeepsWorking"
+   ],
+   "security_fail_patch": "miss_target.patch",
+   "realistic_because": "injected sibling a maintainer could have left: target options already carry per-target forwarding behaviour, and the value is the same kind of proxy-supplied value; the fix never touches the option parser"
+  },
+  {
+   "id": "T5",
+   "shape": "coupled must-keep-working value: headers the client marks connection-scoped must still be removed and upgrade handshakes must still complete, so an over-broad fix fails",
+   "where": "proxy/http_headers.go:51-65",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "tests/functional/proxy/fun_headers_test.go::TestFunClientConnectionHeadersStillRemoved",
+    "tests/functional/proxy/fun_websocket_test.go::TestFunWebsocketHandshakeKeepsWorking",
+    "tests/pristine/proxy/http_integration_test.go::TestProxyProducesCorrectXForwardedSomethingHeader",
+    "tests/pristine/proxy/ws_integration_test.go::TestProxyWSUpstream"
+   ],
+   "security_fail_patch": "protect_all.patch",
+   "realistic_because": "real, unmodified upstream behaviour: the project's own tests require client-named hop-by-hop headers to be stripped and handshakes to complete"
+  }
+ ],
+ "status": "built; gate green 2026-10-26: static PASS; nop PASS (8/8 security fail, 47 functional pass incl. subtests); oracle PASS 3/3 (reward 1.0, identical); patches PASS 13/13 (7 security_fail, 4 functional_fail, alt_fix + hardening pass 1.0). blind.patch and FAIRNESS.md are written later.",
+ "notes": "Pattern A + two injected siblings. The reported flaw is real at the pinned commit; the direct-construction/defaults route and the two injected siblings are additional independent levers. The websocket and target-configuration siblings are injected by environment/injection.patch; the fix patch covers them."
+}

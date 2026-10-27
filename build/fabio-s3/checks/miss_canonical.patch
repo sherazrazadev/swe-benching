@@ -1,0 +1,221 @@
+diff --git a/main.go b/main.go
+index d8d0a878..68b79ac1 100644
+--- a/main.go
++++ b/main.go
+@@ -10,6 +10,7 @@ import (
+ 	"log"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"os"
+ 	"runtime"
+ 	"runtime/debug"
+@@ -166,6 +167,15 @@ func newGrpcProxy(cfg *config.Config, tlscfg *tls.Config, statsHandler *proxy.Gr
+ 	//Init Glob Cache
+ 	globCache := route.NewGlobCache(cfg.GlobCacheSize)
+ 
++	//Init ProtectHeaders
++	protectHeaders := make(map[string]bool, len(proxy.DefaultProtectHeaders)+3)
++	for name := range proxy.DefaultProtectHeaders {
++		protectHeaders[name] = true
++	}
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.RequestID)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.ClientIPHeader)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.TLSHeader)] = true
++
+ 	proxyInterceptor := proxy.GrpcProxyInterceptor{
+ 		Config:       cfg,
+ 		StatsHandler: statsHandler,
+@@ -189,6 +199,15 @@ func newHTTPProxy(cfg *config.Config, statsHandler *proxy.HttpStatsHandler) *pro
+ 	//Init Glob Cache
+ 	globCache := route.NewGlobCache(cfg.GlobCacheSize)
+ 
++	//Init ProtectHeaders
++	protectHeaders := make(map[string]bool, len(proxy.DefaultProtectHeaders)+3)
++	for name := range proxy.DefaultProtectHeaders {
++		protectHeaders[name] = true
++	}
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.RequestID)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.ClientIPHeader)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.TLSHeader)] = true
++
+ 	switch cfg.Log.AccessTarget {
+ 	case "":
+ 		log.Printf("[INFO] Access logging disabled")
+@@ -227,6 +246,7 @@ func newHTTPProxy(cfg *config.Config, statsHandler *proxy.HttpStatsHandler) *pro
+ 		Config:            cfg.Proxy,
+ 		Transport:         transport.NewTransport(nil),
+ 		InsecureTransport: transport.NewTransport(&tls.Config{InsecureSkipVerify: true}),
++		ProtectHeaders:    protectHeaders,
+ 		Lookup: func(r *http.Request) *route.Target {
+ 			t := route.GetTable().Lookup(r, pick, match, globCache, cfg.GlobMatchingDisabled)
+ 			if t == nil {
+diff --git a/proxy/http_headers.go b/proxy/http_headers.go
+index 6ac21b18..7a3d7590 100644
+--- a/proxy/http_headers.go
++++ b/proxy/http_headers.go
+@@ -25,7 +25,9 @@ func addResponseHeaders(w http.ResponseWriter, r *http.Request, cfg config.Proxy
+ 	}
+ }
+ 
+-var protectHeaders = map[string]bool{
++// DefaultProtectHeaders is the base set of headers which are set by the
++// proxy and must not be treated as client scoped hop-by-hop headers.
++var DefaultProtectHeaders = map[string]bool{
+ 	"Forwarded":          true,
+ 	"X-Forwarded-For":    true,
+ 	"X-Forwarded-Host":   true,
+@@ -35,6 +37,28 @@ var protectHeaders = map[string]bool{
+ 	"X-Real-Ip":          true,
+ }
+ 
++// protectedHeaders returns the set of header names whose values are set by
++// the proxy for the upstream request. It contains the defaults, the names
++// taken from the proxy configuration and any additional names for this
++// request.
++func protectedHeaders(cfg config.Proxy, extra ...string) map[string]bool {
++	hdrs := make(map[string]bool, len(DefaultProtectHeaders)+len(extra)+3)
++	for name := range DefaultProtectHeaders {
++		hdrs[name] = true
++	}
++	for _, name := range []string{cfg.ClientIPHeader, cfg.TLSHeader, cfg.RequestID} {
++		if name != "" {
++			hdrs[name] = true
++		}
++	}
++	for _, name := range extra {
++		if name != "" {
++			hdrs[name] = true
++		}
++	}
++	return hdrs
++}
++
+ // addHeaders adds/updates headers in request
+ //
+ // * add/update `Forwarded` header
+@@ -43,6 +67,16 @@ var protectHeaders = map[string]bool{
+ // * ClientIPHeader != "": Set header with that name to <remote ip>
+ // * TLS connection: Set header with name from `cfg.TLSHeader` to `cfg.TLSHeaderValue`
+ func addHeaders(r *http.Request, cfg config.Proxy, stripPath string) error {
++	return addHeadersWithSet(r, protectedHeaders(cfg), cfg, stripPath)
++}
++
++// addHeadersWithSet adds/updates the request headers and keeps the names in
++// hdrs out of the client supplied Connection header so that their values are
++// not removed before the request reaches the upstream.
++func addHeadersWithSet(r *http.Request, hdrs map[string]bool, cfg config.Proxy, stripPath string) error {
++	if hdrs == nil {
++		hdrs = protectedHeaders(cfg)
++	}
+ 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+ 	if err != nil {
+ 		return errors.New("cannot parse " + r.RemoteAddr)
+@@ -53,7 +87,7 @@ func addHeaders(r *http.Request, cfg config.Proxy, stripPath string) error {
+ 	for _, s := range r.Header.Values("Connection") {
+ 		for p := range strings.SplitSeq(s, ",") {
+ 			p = strings.TrimSpace(p)
+-			if !protectHeaders[textproto.CanonicalMIMEHeaderKey(p)] {
++			if !hdrs[textproto.CanonicalMIMEHeaderKey(p)] {
+ 				conHeaders = append(conHeaders, p)
+ 			}
+ 		}
+diff --git a/proxy/http_proxy.go b/proxy/http_proxy.go
+index 307e3102..37b067f3 100644
+--- a/proxy/http_proxy.go
++++ b/proxy/http_proxy.go
+@@ -8,6 +8,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
+@@ -75,6 +76,27 @@ type HTTPProxy struct {
+ 
+ 	// Config is the proxy configuration as provided during startup.
+ 	Config config.Proxy
++
++	// ProtectHeaders contains additional header names which are set by the
++	// proxy and which must not be treated as client scoped headers.
++	ProtectHeaders map[string]bool
++}
++
++// protectedHeaders returns the header names which the proxy sets for the
++// upstream request. It always contains the defaults and the names from the
++// configuration so that a proxy which was constructed without an explicit set
++// remains protected.
++func (p *HTTPProxy) protectedHeaders(t *route.Target) map[string]bool {
++	set := protectedHeaders(p.Config)
++	for name := range p.ProtectHeaders {
++		if name != "" {
++			set[textproto.CanonicalMIMEHeaderKey(name)] = true
++		}
++	}
++	if t != nil && t.RequestHeaderName != "" {
++		set[textproto.CanonicalMIMEHeaderKey(t.RequestHeaderName)] = true
++	}
++	return set
+ }
+ 
+ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -175,8 +197,9 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	// The websocket handshake is written to the backend verbatim, so keep the
+ 	// connection tokens the client sent before the proxy normalises them.
+ 	wsConnTokens := r.Header.Values("Connection")
++	protectSet := p.protectedHeaders(t)
+ 
+-	if err := addHeaders(r, p.Config, t.StripPath); err != nil {
++	if err := addHeadersWithSet(r, protectSet, p.Config, t.StripPath); err != nil {
+ 		http.Error(w, "cannot parse "+r.RemoteAddr, http.StatusInternalServerError)
+ 		return
+ 	}
+@@ -203,9 +226,9 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		if targetURL.Scheme == "https" || targetURL.Scheme == "wss" {
+ 			h = newWSHandler(targetURL.Host, func(network, address string) (net.Conn, error) {
+ 				return tls.Dial(network, address, tr.(*http.Transport).TLSClientConfig)
+-			}, p.Stats.WSConn, wsConnTokens)
++			}, p.Stats.WSConn, wsConnTokens, protectSet)
+ 		} else {
+-			h = newWSHandler(targetURL.Host, net.Dial, p.Stats.WSConn, wsConnTokens)
++			h = newWSHandler(targetURL.Host, net.Dial, p.Stats.WSConn, wsConnTokens, protectSet)
+ 		}
+ 
+ 	case accept == "text/event-stream":
+diff --git a/proxy/ws_handler.go b/proxy/ws_handler.go
+index 8f9c9303..7a751b5b 100644
+--- a/proxy/ws_handler.go
++++ b/proxy/ws_handler.go
+@@ -22,7 +22,7 @@ type dialFunc func(network, address string) (net.Conn, error)
+ // an incoming and outgoing websocket connection. It checks whether
+ // the handshake was completed successfully before forwarding data
+ // between the client and server.
+-func newWSHandler(host string, dial dialFunc, conn gkm.Gauge, connTokens []string) http.Handler {
++func newWSHandler(host string, dial dialFunc, conn gkm.Gauge, connTokens []string, protected map[string]bool) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if conn != nil {
+ 			conn.Set(float64(atomic.AddInt64(&conns, 1)))
+@@ -53,7 +53,7 @@ func newWSHandler(host string, dial dialFunc, conn gkm.Gauge, connTokens []strin
+ 		}
+ 		defer out.Close()
+ 
+-		removeHandshakeHeaders(r.Header, connTokens)
++		removeHandshakeHeaders(r.Header, connTokens, protected)
+ 
+ 		err = r.Write(out)
+ 		if err != nil {
+@@ -126,11 +126,11 @@ var handshakeHeaders = map[string]bool{
+ // removeHandshakeHeaders removes the headers the client declared connection
+ // scoped from the handshake which is written to the backend without the
+ // hop-by-hop handling of the reverse proxy.
+-func removeHandshakeHeaders(h http.Header, tokens []string) {
++func removeHandshakeHeaders(h http.Header, tokens []string, protected map[string]bool) {
+ 	for _, s := range tokens {
+ 		for p := range strings.SplitSeq(s, ",") {
+ 			name := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(p))
+-			if name == "" || handshakeHeaders[name] {
++			if name == "" || handshakeHeaders[name] || protected[name] {
+ 				continue
+ 			}
+ 			h.Del(name)

@@ -1,0 +1,384 @@
+{
+ "slug": "comfyui-manager-s3",
+ "candidate": "h4-2366: comfy-org/comfyui-manager, authorization bypass through state kept in the host's user-writable folder (injected siblings on top of the published fix)",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "c8dce94c031ed87a8673d354482a39dedc15407b, the direct parent of the published fix e44c5cef58fb4973670b86433b9d24d077b44a26 (git rev-list --parents); the fix adds no test files",
+  "entry_points": [
+   "HTTP route table registered by manager_server on a running host: POST /customnode/install/git_url, GET /snapshot/remove, GET /snapshot/restore, GET /manager/queue/update_comfyui, POST /manager/queue/model_download",
+   "ComfyUI startup hook: importing prestartup_script.py in a fresh interpreter, exactly as ComfyUI does before the extension loads",
+   "manager_core public state API: update_user_directory / get_config / write_config / reserve_script / queue_model_download"
+  ],
+  "sites": [
+   "glob/manager_core.py:217 legacy state directory; :1680-1700 write_config; :1710-1775 read_config and its defaults fallback; :1848 queue_model_download (injected)",
+   "glob/manager_server.py:89-100 security-level gate; :1303 install route; :1446 pending-download route (injected)",
+   "prestartup_script.py:89 state directory computed a second time; :92 restore handoff; :97 boot preferences (injected); :106-150 separate config/pip loader; :526-527 startup script and pending-download paths; :582 restore consumer; :803-837 pending-download consumer (injected); :839 pip fixer",
+   "glob/manager_trust.py:21 trusted-source list read from a self-computed path (injected)",
+   "glob/manager_bootstrap.py:17 early TLS/logging reader from a self-computed path (injected)"
+  ],
+  "routes": [
+   "new host, weak level planted in the user folder: install confirmed to run and write its install marker at the pinned commit",
+   "old host, weak level planted: install confirmed to run at the pinned commit",
+   "old host, default level: snapshot removal confirmed to run at the pinned commit",
+   "new host, action planted in the user folder: startup hook confirmed to execute it at the pinned commit",
+   "new host, restore request planted: startup hook confirmed to clone the repository and run its install script at the pinned commit",
+   "old host, configuration and package lists planted: confirmed to disable TLS verification, remap packages and extend the blacklists at the pinned commit",
+   "new host, trusted-source list planted: install confirmed to run at the pinned commit (injected sibling)",
+   "new host, boot preferences planted: TLS verification confirmed to be disabled at the pinned commit (injected sibling)",
+   "new host, pending-download list planted: the payload confirmed to be fetched at startup at the pinned commit (injected sibling)"
+  ],
+  "services": [
+   "loopback dumb-HTTP git repository serving a harmless install script (no external network)",
+   "loopback HTTP payload server for the queued-download route"
+  ],
+  "project_tests_run": [
+   "none: the pinned tree has no test suite or test dependency; the hidden security and functional suites are the project tests for the affected area"
+  ],
+  "local_runs": "pinned+injected: 10 security tests fail and 10 functional tests pass; reference: 20/20; every check patch reproduces its declared outcome locally and in the container gate",
+  "gate": "static PASSED; nop PASSED (10 security tests fail, 10 functional tests pass on the untouched pinned+injected tree); oracle PASSED (three runs, reward 1.0, identical results); patches PASSED (15 checks: 11 security_fail, 2 functional_fail, 2 pass, all as declared). After the patches stage the storage test was tightened to require the Manager state not to live anywhere under the host's writable subtree; it passes on the reference and both pass patches and fails on the pinned tree, so no check outcome changes, and static/nop/oracle were re-run on the final files."
+ },
+ "leak_terms": [
+  "manager_core",
+  "manager_server",
+  "manager_migration",
+  "manager_trust",
+  "manager_bootstrap",
+  "prestartup_script",
+  "cm-cli",
+  "manager_files_path",
+  "manager_config_path",
+  "manager_startup_script_path",
+  "manager_snapshot_path",
+  "update_user_directory",
+  "get_config",
+  "read_config",
+  "write_config",
+  "reserve_script",
+  "queue_model_download",
+  "is_allowed_security_level",
+  "has_system_user_api",
+  "get_manager_path",
+  "force_security_level_if_needed",
+  "apply_boot_preferences",
+  "is_trusted_source",
+  "security_level",
+  "config.ini",
+  "trusted_sources.list",
+  "pip_overrides.json",
+  "pip_blacklist.list",
+  "pip_auto_fix.list",
+  "install-scripts.txt",
+  "restore-snapshot.json",
+  "pending-downloads.json",
+  "startup-scripts",
+  "bypass_ssl",
+  "file_logging",
+  "downgrade_blacklist",
+  "__manager",
+  "get_system_user_directory",
+  "get_user_directory",
+  "default/ComfyUI-Manager",
+  "snapshot/remove",
+  "customnode/install",
+  "manager/queue",
+  "comfyui_outdated",
+  "security_403_response",
+  "e44c5cef",
+  "c8dce94c",
+  "GHSA-95PQ",
+  "CVE-2025-67303"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-protected-storage.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "keeps the legacy directory for core, startup hook and trust store, so the policy stays web-writable"
+  },
+  {
+   "patch": "sf-no-startup-path.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T2"
+   ],
+   "note": "startup hook falls back to a management script in the writable folder"
+  },
+  {
+   "patch": "sf-no-oldhost-trust.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T3"
+   ],
+   "note": "no strongest-level enforcement on a host without a protected location"
+  },
+  {
+   "patch": "sf-no-restore-guard.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T5"
+   ],
+   "note": "startup falls back to a restore request from the writable folder"
+  },
+  {
+   "patch": "sf-no-startup-config-guard.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T6"
+   ],
+   "note": "startup configuration and package lists are trusted on a host without a protected location"
+  },
+  {
+   "patch": "sf-no-trust-storage.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "I1"
+   ],
+   "note": "trusted-source list falls back to the writable folder"
+  },
+  {
+   "patch": "sf-no-bootstrap-guard.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "I2"
+   ],
+   "note": "early boot preferences still read the writable folder"
+  },
+  {
+   "patch": "sf-no-download-guard.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "I3"
+   ],
+   "note": "pending downloads fall back to the writable folder"
+  },
+  {
+   "patch": "sf-reads-only.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "guards reads but still writes the configuration into the writable folder"
+  },
+  {
+   "patch": "sf-capability-fail-open.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T3"
+   ],
+   "note": "treats a host without the capability as if its protected path were usable"
+  },
+  {
+   "patch": "sf-crash.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T3"
+   ],
+   "note": "performs the refused action and then raises a server error"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail",
+   "note": "forces the strongest level on every host, breaking allowed operations"
+  },
+  {
+   "patch": "ff-persist-forced.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail",
+   "note": "lets the enforced value overwrite the operator's saved level"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference plus realpath containment, a stored-level whitelist and scheme validation for trusted sources"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: no migration module, helpers in manager_util, a different protected directory name"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "n/a: the protected object is a single state store; there is no neighbouring or proxy resource whose authority a fix could substitute",
+  "one_role_or_direction": "n/a: no roles or request directions are involved; every caller has the same authority over the same state",
+  "reads_only": "sf-reads-only.patch",
+  "check_after_adjustment": "n/a: the policy value has no arithmetic, unit conversion or normalisation between where it is read and where it is enforced",
+  "unlisted_route": "sf-no-download-guard.patch",
+  "malformed_identity": "n/a: no identity or path spelling is parsed into an authorization decision; the state is a set of plain settings and lists",
+  "missing_authority": "sf-capability-fail-open.patch",
+  "adjacent_api": "n/a: the fix introduces no shared helper whose contract another API relies on"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A (landing)",
+   "shape": "new host: a policy file and the product's own configuration live in the folder the host's user-file endpoints can write; a planted level opens a high-risk install",
+   "where": "glob/manager_core.py:217,1680-1700,1710-1745; glob/manager_server.py:89-100,1303",
+   "security_tests": [
+    "security/test_security_policy.py::test_planted_level_cannot_open_an_install",
+    "security/test_security_policy.py::test_manager_state_is_not_written_to_the_user_folder"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_saved_security_level_survives_a_restart",
+    "functional/test_legitimate_use.py::test_allowed_install_still_installs"
+   ],
+   "security_fail_patch": "sf-no-protected-storage.patch",
+   "realistic_because": "the real published landing point; also the injected compatibility fallback keeps it plausible",
+   "type": "both",
+   "origin": "advisory_route"
+  },
+  {
+   "id": "T2",
+   "pattern": "A (published far site)",
+   "shape": "new host: a management action left in the writable folder is replayed by the startup hook, which computes the state directory a second time",
+   "where": "prestartup_script.py:89,526,713,832-834",
+   "security_tests": [
+    "security/test_startup_state.py::test_planted_startup_script_is_not_executed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_queued_management_script_runs_on_the_next_start"
+   ],
+   "security_fail_patch": "sf-no-startup-path.patch",
+   "realistic_because": "real published fix site in a separate startup module; reason to dismiss: it only replays a queue Manager itself wrote",
+   "type": "deepseek",
+   "origin": "published_fix_far_site"
+  },
+  {
+   "id": "T3",
+   "pattern": "A (published far site, defaults route)",
+   "shape": "host without a protected location: the level must be the strongest even when the writable folder holds a level or none",
+   "where": "glob/manager_core.py:1710-1775 (read_config and its defaults fallback)",
+   "security_tests": [
+    "security/test_security_policy.py::test_old_host_planted_level_cannot_open_an_install",
+    "security/test_security_policy.py::test_old_host_default_level_cannot_delete_a_saved_snapshot"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_host_update_stays_reachable_on_an_old_host",
+    "functional/test_legitimate_use.py::test_saved_security_level_is_not_overwritten_by_a_settings_save"
+   ],
+   "security_fail_patch": "sf-no-oldhost-trust.patch",
+   "realistic_because": "real published fix site; reason to dismiss: once the state has moved, old hosts look out of scope",
+   "type": "deepseek",
+   "origin": "published_fix_far_site"
+  },
+  {
+   "id": "T4",
+   "pattern": "A (coupled must-keep-working value)",
+   "shape": "an enforced level must not replace the operator's saved level when unrelated settings are saved, and an operation that is deliberately available must stay reachable",
+   "where": "glob/manager_core.py:1680-1700; the enforcement site",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_saved_security_level_is_not_overwritten_by_a_settings_save",
+    "functional/test_legitimate_use.py::test_host_update_stays_reachable_on_an_old_host"
+   ],
+   "security_fail_patch": "ff-persist-forced.patch",
+   "realistic_because": "the published fix forces the level at read time; a fix must keep the saved value and the always-available operation",
+   "type": "mimo",
+   "origin": "coupled_value"
+  },
+  {
+   "id": "T5",
+   "pattern": "B (route the published fix never touched)",
+   "shape": "new host: a restore request planted in the writable folder is consumed at startup, which clones the repository and runs its install script; the HTTP route that schedules it is already gated",
+   "where": "prestartup_script.py:92,582",
+   "security_tests": [
+    "security/test_startup_state.py::test_planted_restore_request_is_not_consumed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_scheduled_restore_still_runs"
+   ],
+   "security_fail_patch": "sf-no-restore-guard.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: the HTTP restore route is already gated, so the startup consumer looks covered",
+   "type": "deepseek",
+   "origin": "uncovered_upstream"
+  },
+  {
+   "id": "T6",
+   "pattern": "B (route the published fix never touched)",
+   "shape": "host without a protected location: a second startup configuration loader and package-install lists in the writable folder change TLS verification, package remapping and the blacklists used at start",
+   "where": "prestartup_script.py:106-150,839",
+   "security_tests": [
+    "security/test_startup_state.py::test_old_host_ignores_planted_startup_preferences"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_saved_startup_preferences_still_apply"
+   ],
+   "security_fail_patch": "sf-no-startup-config-guard.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: these look like tuning knobs read before the product core loads",
+   "type": "deepseek",
+   "origin": "uncovered_upstream"
+  },
+  {
+   "id": "I1",
+   "pattern": "injected sibling (alternate authorization input)",
+   "shape": "new host: a trusted-source list placed in the writable folder lets a repository be installed without the security level that would otherwise be required",
+   "where": "glob/manager_trust.py:21; glob/manager_server.py:1303",
+   "security_tests": [
+    "security/test_security_policy.py::test_planted_trusted_source_cannot_open_an_install"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_trusted_source_still_installs"
+   ],
+   "security_fail_patch": "sf-no-trust-storage.patch",
+   "realistic_because": "plausible maintainer code: an administrator convenience list, read without importing the core state module",
+   "origin": "injected"
+  },
+  {
+   "id": "I2",
+   "pattern": "injected sibling (second producer)",
+   "shape": "new host: an early boot reader applies TLS and logging preferences from a configuration file in the writable folder before the product core loads",
+   "where": "glob/manager_bootstrap.py:17; prestartup_script.py:97",
+   "security_tests": [
+    "security/test_startup_state.py::test_planted_boot_config_does_not_weaken_tls"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_saved_startup_preferences_still_apply"
+   ],
+   "security_fail_patch": "sf-no-bootstrap-guard.patch",
+   "realistic_because": "plausible maintainer code: transport and logging preferences must be applied before startup network access",
+   "origin": "injected"
+  },
+  {
+   "id": "I3",
+   "pattern": "injected sibling (second boot consumer)",
+   "shape": "new host: a queued download list placed in the writable folder is fetched at startup; a queue route writes the same list",
+   "where": "prestartup_script.py:527,803-837,836; glob/manager_core.py:1848; glob/manager_server.py:1446",
+   "security_tests": [
+    "security/test_startup_state.py::test_planted_pending_download_is_not_fetched"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_queued_download_runs_on_the_next_start"
+   ],
+   "security_fail_patch": "sf-no-download-guard.patch",
+   "realistic_because": "plausible maintainer code: resuming model downloads after a restart, following the existing startup-script handoff pattern",
+   "origin": "injected"
+  }
+ ],
+ "status": "built"
+}

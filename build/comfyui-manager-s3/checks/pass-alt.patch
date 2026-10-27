@@ -1,0 +1,334 @@
+diff --git a/glob/manager_core.py b/glob/manager_core.py
+index 735482a..7fc12f4 100644
+--- a/glob/manager_core.py
++++ b/glob/manager_core.py
+@@ -43,7 +43,7 @@ import manager_downloader
+ from node_package import InstalledNodePackage
+ 
+ 
+-version_code = [3, 37, 2]
++version_code = [3, 38]
+ version_str = f"V{version_code[0]}.{version_code[1]}" + (f'.{version_code[2]}' if len(version_code) > 2 else '')
+ 
+ 
+@@ -214,9 +214,10 @@ def update_user_directory(user_dir):
+     global manager_pip_blacklist_path
+     global manager_components_path
+ 
+-    manager_files_path = os.path.abspath(os.path.join(user_dir, 'default', 'ComfyUI-Manager'))
++    manager_files_path = manager_util.manager_state_dir(user_dir)
+     if not os.path.exists(manager_files_path):
+         os.makedirs(manager_files_path)
++    manager_util.migrate_manager_state(user_dir, manager_files_path)
+ 
+     manager_snapshot_path = os.path.join(manager_files_path, "snapshots")
+     if not os.path.exists(manager_snapshot_path):
+@@ -1693,7 +1694,7 @@ def write_config():
+         'windows_selector_event_loop_policy': get_config()['windows_selector_event_loop_policy'],
+         'model_download_by_agent': get_config()['model_download_by_agent'],
+         'downgrade_blacklist': get_config()['downgrade_blacklist'],
+-        'security_level': get_config()['security_level'],
++        'security_level': get_config().get('stored_security_level', get_config()['security_level']),
+         'always_lazy_install': get_config()['always_lazy_install'],
+         'network_mode': get_config()['network_mode'],
+         'db_mode': get_config()['db_mode'],
+@@ -1719,7 +1720,7 @@ def read_config():
+         manager_util.use_uv = default_conf['use_uv'].lower() == 'true' if 'use_uv' in default_conf else False
+         manager_util.bypass_ssl = get_bool('bypass_ssl', False)
+ 
+-        return {
++        result = {
+                     'http_channel_enabled': get_bool('http_channel_enabled', False),
+                     'preview_method': default_conf.get('preview_method', manager_funcs.get_current_preview_method()).lower(),
+                     'git_exe': default_conf.get('git_exe', ''),
+@@ -1739,6 +1740,8 @@ def read_config():
+                     'security_level': default_conf.get('security_level', 'normal').lower(),
+                     'db_mode': default_conf.get('db_mode', 'cache').lower(),
+                }
++        manager_util.enforce_old_host_level(result)
++        return result
+ 
+     except Exception:
+         import importlib.util
+@@ -1746,7 +1749,7 @@ def read_config():
+         manager_util.use_uv = importlib.util.find_spec("uv") is not None and platform.system() != "Windows"
+         manager_util.bypass_ssl = False
+ 
+-        return {
++        result = {
+             'http_channel_enabled': False,
+             'preview_method': manager_funcs.get_current_preview_method(),
+             'git_exe': '',
+@@ -1766,6 +1769,8 @@ def read_config():
+             'security_level': 'normal', # strong | normal | normal- | weak
+             'db_mode': 'cache',         # local | cache | remote
+         }
++        manager_util.enforce_old_host_level(result)
++        return result
+ 
+ 
+ def get_config():
+diff --git a/glob/manager_server.py b/glob/manager_server.py
+index c3b2329..0e06509 100644
+--- a/glob/manager_server.py
++++ b/glob/manager_server.py
+@@ -28,6 +28,12 @@ import manager_trust
+ logging.info(f"### Loading: ComfyUI-Manager ({core.version_str})")
+ logging.info("[ComfyUI-Manager] network_mode: " + core.get_config()['network_mode'])
+ 
++
++def security_403_response():
++    if not manager_util.has_system_user_directory():
++        return web.json_response({"error": "comfyui_outdated"}, status=403)
++    return web.json_response({"error": "security_level"}, status=403)
++
+ comfy_ui_hash = "-"
+ comfyui_tag = None
+ 
+@@ -733,7 +739,7 @@ async def fetch_updates(request):
+ async def update_all(request):
+     if not is_allowed_security_level('middle'):
+         logging.error(SECURITY_MESSAGE_MIDDLE_OR_BELOW)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     with task_worker_lock:
+         is_processing = task_worker_thread is not None and task_worker_thread.is_alive()
+@@ -966,7 +972,7 @@ async def get_snapshot_list(request):
+ async def remove_snapshot(request):
+     if not is_allowed_security_level('middle'):
+         logging.error(SECURITY_MESSAGE_MIDDLE_OR_BELOW)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     try:
+         target = request.rel_url.query["target"]
+@@ -984,7 +990,7 @@ async def remove_snapshot(request):
+ async def restore_snapshot(request):
+     if not is_allowed_security_level('middle'):
+         logging.error(SECURITY_MESSAGE_MIDDLE_OR_BELOW)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     try:
+         target = request.rel_url.query["target"]
+@@ -1305,7 +1311,7 @@ async def install_custom_node_git_url(request):
+ 
+     if not is_allowed_security_level('high') and not manager_trust.is_trusted_source(url):
+         logging.error(SECURITY_MESSAGE_NORMAL_MINUS)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     res = await core.gitclone_install(url)
+ 
+@@ -1324,7 +1330,7 @@ async def install_custom_node_git_url(request):
+ async def install_custom_node_pip(request):
+     if not is_allowed_security_level('high'):
+         logging.error(SECURITY_MESSAGE_NORMAL_MINUS)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     packages = await request.text()
+     core.pip_install(packages.split(' '))
+@@ -1616,7 +1622,7 @@ async def get_notice(request):
+ def restart(self):
+     if not is_allowed_security_level('middle'):
+         logging.error(SECURITY_MESSAGE_MIDDLE_OR_BELOW)
+-        return web.Response(status=403)
++        return security_403_response()
+ 
+     try:
+         sys.stdout.close_log()
+diff --git a/glob/manager_trust.py b/glob/manager_trust.py
+index e078780..e429915 100644
+--- a/glob/manager_trust.py
++++ b/glob/manager_trust.py
+@@ -19,7 +19,16 @@ def get_default_manager_path():
+ 
+ 
+ def is_trusted_source(url):
+-    path = get_trust_path(get_default_manager_path())
++    try:
++        import folder_paths
++        import manager_util
++
++        if not manager_util.has_system_user_directory():
++            return False
++        path = get_trust_path(manager_util.manager_state_dir(folder_paths.get_user_directory()))
++    except Exception:
++        return False
++
+     if not os.path.exists(path):
+         return False
+ 
+diff --git a/glob/manager_util.py b/glob/manager_util.py
+index 5d6a58c..0d933c9 100644
+--- a/glob/manager_util.py
++++ b/glob/manager_util.py
+@@ -630,4 +630,64 @@ def restore_pip_snapshot(pips, options):
+             if res != 0:
+                 failed.append(x)
+ 
+-    print(f"Installation failed for pip packages: {failed}")
+\ No newline at end of file
++    print(f"Installation failed for pip packages: {failed}")
++
++# --- Manager state location -------------------------------------------------------
++import configparser as _state_configparser
++
++
++def has_system_user_directory():
++    try:
++        import folder_paths
++        return hasattr(folder_paths, 'get_system_user_directory')
++    except Exception:
++        return False
++
++
++def manager_state_dir(user_dir):
++    if has_system_user_directory():
++        return os.path.abspath(os.path.join(user_dir, '__comfy_state'))
++    return os.path.abspath(os.path.join(user_dir, 'default', 'ComfyUI-Manager'))
++
++
++def migrate_manager_state(user_dir, state_dir):
++    if not has_system_user_directory():
++        return
++
++    legacy_dir = os.path.join(user_dir, 'default', 'ComfyUI-Manager')
++    legacy_config = os.path.join(legacy_dir, 'config.ini')
++    new_config = os.path.join(state_dir, 'config.ini')
++    if not os.path.isdir(legacy_dir) or not os.path.exists(legacy_config):
++        return
++
++    config = _state_configparser.ConfigParser(strict=False)
++    try:
++        config.read(legacy_config)
++    except Exception:
++        return
++
++    if 'default' in config:
++        level = config['default'].get('security_level', 'normal').lower()
++        if level in ('weak', 'normal-'):
++            config['default']['security_level'] = 'normal'
++
++    os.makedirs(state_dir, exist_ok=True)
++    if not os.path.exists(new_config):
++        with open(new_config, 'w') as f:
++            config.write(f)
++
++    backup = os.path.join(state_dir, '.legacy-manager-backup')
++    try:
++        if os.path.exists(backup):
++            shutil.rmtree(backup)
++        shutil.move(legacy_dir, backup)
++    except Exception:
++        pass
++
++
++def enforce_old_host_level(config_dict):
++    if not has_system_user_directory():
++        config_dict.setdefault('stored_security_level', config_dict.get('security_level', 'normal'))
++        config_dict['security_level'] = 'strong'
++        return True
++    return False
+diff --git a/prestartup_script.py b/prestartup_script.py
+index 1ed8528..9936ebb 100644
+--- a/prestartup_script.py
++++ b/prestartup_script.py
+@@ -86,7 +86,13 @@ cm_global.register_api('cm.is_import_failed_extension', is_import_failed_extensi
+ comfyui_manager_path = os.path.abspath(os.path.dirname(__file__))
+ 
+ custom_nodes_base_path = folder_paths.get_folder_paths('custom_nodes')[0]
+-manager_files_path = os.path.abspath(os.path.join(folder_paths.get_user_directory(), 'default', 'ComfyUI-Manager'))
++
++_has_system_user_api = hasattr(folder_paths, 'get_system_user_directory')
++
++if _has_system_user_api:
++    manager_files_path = os.path.abspath(os.path.join(folder_paths.get_user_directory(), '__comfy_state'))
++else:
++    manager_files_path = os.path.abspath(os.path.join(folder_paths.get_user_directory(), 'default', 'ComfyUI-Manager'))
+ manager_pip_overrides_path = os.path.join(manager_files_path, "pip_overrides.json")
+ manager_pip_blacklist_path = os.path.join(manager_files_path, "pip_blacklist.list")
+ restore_snapshot_path = os.path.join(manager_files_path, "startup-scripts", "restore-snapshot.json")
+@@ -94,9 +100,10 @@ manager_config_path = os.path.join(manager_files_path, 'config.ini')
+ 
+ import manager_bootstrap
+ 
+-_boot_preferences = manager_bootstrap.apply_boot_preferences()
+-if _boot_preferences.get('file_logging') is False:
+-    enable_file_logging = False
++if _has_system_user_api:
++    _boot_preferences = manager_bootstrap.apply_boot_preferences(os.path.join(manager_files_path, 'config.ini'))
++    if _boot_preferences.get('file_logging') is False:
++        enable_file_logging = False
+ 
+ cm_cli_path = os.path.join(comfyui_manager_path, "cm-cli.py")
+ 
+@@ -105,6 +112,9 @@ default_conf = {}
+ 
+ def read_config():
+     global default_conf
++    if not _has_system_user_api:
++        default_conf = {}
++        return
+     try:
+         import configparser
+         config = configparser.ConfigParser(strict=False)
+@@ -130,12 +140,12 @@ check_file_logging()
+ 
+ cm_global.pip_overrides = {}
+ 
+-if os.path.exists(manager_pip_overrides_path):
++if _has_system_user_api and os.path.exists(manager_pip_overrides_path):
+     with open(manager_pip_overrides_path, 'r', encoding="UTF-8", errors="ignore") as json_file:
+         cm_global.pip_overrides = json.load(json_file)
+ 
+ 
+-if os.path.exists(manager_pip_blacklist_path):
++if _has_system_user_api and os.path.exists(manager_pip_blacklist_path):
+     with open(manager_pip_blacklist_path, 'r', encoding="UTF-8", errors="ignore") as f:
+         for x in f.readlines():
+             y = x.strip()
+@@ -523,8 +533,8 @@ check_bypass_ssl()
+ 
+ # Perform install
+ processed_install = set()
+-script_list_path = os.path.join(folder_paths.user_directory, "default", "ComfyUI-Manager", "startup-scripts", "install-scripts.txt")
+-pending_downloads_path = os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager", "startup-scripts", "pending-downloads.json")
++script_list_path = os.path.join(manager_files_path, "startup-scripts", "install-scripts.txt")
++pending_downloads_path = os.path.join(manager_files_path, "startup-scripts", "pending-downloads.json")
+ pip_fixer = manager_util.PIPFixer(manager_util.get_installed_packages(), comfy_path, manager_files_path)
+ 
+ 
+@@ -579,7 +589,7 @@ def is_installed(name):
+     return True       # prevent downgrade
+ 
+ 
+-if os.path.exists(restore_snapshot_path):
++if _has_system_user_api and os.path.exists(restore_snapshot_path):
+     try:
+         cloned_repos = []
+ 
+@@ -830,13 +840,18 @@ def process_pending_downloads():
+ 
+ 
+ # Check if script_list_path exists
+-if os.path.exists(script_list_path):
++if not _has_system_user_api:
++    if os.path.exists(script_list_path):
++        print("[ComfyUI-Manager] Startup scripts blocked on old ComfyUI version.")
++elif os.path.exists(script_list_path):
+     execute_startup_script()
+ 
+-process_pending_downloads()
++if _has_system_user_api:
++    process_pending_downloads()
+ 
+ 
+-pip_fixer.fix_broken()
++if _has_system_user_api:
++    pip_fixer.fix_broken()
+ 
+ del processed_install
+ del pip_fixer
