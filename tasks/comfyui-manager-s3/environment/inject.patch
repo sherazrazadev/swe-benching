@@ -1,0 +1,239 @@
+diff --git a/glob/manager_bootstrap.py b/glob/manager_bootstrap.py
+new file mode 100644
+index 0000000..c811ad0
+--- /dev/null
++++ b/glob/manager_bootstrap.py
+@@ -0,0 +1,44 @@
++"""Early boot preferences for the Manager process.
++
++A few preferences have to be applied before the rest of ComfyUI-Manager is
++imported, because startup network access happens during import.
++"""
++
++import configparser
++import os
++
++
++def get_default_config_path():
++    import folder_paths
++
++    return os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager", "config.ini")
++
++
++def apply_boot_preferences(config_path=None):
++    """Apply logging and TLS preferences and return the ones that took effect."""
++    path = config_path or get_default_config_path()
++
++    config = configparser.ConfigParser(strict=False)
++    try:
++        config.read(path)
++        section = config["default"]
++    except Exception:
++        return {}
++
++    applied = {}
++    try:
++        if section.get("bypass_ssl", "false").lower() == "true":
++            import ssl
++
++            ssl._create_default_https_context = ssl._create_unverified_context
++            applied["bypass_ssl"] = True
++    except Exception:
++        pass
++
++    try:
++        if section.get("file_logging", "true").lower() == "false":
++            applied["file_logging"] = False
++    except Exception:
++        pass
++
++    return applied
+diff --git a/glob/manager_core.py b/glob/manager_core.py
+index 6757078..735482a 100644
+--- a/glob/manager_core.py
++++ b/glob/manager_core.py
+@@ -1845,6 +1845,27 @@ def reserve_script(repo_path, install_cmds):
+         file.write(f"{obj}\n")
+ 
+ 
++def queue_model_download(url, save_path):
++    """Record a model download to be resumed at the next startup."""
++    if not os.path.exists(manager_startup_script_path):
++        os.makedirs(manager_startup_script_path)
++
++    path = os.path.join(manager_startup_script_path, "pending-downloads.json")
++
++    items = []
++    if os.path.exists(path):
++        try:
++            with open(path, "r", encoding="UTF-8") as file:
++                items = json.load(file).get("downloads", [])
++        except Exception:
++            items = []
++
++    items.append({"url": url, "save_path": save_path})
++
++    with open(path, "w", encoding="UTF-8") as file:
++        json.dump({"downloads": items}, file, indent=2)
++
++
+ def try_rmtree(title, fullpath):
+     try:
+         shutil.rmtree(fullpath)
+diff --git a/glob/manager_server.py b/glob/manager_server.py
+index cb3bcd9..c3b2329 100644
+--- a/glob/manager_server.py
++++ b/glob/manager_server.py
+@@ -22,6 +22,7 @@ import asyncio
+ import queue
+ 
+ import manager_downloader
++import manager_trust
+ 
+ 
+ logging.info(f"### Loading: ComfyUI-Manager ({core.version_str})")
+@@ -1300,11 +1301,12 @@ async def fix_custom_node(request):
+ 
+ @routes.post("/customnode/install/git_url")
+ async def install_custom_node_git_url(request):
+-    if not is_allowed_security_level('high'):
++    url = await request.text()
++
++    if not is_allowed_security_level('high') and not manager_trust.is_trusted_source(url):
+         logging.error(SECURITY_MESSAGE_NORMAL_MINUS)
+         return web.Response(status=403)
+ 
+-    url = await request.text()
+     res = await core.gitclone_install(url)
+ 
+     if res.action == 'skip':
+@@ -1440,6 +1442,15 @@ async def check_whitelist_for_model(item):
+     return False
+ 
+ 
++@routes.post("/manager/queue/model_download")
++async def queue_model_download(request):
++    json_data = await request.json()
++
++    core.queue_model_download(json_data["url"], json_data["save_path"])
++
++    return web.Response(status=200)
++
++
+ @routes.post("/manager/queue/install_model")
+ async def install_model(request):
+     json_data = await request.json()
+diff --git a/glob/manager_trust.py b/glob/manager_trust.py
+new file mode 100644
+index 0000000..e078780
+--- /dev/null
++++ b/glob/manager_trust.py
+@@ -0,0 +1,33 @@
++"""Operator-managed list of trusted custom node repositories.
++
++Repositories named in ``trusted_sources.list`` can be installed without
++raising the global security level, so an administrator can pre-approve
++routine maintenance sources.
++"""
++
++import os
++
++
++def get_trust_path(manager_files_path):
++    return os.path.join(manager_files_path, "trusted_sources.list")
++
++
++def get_default_manager_path():
++    import folder_paths
++
++    return os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager")
++
++
++def is_trusted_source(url):
++    path = get_trust_path(get_default_manager_path())
++    if not os.path.exists(path):
++        return False
++
++    try:
++        with open(path, "r", encoding="UTF-8", errors="ignore") as file:
++            entries = [x.strip() for x in file if x.strip() and not x.strip().startswith("#")]
++    except OSError:
++        return False
++
++    target = url.rstrip("/")
++    return any(entry.rstrip("/") == target for entry in entries)
+diff --git a/prestartup_script.py b/prestartup_script.py
+index f3e52ea..1ed8528 100644
+--- a/prestartup_script.py
++++ b/prestartup_script.py
+@@ -11,6 +11,7 @@ import json
+ import ast
+ import logging
+ import traceback
++import urllib.request
+ 
+ glob_path = os.path.join(os.path.dirname(__file__), "glob")
+ sys.path.append(glob_path)
+@@ -91,6 +92,12 @@ manager_pip_blacklist_path = os.path.join(manager_files_path, "pip_blacklist.lis
+ restore_snapshot_path = os.path.join(manager_files_path, "startup-scripts", "restore-snapshot.json")
+ manager_config_path = os.path.join(manager_files_path, 'config.ini')
+ 
++import manager_bootstrap
++
++_boot_preferences = manager_bootstrap.apply_boot_preferences()
++if _boot_preferences.get('file_logging') is False:
++    enable_file_logging = False
++
+ cm_cli_path = os.path.join(comfyui_manager_path, "cm-cli.py")
+ 
+ 
+@@ -517,6 +524,7 @@ check_bypass_ssl()
+ # Perform install
+ processed_install = set()
+ script_list_path = os.path.join(folder_paths.user_directory, "default", "ComfyUI-Manager", "startup-scripts", "install-scripts.txt")
++pending_downloads_path = os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager", "startup-scripts", "pending-downloads.json")
+ pip_fixer = manager_util.PIPFixer(manager_util.get_installed_packages(), comfy_path, manager_files_path)
+ 
+ 
+@@ -792,10 +800,41 @@ def execute_startup_script():
+     print("#######################################################################\n")
+ 
+ 
++def process_pending_downloads():
++    print("\n[ComfyUI-Manager] Processing pending model downloads")
++
++    if not os.path.exists(pending_downloads_path):
++        return
++
++    try:
++        with open(pending_downloads_path, "r", encoding="UTF-8", errors="ignore") as file:
++            pending = json.load(file)
++    except Exception as e:
++        print(f"[ComfyUI-Manager] Failed to read pending downloads: {e}")
++        return
++
++    for item in pending.get("downloads", []):
++        try:
++            url = item["url"]
++            target = os.path.join(folder_paths.models_dir, item.get("save_path", ""))
++            os.makedirs(os.path.dirname(target), exist_ok=True)
++            print(f"[ComfyUI-Manager] Resume download: {url}")
++            urllib.request.urlretrieve(url, target)
++        except Exception as e:
++            print(f"[ComfyUI-Manager] Failed to resume download: {e}")
++
++    try:
++        os.remove(pending_downloads_path)
++    except Exception:
++        pass
++
++
+ # Check if script_list_path exists
+ if os.path.exists(script_list_path):
+     execute_startup_script()
+ 
++process_pending_downloads()
++
+ 
+ pip_fixer.fix_broken()
+ 

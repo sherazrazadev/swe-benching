@@ -1,0 +1,414 @@
+diff --git a/mlflow/gateway/network_policy.py b/mlflow/gateway/network_policy.py
+new file mode 100644
+index 000000000..32834d774
+--- /dev/null
++++ b/mlflow/gateway/network_policy.py
+@@ -0,0 +1,136 @@
++"""Outbound destination policy for gateway provider calls.
++
++A gateway endpoint calls a model provider at an address that is derived from the
++endpoint's configuration.  Only publicly routable destinations are allowed.
++"""
++
++import ipaddress
++import re
++import socket
++from urllib.parse import urlsplit
++
++_ALLOWED_SCHEMES = ("http", "https")
++
++# Configuration keys whose value is an address or host.
++_ADDRESS_KEYS = frozenset(
++    {
++        "api_base",
++        "base_url",
++        "openai_api_base",
++        "anthropic_api_base",
++        "mosaicml_api_base",
++        "model_server_url",
++        "hf_server_url",
++        "proxy_url",
++        "endpoint",
++        "server_url",
++    }
++)
++
++# Configuration keys whose value is a name interpolated into a host name.
++_HOST_NAME_KEYS = frozenset(
++    {"vertex_location", "aws_region_name", "region", "location", "workspace_region"}
++)
++_HOST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
++_MAX_HOST_NAME_LENGTH = 63
++
++
++class UnsafeUpstreamError(ValueError):
++    """A configured or derived upstream destination is not publicly routable."""
++
++
++def _ip_is_public(address: ipaddress._BaseAddress) -> bool:
++    if address.version == 6 and address.ipv4_mapped is not None:
++        address = address.ipv4_mapped
++    return address.is_global and not address.is_multicast
++
++
++def _host_is_public(host: str) -> bool:
++    """Whether ``host`` names only publicly routable addresses.
++
++    Names that cannot be resolved here are treated as public: they are not known
++    to be internal, and the connection itself reports the failure.
++    """
++    host = host.strip().strip("[]")
++    try:
++        return _ip_is_public(ipaddress.ip_address(host))
++    except ValueError:
++        pass
++    try:
++        infos = socket.getaddrinfo(host, None)
++    except (socket.gaierror, UnicodeError, OSError):
++        return True
++    if not infos:
++        return True
++    for info in infos:
++        try:
++            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
++        except ValueError:
++            return False
++        if not _ip_is_public(address):
++            return False
++    return True
++
++
++def validate_upstream_url(value: str, *, field: str = "upstream address") -> None:
++    """Raise `UnsafeUpstreamError` unless ``value`` names a public http(s) host."""
++    if not isinstance(value, str) or not value.strip():
++        raise UnsafeUpstreamError(f"{field} must be a non-empty URL")
++    value = value.strip()
++    try:
++        parts = urlsplit(value)
++        host = parts.hostname
++        port = parts.port
++    except ValueError as e:
++        raise UnsafeUpstreamError(f"{field} is not a valid URL: {e}") from e
++    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
++        raise UnsafeUpstreamError(f"{field} must use http or https")
++    if not host:
++        raise UnsafeUpstreamError(f"{field} must include a host")
++    if parts.username is not None or parts.password is not None:
++        raise UnsafeUpstreamError(f"{field} must not embed credentials")
++    if port is not None and not 0 < port < 65536:
++        raise UnsafeUpstreamError(f"{field} has an invalid port")
++    if not _host_is_public(host):
++        raise UnsafeUpstreamError(f"{field} must name a publicly routable host")
++
++
++def validate_host_name(value: str, *, field: str) -> None:
++    """Raise `UnsafeUpstreamError` unless ``value`` is a plain region/location name.
++
++    Region and location names are interpolated into provider host names, so a
++    value carrying URL syntax would change the destination host.
++    """
++    if (
++        not isinstance(value, str)
++        or len(value) > _MAX_HOST_NAME_LENGTH
++        or not _HOST_NAME_RE.match(value)
++    ):
++        raise UnsafeUpstreamError(f"{field} must be a valid region or location name")
++
++
++def _validate_entry(key: str, value: object) -> None:
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            _validate_entry(key, item)
++        return
++    if key in _HOST_NAME_KEYS:
++        validate_host_name(value, field=key)
++        return
++    if key in _ADDRESS_KEYS:
++        validate_upstream_url(value, field=key)
++        return
++
++
++def validate_supplied_config(*configs: dict | None) -> None:
++    """Validate every supplied value that can determine an outbound destination."""
++    for config in configs:
++        if not isinstance(config, dict):
++            continue
++        for key, value in config.items():
++            _validate_entry(key, value)
++
++
++def validate_egress_url(url: str) -> None:
++    """Validate the final URL a provider request will be sent to."""
++    validate_upstream_url(url, field="upstream address")
+diff --git a/mlflow/gateway/providers/databricks.py b/mlflow/gateway/providers/databricks.py
+index 6661f743d..1277dc256 100644
+--- a/mlflow/gateway/providers/databricks.py
++++ b/mlflow/gateway/providers/databricks.py
+@@ -102,6 +102,18 @@ class DatabricksProvider(OpenAICompatibleProvider):
+     def _get_workspace_client(self):
+         if self._workspace_client is None:
+             from databricks.sdk import WorkspaceClient
++            from fastapi import HTTPException
++
++            from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_upstream_url
++
++            configured_host = self._provider_config.host
++            if configured_host:
++                hosts = configured_host if isinstance(configured_host, list) else [configured_host]
++                for candidate in hosts:
++                    try:
++                        validate_upstream_url(candidate, field="host")
++                    except UnsafeUpstreamError as e:
++                        raise HTTPException(status_code=400, detail=str(e)) from e
+ 
+             # Pass only non-None fields to WorkspaceClient; omitted fields
+             # are resolved by the SDK's default credential chain.
+@@ -111,8 +123,16 @@ class DatabricksProvider(OpenAICompatibleProvider):
+ 
+     @property
+     def _api_base(self) -> str:
++        from fastapi import HTTPException
++
++        from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_upstream_url
++
+         client = self._get_workspace_client()
+         host = client.config.host.rstrip("/")
++        try:
++            validate_upstream_url(host, field="host")
++        except UnsafeUpstreamError as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+         return normalize_databricks_base_url(host)
+ 
+     def get_endpoint_url(self, route_type: str) -> str:
+diff --git a/mlflow/gateway/providers/litellm.py b/mlflow/gateway/providers/litellm.py
+index 300c50888..d730ad329 100644
+--- a/mlflow/gateway/providers/litellm.py
++++ b/mlflow/gateway/providers/litellm.py
+@@ -98,6 +98,18 @@ class LiteLLMProvider(BaseProvider):
+ 
+         # The warm-up flag is an MLflow-side option, not a client argument.
+         kwargs.pop("warm_up", None)
++
++        from fastapi import HTTPException
++
++        from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_upstream_url
++
++        for field in ("api_base", "base_url", "host"):
++            value = kwargs.get(field)
++            if value is not None:
++                try:
++                    validate_upstream_url(value, field=field)
++                except UnsafeUpstreamError as e:
++                    raise HTTPException(status_code=400, detail=str(e)) from e
+         return kwargs
+ 
+     def _warm_up_upstream(self) -> None:
+@@ -110,6 +122,14 @@ class LiteLLMProvider(BaseProvider):
+             return
+         import urllib.request
+ 
++        from fastapi import HTTPException
++
++        from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_upstream_url
++
++        try:
++            validate_upstream_url(api_base, field="api_base")
++        except UnsafeUpstreamError as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+         try:
+             request = urllib.request.Request(api_base.rstrip("/") + "/models")
+             urllib.request.urlopen(request, timeout=2).close()
+diff --git a/mlflow/gateway/providers/openai_compatible.py b/mlflow/gateway/providers/openai_compatible.py
+index 74bf14a42..953ac2f90 100644
+--- a/mlflow/gateway/providers/openai_compatible.py
++++ b/mlflow/gateway/providers/openai_compatible.py
+@@ -204,6 +204,13 @@ class OpenAICompatibleProvider(BaseProvider):
+     def _api_base(self) -> str:
+         return getattr(self._provider_config, "api_base", None) or self.DEFAULT_API_BASE
+ 
++    @property
++    def _uses_shipped_api_base(self) -> bool:
++        """True when no address was configured and this provider's own default is used."""
++        return bool(self.DEFAULT_API_BASE) and not getattr(
++            self._provider_config, "api_base", None
++        )
++
+     @property
+     def _api_key(self) -> str:
+         return self._provider_config.api_key
+@@ -258,6 +265,7 @@ class OpenAICompatibleProvider(BaseProvider):
+         resp = await send_request(
+             headers=self.headers,
+             base_url=self._api_base,
++            allow_private=self._uses_shipped_api_base,
+             path="chat/completions",
+             payload=self.adapter_class.chat_to_model(payload_dict, self.config),
+         )
+@@ -279,6 +287,7 @@ class OpenAICompatibleProvider(BaseProvider):
+         stream = send_stream_request(
+             headers=self.headers,
+             base_url=self._api_base,
++            allow_private=self._uses_shipped_api_base,
+             path="chat/completions",
+             payload=self.adapter_class.chat_to_model(payload_dict, self.config),
+         )
+@@ -295,6 +304,7 @@ class OpenAICompatibleProvider(BaseProvider):
+         resp = await send_request(
+             headers=self.headers,
+             base_url=self._api_base,
++            allow_private=self._uses_shipped_api_base,
+             path="embeddings",
+             payload=self.adapter_class.embeddings_to_model(payload_dict, self.config),
+         )
+@@ -353,6 +363,7 @@ class OpenAICompatibleProvider(BaseProvider):
+             stream = send_stream_request(
+                 headers=request_headers,
+                 base_url=self._api_base,
++                allow_private=self._uses_shipped_api_base,
+                 path=provider_path,
+                 payload=payload_with_model,
+             )
+@@ -361,6 +372,7 @@ class OpenAICompatibleProvider(BaseProvider):
+             return await send_request(
+                 headers=request_headers,
+                 base_url=self._api_base,
++                allow_private=self._uses_shipped_api_base,
+                 path=provider_path,
+                 payload=payload_with_model,
+             )
+diff --git a/mlflow/gateway/providers/utils.py b/mlflow/gateway/providers/utils.py
+index 0c0d8206d..d97a03f85 100644
+--- a/mlflow/gateway/providers/utils.py
++++ b/mlflow/gateway/providers/utils.py
+@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator
+ from mlflow.gateway.constants import (
+     MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS,
+ )
++from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_egress_url
+ from mlflow.utils.uri import append_to_uri_path
+ 
+ # Accumulates the total time (ms) spent waiting for provider HTTP responses in the current
+@@ -19,21 +20,41 @@ SUPPORTED_ACCEPT_ENCODING = "gzip, deflate, identity"
+ 
+ 
+ @asynccontextmanager
+-async def _aiohttp_post(headers: dict[str, str], base_url: str, path: str, payload: dict[str, Any]):
++async def _aiohttp_post(
++    headers: dict[str, str],
++    base_url: str,
++    path: str,
++    payload: dict[str, Any],
++    *,
++    allow_private: bool = False,
++):
+     import aiohttp
++    from fastapi import HTTPException
+ 
+     # Drop any client Accept-Encoding (any casing) so we send only one value; otherwise
+     # aiohttp may send both and upstream can respond with Brotli, which is not supported.
+     request_headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+     request_headers["Accept-Encoding"] = SUPPORTED_ACCEPT_ENCODING
+     url = append_to_uri_path(base_url, path)
++    if not allow_private:
++        try:
++            validate_egress_url(url)
++        except UnsafeUpstreamError as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+     async with aiohttp.ClientSession(headers=request_headers) as session:
+         timeout = aiohttp.ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS)
+         async with session.post(url, json=payload, timeout=timeout) as response:
+             yield response
+ 
+ 
+-async def send_request(headers: dict[str, str], base_url: str, path: str, payload: dict[str, Any]):
++async def send_request(
++    headers: dict[str, str],
++    base_url: str,
++    path: str,
++    payload: dict[str, Any],
++    *,
++    allow_private: bool = False,
++):
+     """
+     Send an HTTP request to a specific URL path with given headers and payload.
+ 
+@@ -54,7 +75,9 @@ async def send_request(headers: dict[str, str], base_url: str, path: str, payloa
+ 
+     start = time.perf_counter()
+     try:
+-        async with _aiohttp_post(headers, base_url, path, payload) as response:
++        async with _aiohttp_post(
++            headers, base_url, path, payload, allow_private=allow_private
++        ) as response:
+             content_type = response.headers.get("Content-Type")
+             if content_type and "application/json" in content_type:
+                 js = await response.json()
+@@ -80,7 +103,12 @@ async def send_request(headers: dict[str, str], base_url: str, path: str, payloa
+ 
+ 
+ async def send_stream_request(
+-    headers: dict[str, str], base_url: str, path: str, payload: dict[str, Any]
++    headers: dict[str, str],
++    base_url: str,
++    path: str,
++    payload: dict[str, Any],
++    *,
++    allow_private: bool = False,
+ ) -> AsyncGenerator[bytes, None]:
+     """
+     Send a streaming HTTP request to a specific URL path with given headers and payload.
+@@ -100,7 +128,9 @@ async def send_stream_request(
+     import aiohttp
+     from fastapi import HTTPException
+ 
+-    async with _aiohttp_post(headers, base_url, path, payload) as response:
++    async with _aiohttp_post(
++        headers, base_url, path, payload, allow_private=allow_private
++    ) as response:
+         try:
+             response.raise_for_status()
+         except aiohttp.ClientResponseError as e:
+diff --git a/mlflow/store/tracking/gateway/sqlalchemy_mixin.py b/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
+index 5f8baf6be..d5516e2cb 100644
+--- a/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
++++ b/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
+@@ -35,6 +35,7 @@ from mlflow.entities.gateway_guardrail import (
+     GuardrailAction,
+     GuardrailStage,
+ )
++from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_supplied_config
+ from mlflow.exceptions import MlflowException
+ from mlflow.protos.databricks_pb2 import (
+     INVALID_PARAMETER_VALUE,
+@@ -191,6 +192,8 @@ class SqlAlchemyGatewayStoreMixin:
+         Returns:
+             Secret entity with metadata (encrypted value not included).
+         """
++        _validate_gateway_secret_config(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             secret_id = f"s-{uuid.uuid4().hex}"
+             current_time = get_current_time_millis()
+@@ -288,6 +291,8 @@ class SqlAlchemyGatewayStoreMixin:
+         Returns:
+             Updated Secret entity.
+         """
++        _validate_gateway_secret_config(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             sql_secret = self._get_entity_or_raise(
+                 session, SqlGatewaySecret, {"secret_id": secret_id}, "GatewaySecret"
+@@ -1540,3 +1545,13 @@ class SqlAlchemyGatewayStoreMixin:
+                 .all()
+             )
+             return [c.to_mlflow_entity() for c in configs]
++
++
++def _validate_gateway_secret_config(
++    auth_config: dict[str, Any] | None, secret_value: dict[str, Any] | None
++) -> None:
++    """Reject stored configuration that would send a call to a non-public destination."""
++    try:
++        validate_supplied_config(auth_config, secret_value)
++    except UnsafeUpstreamError as e:
++        raise MlflowException.invalid_parameter_value(str(e)) from e

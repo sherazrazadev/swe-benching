@@ -1,0 +1,118 @@
+diff --git a/src/backend/base/langflow/api/v2/files.py b/src/backend/base/langflow/api/v2/files.py
+index 1594af6..c0423de 100644
+--- a/src/backend/base/langflow/api/v2/files.py
++++ b/src/backend/base/langflow/api/v2/files.py
+@@ -620,6 +620,37 @@ async def read_file_content(file_stream: AsyncIterable[bytes] | bytes, *, decode
+         raise HTTPException(status_code=500, detail=f"Error reading file: {exc}") from exc
+ 
+ 
++@router.get("/preview")
++async def preview_file(
++    path: str,
++    current_user: CurrentActiveUser,
++    storage_service: Annotated[StorageService, Depends(get_storage_service)],
++) -> StreamingResponse:
++    """Stream a stored file from the path returned when it was uploaded.
++
++    Uploads are addressed by the ``<namespace>/<file name>`` path that the upload
++    endpoints return. A bare file name refers to the caller's own uploads. Chat
++    attachments and flow files keep the namespace they were stored under.
++    """
++    namespace, separator, file_name = path.partition("/")
++    if not separator:
++        namespace, file_name = str(current_user.id), path
++    if not namespace or not file_name:
++        raise HTTPException(status_code=400, detail="Invalid stored path")
++
++    await logger.adebug("Previewing stored file for user %s", current_user.id)
++    try:
++        content = await storage_service.get_file(flow_id=namespace, file_name=file_name)
++    except FileNotFoundError as exc:
++        raise HTTPException(status_code=404, detail="File not found") from exc
++
++    return StreamingResponse(
++        io.BytesIO(content),
++        media_type="application/octet-stream",
++        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
++    )
++
++
+ @router.get("/{file_id}")
+ async def download_file(
+     file_id: uuid.UUID,
+@@ -709,6 +740,39 @@ async def edit_file_name(
+     return UploadFileResponse(id=file.id, name=file.name, path=file.path, size=file.size)
+ 
+ 
++@router.post("/{file_id}/copy", status_code=HTTPStatus.CREATED)
++async def copy_file(
++    file_id: uuid.UUID,
++    name: str,
++    current_user: CurrentActiveUser,
++    session: DbSession,
++    storage_service: Annotated[StorageService, Depends(get_storage_service)],
++) -> UploadFileResponse:
++    """Duplicate a file under a new name in the caller's uploads."""
++    file = await fetch_file_object(file_id, current_user, session)
++    if not file:
++        raise HTTPException(status_code=404, detail="File not found")
++
++    file_name = Path(file.path).name
++    await storage_service.copy_file(
++        flow_id=str(current_user.id),
++        file_name=file_name,
++        new_name=name,
++    )
++
++    copied = UserFile(
++        id=uuid.uuid4(),
++        user_id=current_user.id,
++        name=name,
++        path=f"{current_user.id}/{name}",
++        size=file.size,
++    )
++    session.add(copied)
++    await session.flush()
++    await session.refresh(copied)
++    return UploadFileResponse(id=copied.id, name=copied.name, path=copied.path, size=copied.size)
++
++
+ @router.delete("/{file_id}")
+ async def delete_file(
+     file_id: uuid.UUID,
+diff --git a/src/backend/base/langflow/services/storage/local.py b/src/backend/base/langflow/services/storage/local.py
+index d9e33e1..ab14173 100644
+--- a/src/backend/base/langflow/services/storage/local.py
++++ b/src/backend/base/langflow/services/storage/local.py
+@@ -260,6 +260,31 @@ class LocalStorageService(StorageService):
+         else:
+             await logger.awarning(f"Attempted to delete non-existent file {file_name} in flow {flow_id}.")
+ 
++    async def copy_file(self, flow_id: str, file_name: str, new_name: str) -> None:
++        """Copy a file to a new name in the same namespace.
++
++        Args:
++            flow_id: The identifier for the namespace holding the file.
++            file_name: The name of the file to copy.
++            new_name: The name of the copy.
++
++        Raises:
++            FileNotFoundError: If the source file does not exist.
++        """
++        folder_path = self.data_dir / flow_id
++        source_path = folder_path / file_name
++        if not await source_path.exists():
++            await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
++            msg = f"File {file_name} not found in flow {flow_id}"
++            raise FileNotFoundError(msg)
++
++        target_path = folder_path / new_name
++        async with aiofiles.open(str(source_path), "rb") as source:
++            content = await source.read()
++        async with aiofiles.open(str(target_path), "wb") as target:
++            await target.write(content)
++        await logger.ainfo(f"File {file_name} copied to {new_name} in flow {flow_id}.")
++
+     async def get_file_size(self, flow_id: str, file_name: str) -> int:
+         """Get the size of a file in bytes.
+ 

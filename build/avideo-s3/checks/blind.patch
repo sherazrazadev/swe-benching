@@ -1,0 +1,394 @@
+diff -ruN pristine/plugin/AuthorizeNet/AuthorizeNet.php app/plugin/AuthorizeNet/AuthorizeNet.php
+--- a/plugin/AuthorizeNet/AuthorizeNet.php	2026-10-26 23:01:17.000000000 +0000
++++ b/plugin/AuthorizeNet/AuthorizeNet.php	2026-10-26 23:22:43.265019115 +0000
+@@ -41,26 +41,40 @@
+     // --- inside AuthorizeNet class ---
+ 
+     /**
+-     * Validate ANet webhook signature (HMAC-SHA512).
++     * Read a request header without depending on the HTTP stack's casing.
++     */
++    private static function headerValue(array $headers, string $name): string
++    {
++        foreach ($headers as $key => $value) {
++            if (strcasecmp((string)$key, $name) === 0) {
++                return trim((string)$value);
++            }
++        }
++        return '';
++    }
++
++    /**
++     * Validate the ANet webhook signature (HMAC-SHA512).
++     *
++     * The configured Signature Key is used verbatim as the HMAC key. Verification fails
++     * closed: an unconfigured/empty key can never authenticate a notification.
+      *
+      * @param string $rawBody
+      * @param array  $headers
+-     * @param string $signatureKeyHex
+-     * @return array{valid:bool,expected:string,received:string}
++     * @param string $signatureKey
++     * @return bool
+      */
+-    public static function verifySignature(string $rawBody, array $headers, string $signatureKeyHex): array
++    public static function verifySignature(string $rawBody, array $headers, string $signatureKey): bool
+     {
+-        $received = $headers['X-ANET-Signature'] ?? ($headers['x-anet-signature'] ?? '');
+-        if (empty($signatureKeyHex) || !ctype_xdigit($signatureKeyHex) || empty($received)) {
+-            return ['valid' => false, 'expected' => '', 'received' => $received];
++        if (trim($signatureKey) === '') {
++            return false;
+         }
+-        $keyBin   = hex2bin($signatureKeyHex);
+-        $expected = 'sha512=' . hash_hmac('sha512', $rawBody, $keyBin);
+-        return [
+-            'valid'    => hash_equals($expected, $received),
+-            'expected' => $expected,
+-            'received' => $received
+-        ];
++        $received = self::headerValue($headers, 'X-ANET-Signature');
++        if ($received === '') {
++            return false;
++        }
++        $expected = 'sha512=' . hash_hmac('sha512', $rawBody, $signatureKey);
++        return hash_equals($expected, strtolower($received));
+     }
+ 
+     /**
+@@ -86,12 +100,12 @@
+      */
+     public static function parseWebhookRequest(string $rawBody, array $headers, array $allowedEvents = ['net.authorize.payment.authcapture.created']): array
+     {
+-        $cfg              = self::getConfig();
+-        $sig = self::verifySignature($rawBody, $headers, trim($cfg->signatureKey ?? ''));
++        $cfg           = self::getConfig();
++        $signatureValid = self::verifySignature($rawBody, $headers, trim((string)($cfg->signatureKey ?? '')));
+ 
+         $json = json_decode($rawBody, true);
+         if (!is_array($json)) {
+-            return ['error' => true, 'msg' => 'Invalid JSON', 'signatureValid' => $sig['valid']];
++            return ['error' => true, 'msg' => 'Invalid JSON', 'signatureValid' => $signatureValid];
+         }
+ 
+         $eventType     = $json['eventType'] ?? '';
+@@ -100,7 +114,7 @@
+                 'error'          => true,
+                 'msg'            => 'Ignored event type',
+                 'eventType'      => $eventType,
+-                'signatureValid' => $sig['valid']
++                'signatureValid' => $signatureValid
+             ];
+         }
+ 
+@@ -124,11 +138,71 @@
+             'metadata'        => $metadata,
+             'users_id'        => $users_id,
+             'uniq_key'        => $uniq_key,
+-            'signatureValid'  => $sig['valid']
++            'signatureValid'  => $signatureValid
++        ];
++    }
++
++    /**
++     * Resolve the gateway's authoritative view of a transaction.
++     *
++     * Every wallet credit in this plugin must be driven by this result, never by values a
++     * request supplied: the account, amount, currency, plan and approval all come from the
++     * transaction record the payment provider holds.
++     *
++     * @return array{error:bool,msg?:string,users_id?:int,amount?:float,currency?:?string,
++     *               plans_id?:int,isApproved?:bool,transaction?:array}
++     */
++    public static function confirmedTransaction(string $transactionId): array
++    {
++        if (trim($transactionId) === '') {
++            return ['error' => true, 'msg' => 'Missing transaction reference'];
++        }
++
++        $txnInfo = self::getTransactionDetails($transactionId);
++        if (empty($txnInfo) || !empty($txnInfo['error'])) {
++            return [
++                'error' => true,
++                'msg'   => 'The gateway did not confirm transaction ' . $transactionId
++                    . (!empty($txnInfo['msg']) ? ': ' . $txnInfo['msg'] : ''),
++            ];
++        }
++
++        $users_id = (int)($txnInfo['users_id'] ?? 0);
++        $amount   = isset($txnInfo['amount']) ? (float)$txnInfo['amount'] : 0.0;
++        if ($users_id <= 0 || $amount <= 0) {
++            return ['error' => true, 'msg' => 'The gateway transaction is missing an account or amount'];
++        }
++
++        if (empty($txnInfo['isApproved'])) {
++            return [
++                'error' => true,
++                'msg'   => 'The gateway reports transaction ' . $transactionId . ' as not approved'
++                    . (!empty($txnInfo['status']) ? ' (' . $txnInfo['status'] . ')' : ''),
++            ];
++        }
++
++        return [
++            'error'       => false,
++            'users_id'    => $users_id,
++            'amount'      => $amount,
++            'currency'    => $txnInfo['currency'] ?? null,
++            'plans_id'    => (int)($txnInfo['plans_id'] ?? 0),
++            'isApproved'  => true,
++            'status'      => $txnInfo['status'] ?? null,
++            'transaction' => $txnInfo,
+         ];
+     }
+ 
+     /**
++     * Whether a gateway transaction status means the charge is approved/settled.
++     * The provider's spelling is not fixed, so the comparison is case-insensitive.
++     */
++    private static function isApprovedStatus($status): bool
++    {
++        return in_array(strtolower(trim((string)$status)), ['capturedpendingsettlement', 'settledsuccessfully'], true);
++    }
++
++    /**
+      * Try to pull users_id from TransactionDetailsType->userFields.
+      */
+     private static function extractUsersIdFromTxnRaw($txnRaw): ?int
+@@ -221,8 +295,7 @@
+         // approval check
+         $isApproved = false;
+         if ($transactionRawObject && method_exists($transactionRawObject, 'getTransactionStatus')) {
+-            $status = strtolower((string)$transactionRawObject->getTransactionStatus());
+-            $isApproved = in_array($status, ['capturedpendingsettlement', 'settledsuccessfully'], true);
++            $isApproved = self::isApprovedStatus($transactionRawObject->getTransactionStatus());
+         } elseif (isset($payload['responseCode'])) {
+             $isApproved = ((int)$payload['responseCode'] === 1);
+         }
+@@ -1024,7 +1097,7 @@
+                 $submitTime   = method_exists($txn, 'getSubmitTimeUTC') ? $txn->getSubmitTimeUTC() : null;
+                 $responseCode = $txn->getResponseCode() ?? '';
+                 $status       = $txn->getTransactionStatus() ?? '';
+-                $isApproved   = $responseCode == 1 && in_array($status, ['capturedPendingSettlement', 'settledSuccessfully'], true);
++                $isApproved   = $responseCode == 1 && self::isApprovedStatus($status);
+ 
+                 // ---- NEW: get description and decode metadata ----
+                 $orderDescription = ($order && method_exists($order, 'getDescription')) ? (string)$order->getDescription() : null;
+diff -ruN pristine/plugin/AuthorizeNet/processPayment.json.php app/plugin/AuthorizeNet/processPayment.json.php
+--- a/plugin/AuthorizeNet/processPayment.json.php	2026-10-26 23:01:17.000000000 +0000
++++ b/plugin/AuthorizeNet/processPayment.json.php	2026-10-26 23:23:05.277152253 +0000
+@@ -3,27 +3,13 @@
+ require_once __DIR__ . '/../../videos/configuration.php';
+ 
+ header('Content-Type: application/json');
+-$plugin = new AuthorizeNet();
+-$amount = isset($_POST['amount']) ? floatval($_POST['amount']) : 0;
+-$userData = isset($_POST['userData']) ? $_POST['userData'] : [];
+-if ($amount <= 0) {
+-    echo json_encode(['error' => 'Invalid amount']);
+-    exit;
+-}
+-// TODO: Implement payment logic using Authorize.Net API
+-// Example: Call Authorize.Net API here
+-// $result = $plugin->chargePayment($amount, $userData);
+ 
+-// Simulate payment success for now
+-$paymentSuccess = true;
+-$users_id = @User::getId();
+-if ($paymentSuccess && !empty($users_id)) {
+-    // Add funds to wallet
+-    $walletPlugin = AVideoPlugin::loadPluginIfEnabled("YPTWallet");
+-    if ($walletPlugin) {
+-        $walletPlugin->addBalance($users_id, $amount, 'Authorize.Net one-time payment');
+-        echo json_encode(['success' => true, 'result' => 'Payment processed and wallet updated']);
+-        exit;
+-    }
+-}
+-echo json_encode(['error' => 'Payment failed or user not logged in']);
++/*
++ * There is no payment here to confirm. A request to this endpoint carries only a desired
++ * amount, so it can never prove that the gateway charged anybody. Wallet top-ups are
++ * credited by the notification handlers, from the gateway's transaction record; allowing
++ * this endpoint to add balance would let any signed-in user mint money.
++ */
++http_response_code(400);
++echo json_encode(['error' => 'A payment must be completed and confirmed by the gateway']);
++exit;
+diff -ruN pristine/plugin/AuthorizeNet/silentPost.php app/plugin/AuthorizeNet/silentPost.php
+--- a/plugin/AuthorizeNet/silentPost.php	2026-10-26 23:02:02.000000000 +0000
++++ b/plugin/AuthorizeNet/silentPost.php	2026-10-26 23:23:00.343787695 +0000
+@@ -10,41 +10,28 @@
+ 
+ header('Content-Type: text/plain');
+ 
+-$transId  = $_POST['x_trans_id'] ?? '';
+-$response = $_POST['x_response_code'] ?? '';
+-$amount   = isset($_POST['x_amount']) ? (float)$_POST['x_amount'] : 0;
+-$users_id = isset($_POST['x_cust_id']) ? (int)$_POST['x_cust_id'] : 0;
++$transId  = trim((string)($_POST['x_trans_id'] ?? ''));
+ 
+-if (empty($transId)) {
++if ($transId === '') {
+     http_response_code(400);
+     echo 'missing transaction';
+     exit;
+ }
+ 
+-// Confirm the transaction exists at the gateway before the wallet is touched.
+-$txnInfo = AuthorizeNet::getTransactionDetails($transId);
+-if (!empty($txnInfo['error'])) {
++// The posted form only identifies the transaction. Everything that is credited — the
++// account, the amount and whether the charge was approved — comes from the gateway record.
++$confirmed = AuthorizeNet::confirmedTransaction($transId);
++if (!empty($confirmed['error'])) {
++    _error_log('[Authorize.Net silent post] refused: ' . $confirmed['msg']);
+     http_response_code(400);
+-    echo 'unknown transaction';
++    echo 'transaction not confirmed';
+     exit;
+ }
+ 
+-if ((int)$response !== 1) {
+-    echo 'not approved';
+-    exit;
+-}
+-
+-if (empty($users_id)) {
+-    $users_id = (int)($txnInfo['users_id'] ?? 0);
+-}
+-if ($amount <= 0) {
+-    $amount = (float)($txnInfo['amount'] ?? 0);
+-}
+-
+ $uniq_key = sha1('net.authorize.payment.authcapture.created' . $transId);
+ $result = AuthorizeNet::processSinglePayment(
+-    $users_id,
+-    $amount,
++    (int)$confirmed['users_id'],
++    (float)$confirmed['amount'],
+     $uniq_key,
+     'net.authorize.payment.authcapture.created',
+     $_POST,
+diff -ruN pristine/plugin/AuthorizeNet/webhook.php app/plugin/AuthorizeNet/webhook.php
+--- a/plugin/AuthorizeNet/webhook.php	2026-10-26 23:01:17.000000000 +0000
++++ b/plugin/AuthorizeNet/webhook.php	2026-10-26 23:22:51.083796661 +0000
+@@ -15,6 +15,15 @@
+     exit;
+ }
+ 
++// Authentication is mandatory. A notification that fails the configured signature check
++// must not reach the wallet, whatever the transaction reference it carries.
++if (empty($parsed['signatureValid'])) {
++    _error_log('[Authorize.Net webhook] Rejected notification with an invalid or missing signature');
++    http_response_code(401);
++    echo 'invalid signature';
++    exit;
++}
++
+ _error_log('[Authorize.Net webhook] Event: ' . $parsed['eventType']);
+ _error_log('[Authorize.Net webhook] uniq_key: ' . $parsed['uniq_key']);
+ 
+@@ -26,44 +35,25 @@
+     exit;
+ }
+ 
+-// 3) Fetch txn (fallback/confirm)
+-$txnInfo = AuthorizeNet::getTransactionDetails($parsed['transactionId']);
+-
+-// 4) Block only if both invalid signature AND no valid txn info
+-if (!$parsed['signatureValid'] && (empty($txnInfo) || !empty($txnInfo['error']))) {
+-    _error_log('[Authorize.Net webhook] Bad signature and could not confirm transaction');
+-    http_response_code(401);
+-    echo 'invalid signature';
++// 3) The gateway record is authoritative: the account, amount, currency, plan and approval
++// used for the credit all come from the transaction the provider holds.
++$confirmed = AuthorizeNet::confirmedTransaction((string)($parsed['transactionId'] ?? ''));
++if (!empty($confirmed['error'])) {
++    _error_log('[Authorize.Net webhook] Refused: ' . $confirmed['msg']);
++    http_response_code(400);
++    echo 'transaction not confirmed';
+     exit;
+ }
++$txnInfo = $confirmed['transaction'];
+ 
+-// 5) Analyze payload + raw txn
++// 4) Subscription metadata may still come from the payload; the money does not.
+ $analysis = AuthorizeNet::analyzeTransactionFromWebhook($parsed['payload'], $txnInfo['raw'] ?? null);
+-
+-// Fill missing basics from txnInfo if needed
+-if (!$analysis['users_id'] && !empty($txnInfo['users_id'])) {
+-    $analysis['users_id'] = (int)$txnInfo['users_id'];
+-}
+-if (!$analysis['amount'] && isset($txnInfo['amount'])) {
+-    $analysis['amount'] = (float)$txnInfo['amount'];
+-}
+-if (!$analysis['currency'] && !empty($txnInfo['currency'])) {
+-    $analysis['currency'] = $txnInfo['currency'];
+-}
+-if (!$analysis['isApproved'] && !empty($txnInfo['isApproved'])) {
+-    $analysis['isApproved'] = (bool)$txnInfo['isApproved'];
+-}
+-if (!$analysis['plans_id'] && !empty($txnInfo['plans_id'])) {
+-    $analysis['plans_id'] = (int)$txnInfo['plans_id'];
+-}
+-_error_log('[Authorize.Net webhook] Analysis: ' . json_encode($analysis));
+-
+-if(empty($analysis['users_id']) || empty($analysis['amount'])) {
+-    _error_log('[Authorize.Net webhook] Missing user ID or amount in analysis');
+-    http_response_code(400);
+-    echo 'missing user ID or amount';
+-    exit;
+-}
++$analysis['users_id']   = $confirmed['users_id'];
++$analysis['amount']     = $confirmed['amount'];
++$analysis['currency']   = $confirmed['currency'];
++$analysis['plans_id']   = $confirmed['plans_id'];
++$analysis['isApproved'] = true;
++_error_log('[Authorize.Net webhook] Confirmed: ' . json_encode($analysis));
+ 
+ $result = AuthorizeNet::processSinglePayment(
+             $analysis['users_id'],
+diff -ruN pristine/plugin/AuthorizeNet/webhookSubscription.php app/plugin/AuthorizeNet/webhookSubscription.php
+--- a/plugin/AuthorizeNet/webhookSubscription.php	2026-10-26 23:02:02.000000000 +0000
++++ b/plugin/AuthorizeNet/webhookSubscription.php	2026-10-26 23:22:55.630174051 +0000
+@@ -22,29 +22,27 @@
+     exit;
+ }
+ 
+-$cfg = AVideoPlugin::getDataObject('AuthorizeNet');
+-$signatureValid = AuthorizeNet::verifySignature($rawBody, $headers, trim((string)($cfg->signatureKey ?? '')));
+-if (!$signatureValid) {
++// Authentication is mandatory: a recurring notification that does not carry a valid
++// signature must never reach the wallet, even if its transaction reference is real.
++if (empty($parsed['signatureValid'])) {
+     _error_log('[Authorize.Net recurring webhook] signature not valid for ' . ($parsed['transactionId'] ?? 'n/a'));
+-}
+-
+-$analysis = AuthorizeNet::analyzeTransactionFromWebhook($parsed['payload']);
+-
+-if (empty($analysis['users_id']) || empty($analysis['amount'])) {
+-    http_response_code(400);
+-    echo json_encode(['success' => false, 'msg' => 'missing user ID or amount']);
++    http_response_code(401);
++    echo json_encode(['success' => false, 'msg' => 'invalid signature']);
+     exit;
+ }
+ 
+-if (empty($analysis['isApproved'])) {
++// Credit only what the gateway's own transaction record says, and only if it was approved.
++$confirmed = AuthorizeNet::confirmedTransaction((string)($parsed['transactionId'] ?? ''));
++if (!empty($confirmed['error'])) {
++    _error_log('[Authorize.Net recurring webhook] refused: ' . $confirmed['msg']);
+     http_response_code(400);
+-    echo json_encode(['success' => false, 'msg' => 'transaction not approved']);
++    echo json_encode(['success' => false, 'msg' => 'transaction not confirmed']);
+     exit;
+ }
+ 
+ $result = AuthorizeNet::processSinglePayment(
+-    (int)$analysis['users_id'],
+-    (float)$analysis['amount'],
++    (int)$confirmed['users_id'],
++    (float)$confirmed['amount'],
+     $parsed['uniq_key'],
+     $parsed['eventType'],
+     $parsed['payload'],

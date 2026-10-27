@@ -1,0 +1,620 @@
+diff -ruN a/src/backend/base/langflow/api/v1/mcp_projects.py b/src/backend/base/langflow/api/v1/mcp_projects.py
+--- a/src/backend/base/langflow/api/v1/mcp_projects.py	2026-10-26 22:58:59.000000000 +0000
++++ b/src/backend/base/langflow/api/v1/mcp_projects.py	2026-10-26 23:48:57.161322547 +0000
+@@ -1249,7 +1249,7 @@
+         @self.server.read_resource()
+         async def handle_read_project_resource(uri: str) -> bytes:
+             """Handle resource read requests for this specific project."""
+-            return await handle_read_resource(uri=uri)
++            return await handle_read_resource(uri=uri, project_id=self.project_id)
+ 
+         @self.server.call_tool()
+         @handle_mcp_errors
+diff -ruN a/src/backend/base/langflow/api/v1/mcp_utils.py b/src/backend/base/langflow/api/v1/mcp_utils.py
+--- a/src/backend/base/langflow/api/v1/mcp_utils.py	2026-10-26 22:58:59.000000000 +0000
++++ b/src/backend/base/langflow/api/v1/mcp_utils.py	2026-10-26 23:48:53.643258678 +0000
+@@ -11,7 +11,7 @@
+ from pathlib import Path
+ from typing import Any, ParamSpec, TypeVar
+ from urllib.parse import quote, unquote, urlparse
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ from lfx.base.mcp.constants import MAX_MCP_TOOL_NAME_LENGTH
+ from lfx.base.mcp.util import get_flow_snake_case, get_unique_name, sanitize_mcp_name
+@@ -78,6 +78,68 @@
+     return MCPConfig()
+ 
+ 
++def _request_user_or_none() -> User | None:
++    """Return the authenticated user for this request, or ``None`` outside a request."""
++    try:
++        return current_user_ctx.get()
++    except LookupError:
++        return None
++
++
++def _decode_resource_filename(raw_file_name: str) -> str:
++    """Decode the last URI segment and require it to be a bare file name.
++
++    The resource URI is client-controlled. Decoding happens *before* the check, so a
++    percent-encoded separator cannot be smuggled past it and reach a parent or
++    sibling namespace.
++    """
++    file_name = unquote(raw_file_name)
++    if (
++        not file_name
++        or file_name in {".", ".."}
++        or "/" in file_name
++        or "\\" in file_name
++        or "\x00" in file_name
++    ):
++        msg = f"Invalid file name in resource URI: {file_name!r}"
++        raise ValueError(msg)
++    return file_name
++
++
++async def _assert_namespace_readable(session, current_user: User, namespace_id: str, project_id) -> None:
++    """Raise unless ``namespace_id`` is readable by ``current_user``.
++
++    Two shapes are allowed: the caller's own account-level file bucket (only on the
++    global server, where ``project_id`` is ``None``) and one of the caller's own
++    flows. On a project-scoped server the flow must additionally sit in that project.
++    """
++    if str(current_user.id) == str(namespace_id):
++        if project_id is not None:
++            msg = "Resource not found or access denied"
++            raise ValueError(msg)
++        return
++
++    try:
++        namespace_uuid = UUID(str(namespace_id))
++        user_uuid = UUID(str(current_user.id))
++    except (AttributeError, TypeError, ValueError) as exc:
++        msg = "Resource not found or access denied"
++        raise ValueError(msg) from exc
++
++    flows_query = select(Flow).where(Flow.id == namespace_uuid, Flow.user_id == user_uuid)
++    if project_id is not None:
++        try:
++            project_uuid = project_id if isinstance(project_id, UUID) else UUID(str(project_id))
++        except (AttributeError, TypeError, ValueError) as exc:
++            msg = "Resource not found or access denied"
++            raise ValueError(msg) from exc
++        flows_query = flows_query.where(Flow.folder_id == project_uuid)
++
++    if (await session.exec(flows_query)).first() is None:
++        msg = "Resource not found or access denied"
++        raise ValueError(msg)
++
++
+ async def handle_list_resources(project_id=None):
+     """Handle listing resources for MCP.
+ 
+@@ -94,15 +156,18 @@
+         port = getattr(settings_service.settings, "port", 3000)
+ 
+         base_url = f"http://{host}:{port}".rstrip("/")
+-        try:
+-            current_user = current_user_ctx.get()
+-        except Exception as e:  # noqa: BLE001
+-            msg = f"Error getting current user: {e!s}"
+-            await logger.aexception(msg)
+-            current_user = None
++        current_user = _request_user_or_none()
++        if current_user is None:
++            await logger.awarning("handle_list_resources called without a current user; returning empty list")
++            return resources
+         async with session_scope() as session:
+-            # Build query based on whether project_id is provided
+-            flows_query = select(Flow).where(Flow.folder_id == project_id) if project_id else select(Flow)
++            # Every listing is scoped to the caller; a project view narrows it further.
++            if project_id:
++                flows_query = select(Flow).where(
++                    Flow.folder_id == project_id, Flow.user_id == current_user.id
++                )
++            else:
++                flows_query = select(Flow).where(Flow.user_id == current_user.id)
+ 
+             flows = (await session.exec(flows_query)).all()
+ 
+@@ -133,7 +198,9 @@
+             # So we list all user files for the current user.
+             # This is not good. We need to fix this for 1.8.0.
+             ###################################################
+-            if current_user:
++            # Account-level uploads belong to the whole account, not to a project,
++            # so a project-scoped view must not include them.
++            if project_id is None:
+                 user_files_stmt = select(UserFile).where(UserFile.user_id == current_user.id)
+                 user_files = (await session.exec(user_files_stmt)).all()
+                 for user_file in user_files:
+@@ -158,8 +225,14 @@
+     return resources
+ 
+ 
+-async def handle_read_resource(uri: str) -> bytes:
+-    """Handle resource read requests."""
++async def handle_read_resource(uri: str, project_id: UUID | str | None = None) -> bytes:
++    """Handle resource read requests.
++
++    Args:
++        uri: Resource URI whose last two path segments name a namespace and a file.
++        project_id: Optional project the request is scoped to; when given, only
++            flows inside that project may be read.
++    """
+     try:
+         # Parse the URI properly
+         parsed_uri = urlparse(str(uri))
+@@ -168,21 +241,29 @@
+         # Remove empty strings from split
+         path_parts = [p for p in path_parts if p]
+ 
+-        # The flow_id and filename should be the last two parts
++        # The namespace and filename should be the last two parts
+         two = 2
+         if len(path_parts) < two:
+             msg = f"Invalid URI format: {uri}"
+             raise ValueError(msg)
+ 
+-        flow_id = path_parts[-2]
+-        filename = unquote(path_parts[-1])  # URL decode the filename
++        namespace_id = path_parts[-2]
++        filename = _decode_resource_filename(path_parts[-1])
++
++        current_user = _request_user_or_none()
++        if current_user is None:
++            msg = "Authenticated user context is required to read MCP resources"
++            raise ValueError(msg)
++
++        async with session_scope() as session:
++            await _assert_namespace_readable(session, current_user, namespace_id, project_id)
+ 
+         storage_service = get_storage_service()
+ 
+         # Read the file content
+-        content = await storage_service.get_file(flow_id=flow_id, file_name=filename)
++        content = await storage_service.get_file(flow_id=namespace_id, file_name=filename)
+         if not content:
+-            msg = f"File {filename} not found in flow {flow_id}"
++            msg = f"File {filename} not found in flow {namespace_id}"
+             raise ValueError(msg)
+ 
+         # Ensure content is base64 encoded
+@@ -335,16 +416,24 @@
+     """
+     tools = []
+     try:
++        current_user = _request_user_or_none()
++        if current_user is None:
++            await logger.awarning("handle_list_tools called without a current user; returning empty list")
++            return tools
+         async with session_scope() as session:
+-            # Build query based on parameters
++            # Build query based on parameters; always scoped to the calling user.
+             if project_id:
+                 # Filter flows by project and optionally by MCP enabled status
+-                flows_query = select(Flow).where(Flow.folder_id == project_id, Flow.is_component == False)  # noqa: E712
++                flows_query = select(Flow).where(
++                    Flow.folder_id == project_id,
++                    Flow.user_id == current_user.id,
++                    Flow.is_component == False,  # noqa: E712
++                )
+                 if mcp_enabled_only:
+                     flows_query = flows_query.where(Flow.mcp_enabled == True)  # noqa: E712
+             else:
+-                # Get all flows
+-                flows_query = select(Flow)
++                # Get the caller's own flows
++                flows_query = select(Flow).where(Flow.user_id == current_user.id)
+ 
+             flows = (await session.exec(flows_query)).all()
+ 
+diff -ruN a/src/backend/base/langflow/api/v2/files.py b/src/backend/base/langflow/api/v2/files.py
+--- a/src/backend/base/langflow/api/v2/files.py	2026-10-26 22:59:06.000000000 +0000
++++ b/src/backend/base/langflow/api/v2/files.py	2026-10-26 23:49:08.679531563 +0000
+@@ -17,6 +17,7 @@
+ from langflow.api.schemas import UploadFileResponse
+ from langflow.api.utils import CurrentActiveUser, DbSession
+ from langflow.services.database.models.file.model import File as UserFile
++from langflow.services.database.models.flow.model import Flow
+ from langflow.services.deps import get_settings_service, get_storage_service
+ from langflow.services.settings.service import SettingsService
+ from langflow.services.storage.service import StorageService
+@@ -27,6 +28,30 @@
+ MCP_SERVERS_FILE = "_mcp_servers"
+ SAMPLE_DATA_DIR = Path(__file__).parent / "sample_data"
+ 
++# A stored path or copy destination must name an entry, not a directory or a route
++# out of the namespace it is joined to.
++_FORBIDDEN_NAME_CHARS = ("/", "\\", "\x00")
++
++
++def _bare_file_name(name: str) -> str:
++    """Return ``name`` if it is a single path component, otherwise raise ``ValueError``."""
++    if not name or name in {".", ".."} or any(char in name for char in _FORBIDDEN_NAME_CHARS):
++        msg = "Invalid file name"
++        raise ValueError(msg)
++    return name
++
++
++async def _caller_owns_namespace(session, current_user, namespace: str) -> bool:
++    """Whether ``namespace`` is the caller's own bucket or one of the caller's flows."""
++    if namespace == str(current_user.id):
++        return True
++    try:
++        namespace_id = uuid.UUID(namespace)
++    except (AttributeError, TypeError, ValueError):
++        return False
++    owned = await session.exec(select(Flow).where(Flow.id == namespace_id, Flow.user_id == current_user.id))
++    return owned.first() is not None
++
+ 
+ def is_permanent_storage_failure(error: Exception) -> bool:
+     """Check if a storage deletion error is a permanent failure (file/storage gone).
+@@ -624,13 +649,15 @@
+ async def preview_file(
+     path: str,
+     current_user: CurrentActiveUser,
++    session: DbSession,
+     storage_service: Annotated[StorageService, Depends(get_storage_service)],
+ ) -> StreamingResponse:
+     """Stream a stored file from the path returned when it was uploaded.
+ 
+     Uploads are addressed by the ``<namespace>/<file name>`` path that the upload
+     endpoints return. A bare file name refers to the caller's own uploads. Chat
+-    attachments and flow files keep the namespace they were stored under.
++    attachments and flow files keep the namespace they were stored under, and that
++    namespace must be one the caller owns.
+     """
+     namespace, separator, file_name = path.partition("/")
+     if not separator:
+@@ -638,11 +665,16 @@
+     if not namespace or not file_name:
+         raise HTTPException(status_code=400, detail="Invalid stored path")
+ 
++    if not await _caller_owns_namespace(session, current_user, namespace):
++        raise HTTPException(status_code=404, detail="File not found")
++
+     await logger.adebug("Previewing stored file for user %s", current_user.id)
+     try:
+         content = await storage_service.get_file(flow_id=namespace, file_name=file_name)
+     except FileNotFoundError as exc:
+         raise HTTPException(status_code=404, detail="File not found") from exc
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="Invalid stored path") from exc
+ 
+     return StreamingResponse(
+         io.BytesIO(content),
+@@ -749,16 +781,24 @@
+     storage_service: Annotated[StorageService, Depends(get_storage_service)],
+ ) -> UploadFileResponse:
+     """Duplicate a file under a new name in the caller's uploads."""
++    try:
++        _bare_file_name(name)
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="Invalid file name") from exc
++
+     file = await fetch_file_object(file_id, current_user, session)
+     if not file:
+         raise HTTPException(status_code=404, detail="File not found")
+ 
+     file_name = Path(file.path).name
+-    await storage_service.copy_file(
+-        flow_id=str(current_user.id),
+-        file_name=file_name,
+-        new_name=name,
+-    )
++    try:
++        await storage_service.copy_file(
++            flow_id=str(current_user.id),
++            file_name=file_name,
++            new_name=name,
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="Invalid file name") from exc
+ 
+     copied = UserFile(
+         id=uuid.uuid4(),
+diff -ruN a/src/backend/base/langflow/services/storage/local.py b/src/backend/base/langflow/services/storage/local.py
+--- a/src/backend/base/langflow/services/storage/local.py	2026-10-26 22:59:06.000000000 +0000
++++ b/src/backend/base/langflow/services/storage/local.py	2026-10-26 23:50:32.567045673 +0000
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -19,6 +20,27 @@
+ # Constants for path parsing
+ EXPECTED_PATH_PARTS = 2  # Path format: "flow_id/filename"
+ 
++# Characters that must never appear in a storage identifier or file name: either a
++# path separator (which would let the value address a sibling or parent directory)
++# or a NUL byte (which truncates the path at the OS boundary).
++_FORBIDDEN_NAME_CHARS = ("/", "\\", "\x00")
++
++
++def _require_single_component(value: object, what: str) -> str:
++    """Return ``value`` if it is one self-contained path component, else raise.
++
++    A storage file name is joined to a namespace directory. Rejecting separators
++    and the traversal components ``.``/``..`` here means the name can only ever
++    address an entry directly inside that directory.
++    """
++    if not isinstance(value, str) or not value or value in {".", ".."}:
++        msg = f"Invalid {what}"
++        raise ValueError(msg)
++    if any(char in value for char in _FORBIDDEN_NAME_CHARS):
++        msg = f"Invalid {what}: path separators are not allowed"
++        raise ValueError(msg)
++    return value
++
+ 
+ class LocalStorageService(StorageService):
+     """A service class for handling local file storage operations."""
+@@ -38,6 +60,33 @@
+         super().__init__(session_service, settings_service)
+         # Base class already sets self.data_dir as anyio.Path from settings_service.settings.config_dir
+ 
++    def _contained_path(self, flow_id: str, file_name: str):
++        """Return ``data_dir/<flow_id>/<file_name>``, refusing to leave the namespace.
++
++        The file name must be a single path component; ``flow_id`` names the
++        containing directory (and may itself be a relative path). As defence in
++        depth the joined path is also resolved and required to stay beneath that
++        directory, so a pre-existing symlink cannot redirect a read or a write.
++
++        Raises:
++            ValueError: If the file name is not a plain component or the joined
++                path escapes the namespace directory.
++        """
++        name = _require_single_component(file_name, "file name")
++
++        folder_path = self.data_dir / str(flow_id)
++        file_path = folder_path / name
++        resolved_folder = os.path.realpath(str(folder_path))
++        resolved_file = os.path.realpath(str(file_path))
++        try:
++            contained = os.path.commonpath([resolved_folder, resolved_file]) == resolved_folder
++        except ValueError:  # different drives / mixed absolute-relative paths
++            contained = False
++        if not contained:
++            msg = "Invalid file path: escapes its namespace"
++            raise ValueError(msg)
++        return file_path
++
+     def resolve_component_path(self, logical_path: str) -> str:
+         """Convert logical path to absolute filesystem path for local storage.
+ 
+@@ -112,57 +161,10 @@
+             PermissionError: If there is no permission to write the file.
+             ValueError: If path traversal is detected (security violation).
+         """
+-        # SECURITY FIX: Defense-in-depth path containment check to prevent directory traversal
+-        # Validate BEFORE creating any directories to prevent race conditions
+-        # This ensures the resolved absolute path stays within the intended flow directory
+-        # even if the API layer validation is bypassed or has bugs.
+-        folder_path = self.data_dir / flow_id
+-        file_path = folder_path / file_name
+-
+-        try:
+-            # Resolve paths to their absolute canonical forms
+-            # Note: resolve() works even if the path doesn't exist yet
+-            resolved_folder_path = await folder_path.resolve()
+-            resolved_file_path = await file_path.resolve()
+-
+-            # Check if the resolved file path is actually within the flow directory
+-            # Using is_relative_to() ensures no path traversal can escape the boundary
+-            # Example attack: file_name="../../etc/passwd" would resolve outside folder_path
+-            if not resolved_file_path.is_relative_to(resolved_folder_path):
+-                # SECURITY: Don't log the actual paths to avoid information disclosure
+-                await logger.aerror(
+-                    f"Path traversal attempt detected for flow_id='{flow_id}'. "
+-                    "File path would escape flow directory boundary."
+-                )
+-                msg = "Invalid file path: path traversal detected"
+-                raise ValueError(msg)
+-
+-            # Additional check: ensure file_name doesn't contain path separators
+-            # This catches cases where Path() might normalize away dangerous sequences
+-            if "/" in file_name or "\\" in file_name or ".." in file_name:
+-                await logger.aerror(
+-                    f"Invalid file_name contains path separators or traversal sequences: flow_id='{flow_id}'"
+-                )
+-                msg = "Invalid file name: contains path separators"
+-                raise ValueError(msg)
+-
+-        except ValueError:
+-            # Re-raise ValueError (our security checks)
+-            raise
+-        except AttributeError:
+-            # is_relative_to() not available (Python < 3.9), fall back to string comparison
+-            # This should never happen in production but provides compatibility
+-            resolved_folder_str = str(await folder_path.resolve())
+-            resolved_file_str = str(await file_path.resolve())
+-            if not resolved_file_str.startswith(resolved_folder_str):
+-                await logger.aerror(f"Path traversal attempt detected for flow_id='{flow_id}' (fallback check)")
+-                msg = "Invalid file path: path traversal detected"
+-                raise ValueError(msg) from None
+-        except Exception as e:
+-            # Log unexpected errors during path resolution but don't expose details to user
+-            await logger.aerror(f"Error validating file path for flow_id='{flow_id}': {type(e).__name__}")
+-            msg = "Invalid file path"
+-            raise ValueError(msg) from e
++        # SECURITY: Validate before creating any directories, so an escaping name
++        # can neither read nor create anything outside its namespace.
++        file_path = self._contained_path(flow_id, file_name)
++        folder_path = self.data_dir / str(flow_id)
+ 
+         # Only create directory after validation passes
+         await folder_path.mkdir(parents=True, exist_ok=True)
+@@ -190,7 +192,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if not await file_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"
+@@ -204,7 +206,7 @@
+ 
+     async def get_file_stream(self, flow_id: str, file_name: str, chunk_size: int = 8192) -> AsyncIterator[bytes]:
+         """Retrieve a file from storage as a stream."""
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if not await file_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"
+@@ -253,7 +255,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if await file_path.exists():
+             await file_path.unlink()
+             await logger.ainfo(f"File {file_name} deleted successfully from flow {flow_id}.")
+@@ -271,14 +273,13 @@
+         Raises:
+             FileNotFoundError: If the source file does not exist.
+         """
+-        folder_path = self.data_dir / flow_id
+-        source_path = folder_path / file_name
++        source_path = self._contained_path(flow_id, file_name)
+         if not await source_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"
+             raise FileNotFoundError(msg)
+ 
+-        target_path = folder_path / new_name
++        target_path = self._contained_path(flow_id, new_name)
+         async with aiofiles.open(str(source_path), "rb") as source:
+             content = await source.read()
+         async with aiofiles.open(str(target_path), "wb") as target:
+@@ -298,7 +299,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if not await file_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"
+diff -ruN a/src/lfx/src/lfx/services/storage/local.py b/src/lfx/src/lfx/services/storage/local.py
+--- a/src/lfx/src/lfx/services/storage/local.py	2026-10-26 22:58:59.000000000 +0000
++++ b/src/lfx/src/lfx/services/storage/local.py	2026-10-26 23:50:33.249058003 +0000
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import TYPE_CHECKING
+ 
+ import aiofiles
+@@ -18,6 +19,27 @@
+ # Constants for path parsing
+ EXPECTED_PATH_PARTS = 2  # Path format: "flow_id/filename"
+ 
++# Characters that must never appear in a storage identifier or file name: either a
++# path separator (which would let the value address a sibling or parent directory)
++# or a NUL byte (which truncates the path at the OS boundary).
++_FORBIDDEN_NAME_CHARS = ("/", "\\", "\x00")
++
++
++def _require_single_component(value: object, what: str) -> str:
++    """Return ``value`` if it is one self-contained path component, else raise.
++
++    A storage file name is joined to a namespace directory. Rejecting separators
++    and the traversal components ``.``/``..`` here means the name can only ever
++    address an entry directly inside that directory.
++    """
++    if not isinstance(value, str) or not value or value in {".", ".."}:
++        msg = f"Invalid {what}"
++        raise ValueError(msg)
++    if any(char in value for char in _FORBIDDEN_NAME_CHARS):
++        msg = f"Invalid {what}: path separators are not allowed"
++        raise ValueError(msg)
++    return value
++
+ 
+ class LocalStorageService(StorageService, Service):
+     """A service class for handling local file storage operations."""
+@@ -37,6 +59,33 @@
+         super().__init__(session_service, settings_service)
+         # Base class already sets self.data_dir as anyio.Path from settings_service.settings.config_dir
+ 
++    def _contained_path(self, flow_id: str, file_name: str):
++        """Return ``data_dir/<flow_id>/<file_name>``, refusing to leave the namespace.
++
++        The file name must be a single path component; ``flow_id`` names the
++        containing directory (and may itself be a relative path). As defence in
++        depth the joined path is also resolved and required to stay beneath that
++        directory, so a pre-existing symlink cannot redirect a read or a write.
++
++        Raises:
++            ValueError: If the file name is not a plain component or the joined
++                path escapes the namespace directory.
++        """
++        name = _require_single_component(file_name, "file name")
++
++        folder_path = self.data_dir / str(flow_id)
++        file_path = folder_path / name
++        resolved_folder = os.path.realpath(str(folder_path))
++        resolved_file = os.path.realpath(str(file_path))
++        try:
++            contained = os.path.commonpath([resolved_folder, resolved_file]) == resolved_folder
++        except ValueError:  # different drives / mixed absolute-relative paths
++            contained = False
++        if not contained:
++            msg = "Invalid file path: escapes its namespace"
++            raise ValueError(msg)
++        return file_path
++
+     def resolve_component_path(self, logical_path: str) -> str:
+         """Convert logical path to absolute filesystem path for local storage.
+ 
+@@ -113,9 +162,11 @@
+             IsADirectoryError: If the file name is a directory.
+             PermissionError: If there is no permission to write the file.
+         """
+-        folder_path = self.data_dir / flow_id
++        # SECURITY: Validate before creating any directories, so an escaping name
++        # can neither read nor create anything outside its namespace.
++        file_path = self._contained_path(flow_id, file_name)
++        folder_path = self.data_dir / str(flow_id)
+         await folder_path.mkdir(parents=True, exist_ok=True)
+-        file_path = folder_path / file_name
+ 
+         try:
+             mode = "ab" if append else "wb"
+@@ -140,7 +191,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if not await file_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"
+@@ -188,7 +239,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if await file_path.exists():
+             await file_path.unlink()
+             await logger.ainfo(f"File {file_name} deleted successfully from flow {flow_id}.")
+@@ -208,7 +259,7 @@
+         Raises:
+             FileNotFoundError: If the file does not exist.
+         """
+-        file_path = self.data_dir / flow_id / file_name
++        file_path = self._contained_path(flow_id, file_name)
+         if not await file_path.exists():
+             await logger.awarning(f"File {file_name} not found in flow {flow_id}.")
+             msg = f"File {file_name} not found in flow {flow_id}"

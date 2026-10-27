@@ -1,0 +1,335 @@
+diff -ruN a/glob/manager_bootstrap.py b/glob/manager_bootstrap.py
+--- a/glob/manager_bootstrap.py	2026-10-26 23:01:59.000000000 +0000
++++ b/glob/manager_bootstrap.py	2026-10-26 23:22:44.582384217 +0000
+@@ -7,11 +7,15 @@
+ import configparser
+ import os
+ 
++import manager_state
++
+ 
+ def get_default_config_path():
+     import folder_paths
+ 
+-    return os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager", "config.ini")
++    return os.path.join(
++        manager_state.get_manager_files_path(folder_paths.get_user_directory()),
++        "config.ini")
+ 
+ 
+ def apply_boot_preferences(config_path=None):
+diff -ruN a/glob/manager_core.py b/glob/manager_core.py
+--- a/glob/manager_core.py	2026-10-26 23:01:59.000000000 +0000
++++ b/glob/manager_core.py	2026-10-26 23:22:22.158471406 +0000
+@@ -40,6 +40,7 @@
+ import manager_util
+ import git_utils
+ import manager_downloader
++import manager_state
+ from node_package import InstalledNodePackage
+ 
+ 
+@@ -214,7 +215,7 @@
+     global manager_pip_blacklist_path
+     global manager_components_path
+ 
+-    manager_files_path = os.path.abspath(os.path.join(user_dir, 'default', 'ComfyUI-Manager'))
++    manager_files_path = manager_state.get_manager_files_path(user_dir)
+     if not os.path.exists(manager_files_path):
+         os.makedirs(manager_files_path)
+ 
+@@ -1693,7 +1694,8 @@
+         'windows_selector_event_loop_policy': get_config()['windows_selector_event_loop_policy'],
+         'model_download_by_agent': get_config()['model_download_by_agent'],
+         'downgrade_blacklist': get_config()['downgrade_blacklist'],
+-        'security_level': get_config()['security_level'],
++        # Never persist an enforced level over the value the operator saved.
++        'security_level': get_config().get('stored_security_level', get_config()['security_level']),
+         'always_lazy_install': get_config()['always_lazy_install'],
+         'network_mode': get_config()['network_mode'],
+         'db_mode': get_config()['db_mode'],
+@@ -1707,10 +1709,57 @@
+         config.write(configfile)
+ 
+ 
++def _default_config():
++    import importlib.util
++    # temporary disable `uv` on Windows by default (https://github.com/Comfy-Org/ComfyUI-Manager/issues/1969)
++    manager_util.use_uv = importlib.util.find_spec("uv") is not None and platform.system() != "Windows"
++    manager_util.bypass_ssl = False
++
++    return {
++        'http_channel_enabled': False,
++        'preview_method': manager_funcs.get_current_preview_method(),
++        'git_exe': '',
++        'use_uv': manager_util.use_uv,
++        'channel_url': DEFAULT_CHANNEL,
++        'default_cache_as_channel_url': False,
++        'share_option': 'all',
++        'bypass_ssl': manager_util.bypass_ssl,
++        'file_logging': True,
++        'component_policy': 'workflow',
++        'update_policy': 'stable-comfyui',
++        'windows_selector_event_loop_policy': False,
++        'model_download_by_agent': False,
++        'downgrade_blacklist': '',
++        'always_lazy_install': False,
++        'network_mode': 'public',   # public | private | offline
++        'security_level': 'normal', # strong | normal | normal- | weak
++        'db_mode': 'cache',         # local | cache | remote
++    }
++
++
+ def read_config():
++    config = configparser.ConfigParser(strict=False)
+     try:
+-        config = configparser.ConfigParser(strict=False)
+         config.read(manager_config_path)
++        has_section = 'default' in config
++    except Exception:
++        config = None
++        has_section = False
++
++    if not manager_state.has_protected_user_directory():
++        # No protected location exists: a user-writable config must not decide
++        # what the product allows, trusts, installs or runs.  Remember only the
++        # saved level so saving unrelated settings later does not erase it.
++        result = _default_config()
++        result['security_level'] = 'strong'
++        if has_section and 'security_level' in config['default']:
++            result['stored_security_level'] = config['default']['security_level'].strip().lower()
++        return result
++
++    if not has_section:
++        return _default_config()
++
++    try:
+         default_conf = config['default']
+ 
+         def get_bool(key, default_value):
+@@ -1741,31 +1790,7 @@
+                }
+ 
+     except Exception:
+-        import importlib.util
+-        # temporary disable `uv` on Windows by default (https://github.com/Comfy-Org/ComfyUI-Manager/issues/1969)
+-        manager_util.use_uv = importlib.util.find_spec("uv") is not None and platform.system() != "Windows"
+-        manager_util.bypass_ssl = False
+-
+-        return {
+-            'http_channel_enabled': False,
+-            'preview_method': manager_funcs.get_current_preview_method(),
+-            'git_exe': '',
+-            'use_uv': manager_util.use_uv,
+-            'channel_url': DEFAULT_CHANNEL,
+-            'default_cache_as_channel_url': False,
+-            'share_option': 'all',
+-            'bypass_ssl': manager_util.bypass_ssl,
+-            'file_logging': True,
+-            'component_policy': 'workflow',
+-            'update_policy': 'stable-comfyui',
+-            'windows_selector_event_loop_policy': False,
+-            'model_download_by_agent': False,
+-            'downgrade_blacklist': '',
+-            'always_lazy_install': False,
+-            'network_mode': 'public',   # public | private | offline
+-            'security_level': 'normal', # strong | normal | normal- | weak
+-            'db_mode': 'cache',         # local | cache | remote
+-        }
++        return _default_config()
+ 
+ 
+ def get_config():
+diff -ruN a/glob/manager_state.py b/glob/manager_state.py
+--- a/glob/manager_state.py	1970-01-01 00:00:00.000000000 +0000
++++ b/glob/manager_state.py	2026-10-26 23:22:08.753523123 +0000
+@@ -0,0 +1,49 @@
++"""Resolve where ComfyUI-Manager keeps the state that controls its behaviour.
++
++The host's user-file endpoints can write the user directory, so a file placed
++there must never decide what Manager allows, trusts, installs or runs.  Newer
++ComfyUI versions expose a system user directory that those endpoints cannot
++write; Manager state belongs there.  On hosts without that capability there is
++no safe place at all, so callers must treat every value from the user
++directory as untrusted (and the security level must be ``strong``).
++"""
++
++import os
++
++MANAGER_DIR_NAME = 'ComfyUI-Manager'
++
++
++def has_protected_user_directory():
++    """Whether the host offers a user directory the user-file API cannot write."""
++    try:
++        import folder_paths
++        return hasattr(folder_paths, 'get_system_user_directory')
++    except Exception:
++        return False
++
++
++def get_manager_files_path(user_dir):
++    """Return the directory that holds Manager state on this host.
++
++    On hosts with the protected system user API this is a Manager-owned
++    subdirectory of that protected directory.  Otherwise it is the legacy,
++    user-writable location: callers must never trust data read from it.
++    """
++    try:
++        import folder_paths
++        getter = getattr(folder_paths, 'get_system_user_directory', None)
++    except Exception:
++        getter = None
++
++    if getter is not None:
++        try:
++            protected_base = getter()
++        except Exception:
++            protected_base = None
++        if protected_base:
++            return os.path.abspath(os.path.join(protected_base, MANAGER_DIR_NAME))
++        # The host advertises the API but gave no path.  Keep the state out of
++        # the writable ``default`` subtree as the next best protected location.
++        return os.path.abspath(os.path.join(user_dir, '__manager'))
++
++    return os.path.abspath(os.path.join(user_dir, 'default', MANAGER_DIR_NAME))
+diff -ruN a/glob/manager_trust.py b/glob/manager_trust.py
+--- a/glob/manager_trust.py	2026-10-26 23:01:59.000000000 +0000
++++ b/glob/manager_trust.py	2026-10-26 23:22:42.755391845 +0000
+@@ -7,6 +7,8 @@
+ 
+ import os
+ 
++import manager_state
++
+ 
+ def get_trust_path(manager_files_path):
+     return os.path.join(manager_files_path, "trusted_sources.list")
+@@ -15,11 +17,19 @@
+ def get_default_manager_path():
+     import folder_paths
+ 
+-    return os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager")
++    return manager_state.get_manager_files_path(folder_paths.get_user_directory())
+ 
+ 
+ def is_trusted_source(url):
+-    path = get_trust_path(get_default_manager_path())
++    # A trusted-source list may make an install allowed, so it may only be read
++    # from the host's protected state directory.
++    try:
++        if not manager_state.has_protected_user_directory():
++            return False
++        path = get_trust_path(get_default_manager_path())
++    except Exception:
++        return False
++
+     if not os.path.exists(path):
+         return False
+ 
+diff -ruN a/prestartup_script.py b/prestartup_script.py
+--- a/prestartup_script.py	2026-10-26 23:01:59.000000000 +0000
++++ b/prestartup_script.py	2026-10-26 23:22:40.258402270 +0000
+@@ -86,7 +86,11 @@
+ comfyui_manager_path = os.path.abspath(os.path.dirname(__file__))
+ 
+ custom_nodes_base_path = folder_paths.get_folder_paths('custom_nodes')[0]
+-manager_files_path = os.path.abspath(os.path.join(folder_paths.get_user_directory(), 'default', 'ComfyUI-Manager'))
++
++import manager_state
++
++_protected_state = manager_state.has_protected_user_directory()
++manager_files_path = manager_state.get_manager_files_path(folder_paths.get_user_directory())
+ manager_pip_overrides_path = os.path.join(manager_files_path, "pip_overrides.json")
+ manager_pip_blacklist_path = os.path.join(manager_files_path, "pip_blacklist.list")
+ restore_snapshot_path = os.path.join(manager_files_path, "startup-scripts", "restore-snapshot.json")
+@@ -94,9 +98,10 @@
+ 
+ import manager_bootstrap
+ 
+-_boot_preferences = manager_bootstrap.apply_boot_preferences()
+-if _boot_preferences.get('file_logging') is False:
+-    enable_file_logging = False
++if _protected_state:
++    _boot_preferences = manager_bootstrap.apply_boot_preferences(manager_config_path)
++    if _boot_preferences.get('file_logging') is False:
++        enable_file_logging = False
+ 
+ cm_cli_path = os.path.join(comfyui_manager_path, "cm-cli.py")
+ 
+@@ -105,6 +110,11 @@
+ 
+ def read_config():
+     global default_conf
++    if not _protected_state:
++        # The host has no protected location: nothing from the user-writable
++        # folder may be trusted for configuration.
++        default_conf = {}
++        return
+     try:
+         import configparser
+         config = configparser.ConfigParser(strict=False)
+@@ -130,12 +140,12 @@
+ 
+ cm_global.pip_overrides = {}
+ 
+-if os.path.exists(manager_pip_overrides_path):
++if _protected_state and os.path.exists(manager_pip_overrides_path):
+     with open(manager_pip_overrides_path, 'r', encoding="UTF-8", errors="ignore") as json_file:
+         cm_global.pip_overrides = json.load(json_file)
+ 
+ 
+-if os.path.exists(manager_pip_blacklist_path):
++if _protected_state and os.path.exists(manager_pip_blacklist_path):
+     with open(manager_pip_blacklist_path, 'r', encoding="UTF-8", errors="ignore") as f:
+         for x in f.readlines():
+             y = x.strip()
+@@ -523,8 +533,8 @@
+ 
+ # Perform install
+ processed_install = set()
+-script_list_path = os.path.join(folder_paths.user_directory, "default", "ComfyUI-Manager", "startup-scripts", "install-scripts.txt")
+-pending_downloads_path = os.path.join(folder_paths.get_user_directory(), "default", "ComfyUI-Manager", "startup-scripts", "pending-downloads.json")
++script_list_path = os.path.join(manager_files_path, "startup-scripts", "install-scripts.txt")
++pending_downloads_path = os.path.join(manager_files_path, "startup-scripts", "pending-downloads.json")
+ pip_fixer = manager_util.PIPFixer(manager_util.get_installed_packages(), comfy_path, manager_files_path)
+ 
+ 
+@@ -579,7 +589,7 @@
+     return True       # prevent downgrade
+ 
+ 
+-if os.path.exists(restore_snapshot_path):
++if _protected_state and os.path.exists(restore_snapshot_path):
+     try:
+         cloned_repos = []
+ 
+@@ -830,13 +840,18 @@
+ 
+ 
+ # Check if script_list_path exists
+-if os.path.exists(script_list_path):
++if not _protected_state:
++    if os.path.exists(script_list_path):
++        print("[ComfyUI-Manager] Queued startup actions are not trusted on this ComfyUI version.")
++elif os.path.exists(script_list_path):
+     execute_startup_script()
+ 
+-process_pending_downloads()
++if _protected_state:
++    process_pending_downloads()
+ 
+ 
+-pip_fixer.fix_broken()
++if _protected_state:
++    pip_fixer.fix_broken()
+ 
+ del processed_install
+ del pip_fixer
+@@ -888,5 +903,5 @@
+         pass
+ 
+ 
+-if platform.system() == 'Windows':
++if platform.system() == 'Windows' and _protected_state:
+     check_windows_event_loop_policy()

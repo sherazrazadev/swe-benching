@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/mlflow-s3/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/mlflow-s3/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 67,
+ "duration_ms": 273685,
+ "total_cost_usd": 2.0587528,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "62436e29-a758-46b2-b456-fb8b41ceb83d",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 91609,
+   "outputTokens": 43396,
+   "cacheReadInputTokens": 4121984,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 2.0587528,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "Done. The fix is complete and the patch is written.\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/mlflow-s3/blind.patch` (367 lines, 6 files; applies cleanly with `patch -p1 --dry-run` to a fresh copy of `pristine`, and the applied tree is byte-identical to `app/`).\n\n**Five-line summary**\n1. Added `mlflow/gateway/upstream_policy.py`: refuses non-http(s)/credentialed URLs and any destination that is or resolves to a non-public address, refuses region/location tokens carrying non-label syntax, and validates supplied config maps/lists; `BuiltinDefault` distinguishes a shipped provider default from a user-supplied value.\n2. `create_gateway_secret` / `update_gateway_secret` validate `auth_config` and `secret_value` *before* writing, returning `INVALID_PARAMETER_VALUE` (400) and leaving existing rows untouched.\n3. `_aiohttp_post` validates the final request URL before any session is opened, exempting only an un-supplied `BuiltinDefault`, so stored/legacy/derived destinations are refused at connect time.\n4. `DatabricksProvider` validates the configured host before the SDK client is constructed and the resolved host before use, so the SDK\u2019s own pre-request contact cannot reach an internal address.\n5. `LiteLLMProvider` validates the merged auth-config/secret destination arguments before the external client call and the warm-up base before `urllib` opens a connection.\n\n**Mechanisms**\n- `upstream_policy.py` (new) \u2014 single policy: public-IP/host checks (incl. IPv4-mapped IPv6), DNS results, URL shape/credentials/port, region/location label syntax, supplied-config walker, `BuiltinDefault` marker.\n- `sqlalchemy_mixin.py` `create/update_gateway_secret` \u2014 supply-time refusal of address keys (`api_base`, `base_url`, `host`, \u2026), host-label keys (`vertex_location`, `aws_region_name`, \u2026) and URL-shaped unknown keys, before any persistence.\n- `openai_compatible.py` `_api_base` \u2014 returns configured base as a plain string, or the provider `DEFAULT_API_BASE` wrapped as `BuiltinDefault`.\n- `providers/utils.py` `_aiohttp_post` \u2014 connect-time `check_outbound_url` on the assembled URL unless the base is a `BuiltinDefault`; raises HTTP 400 before dialing.\n- `databricks.py` `_get_workspace_client`/`_api_base` \u2014 host validated (string or list) before `WorkspaceClient` construction and again on the resolved host.\n- `litellm.py` `_build_litellm_kwargs`/`_warm_up_upstream` \u2014 destination args in merged kwargs and the warm-up base validated before the client/`urllib` connects.\n\nVerification note: the full stack (fastapi/protobuf/litellm) isn\u2019t installed in this environment, so I could not run the hidden pytest groups locally. I validated the policy module with a standalone probe suite (`probe/test_policy.py`, all passing) covering every supplied/stored shape in the tests and the built-in-default exemption, and confirmed the patch applies cleanly to pristine.",
+ "status": "ok"
+}

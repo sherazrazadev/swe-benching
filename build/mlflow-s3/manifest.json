@@ -1,0 +1,258 @@
+{
+ "slug": "mlflow-s3",
+ "candidate": {
+  "advisory_ids": [
+   "GHSA-H7X2-H6G9-P789",
+   "CVE-2026-71211",
+   "PYSEC-2026-3865"
+  ],
+  "repo": "mlflow/mlflow",
+  "pinned_commit": "ee9f83604d715ff6b0ae453097c6bc90e784dc89",
+  "fix_commit": "96b7d900e14227e0821981409d86f5fb6c59b386",
+  "source": "injected"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "real HTTP routes POST /api/3.0/mlflow/gateway/secrets/{create,update}, POST /api/3.0/mlflow/gateway/{model-definitions,endpoints}/create, and POST /gateway/mlflow/v1/chat/completions",
+  "sites": [
+   "mlflow/gateway/providers/ollama.py:13 (shipped default)",
+   "mlflow/gateway/providers/openai_compatible.py:204-211 (_api_base selection)",
+   "mlflow/gateway/providers/vertex_ai.py:76-82,124-130 (location-composed host)",
+   "mlflow/gateway/providers/bedrock.py:494-502,607-609 (region-composed host)",
+   "mlflow/gateway/providers/utils.py:23-45 (_aiohttp_post egress)",
+   "mlflow/store/tracking/gateway/config_resolver.py:129,246 (config loader)",
+   "mlflow/store/tracking/gateway/sqlalchemy_mixin.py:169-316 (secret create/update)",
+   "mlflow/server/gateway_api.py:242-410 (provider config build and merge)",
+   "mlflow/gateway/providers/litellm.py:90-127 (external client and diagnostic)",
+   "mlflow/gateway/providers/databricks.py:102-133 (workspace client transport)"
+  ],
+  "routes": [
+   "POST /api/3.0/mlflow/gateway/secrets/create",
+   "POST /api/3.0/mlflow/gateway/secrets/update",
+   "GET /api/3.0/mlflow/gateway/secrets/get",
+   "GET /api/3.0/mlflow/gateway/secrets/list",
+   "POST /api/3.0/mlflow/gateway/model-definitions/create",
+   "POST /api/3.0/mlflow/gateway/endpoints/create",
+   "GET /api/3.0/mlflow/gateway/endpoints/get",
+   "POST /gateway/mlflow/v1/chat/completions"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/gateway/providers/test_litellm.py",
+   "tests/gateway/test_utils.py",
+   "tests/gateway/test_provider_registry.py"
+  ],
+  "local_results": {
+   "nop_injected_tree": "15 security failed, 9 functional passed",
+   "oracle": "15 security passed, 9 functional passed",
+   "check_patches": "12/12 behaved as declared"
+  }
+ },
+ "leak_terms": [
+  "api_base",
+  "openai_api_base",
+  "anthropic_api_base",
+  "auth_config",
+  "network_policy",
+  "sqlalchemy_mixin",
+  "openai_compatible",
+  "litellm",
+  "databricks",
+  "config_resolver",
+  "vertex_location",
+  "aws_region_name",
+  "warm_up"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_derived_host.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T2"
+  },
+  {
+   "patch": "sf_miss_connect.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T3"
+  },
+  {
+   "patch": "sf_miss_merged_secret.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T4"
+  },
+  {
+   "patch": "sf_miss_workspace_connect.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T5"
+  },
+  {
+   "patch": "sf_miss_legacy_alias.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "I1"
+  },
+  {
+   "patch": "sf_miss_warmup_connect.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "I3"
+  },
+  {
+   "patch": "sf_crash_as_refusal.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "crash"
+  },
+  {
+   "patch": "sf_wrong_value.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "wrong_object"
+  },
+  {
+   "patch": "sf_create_only.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "write_only_create"
+  },
+  {
+   "patch": "ff_block_default.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "lever": "T1"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_block_default.patch",
+  "crash_as_refusal": "sf_crash_as_refusal.patch",
+  "wrong_resource": "sf_wrong_value.patch",
+  "one_role_or_direction": "sf_create_only.patch",
+  "reads_only": "n/a: the protected path has no read/write pair; every guarded operation is a configuration write or an outbound call.",
+  "check_after_adjustment": "sf_miss_derived_host.patch",
+  "unlisted_route": "sf_miss_merged_secret.patch",
+  "malformed_identity": "sf_miss_derived_host.patch",
+  "missing_authority": "n/a: no role or authority lookup exists on this path; the destination comes from stored configuration, so there is no fail-open branch.",
+  "adjacent_api": "ff_block_default.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "coupled must-keep: an un-supplied shipped local default must keep being called, while a user-supplied value spelling the same address must be refused",
+   "where": "mlflow/gateway/providers/ollama.py:13; mlflow/gateway/providers/openai_compatible.py:204-211",
+   "security_tests": [
+    "security/test_shipped_default.py::test_supplied_address_matching_the_shipped_default_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_upstreams.py::test_shipped_local_default_is_still_called"
+   ],
+   "security_fail_patch": "ff_block_default.patch",
+   "security_fail_kind": "functional_fail (the miss is over-broad: the default is refused too)",
+   "realistic_because": "real, unmodified upstream default"
+  },
+  {
+   "id": "T2",
+   "shape": "host assembled from a location/region token: a non-URL value is interpolated into the host name",
+   "where": "mlflow/gateway/providers/vertex_ai.py:76-82,124-130; mlflow/gateway/providers/bedrock.py:494-502,607-609",
+   "security_tests": [
+    "security/test_derived_host.py::test_location_value_cannot_rewrite_the_host",
+    "security/test_derived_host.py::test_region_value_cannot_rewrite_the_host"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_upstreams.py::test_legitimate_region_and_location_names_are_accepted"
+   ],
+   "security_fail_patch": "sf_miss_derived_host.patch",
+   "realistic_because": "real, unmodified upstream host composition"
+  },
+  {
+   "id": "T3",
+   "shape": "stored configuration reloaded at connect time; a supply-only check never sees the row",
+   "where": "mlflow/store/tracking/gateway/config_resolver.py:129,246; mlflow/gateway/providers/utils.py:23-45",
+   "security_tests": [
+    "security/test_stored_destination.py::test_stored_internal_destination_is_never_dialed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_upstreams.py::test_public_configuration_round_trip",
+    "functional/test_endpoint_lifecycle.py::test_public_destination_is_used"
+   ],
+   "security_fail_patch": "sf_miss_connect.patch",
+   "realistic_because": "real, unmodified upstream store and loader"
+  },
+  {
+   "id": "T4",
+   "shape": "the encrypted secret map is merged over stored configuration and handed to an external client that opens its own connection",
+   "where": "mlflow/server/gateway_api.py:404-410; mlflow/gateway/providers/litellm.py:90-118",
+   "security_tests": [
+    "security/test_fallback_client.py::test_merged_secret_value_cannot_set_the_destination"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_fallback_and_diagnostics.py::test_public_destination_reaches_the_fallback_client"
+   ],
+   "security_fail_patch": "sf_miss_merged_secret.patch",
+   "realistic_because": "real, unmodified upstream merge and fallback client"
+  },
+  {
+   "id": "T5",
+   "shape": "a workspace client contacts its configured host before the shared request helper runs",
+   "where": "mlflow/gateway/providers/databricks.py:102-133",
+   "security_tests": [
+    "security/test_workspace_host.py::test_workspace_host_destination_is_refused",
+    "security/test_stored_destination.py::test_stored_workspace_destination_is_never_dialed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_upstreams.py::test_legitimate_workspace_host_is_accepted"
+   ],
+   "security_fail_patch": "sf_miss_workspace_connect.patch",
+   "realistic_because": "real, unmodified upstream workspace client transport"
+  },
+  {
+   "id": "I1",
+   "shape": "a legacy configuration name is mapped onto the current address name by the configuration loader after supply-time validation",
+   "where": "mlflow/store/tracking/gateway/config_resolver.py:25-35,129,246",
+   "security_tests": [
+    "security/test_legacy_alias.py::test_legacy_host_value_cannot_set_the_destination",
+    "security/test_stored_destination.py::test_stored_legacy_value_is_never_dialed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_fallback_and_diagnostics.py::test_legacy_public_host_value_is_used"
+   ],
+   "security_fail_patch": "sf_miss_legacy_alias.patch",
+   "realistic_because": "injected: a maintainer keeping pre-standardisation rows readable"
+  },
+  {
+   "id": "I3",
+   "shape": "an opt-in diagnostic dials the supplied destination directly, before the client call",
+   "where": "mlflow/gateway/providers/litellm.py:100-127",
+   "security_tests": [
+    "security/test_fallback_client.py::test_opt_in_warm_up_cannot_reach_an_internal_destination",
+    "security/test_stored_destination.py::test_stored_warm_up_destination_is_never_dialed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_fallback_and_diagnostics.py::test_warm_up_is_not_sent_without_the_flag"
+   ],
+   "security_fail_patch": "sf_miss_warmup_connect.patch",
+   "realistic_because": "injected: a maintainer adding a reachability warm-up behind an opt-in flag"
+  }
+ ],
+ "status": "gate-passed: static clean apart from the later blind patch; nop PASS; oracle 3/3 PASS; patches 12/12 PASS"
+}
