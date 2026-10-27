@@ -4,5 +4,5 @@ Started 2026-10-27T13:42Z. [run 40514332361](https://github.com/sherazrazadev/sw
 
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
-| `mjml-s3` | - | - | - | **running** |
-| `uri.js-s3` | - | - | - | **running** |
+| `mjml-s3` | sound | 1 | 1 | **REJECTED** |
+| `uri.js-s3` | sound | 0.7778 0.7778 0.7778 | 0.7778 0.4722 0.7778 | **in final checks** |
