@@ -1,42 +1,57 @@
 name: build
 # Build + gate prepared tasks on GitHub-hosted runners (one job per task), then trial the sound ones.
 # Same scripts as the VM: pipelines/sibling/6-build/run_pipeline.sh, or run_stack_pipeline.sh for stk-* slugs.
-# Results go to branch runs/<run id>; Harbor job folders stay in the run's artifacts.
+# Results go to branch runs/<run id>; Harbor job folders stay in the run's artifacts. Each batch is recorded in
+# reports/actions/ on main (tasks.tsv, batch-NN.md, README.md). With chain on, the next batch from
+# reports/actions/queue.txt starts when this one ends (cancel a run to stop the chain).
 on:
   workflow_dispatch:
     inputs:
-      slugs: { description: "comma-separated slugs (each needs build/<slug>/BUILD-PROMPT.md)", required: true }
+      slugs: { description: "comma-separated slugs (each needs build/<slug>/BUILD-PROMPT.md); empty = next from reports/actions/queue.txt", default: "" }
+      chain: { description: "when this batch ends, start the next one from the queue", type: boolean, default: false }
       driver: { description: "builder model (sibling builds)", type: choice, options: [deepseek, mimo], default: deepseek }
       trials: { description: "trial the sound tasks after the builds", type: boolean, default: true }
       models: { description: "trial models", default: "deepseek,mimo" }
       runs: { description: "trial runs per model", default: "3" }
-      max_parallel: { description: "runners at once", default: "7" }
+      max_parallel: { description: "runners at once (and tasks per batch from the queue)", default: "7" }
       build_hours: { description: "builder time limit in hours (job cap is 6 h incl. the gate)", default: "4" }
       gate_slots: { description: "gate Harbor runs at once per runner (2 for heavy Java/Gradle repos: 16 GB RAM)", default: "4" }
 permissions:
   contents: write
-  actions: read
+  actions: write   # the chain dispatches the next batch
 
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    outputs: { slugs: "${{ steps.p.outputs.slugs }}" }
+    outputs: { slugs: "${{ steps.p.outputs.slugs }}", batch: "${{ steps.p.outputs.batch }}" }
     steps:
       - uses: actions/checkout@v4
       - id: p
-        env: { SLUGS: "${{ inputs.slugs }}" }
+        env: { SLUGS: "${{ inputs.slugs }}", N: "${{ inputs.max_parallel }}", RUN: "${{ github.run_id }}" }
         run: |
-          bad=0; out=()
-          for s in $(echo "$SLUGS" | tr ', ' '\n\n'); do
-            [ -f "build/$s/BUILD-PROMPT.md" ] || { echo "::error::$s has no build/$s/BUILD-PROMPT.md"; bad=1; }
-            [ -f "build/$s/pipeline.log" ] && { echo "::error::$s already has build/$s/pipeline.log (run_pipeline.sh would skip it)"; bad=1; }
-            out+=("$s")
+          # Claim the tasks in reports/actions/tasks.tsv on main before building, so no other batch takes them.
+          git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for try in 1 2 3 4 5; do
+            git fetch -q origin main && git reset -q --hard FETCH_HEAD
+            s=$(echo "${SLUGS:-$(python3 -I common/ci/batches.py pick "$N")}" | tr ', ' '\n\n' | grep . | paste -sd, -)
+            if [ -z "$s" ]; then echo "queue empty: nothing to build" | tee -a "$GITHUB_STEP_SUMMARY"; echo "slugs=[]" >> "$GITHUB_OUTPUT"; exit 0; fi
+            bad=0
+            for x in ${s//,/ }; do
+              [ -f "build/$x/BUILD-PROMPT.md" ] || { echo "::error::$x has no build/$x/BUILD-PROMPT.md"; bad=1; }
+              [ -f "build/$x/pipeline.log" ] && { echo "::error::$x already has build/$x/pipeline.log (run_pipeline.sh would skip it)"; bad=1; }
+            done
+            [ "$bad" = 0 ] || exit 1
+            b=$(python3 -I common/ci/batches.py claim "$s" "$RUN")
+            git add reports/actions && git commit -q -m "Actions batch $b: claim $s" && git push -q origin HEAD:main && break
+            [ "$try" = 5 ] && exit 1; sleep $((RANDOM % 20 + 5))
           done
-          [ "$bad" = 0 ] || exit 1
-          echo "slugs=$(printf '%s\n' "${out[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          echo "batch $b: $s" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "batch=$b" >> "$GITHUB_OUTPUT"
+          echo "slugs=$(echo "$s" | tr ',' '\n' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
+    if: needs.plan.outputs.slugs != '[]'
     name: build ${{ matrix.slug }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
@@ -117,10 +132,39 @@ jobs:
     secrets: inherit
 
   collect:
-    needs: [build, trials]
+    needs: [plan, build, trials]
     if: always() && needs.build.result != 'skipped'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/collect
         with: { token: "${{ github.token }}" }
+      - name: Record the batch in reports/actions (main)
+        env:
+          SLUGS: ${{ join(fromJSON(needs.plan.outputs.slugs), ',') }}
+          BATCH: ${{ needs.plan.outputs.batch }}
+          RUN: ${{ github.run_id }}
+        run: |
+          python3 -I common/ci/batches.py summarize "$SLUGS" > /tmp/batch.json   # from the collected results
+          jq -r '.[] | "\(.slug): \(.status) (DeepSeek \(.deepseek), MiMo \(.mimo))"' /tmp/batch.json | tee -a "$GITHUB_STEP_SUMMARY"
+          git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for try in 1 2 3 4 5; do
+            git fetch -q origin main && git reset -q --hard FETCH_HEAD
+            python3 -I common/ci/batches.py record /tmp/batch.json --run "$RUN" --batch "$BATCH" --repo "$GITHUB_REPOSITORY"
+            git add reports/actions && git commit -q -m "Actions batch $BATCH: results" && git push -q origin HEAD:main && break
+            [ "$try" = 5 ] && exit 1; sleep $((RANDOM % 20 + 5))
+          done
+
+  next:
+    needs: [plan, collect]
+    if: ${{ !cancelled() && inputs.chain && needs.plan.outputs.slugs != '' && needs.plan.outputs.slugs != '[]' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Start the next batch from the queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          I: ${{ toJSON(inputs) }}
+        run: |
+          gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref main -f chain=true \
+            $(echo "$I" | jq -r 'to_entries[] | select(.key | IN("slugs","chain") | not) | "-f \(.key)=\(.value)"')
+          echo "next batch dispatched" | tee -a "$GITHUB_STEP_SUMMARY"

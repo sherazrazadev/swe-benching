@@ -13,6 +13,12 @@ the run's `jobs-*` artifacts (30 days; dependency folders such as `node_modules`
 `build-*` / `trial-*` artifacts hold only repo files, so trials and collect download little. If a run's own collect
 failed, run the `collect` workflow with its run id. Verdicts are not made in CI: they stay with `trial.py` records and `audit_results.py`.
 
+**Batches and the queue:** every `build` run is a batch recorded on `main` in `reports/actions/` (`README.md` totals and
+accepted tasks, `batch-NN.md`, `tasks.tsv`). Leave `slugs` empty to take the next `max_parallel` slugs of
+`reports/actions/queue.txt`; turn `chain` on and each batch starts the next when it ends, until the queue is empty
+(cancel the running batch to stop). A task is claimed in `tasks.tsv` before it builds and never picked again
+(`common/ci/batches.py`).
+
 **Inputs:** a slug must have `build/<slug>/BUILD-PROMPT.md` committed (prepare it on the VM/Mac as usual) and no
 `build/<slug>/pipeline.log` yet. A trial-only run needs `build/<slug>/.sound` and `tasks/<slug>/` committed, or a
 `build_run` id whose `build-<slug>` artifact has them.
