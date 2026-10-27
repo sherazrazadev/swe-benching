@@ -1,0 +1,58 @@
+name: regrade
+# Re-grade the SAVED failing runs of a separate-mode task (no new model run): rebuild the task's verifier image from
+# tasks/<slug>/tests (optionally after a test fix), restore each run's saved /workspace, run tests/test.sh as Harbor does.
+# Runs twice: unchanged tests (control: must reproduce the original rewards) and with the fix.
+on:
+  workflow_dispatch:
+    inputs:
+      slug: { description: "task slug", required: true }
+      run: { description: "run id whose branch runs/<id> holds the task and whose artifacts hold the trials", required: true }
+      fix: { description: "patch (path on main) applied to the task for the fixed pass, e.g. reports/actions/fixes/x.patch", required: true }
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  regrade:
+    name: regrade ${{ inputs.slug }} (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: { mode: [control, fixed] }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Task files from branch runs/<run> (+ the fix)
+        env: { FIX: "${{ inputs.fix }}", MODE: "${{ matrix.mode }}" }
+        run: |
+          git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
+          if [ "$MODE" = fixed ]; then git apply "$FIX" && git diff --stat; fi
+      - uses: actions/download-artifact@v4
+        with: { pattern: "*trial-${{ inputs.slug }}-*", path: /tmp/art, run-id: "${{ inputs.run }}", github-token: "${{ github.token }}" }
+      - name: Re-grade each saved failing run
+        env: { SLUG: "${{ inputs.slug }}", MODE: "${{ matrix.mode }}" }
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
+          python3 -I common/ci/ci.py collect /tmp/art --jobs
+          docker build -q -t "verifier-$SLUG" "tasks/$SLUG/tests" >/dev/null
+          echo "| Run | Original reward | $MODE reward | Failed tests |" >> "$GITHUB_STEP_SUMMARY"; echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          python3 -I -c 'import json,sys
+          for m in ("deepseek","mimo"):
+              try: runs=json.load(open(f"build/{sys.argv[1]}/trial_detail_{m}.json"))["runs"]
+              except OSError: continue
+              for r in runs:
+                  if r.get("reward") is not None and r["reward"] != 1.0: print(r["job"], r["reward"])' "$SLUG" > /tmp/runs.txt
+          while read -r job orig; do
+            t=$(ls -d "$HOME/.tb-graders/cwe/jobs/$job"/*/ | head -1)
+            w=$(mktemp -d); l=$(mktemp -d); cp -a "$t/artifacts/workspace/." "$w/"
+            timeout 2400 docker run --rm --network none --cpus 2 --memory 4g -v "$w:/workspace" -v "$PWD/tasks/$SLUG/tests:/tests:ro" \
+              -v "$l:/logs/verifier" "verifier-$SLUG" bash /tests/test.sh > "$l/stdout.txt" 2>&1 || true
+            new=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reward"])' "$l/reward.json" 2>/dev/null || echo "none")
+            failed=$(grep -rhoE '<testcase [^>]*name="[^"]+"[^>]*>\s*<(failure|error)' "$l" 2>/dev/null | grep -oE 'name="[^"]+"' | tr '\n' ' ')
+            echo "$job $MODE: $orig -> $new  $failed"
+            echo "| $job | $orig | **$new** | $failed |" >> "$GITHUB_STEP_SUMMARY"
+            mkdir -p "/tmp/out/$job"; cp -a "$l/." "/tmp/out/$job/"
+          done < /tmp/runs.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "regrade-${{ inputs.slug }}-${{ matrix.mode }}", path: /tmp/out, retention-days: 30 }
