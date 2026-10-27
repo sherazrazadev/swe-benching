@@ -9,7 +9,9 @@ one runner per trial run. Up to `max_parallel` (default 7) runners at once.
 | `trial` | `common/trial/trial.py <slug> --models <m> --first-run <n> --max-runs 1 --no-verdict` per (task, model, run). Run 1 first; runs 2..N only for tasks no model solved in run 1 |
 
 Both push their results to branch `runs/<run id>` (never to `main`). Harbor job folders (gate-jobs, trial jobs) are only in
-the run's artifacts (30 days). Verdicts are not made in CI: they stay with `trial.py` records and `audit_results.py`.
+the run's `jobs-*` artifacts (30 days; dependency folders such as `node_modules`, `.venv`, `target` left out). The
+`build-*` / `trial-*` artifacts hold only repo files, so trials and collect download little. If a run's own collect
+failed, run the `collect` workflow with its run id. Verdicts are not made in CI: they stay with `trial.py` records and `audit_results.py`.
 
 **Inputs:** a slug must have `build/<slug>/BUILD-PROMPT.md` committed (prepare it on the VM/Mac as usual) and no
 `build/<slug>/pipeline.log` yet. A trial-only run needs `build/<slug>/.sound` and `tasks/<slug>/` committed, or a
@@ -23,7 +25,8 @@ gh run download <run id> -D /tmp/art && python3 -I common/ci/ci.py collect /tmp/
 ```
 
 **Runner differences from the VM:** the project root is `/home/mara/cwe-bench` via a symlink (BUILD-PROMPTs name it);
-`GATE_GLOBAL_SLOTS=4` (VM 60); builder limit `build_hours` (default 4 h, VM 5 h) because a job stops at 6 h. A build
+`GATE_GLOBAL_SLOTS=4` (VM 60; build input `gate_slots`, use 2 for heavy Java/Gradle repos: a 16 GB runner
+running out of memory is shut down with no artifact); builder limit `build_hours` (default 4 h, VM 5 h) because a job stops at 6 h. A build
 cut by that cap is re-run on the VM, as in the 2026-10-22 precision_validation rule.
 
 Secrets: `DEEPSEEK_API_KEY` (required), `MIMO_API_KEY` (MiMo trials).

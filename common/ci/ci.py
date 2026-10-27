@@ -31,11 +31,14 @@ TB = Path.home() / ".tb-graders" / "cwe"
 LOGS = {".log", ".tsv", ".jsonl"}   # append-only files: merge new lines, never overwrite
 SKIP_DIRS = {".git", ".github", "common", "__pycache__"}
 MAX_FILE = 50 * 1024 * 1024
+# dependency/build folders inside Harbor job folders: hundreds of thousands of files, not needed for audits
+JOB_SKIP = {".git", "node_modules", ".venv", "venv", "site-packages", ".gradle", ".m2", ".cache", ".npm",
+            ".pnpm-store", "target", "__pycache__"}
 
 
-def newer_files(base, mark):
+def newer_files(base, mark, skip=frozenset({"__pycache__"})):
     for dp, dns, fns in os.walk(base):
-        dns[:] = [d for d in dns if d not in SKIP_DIRS] if Path(dp) == ROOT else [d for d in dns if d != "__pycache__"]
+        dns[:] = [d for d in dns if d not in (SKIP_DIRS if Path(dp) == ROOT else skip)]
         for fn in fns:
             p = Path(dp) / fn
             try:
@@ -61,7 +64,7 @@ def scrub(path, keys):
 def pack(kind, slug, out, model=None, run=None):
     mark = Path(os.environ.get("CI_MARK_FILE", "/tmp/ci_mark")).stat().st_mtime   # touched when the job's work starts
     keys = [os.environ[k].encode() for k in ("DEEPSEEK_API_KEY", "MIMO_API_KEY") if len(os.environ.get(k, "")) > 8]
-    stage = Path(tempfile.mkdtemp())
+    stage, jstage = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
     n = 0
     for p in newer_files(ROOT, mark):
         dst = stage / "repo" / p.relative_to(ROOT)
@@ -73,21 +76,26 @@ def pack(kind, slug, out, model=None, run=None):
     if jobs_root.is_dir():
         for d in jobs_root.iterdir():
             if d.name.startswith(prefix) and d.is_dir():
-                for p in newer_files(d, 0):
-                    dst = stage / "tb" / jobs_root.name / p.relative_to(jobs_root)
+                for p in newer_files(d, 0, JOB_SKIP):
+                    dst = jstage / "tb" / jobs_root.name / p.relative_to(jobs_root)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p, dst)
                     m += 1
-    for p in stage.rglob("*"):
-        if p.is_file():
-            scrub(p, keys)
-    (stage / "meta.json").write_text(json.dumps({"kind": kind, "slug": slug, "model": model, "run": run,
-                                                 "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                                 "repo_files": n, "job_files": m}))
-    with tarfile.open(out, "w:gz") as t:
-        t.add(stage, arcname=".")
-    shutil.rmtree(stage)
-    print(f"packed {kind} {slug}: {n} repo files, {m} job files -> {out}")
+    # repo files -> <out> (small: what trials and collect need); Harbor job folders -> jobs-<out name> (audits only)
+    meta = json.dumps({"kind": kind, "slug": slug, "model": model, "run": run,
+                       "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo_files": n, "job_files": m})
+    jout = Path(out).with_name("jobs-" + Path(out).name)
+    for st, o in ((stage, Path(out)), (jstage, jout)):
+        for p in st.rglob("*"):
+            if p.is_file():
+                scrub(p, keys)
+        if st is jstage and not m:
+            break
+        (st / "meta.json").write_text(meta)
+        with tarfile.open(o, "w:gz") as t:
+            t.add(st, arcname=".")
+    shutil.rmtree(stage); shutil.rmtree(jstage)
+    print(f"packed {kind} {slug}: {n} repo files -> {out}; {m} job files -> {jout if m else '-'}")
 
 
 def merge_lines(src, dst):
@@ -110,10 +118,11 @@ def merge_detail(src, dst):
     dst.write_text(json.dumps(a, indent=1))
 
 
-def unpack(tgz):
+def unpack(tgz, jobs=False):
     d = Path(tempfile.mkdtemp())
     with tarfile.open(tgz) as t:
-        t.extractall(d, filter="data")
+        # older packs carry the job folders inside: leave them packed unless asked for
+        t.extractall(d, members=(m for m in t if jobs or not m.name.startswith(("./tb/", "tb/"))), filter="data")
     return d
 
 
@@ -121,9 +130,15 @@ def artifacts(where):
     return sorted(Path(where).rglob("*.tgz"), key=lambda p: (not p.name.startswith("build-"), p.name))
 
 
+def is_jobs(tgz):
+    return tgz.name.startswith("jobs-")
+
+
 def collect(where, jobs):
     for tgz in artifacts(where):
-        d = unpack(tgz)
+        if is_jobs(tgz) and not jobs:
+            continue
+        d = unpack(tgz, jobs)
         meta = json.loads((d / "meta.json").read_text())
         task_dirs = (f"build/{meta['slug']}/", f"tasks/{meta['slug']}/")
         c = 0

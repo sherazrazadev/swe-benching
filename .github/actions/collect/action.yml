@@ -1,26 +1,37 @@
 name: collect
-description: Merge this run's build/trial artifacts into the checkout and push them to branch runs/<run id> (never to main).
+description: Merge a run's build/trial artifacts into the checkout and push them to branch runs/<run id> (never to main).
 inputs:
+  run_id: { required: false, default: "" }      # run whose results to collect; empty = this run
   build_run: { required: false, default: "" }   # another run whose build-* artifacts the trials used
   token: { required: true }
 runs:
   using: composite
   steps:
-    - name: Build artifacts of the run the trials came from
-      if: inputs.build_run != '' && inputs.build_run != github.run_id
-      uses: actions/download-artifact@v4
-      with: { pattern: "build-*", path: /tmp/art, run-id: "${{ inputs.build_run }}", github-token: "${{ inputs.token }}" }
-    - name: This run's artifacts
-      uses: actions/download-artifact@v4
-      with: { path: /tmp/art }
-    - name: Merge and push
+    - name: Download space
+      id: d
       shell: bash
       run: |
-        [ -d /tmp/art ] || { echo "no artifacts"; exit 0; }
-        python3 -I common/ci/ci.py collect /tmp/art
+        # older build-* artifacts carry the gate-job folders inside (GBs): download on the larger disk
+        sudo mkdir -p /mnt/art && sudo chown "$USER" /mnt/art
+        echo "run=${{ inputs.run_id || github.run_id }}" >> "$GITHUB_OUTPUT"
+    - name: Build artifacts of the run the trials came from
+      if: inputs.build_run != '' && inputs.build_run != steps.d.outputs.run
+      uses: actions/download-artifact@v4
+      with: { pattern: "build-*", path: /mnt/art, run-id: "${{ inputs.build_run }}", github-token: "${{ inputs.token }}" }
+    - name: Build artifacts
+      uses: actions/download-artifact@v4
+      with: { pattern: "build-*", path: /mnt/art, run-id: "${{ steps.d.outputs.run }}", github-token: "${{ inputs.token }}" }
+    - name: Trial artifacts
+      uses: actions/download-artifact@v4
+      with: { pattern: "trial-*", path: /mnt/art, run-id: "${{ steps.d.outputs.run }}", github-token: "${{ inputs.token }}" }
+    - name: Merge and push
+      shell: bash
+      env: { RUN: "${{ steps.d.outputs.run }}" }
+      run: |
+        python3 -I common/ci/ci.py collect /mnt/art
         git add -A -- build tasks pipelines reports
         if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
         git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-          commit -q -m "CI results: ${{ github.workflow }} run ${{ github.run_id }}"
-        git push -q origin "HEAD:refs/heads/runs/${{ github.run_id }}"
-        echo "results pushed to branch runs/${{ github.run_id }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          commit -q -m "CI results: run $RUN"
+        git push -q origin "HEAD:refs/heads/runs/$RUN"
+        echo "results pushed to branch runs/$RUN" | tee -a "$GITHUB_STEP_SUMMARY"
