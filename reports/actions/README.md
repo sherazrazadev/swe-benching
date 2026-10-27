@@ -26,4 +26,4 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 |---|---|---|---|---|---|---|---|
 | [`jenkins-s3`](verdicts/jenkins-s3.md) | 2 | CWE-502 | Java | https://github.com/jenkinsci/jenkins | 0.6 0.6 0.6 | 0 0 0 | A submitted configuration document can make the controller instantiate and keep objects of a type the configured setting does not hold, and can recreate internal request-routing and plugin objects. |
 
-Files: `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `verdicts/` (final verdict of each accepted task), `audits/` (every failing run's audit), `queue.txt` (what to build next).
+Files: `RESULTS.md` (each accepted task: what it is, how the models failed, why it is fair; task files in `tasks/<slug>/`), `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `verdicts/` (final verdict of each accepted task), `audits/` (every failing run's audit), `queue.txt` (what to build next).

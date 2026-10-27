@@ -335,7 +335,7 @@ def write_readme(rows, gh_repo):
             "|---|---|---|---|---|---|---|---|"]
     out += [f"| [`{r['slug']}`](verdicts/{r['slug']}.md) | {r['batch']} | {r['cwe']} | {r['language']} | {r['repo']} | "
             f"{r['deepseek']} | {r['mimo']} | {r['description']} |" for r in acc]
-    out += ["", "Files: `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `verdicts/` (final verdict of each "
+    out += ["", "Files: `RESULTS.md` (each accepted task: what it is, how the models failed, why it is fair; task files in `tasks/<slug>/`), `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `verdicts/` (final verdict of each "
             "accepted task), `audits/` (every failing run's audit), `queue.txt` (what to build next)."]
     (REP / "README.md").write_text("\n".join(out) + "\n")
 
