@@ -4,11 +4,11 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 
 **Accepted** = gate sound and both models failed all 3 runs (no run at 1.0). Each accepted task then gets the final verdict steps: an audit of every failing run (Claude Opus, `common/audit/postmortem.py`) and the fairness review (DeepSeek, `pipelines/sibling/9-fairness`). **FINAL BREAKER** = fairness READY and every failing run audited trustworthy: these are the tasks to share. **NEEDS HUMAN DECISION** = the same, but the fairness review asked a person a question (answer in `build/<slug>/HUMAN-DECISION.md`). **NEEDS FIX** = a fault was found (fairfix, GUIDE step 10). **NEEDS RE-RUN** = no fault, but a run was excluded (provider/infra) so a model needs another trial. **PENDING** = a step has not finished.
 
-## Totals (15 tasks)
+## Totals (17 tasks)
 
 | accepted | rejected | unsound | running |
 |---|---|---|---|
-| 4 | 3 | 1 | 7 |
+| 4 | 9 | 2 | 2 |
 
 ## Batches
 
@@ -17,7 +17,8 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 | [1](batch-01.md) | 2026-10-26T20:05Z | 1 | 0 | 1 | 0 | 0 | 0 | [40392574291](https://github.com/sherazrazadev/swe-benching/actions/runs/40392574291) |
 | [2](batch-02.md) | 2026-10-26T22:41Z | 7 | 4 | 1 | 1 | 1 | 0 | [40414311131](https://github.com/sherazrazadev/swe-benching/actions/runs/40414311131) |
 | [3](batch-03.md) | 2026-10-27T01:40Z | 1 | 0 | 1 | 0 | 0 | 0 | [40433928167](https://github.com/sherazrazadev/swe-benching/actions/runs/40433928167) |
-| [4](batch-04.md) | 2026-10-27T09:45Z | 7 | 0 | 0 | 0 | 0 | 7 | [40483249820](https://github.com/sherazrazadev/swe-benching/actions/runs/40483249820) |
+| [4](batch-04.md) | 2026-10-27T09:45Z | 7 | 0 | 6 | 1 | 0 | 0 | [40483249820](https://github.com/sherazrazadev/swe-benching/actions/runs/40483249820) |
+| [5](batch-05.md) | 2026-10-27T13:42Z | 2 | 0 | 0 | 0 | 0 | 2 | [40514332361](https://github.com/sherazrazadev/swe-benching/actions/runs/40514332361) |
 
 ## Accepted tasks (4: 2 NEEDS FIX, 1 NEEDS HUMAN DECISION, 1 NEEDS RE-RUN)
 
