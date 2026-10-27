@@ -1,0 +1,367 @@
+diff -ruN -x libs pristine/mlflow/gateway/providers/databricks.py app/mlflow/gateway/providers/databricks.py
+--- a/mlflow/gateway/providers/databricks.py	2026-10-26 23:12:40.000000000 +0000
++++ b/mlflow/gateway/providers/databricks.py	2026-10-26 23:31:22.768039436 +0000
+@@ -101,6 +101,25 @@
+ 
+     def _get_workspace_client(self):
+         if self._workspace_client is None:
++            from fastapi import HTTPException
++
++            from mlflow.gateway.upstream_policy import DestinationRefused, check_url
++
++            # The SDK contacts the configured host while it is built, so the host
++            # has to be cleared before that constructor runs.
++            configured_host = self._provider_config.host
++            if isinstance(configured_host, (list, tuple)):
++                hosts = configured_host
++            else:
++                hosts = [configured_host]
++            for candidate in hosts:
++                if candidate is None:
++                    continue
++                try:
++                    check_url(candidate, field="host")
++                except DestinationRefused as e:
++                    raise HTTPException(status_code=400, detail=str(e)) from e
++
+             from databricks.sdk import WorkspaceClient
+ 
+             # Pass only non-None fields to WorkspaceClient; omitted fields
+@@ -111,8 +130,16 @@
+ 
+     @property
+     def _api_base(self) -> str:
++        from fastapi import HTTPException
++
++        from mlflow.gateway.upstream_policy import DestinationRefused, check_url
++
+         client = self._get_workspace_client()
+         host = client.config.host.rstrip("/")
++        try:
++            check_url(host, field="host")
++        except DestinationRefused as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+         return normalize_databricks_base_url(host)
+ 
+     def get_endpoint_url(self, route_type: str) -> str:
+diff -ruN -x libs pristine/mlflow/gateway/providers/litellm.py app/mlflow/gateway/providers/litellm.py
+--- a/mlflow/gateway/providers/litellm.py	2026-10-26 23:12:40.000000000 +0000
++++ b/mlflow/gateway/providers/litellm.py	2026-10-26 23:31:09.273943049 +0000
+@@ -90,6 +90,26 @@
+     def adapter_class(self):
+         return LiteLLMAdapter
+ 
++    # Arguments that tell the client library where to open its connection.
++    _DESTINATION_ARGUMENTS = ("api_base", "base_url", "host")
++
++    @classmethod
++    def _refuse_private_destinations(cls, values: dict[str, Any]) -> None:
++        from fastapi import HTTPException
++
++        from mlflow.gateway.upstream_policy import DestinationRefused, check_url
++
++        for key in cls._DESTINATION_ARGUMENTS:
++            value = values.get(key)
++            candidates = value if isinstance(value, (list, tuple)) else [value]
++            for candidate in candidates:
++                if candidate is None:
++                    continue
++                try:
++                    check_url(candidate, field=key)
++                except DestinationRefused as e:
++                    raise HTTPException(status_code=400, detail=str(e)) from e
++
+     def _build_litellm_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
+         kwargs = {**payload}
+ 
+@@ -98,6 +118,7 @@
+ 
+         # The warm-up flag is an MLflow-side option, not a client argument.
+         kwargs.pop("warm_up", None)
++        self._refuse_private_destinations(kwargs)
+         return kwargs
+ 
+     def _warm_up_upstream(self) -> None:
+@@ -110,6 +131,14 @@
+             return
+         import urllib.request
+ 
++        from fastapi import HTTPException
++
++        from mlflow.gateway.upstream_policy import DestinationRefused, check_url
++
++        try:
++            check_url(api_base, field="api_base")
++        except DestinationRefused as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+         try:
+             request = urllib.request.Request(api_base.rstrip("/") + "/models")
+             urllib.request.urlopen(request, timeout=2).close()
+diff -ruN -x libs pristine/mlflow/gateway/providers/openai_compatible.py app/mlflow/gateway/providers/openai_compatible.py
+--- a/mlflow/gateway/providers/openai_compatible.py	2026-10-26 23:12:40.000000000 +0000
++++ b/mlflow/gateway/providers/openai_compatible.py	2026-10-26 23:31:01.930893749 +0000
+@@ -18,6 +18,7 @@
+ )
+ from mlflow.gateway.providers.utils import send_request, send_stream_request
+ from mlflow.gateway.schemas import chat, embeddings
++from mlflow.gateway.upstream_policy import BuiltinDefault
+ from mlflow.gateway.utils import stream_sse_data
+ 
+ 
+@@ -202,7 +203,11 @@
+ 
+     @property
+     def _api_base(self) -> str:
+-        return getattr(self._provider_config, "api_base", None) or self.DEFAULT_API_BASE
++        configured = getattr(self._provider_config, "api_base", None)
++        if configured:
++            return configured
++        # No address was configured, so this is the provider's shipped default.
++        return BuiltinDefault(self.DEFAULT_API_BASE)
+ 
+     @property
+     def _api_key(self) -> str:
+diff -ruN -x libs pristine/mlflow/gateway/providers/utils.py app/mlflow/gateway/providers/utils.py
+--- a/mlflow/gateway/providers/utils.py	2026-10-26 23:12:40.000000000 +0000
++++ b/mlflow/gateway/providers/utils.py	2026-10-26 23:30:56.650858311 +0000
+@@ -6,6 +6,11 @@
+ from mlflow.gateway.constants import (
+     MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS,
+ )
++from mlflow.gateway.upstream_policy import (
++    BuiltinDefault,
++    DestinationRefused,
++    check_outbound_url,
++)
+ from mlflow.utils.uri import append_to_uri_path
+ 
+ # Accumulates the total time (ms) spent waiting for provider HTTP responses in the current
+@@ -21,12 +26,19 @@
+ @asynccontextmanager
+ async def _aiohttp_post(headers: dict[str, str], base_url: str, path: str, payload: dict[str, Any]):
+     import aiohttp
++    from fastapi import HTTPException
+ 
+     # Drop any client Accept-Encoding (any casing) so we send only one value; otherwise
+     # aiohttp may send both and upstream can respond with Brotli, which is not supported.
+     request_headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+     request_headers["Accept-Encoding"] = SUPPORTED_ACCEPT_ENCODING
+     url = append_to_uri_path(base_url, path)
++    # A provider's own shipped default may be local; anything else must be public.
++    if not isinstance(base_url, BuiltinDefault):
++        try:
++            check_outbound_url(url)
++        except DestinationRefused as e:
++            raise HTTPException(status_code=400, detail=str(e)) from e
+     async with aiohttp.ClientSession(headers=request_headers) as session:
+         timeout = aiohttp.ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS)
+         async with session.post(url, json=payload, timeout=timeout) as response:
+diff -ruN -x libs pristine/mlflow/gateway/upstream_policy.py app/mlflow/gateway/upstream_policy.py
+--- a/mlflow/gateway/upstream_policy.py	1970-01-01 00:00:00.000000000 +0000
++++ b/mlflow/gateway/upstream_policy.py	2026-10-26 23:30:53.465837217 +0000
+@@ -0,0 +1,164 @@
++"""Outbound destination policy for gateway provider calls.
++
++A gateway endpoint calls a model provider at a destination that is built from
++that endpoint's configuration.  Only publicly routable destinations may be
++contacted, whether the value was submitted by a user or was already stored.
++"""
++
++import ipaddress
++import re
++import socket
++from urllib.parse import urlsplit
++
++_PUBLIC_SCHEMES = frozenset({"http", "https"})
++
++# Configuration keys that hold an outbound address in one piece.
++_ADDRESS_KEYS = frozenset(
++    {
++        "api_base",
++        "base_url",
++        "endpoint",
++        "hf_server_url",
++        "host",
++        "model_server_url",
++        "openai_api_base",
++        "proxy_url",
++        "server_url",
++    }
++)
++
++# Configuration keys whose value becomes a label inside a provider host name.
++_HOST_LABEL_KEYS = frozenset(
++    {
++        "aws_region",
++        "aws_region_name",
++        "location",
++        "region",
++        "vertex_location",
++        "workspace_region",
++    }
++)
++
++# A region/location token is a DNS label, never URL syntax.
++_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
++
++
++class DestinationRefused(ValueError):
++    """A supplied or stored destination is not publicly routable."""
++
++
++class BuiltinDefault(str):
++    """A base URL shipped by the product for a provider, not supplied by a user.
++
++    Instances are marked so the connect-time guard can tell a provider's own
++    built-in default (which may be a local address) from a configured value.
++    """
++
++
++def _address_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
++    if address.version == 6 and address.ipv4_mapped is not None:
++        address = address.ipv4_mapped
++    return address.is_global and not address.is_multicast
++
++
++def _host_is_public(host: str) -> bool:
++    """Whether ``host`` names only publicly routable addresses.
++
++    A name that cannot be resolved here is treated as public: it is not known to
++    be internal, and the eventual connection reports any real failure.
++    """
++    host = host.strip()
++    if host.startswith("[") and host.endswith("]"):
++        host = host[1:-1]
++    try:
++        return _address_is_public(ipaddress.ip_address(host))
++    except ValueError:
++        pass
++    try:
++        infos = socket.getaddrinfo(host, None)
++    except (socket.gaierror, UnicodeError, OSError):
++        return True
++    if not infos:
++        return True
++    for info in infos:
++        try:
++            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
++        except ValueError:
++            return False
++        if not _address_is_public(address):
++            return False
++    return True
++
++
++def check_url(value: object, *, field: str) -> str:
++    """Raise `DestinationRefused` unless ``value`` is an http(s) public URL."""
++    if not isinstance(value, str) or not value.strip():
++        raise DestinationRefused(f"{field} must be a non-empty http(s) URL")
++    candidate = value.strip()
++    try:
++        parts = urlsplit(candidate)
++        hostname = parts.hostname
++        port = parts.port
++    except ValueError as e:
++        raise DestinationRefused(f"{field} is not a valid URL: {e}") from e
++    if parts.scheme.lower() not in _PUBLIC_SCHEMES:
++        raise DestinationRefused(f"{field} must use http or https")
++    if not hostname:
++        raise DestinationRefused(f"{field} must name a host")
++    if parts.username is not None or parts.password is not None:
++        raise DestinationRefused(f"{field} must not embed credentials")
++    if port is not None and not 0 < port < 65536:
++        raise DestinationRefused(f"{field} has an invalid port")
++    if not _host_is_public(hostname):
++        raise DestinationRefused(f"{field} must name a publicly routable host")
++    return candidate
++
++
++def check_host_label(value: object, *, field: str) -> None:
++    """Raise `DestinationRefused` unless ``value`` is a plain region/location name.
++
++    These names are spliced into provider host names, so a value carrying URL
++    syntax would move the request to a different host.
++    """
++    if not isinstance(value, str) or not _LABEL_RE.match(value):
++        raise DestinationRefused(f"{field} must be a valid region or location name")
++
++
++def _check_entry(key: str, value: object) -> None:
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            _check_entry(key, item)
++        return
++    if isinstance(value, dict):
++        # Nested configuration blocks (e.g. aws_config) carry their own keys.
++        for nested_key, nested_value in value.items():
++            _check_entry(nested_key, nested_value)
++        return
++    if key in _HOST_LABEL_KEYS:
++        check_host_label(value, field=key)
++        return
++    if key in _ADDRESS_KEYS:
++        check_url(value, field=key)
++        return
++    # Under an unfamiliar key only an absolute http(s) value can steer a request.
++    if isinstance(value, str):
++        try:
++            parts = urlsplit(value)
++        except ValueError:
++            return
++        if parts.scheme.lower() in _PUBLIC_SCHEMES and parts.hostname:
++            check_url(value, field=key)
++
++
++def check_configuration(*configs: object) -> None:
++    """Refuse any supplied value that could determine an outbound destination."""
++    for config in configs:
++        if not isinstance(config, dict):
++            continue
++        for key, value in config.items():
++            _check_entry(key, value)
++
++
++def check_outbound_url(url: str) -> None:
++    """Refuse a final request URL unless it is publicly routable."""
++    check_url(url, field="upstream address")
+diff -ruN -x libs pristine/mlflow/store/tracking/gateway/sqlalchemy_mixin.py app/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
+--- a/mlflow/store/tracking/gateway/sqlalchemy_mixin.py	2026-10-26 23:12:40.000000000 +0000
++++ b/mlflow/store/tracking/gateway/sqlalchemy_mixin.py	2026-10-26 23:31:16.684993274 +0000
+@@ -35,6 +35,7 @@
+     GuardrailAction,
+     GuardrailStage,
+ )
++from mlflow.gateway.upstream_policy import DestinationRefused, check_configuration
+ from mlflow.exceptions import MlflowException
+ from mlflow.protos.databricks_pb2 import (
+     INVALID_PARAMETER_VALUE,
+@@ -191,6 +192,8 @@
+         Returns:
+             Secret entity with metadata (encrypted value not included).
+         """
++        _refuse_unsafe_gateway_configuration(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             secret_id = f"s-{uuid.uuid4().hex}"
+             current_time = get_current_time_millis()
+@@ -288,6 +291,8 @@
+         Returns:
+             Updated Secret entity.
+         """
++        _refuse_unsafe_gateway_configuration(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             sql_secret = self._get_entity_or_raise(
+                 session, SqlGatewaySecret, {"secret_id": secret_id}, "GatewaySecret"
+@@ -1540,3 +1545,11 @@
+                 .all()
+             )
+             return [c.to_mlflow_entity() for c in configs]
++
++
++def _refuse_unsafe_gateway_configuration(*configs: Any) -> None:
++    """Reject configuration that would send a gateway call to a non-public destination."""
++    try:
++        check_configuration(*configs)
++    except DestinationRefused as e:
++        raise MlflowException.invalid_parameter_value(str(e)) from e

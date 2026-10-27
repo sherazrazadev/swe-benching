@@ -1,0 +1,134 @@
+diff --git a/proxy/http_proxy.go b/proxy/http_proxy.go
+index a049d25f..307e3102 100644
+--- a/proxy/http_proxy.go
++++ b/proxy/http_proxy.go
+@@ -172,11 +172,19 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 	}
+ 
++	// The websocket handshake is written to the backend verbatim, so keep the
++	// connection tokens the client sent before the proxy normalises them.
++	wsConnTokens := r.Header.Values("Connection")
++
+ 	if err := addHeaders(r, p.Config, t.StripPath); err != nil {
+ 		http.Error(w, "cannot parse "+r.RemoteAddr, http.StatusInternalServerError)
+ 		return
+ 	}
+ 
++	if t.RequestHeaderName != "" {
++		r.Header.Set(t.RequestHeaderName, t.RequestHeaderValue)
++	}
++
+ 	addResponseHeaders(w, r, p.Config)
+ 
+ 	upgrade, accept := r.Header.Get("Upgrade"), r.Header.Get("Accept")
+@@ -195,9 +203,9 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		if targetURL.Scheme == "https" || targetURL.Scheme == "wss" {
+ 			h = newWSHandler(targetURL.Host, func(network, address string) (net.Conn, error) {
+ 				return tls.Dial(network, address, tr.(*http.Transport).TLSClientConfig)
+-			}, p.Stats.WSConn)
++			}, p.Stats.WSConn, wsConnTokens)
+ 		} else {
+-			h = newWSHandler(targetURL.Host, net.Dial, p.Stats.WSConn)
++			h = newWSHandler(targetURL.Host, net.Dial, p.Stats.WSConn, wsConnTokens)
+ 		}
+ 
+ 	case accept == "text/event-stream":
+diff --git a/proxy/ws_handler.go b/proxy/ws_handler.go
+index 1bdebb07..8f9c9303 100644
+--- a/proxy/ws_handler.go
++++ b/proxy/ws_handler.go
+@@ -7,6 +7,7 @@ import (
+ 	"log"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"strings"
+ 	"sync/atomic"
+ 	"time"
+@@ -21,7 +22,7 @@ type dialFunc func(network, address string) (net.Conn, error)
+ // an incoming and outgoing websocket connection. It checks whether
+ // the handshake was completed successfully before forwarding data
+ // between the client and server.
+-func newWSHandler(host string, dial dialFunc, conn gkm.Gauge) http.Handler {
++func newWSHandler(host string, dial dialFunc, conn gkm.Gauge, connTokens []string) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if conn != nil {
+ 			conn.Set(float64(atomic.AddInt64(&conns, 1)))
+@@ -52,6 +53,8 @@ func newWSHandler(host string, dial dialFunc, conn gkm.Gauge) http.Handler {
+ 		}
+ 		defer out.Close()
+ 
++		removeHandshakeHeaders(r.Header, connTokens)
++
+ 		err = r.Write(out)
+ 		if err != nil {
+ 			log.Printf("[ERROR] Error copying request for %s. %s", r.URL, err)
+@@ -107,3 +110,30 @@ func newWSHandler(host string, dial dialFunc, conn gkm.Gauge) http.Handler {
+ 		}
+ 	})
+ }
++
++// handshakeHeaders are required for the upgrade or are written separately and
++// are therefore never removed from the backend handshake.
++var handshakeHeaders = map[string]bool{
++	"Connection":               true,
++	"Upgrade":                  true,
++	"Sec-Websocket-Key":        true,
++	"Sec-Websocket-Version":    true,
++	"Sec-Websocket-Extensions": true,
++	"Sec-Websocket-Protocol":   true,
++	"Sec-Websocket-Accept":     true,
++}
++
++// removeHandshakeHeaders removes the headers the client declared connection
++// scoped from the handshake which is written to the backend without the
++// hop-by-hop handling of the reverse proxy.
++func removeHandshakeHeaders(h http.Header, tokens []string) {
++	for _, s := range tokens {
++		for p := range strings.SplitSeq(s, ",") {
++			name := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(p))
++			if name == "" || handshakeHeaders[name] {
++				continue
++			}
++			h.Del(name)
++		}
++	}
++}
+diff --git a/route/route.go b/route/route.go
+index 4adf6e05..d65b49b8 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -76,6 +76,13 @@ func (r *Route) addTarget(service string, targetURL *url.URL, fixedWeight float6
+ 		t.Host = opts["host"]
+ 		t.ProxyProto = opts["pxyproto"] == "true"
+ 
++		if h := opts["header"]; h != "" {
++			if name, value, ok := strings.Cut(h, ":"); ok {
++				t.RequestHeaderName = strings.TrimSpace(name)
++				t.RequestHeaderValue = strings.TrimSpace(value)
++			}
++		}
++
+ 		// if Host is "dst", we don't need a special transport to override the sni because
+ 		// this is already the default behavior.
+ 		if t.Host != "" && t.Host != "dst" && (t.URL.Scheme == "https" || opts["proto"] == "https") {
+diff --git a/route/target.go b/route/target.go
+index 9f330799..3ebc1451 100644
+--- a/route/target.go
++++ b/route/target.go
+@@ -71,6 +71,14 @@ type Target struct {
+ 
+ 	// ProxyProto enables PROXY Protocol on upstream connection
+ 	ProxyProto bool
++
++	// RequestHeaderName is the name of a header which is added to the
++	// upstream request for this target.
++	RequestHeaderName string
++
++	// RequestHeaderValue is the value of the header which is added to the
++	// upstream request for this target.
++	RequestHeaderValue string
+ }
+ 
+ func (t *Target) BuildRedirectURL(requestURL *url.URL) {

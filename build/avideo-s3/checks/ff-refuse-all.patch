@@ -1,0 +1,366 @@
+diff --git a/plugin/AuthorizeNet/AuthorizeNet.php b/plugin/AuthorizeNet/AuthorizeNet.php
+index 937beeafc..b269b2358 100644
+--- a/plugin/AuthorizeNet/AuthorizeNet.php
++++ b/plugin/AuthorizeNet/AuthorizeNet.php
+@@ -43,24 +43,21 @@ class AuthorizeNet extends PluginAbstract
+     /**
+      * Validate ANet webhook signature (HMAC-SHA512).
+      *
++     * The Signature Key is used as a raw ASCII string in the HMAC — not hex-decoded.
++     *
+      * @param string $rawBody
+      * @param array  $headers
+-     * @param string $signatureKeyHex
+-     * @return array{valid:bool,expected:string,received:string}
++     * @param string $signatureKey
++     * @return bool
+      */
+-    public static function verifySignature(string $rawBody, array $headers, string $signatureKeyHex): array
++    public static function verifySignature(string $rawBody, array $headers, string $signatureKey): bool
+     {
+         $received = $headers['X-ANET-Signature'] ?? ($headers['x-anet-signature'] ?? '');
+-        if (empty($signatureKeyHex) || !ctype_xdigit($signatureKeyHex) || empty($received)) {
+-            return ['valid' => false, 'expected' => '', 'received' => $received];
++        if (empty($signatureKey) || empty($received)) {
++            return false;
+         }
+-        $keyBin   = hex2bin($signatureKeyHex);
+-        $expected = 'sha512=' . hash_hmac('sha512', $rawBody, $keyBin);
+-        return [
+-            'valid'    => hash_equals($expected, $received),
+-            'expected' => $expected,
+-            'received' => $received
+-        ];
++        $expected = 'sha512=' . strtolower(hash_hmac('sha512', $rawBody, $signatureKey));
++        return hash_equals($expected, strtolower($received));
+     }
+ 
+     /**
+@@ -86,22 +83,17 @@ class AuthorizeNet extends PluginAbstract
+      */
+     public static function parseWebhookRequest(string $rawBody, array $headers, array $allowedEvents = ['net.authorize.payment.authcapture.created']): array
+     {
+-        $cfg              = self::getConfig();
+-        $sig = self::verifySignature($rawBody, $headers, trim($cfg->signatureKey ?? ''));
++        $cfg      = self::getConfig();
++        $sigValid = self::verifySignature($rawBody, $headers, trim((string)($cfg->signatureKey ?? '')));
+ 
+         $json = json_decode($rawBody, true);
+         if (!is_array($json)) {
+-            return ['error' => true, 'msg' => 'Invalid JSON', 'signatureValid' => $sig['valid']];
++            return ['error' => true, 'msg' => 'Invalid JSON', 'signatureValid' => $sigValid];
+         }
+ 
+-        $eventType     = $json['eventType'] ?? '';
++        $eventType = $json['eventType'] ?? '';
+         if (!in_array($eventType, $allowedEvents)) {
+-            return [
+-                'error'          => true,
+-                'msg'            => 'Ignored event type',
+-                'eventType'      => $eventType,
+-                'signatureValid' => $sig['valid']
+-            ];
++            return ['error' => true, 'msg' => 'Ignored event type', 'eventType' => $eventType, 'signatureValid' => $sigValid];
+         }
+ 
+         $payload       = $json['payload'] ?? [];
+@@ -110,21 +102,20 @@ class AuthorizeNet extends PluginAbstract
+         $currency      = $payload['currencyCode'] ?? ($payload['currency'] ?? null);
+         $metadata      = $payload['metadata'] ?? [];
+         $users_id      = isset($metadata['users_id']) ? (int)$metadata['users_id'] : null;
+-
+-        $uniq_key = sha1($eventType . ($transactionId ?? 'no-txn'));
++        $uniq_key      = sha1($eventType . ($transactionId ?? 'no-txn'));
+ 
+         return [
+-            'error'           => false,
+-            'data'            => $json,
+-            'payload'         => $payload,
+-            'eventType'       => $eventType,
+-            'transactionId'   => $transactionId,
+-            'amount'          => $amount,
+-            'currency'        => $currency,
+-            'metadata'        => $metadata,
+-            'users_id'        => $users_id,
+-            'uniq_key'        => $uniq_key,
+-            'signatureValid'  => $sig['valid']
++            'error'          => false,
++            'data'           => $json,
++            'payload'        => $payload,
++            'eventType'      => $eventType,
++            'transactionId'  => $transactionId,
++            'amount'         => $amount,
++            'currency'       => $currency,
++            'metadata'       => $metadata,
++            'users_id'       => $users_id,
++            'uniq_key'       => $uniq_key,
++            'signatureValid' => $sigValid,
+         ];
+     }
+ 
+@@ -1024,7 +1015,7 @@ class AuthorizeNet extends PluginAbstract
+                 $submitTime   = method_exists($txn, 'getSubmitTimeUTC') ? $txn->getSubmitTimeUTC() : null;
+                 $responseCode = $txn->getResponseCode() ?? '';
+                 $status       = $txn->getTransactionStatus() ?? '';
+-                $isApproved   = $responseCode == 1 && in_array($status, ['capturedPendingSettlement', 'settledSuccessfully'], true);
++                $isApproved   = $responseCode == 1 && in_array(strtolower($status), ['capturedpendingsettlement', 'settledsuccessfully'], true);
+ 
+                 // ---- NEW: get description and decode metadata ----
+                 $orderDescription = ($order && method_exists($order, 'getDescription')) ? (string)$order->getDescription() : null;
+diff --git a/plugin/AuthorizeNet/processPayment.json.php b/plugin/AuthorizeNet/processPayment.json.php
+index 905bfa808..292e98edc 100644
+--- a/plugin/AuthorizeNet/processPayment.json.php
++++ b/plugin/AuthorizeNet/processPayment.json.php
+@@ -10,20 +10,10 @@ if ($amount <= 0) {
+     echo json_encode(['error' => 'Invalid amount']);
+     exit;
+ }
+-// TODO: Implement payment logic using Authorize.Net API
+-// Example: Call Authorize.Net API here
+-// $result = $plugin->chargePayment($amount, $userData);
+ 
+-// Simulate payment success for now
+-$paymentSuccess = true;
+-$users_id = @User::getId();
+-if ($paymentSuccess && !empty($users_id)) {
+-    // Add funds to wallet
+-    $walletPlugin = AVideoPlugin::loadPluginIfEnabled("YPTWallet");
+-    if ($walletPlugin) {
+-        $walletPlugin->addBalance($users_id, $amount, 'Authorize.Net one-time payment');
+-        echo json_encode(['success' => true, 'result' => 'Payment processed and wallet updated']);
+-        exit;
+-    }
+-}
+-echo json_encode(['error' => 'Payment failed or user not logged in']);
++// Payments are completed on the hosted payment page and credited only once the
++// gateway confirms the transaction; this endpoint cannot confirm anything, so it
++// must not change a wallet balance.
++http_response_code(400);
++echo json_encode(['error' => 'Payment must be completed and confirmed by the gateway']);
++exit;
+diff --git a/plugin/AuthorizeNet/registerWebhook.json.php b/plugin/AuthorizeNet/registerWebhook.json.php
+new file mode 100644
+index 000000000..51aa95993
+--- /dev/null
++++ b/plugin/AuthorizeNet/registerWebhook.json.php
+@@ -0,0 +1,39 @@
++<?php
++/**
++ * Admin-only endpoint to manually (re)register the AuthorizeNet webhook.
++ * Use this after changing API credentials in the plugin settings.
++ *
++ * GET/POST /plugin/AuthorizeNet/registerWebhook.json.php
++ */
++header('Content-Type: application/json');
++
++require_once __DIR__ . '/../../videos/configuration.php';
++require_once $global['systemRootPath'] . 'objects/user.php';
++
++if (!User::isAdmin()) {
++    http_response_code(403);
++    echo json_encode(['error' => true, 'msg' => 'Permission denied']);
++    exit;
++}
++
++require_once $global['systemRootPath'] . 'plugin/AuthorizeNet/AuthorizeNet.php';
++
++$cfg = AVideoPlugin::getDataObject('AuthorizeNet');
++if (empty($cfg->apiLoginId) || empty($cfg->transactionKey) || empty($cfg->signatureKey)) {
++    echo json_encode(['error' => true, 'msg' => 'AuthorizeNet credentials not fully configured. Set API Login ID, Transaction Key and Signature Key first.']);
++    exit;
++}
++
++$result = AuthorizeNet::createWebhookIfNotExists(['net.authorize.payment.authcapture.created']);
++
++$response = [
++    'error'      => !empty($result['error']),
++    'msg'        => $result['msg'] ?? null,
++    'webhookId'  => $result['webhookId'] ?? null,
++    'status'     => $result['status'] ?? null,
++    'webhookUrl' => AuthorizeNet::getWebhookURL(),
++];
++
++_error_log('[AuthorizeNet] Manual webhook registration: ' . json_encode($response));
++
++echo json_encode($response);
+diff --git a/plugin/AuthorizeNet/silentPost.php b/plugin/AuthorizeNet/silentPost.php
+index c1d119f1a..489e70b17 100644
+--- a/plugin/AuthorizeNet/silentPost.php
++++ b/plugin/AuthorizeNet/silentPost.php
+@@ -9,6 +9,9 @@
+ require_once __DIR__ . '/../../videos/configuration.php';
+ 
+ header('Content-Type: text/plain');
++http_response_code(403);
++echo 'refused';
++exit;
+ 
+ $transId  = $_POST['x_trans_id'] ?? '';
+ $response = $_POST['x_response_code'] ?? '';
+@@ -34,11 +37,19 @@ if ((int)$response !== 1) {
+     exit;
+ }
+ 
+-if (empty($users_id)) {
+-    $users_id = (int)($txnInfo['users_id'] ?? 0);
++// The transaction record is authoritative for who is credited and how much.
++$users_id = (int)($txnInfo['users_id'] ?? 0);
++$amount   = (float)($txnInfo['amount'] ?? 0);
++
++if (empty($txnInfo['isApproved'])) {
++    http_response_code(400);
++    echo 'not approved';
++    exit;
+ }
+-if ($amount <= 0) {
+-    $amount = (float)($txnInfo['amount'] ?? 0);
++if (empty($users_id) || $amount <= 0) {
++    http_response_code(400);
++    echo 'missing account or amount';
++    exit;
+ }
+ 
+ $uniq_key = sha1('net.authorize.payment.authcapture.created' . $transId);
+diff --git a/plugin/AuthorizeNet/webhook.php b/plugin/AuthorizeNet/webhook.php
+index 215d9af95..d53e35572 100644
+--- a/plugin/AuthorizeNet/webhook.php
++++ b/plugin/AuthorizeNet/webhook.php
+@@ -5,8 +5,11 @@ $global['bypassSameDomainCheck'] = 1;
+ 
+ $rawBody = file_get_contents('php://input');
+ $headers = getallheaders();
++http_response_code(401);
++echo 'refused';
++exit;
+ 
+-// 1) Parse + signature
++// 1) Parse + signature — reject immediately if signature is invalid
+ $parsed = AuthorizeNet::parseWebhookRequest($rawBody, $headers);
+ if (!empty($parsed['error'])) {
+     _error_log('[Authorize.Net webhook] ' . $parsed['msg']);
+@@ -14,9 +17,18 @@ if (!empty($parsed['error'])) {
+     echo $parsed['msg'] ?? 'ignored';
+     exit;
+ }
+-
+-_error_log('[Authorize.Net webhook] Event: ' . $parsed['eventType']);
+-_error_log('[Authorize.Net webhook] uniq_key: ' . $parsed['uniq_key']);
++if (!$parsed['signatureValid']) {
++    $sigHeader = $headers['X-ANET-Signature'] ?? ($headers['x-anet-signature'] ?? '');
++    _error_log('[Authorize.Net webhook] Bad signature'
++        . ' | event=' . $parsed['eventType']
++        . ' | txn=' . ($parsed['transactionId'] ?? 'n/a')
++        . ' | body_len=' . strlen($rawBody)
++        . ' | sig_header=' . (empty($sigHeader) ? 'missing' : 'present')
++    );
++    http_response_code(401);
++    echo 'invalid signature';
++    exit;
++}
+ 
+ // 2) Dedup
+ if (Anet_webhook_log::alreadyProcessed($parsed['uniq_key'])) {
+@@ -26,45 +38,52 @@ if (Anet_webhook_log::alreadyProcessed($parsed['uniq_key'])) {
+     exit;
+ }
+ 
+-// 3) Fetch txn (fallback/confirm)
++// 3) Fetch txn details for enrichment
+ $txnInfo = AuthorizeNet::getTransactionDetails($parsed['transactionId']);
+ 
+-// 4) Block only if both invalid signature AND no valid txn info
+-if (!$parsed['signatureValid'] && (empty($txnInfo) || !empty($txnInfo['error']))) {
+-    _error_log('[Authorize.Net webhook] Bad signature and could not confirm transaction');
+-    http_response_code(401);
+-    echo 'invalid signature';
+-    exit;
+-}
+-
+-// 5) Analyze payload + raw txn
++// 4) Analyze payload + raw txn
+ $analysis = AuthorizeNet::analyzeTransactionFromWebhook($parsed['payload'], $txnInfo['raw'] ?? null);
+ 
+-// Fill missing basics from txnInfo if needed
+-if (!$analysis['users_id'] && !empty($txnInfo['users_id'])) {
++// Always prefer the Authorize.Net transaction details over webhook payload values.
++if (!empty($txnInfo['users_id'])) {
+     $analysis['users_id'] = (int)$txnInfo['users_id'];
+ }
+-if (!$analysis['amount'] && isset($txnInfo['amount'])) {
++if (isset($txnInfo['amount'])) {
+     $analysis['amount'] = (float)$txnInfo['amount'];
+ }
+-if (!$analysis['currency'] && !empty($txnInfo['currency'])) {
++if (!empty($txnInfo['currency'])) {
+     $analysis['currency'] = $txnInfo['currency'];
+ }
+-if (!$analysis['isApproved'] && !empty($txnInfo['isApproved'])) {
++if (array_key_exists('isApproved', $txnInfo)) {
+     $analysis['isApproved'] = (bool)$txnInfo['isApproved'];
+ }
+-if (!$analysis['plans_id'] && !empty($txnInfo['plans_id'])) {
++if (!empty($txnInfo['plans_id'])) {
+     $analysis['plans_id'] = (int)$txnInfo['plans_id'];
+ }
+-_error_log('[Authorize.Net webhook] Analysis: ' . json_encode($analysis));
+-
+-if(empty($analysis['users_id']) || empty($analysis['amount'])) {
+-    _error_log('[Authorize.Net webhook] Missing user ID or amount in analysis');
++if (empty($analysis['users_id']) || empty($analysis['amount'])) {
++    _error_log('[Authorize.Net webhook] Missing user ID or amount'
++        . ' | txn=' . ($parsed['transactionId'] ?? 'n/a')
++        . ' | users_id=' . ($analysis['users_id'] ?? 'null')
++        . ' | amount=' . ($analysis['amount'] ?? 'null')
++        . ' | txn_lookup=' . (!empty($txnInfo['error']) ? 'error:' . $txnInfo['msg'] : 'ok')
++        . ' | txn_email=' . ($txnInfo['email'] ?? 'n/a')
++    );
+     http_response_code(400);
+     echo 'missing user ID or amount';
+     exit;
+ }
+ 
++if (empty($analysis['isApproved'])) {
++    _error_log('[Authorize.Net webhook] Transaction not approved'
++        . ' | txn=' . ($parsed['transactionId'] ?? 'n/a')
++        . ' | status=' . ($txnInfo['status'] ?? 'n/a')
++        . ' | responseCode=' . ($txnInfo['responseCode'] ?? 'n/a')
++    );
++    http_response_code(400);
++    echo 'transaction not approved';
++    exit;
++}
++
+ $result = AuthorizeNet::processSinglePayment(
+             $analysis['users_id'],
+             (float)$analysis['amount'],
+@@ -134,14 +153,5 @@ if (!empty($analysis['plans_id'])) {
+     }
+ }
+ 
+-// 9) Return success response
+-echo json_encode([
+-    'success'           => true,
+-    'users_id'          => $analysis['users_id'],
+-    'subscription'      => $analysis['isASubscription'],
+-    'subscriptionId'    => $analysis['subscriptionId'] ?? ($subscriptionResult['subscriptionId'] ?? null),
+-    'newSubscription'   => $shouldCreateSubscription,
+-    'subscriptionCreated' => !empty($subscriptionResult) && empty($subscriptionResult['error']),
+-    'sigValid'          => $parsed['signatureValid'],
+-    'logId'             => $result['logId'] ?? null
+-]);
++http_response_code(200);
++echo json_encode(['success' => true]);
+diff --git a/plugin/AuthorizeNet/webhookSubscription.php b/plugin/AuthorizeNet/webhookSubscription.php
+index e7b082074..51cefa492 100644
+--- a/plugin/AuthorizeNet/webhookSubscription.php
++++ b/plugin/AuthorizeNet/webhookSubscription.php
+@@ -26,6 +26,9 @@ $cfg = AVideoPlugin::getDataObject('AuthorizeNet');
+ $signatureValid = AuthorizeNet::verifySignature($rawBody, $headers, trim((string)($cfg->signatureKey ?? '')));
+ if (!$signatureValid) {
+     _error_log('[Authorize.Net recurring webhook] signature not valid for ' . ($parsed['transactionId'] ?? 'n/a'));
++    http_response_code(401);
++    echo json_encode(['success' => false, 'msg' => 'invalid signature']);
++    exit;
+ }
+ 
+ $analysis = AuthorizeNet::analyzeTransactionFromWebhook($parsed['payload']);

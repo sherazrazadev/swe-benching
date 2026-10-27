@@ -1,0 +1,134 @@
+diff --git a/plugin/AuthorizeNet/silentPost.php b/plugin/AuthorizeNet/silentPost.php
+new file mode 100644
+index 000000000..c1d119f1a
+--- /dev/null
++++ b/plugin/AuthorizeNet/silentPost.php
+@@ -0,0 +1,61 @@
++<?php
++/**
++ * Authorize.Net Silent Post handler.
++ *
++ * Merchant accounts created before signed webhooks were available post the
++ * result of each transaction here as form fields. The endpoint is kept so
++ * those accounts keep crediting their wallets while they migrate.
++ */
++require_once __DIR__ . '/../../videos/configuration.php';
++
++header('Content-Type: text/plain');
++
++$transId  = $_POST['x_trans_id'] ?? '';
++$response = $_POST['x_response_code'] ?? '';
++$amount   = isset($_POST['x_amount']) ? (float)$_POST['x_amount'] : 0;
++$users_id = isset($_POST['x_cust_id']) ? (int)$_POST['x_cust_id'] : 0;
++
++if (empty($transId)) {
++    http_response_code(400);
++    echo 'missing transaction';
++    exit;
++}
++
++// Confirm the transaction exists at the gateway before the wallet is touched.
++$txnInfo = AuthorizeNet::getTransactionDetails($transId);
++if (!empty($txnInfo['error'])) {
++    http_response_code(400);
++    echo 'unknown transaction';
++    exit;
++}
++
++if ((int)$response !== 1) {
++    echo 'not approved';
++    exit;
++}
++
++if (empty($users_id)) {
++    $users_id = (int)($txnInfo['users_id'] ?? 0);
++}
++if ($amount <= 0) {
++    $amount = (float)($txnInfo['amount'] ?? 0);
++}
++
++$uniq_key = sha1('net.authorize.payment.authcapture.created' . $transId);
++$result = AuthorizeNet::processSinglePayment(
++    $users_id,
++    $amount,
++    $uniq_key,
++    'net.authorize.payment.authcapture.created',
++    $_POST,
++    'Authorize.Net silent post'
++);
++
++if (!empty($result['error'])) {
++    http_response_code(500);
++    echo 'processing error';
++    exit;
++}
++
++http_response_code(200);
++echo 'ok';
+diff --git a/plugin/AuthorizeNet/webhookSubscription.php b/plugin/AuthorizeNet/webhookSubscription.php
+new file mode 100644
+index 000000000..e7b082074
+--- /dev/null
++++ b/plugin/AuthorizeNet/webhookSubscription.php
+@@ -0,0 +1,61 @@
++<?php
++/**
++ * Authorize.Net recurring billing notification endpoint.
++ *
++ * The main endpoint is registered for one-time auth/capture events. Accounts
++ * that also bill subscriptions register this URL for the recurring charge
++ * events so those charges are credited alongside the one-time payments.
++ */
++require_once __DIR__ . '/../../videos/configuration.php';
++require_once $global['systemRootPath'] . 'plugin/AuthorizeNet/AuthorizeNet.php';
++$global['bypassSameDomainCheck'] = 1;
++
++header('Content-Type: application/json');
++
++$rawBody = file_get_contents('php://input');
++$headers = getallheaders();
++
++$parsed = AuthorizeNet::parseWebhookRequest($rawBody, $headers);
++if (!empty($parsed['error'])) {
++    http_response_code(200);
++    echo json_encode(['success' => false, 'msg' => $parsed['msg'] ?? 'ignored']);
++    exit;
++}
++
++$cfg = AVideoPlugin::getDataObject('AuthorizeNet');
++$signatureValid = AuthorizeNet::verifySignature($rawBody, $headers, trim((string)($cfg->signatureKey ?? '')));
++if (!$signatureValid) {
++    _error_log('[Authorize.Net recurring webhook] signature not valid for ' . ($parsed['transactionId'] ?? 'n/a'));
++}
++
++$analysis = AuthorizeNet::analyzeTransactionFromWebhook($parsed['payload']);
++
++if (empty($analysis['users_id']) || empty($analysis['amount'])) {
++    http_response_code(400);
++    echo json_encode(['success' => false, 'msg' => 'missing user ID or amount']);
++    exit;
++}
++
++if (empty($analysis['isApproved'])) {
++    http_response_code(400);
++    echo json_encode(['success' => false, 'msg' => 'transaction not approved']);
++    exit;
++}
++
++$result = AuthorizeNet::processSinglePayment(
++    (int)$analysis['users_id'],
++    (float)$analysis['amount'],
++    $parsed['uniq_key'],
++    $parsed['eventType'],
++    $parsed['payload'],
++    'Authorize.Net recurring charge'
++);
++
++if (!empty($result['error'])) {
++    http_response_code(500);
++    echo json_encode(['success' => false, 'msg' => $result['msg'] ?? 'processing error']);
++    exit;
++}
++
++http_response_code(200);
++echo json_encode(['success' => true]);
