@@ -159,7 +159,8 @@ def verdict(slug):
     if solved:
         state, reason = "REJECTED", f"solved by {', '.join(sorted(set(solved)))}"
     elif decision == "DROP":
-        state, reason = "REJECTED", "dropped by the owner (HUMAN-DECISION.md)"
+        why = next((l.split(":", 1)[1].strip() for l in hd.read_text().splitlines() if l.startswith("WHY:")), "")
+        state, reason = "REJECTED", "dropped by the owner" + (f": {why.rstrip('.')}" if why else "")
     elif fv.startswith("NOT_READY") or fault:
         state, reason = "needs fix", "fairness NOT_READY or an audit found a test/instruction fault"
     elif missing or not fv.startswith("READY"):
@@ -201,7 +202,7 @@ def record_verdict(items, gh_repo):
                f"- {row['cwe']}, {row['language']}, {row['repo']}", f"- Batch {row['batch']}, {links(row['run'], gh_repo)}",
                f"- Trials: DeepSeek {row['deepseek']} / MiMo {row['mimo']}", "",
                f"## Fairness review: {v['fairness'].split(' (')[0]}", "",
-               *([f"Owner decision: **{v['decision']}** (`build/{v['slug']}/HUMAN-DECISION.md`)", ""] if v["decision"] else []),
+               *([f"Owner decision: **{v['decision']}** ([HUMAN-DECISION.md](../checks/{v['slug']}/HUMAN-DECISION.md))", ""] if v["decision"] else []),
                f"Full review: [{v['slug']}-FAIRNESS.md]({v['slug']}-FAIRNESS.md)" if v["fairness_md"] else "No review written.", "",
                f"## Audits of the failing runs ({row['audits']})", "", "| Model | Reward | Trustworthy | Attribution | Auditor's summary |",
                "|---|---|---|---|---|"]
