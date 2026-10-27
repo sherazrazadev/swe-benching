@@ -19,6 +19,12 @@ accepted tasks, `batch-NN.md`, `tasks.tsv`). Leave `slugs` empty to take the nex
 (cancel the running batch to stop). A task is claimed in `tasks.tsv` before it builds and never picked again
 (`common/ci/batches.py`).
 
+**Final verdict of accepted tasks:** after a batch records an accepted task (sound, both models 0/3 at 1.0), the
+`verdict` workflow runs the GUIDE's steps 8-9 on it: the DeepSeek fairness review and a Claude Opus audit of every
+failing run (only with secret `ANTHROPIC_API_KEY`; without it audits stay PENDING and are run where Opus is
+available, then recorded with `batches.py verdict` / `record-verdict`). Results: `reports/actions/README.md` (accepted
+table, final verdict column) and `reports/actions/verdicts/<slug>.md`.
+
 **Inputs:** a slug must have `build/<slug>/BUILD-PROMPT.md` committed (prepare it on the VM/Mac as usual) and no
 `build/<slug>/pipeline.log` yet. A trial-only run needs `build/<slug>/.sound` and `tasks/<slug>/` committed, or a
 `build_run` id whose `build-<slug>` artifact has them.

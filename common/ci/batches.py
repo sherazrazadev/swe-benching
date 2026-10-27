@@ -6,6 +6,9 @@
     batches.py summarize <slugs>        JSON results of these tasks from this checkout (build/<slug>/, tasks/<slug>/)
     batches.py record <json> --run <id> [--batch N --utc T]
                                         write those results into tasks.tsv, batch-<N>.md and README.md
+    batches.py verdict <slugs>          JSON final-verdict inputs of accepted tasks: fairness (build/<slug>/FAIRNESS.md)
+                                        and the audit of every failing run (~/.tb-graders/cwe/jobs/.../postmortem-*/)
+    batches.py record-verdict <json>    write them into tasks.tsv, verdicts/<slug>.md, batch-<N>.md and README.md
 
 A slug in tasks.tsv is never picked again (whatever its outcome), so no task is built twice. To build one again,
 dispatch the build workflow with its slug.
@@ -16,9 +19,15 @@ Outcome (per task, from the trial records; the official verdict is still audit_r
     incomplete   gate sound, fewer graded runs than that and no solve
     unsound / gate error / listing fail   the gate's marker
     build failed no gate marker (builder or runner died)
+
+Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-9; this is what is shared):
+    FINAL BREAKER  fairness READY and every failing run audited trustworthy (the model's own failure)
+    NEEDS FIX      fairness NOT_READY or an audit found a test / instruction / harness fault (GUIDE step 10)
+    PENDING        an audit or the fairness review is missing or errored
 """
 import argparse
 import json
+import subprocess
 import sys
 import time
 import tomllib
@@ -29,7 +38,9 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root
 REP = ROOT / "reports" / "actions"
 TASKS = REP / "tasks.tsv"
 QUEUE = REP / "queue.txt"
-COLS = ["slug", "batch", "run", "utc", "status", "gate", "deepseek", "mimo", "cwe", "language", "repo", "description"]
+COLS = ["slug", "batch", "run", "utc", "status", "gate", "deepseek", "mimo", "cwe", "language", "repo", "description",
+        "final", "fairness", "audits"]
+JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 MODELS = ("deepseek", "mimo")
 MARKERS = {".sound": "sound", ".unsound": "unsound", ".gate_error": "gate error", ".listing_fail": "listing fail"}
 
@@ -113,6 +124,66 @@ def record(results, run, batch, utc, gh_repo):
     write_readme(rows, gh_repo)
 
 
+def audit_of(job):
+    """Newest recorded audit (POSTMORTEM.json) of a trial job, or None."""
+    pms = sorted((JOBS / job).glob("*/postmortem-*/POSTMORTEM.json"))
+    return json.loads(pms[-1].read_text()) if pms else None
+
+
+def verdict(slug):
+    b = ROOT / "build" / slug
+    fv = subprocess.run([sys.executable, "-I", str(ROOT / "common/fairness/fairness_verdict.py"), slug],
+                        capture_output=True, text=True).stdout.strip() or "ERROR: no output"
+    audits = []
+    for m in MODELS:
+        f = b / f"trial_detail_{m}.json"
+        for r in json.loads(f.read_text()).get("runs", []) if f.is_file() else []:
+            if r.get("reward") is None or r["reward"] == 1.0:
+                continue                      # ungraded runs never count; solves are not audited
+            a = audit_of(r["job"]) or {}
+            audits.append({"model": m, "job": r["job"], "reward": r["reward"], "trustworthy": a.get("trustworthy"),
+                           "attribution": a.get("attribution", "not audited"), "confidence": a.get("confidence", ""),
+                           "summary": a.get("summary", "")})
+    bad = [a for a in audits if a["trustworthy"] is False or a["attribution"] not in ("model-failed", "not audited")]
+    missing = [a for a in audits if a["trustworthy"] is None]
+    if fv.startswith("NOT_READY") or bad:
+        final = "NEEDS FIX"
+    elif fv.startswith("READY") and audits and not missing:
+        final = "FINAL BREAKER"
+    else:
+        final = "PENDING"
+    fair = b / "FAIRNESS.md"
+    return {"slug": slug, "final": final, "fairness": fv, "audits": audits,
+            "fairness_md": fair.read_text() if fair.is_file() else ""}
+
+
+def record_verdict(items, gh_repo):
+    rows = read_rows()
+    (REP / "verdicts").mkdir(parents=True, exist_ok=True)
+    batches = set()
+    for v in items:
+        row = [r for r in rows if r["slug"] == v["slug"]][-1]
+        ok = sum(a["trustworthy"] is True and a["attribution"] == "model-failed" for a in v["audits"])
+        row.update(final=v["final"], fairness=v["fairness"].split(" (")[0], audits=f"{ok}/{len(v['audits'])} trustworthy")
+        batches.add(row["batch"])
+        out = [f"# `{v['slug']}`: {v['final']}", "", f"- {row['description']}",
+               f"- {row['cwe']}, {row['language']}, {row['repo']}", f"- Batch {row['batch']}, {links(row['run'], gh_repo)}",
+               f"- Trials: DeepSeek {row['deepseek']} / MiMo {row['mimo']} (no run at 1.0)", "",
+               f"## Fairness review: {v['fairness']}", "",
+               f"Full review: [{v['slug']}-FAIRNESS.md]({v['slug']}-FAIRNESS.md)" if v["fairness_md"] else "No review written.", "",
+               f"## Audits of the failing runs ({row['audits']})", "", "| Model | Reward | Trustworthy | Attribution | Auditor's summary |",
+               "|---|---|---|---|---|"]
+        out += [f"| {a['model']} | {a['reward']:g} | {a['trustworthy']} | {a['attribution']} ({a['confidence']}) | "
+                f"{a['summary'].replace('|', '/').replace(chr(10), ' ')} |" for a in v["audits"]]
+        (REP / "verdicts" / f"{v['slug']}.md").write_text("\n".join(out) + "\n")
+        if v["fairness_md"]:
+            (REP / "verdicts" / f"{v['slug']}-FAIRNESS.md").write_text(v["fairness_md"])
+    write_rows(rows)
+    for n in batches:
+        write_batch(int(n), [r for r in rows if r["batch"] == n], [], gh_repo)
+    write_readme(rows, gh_repo)
+
+
 def links(run, gh_repo):
     return (f"[run {run}](https://github.com/{gh_repo}/actions/runs/{run}) · "
             f"[results branch](https://github.com/{gh_repo}/tree/runs/{run})")
@@ -131,7 +202,8 @@ def write_batch(n, rows, results, gh_repo):
             a = by_slug.get(r["slug"], {})
             out += [f"### `{r['slug']}`", "", f"- {r['description']}", f"- {r['cwe']}, {r['language']}, {r['repo']}"
                     + (f" ({a['advisory']})" if a.get("advisory") else ""),
-                    f"- DeepSeek {r['deepseek']} / MiMo {r['mimo']}", ""]
+                    f"- DeepSeek {r['deepseek']} / MiMo {r['mimo']}",
+                    f"- Final verdict: **{r['final'] or 'PENDING'}**" + (f" ([details](verdicts/{r['slug']}.md))" if r["final"] else ""), ""]
     (REP / f"batch-{n:02d}.md").write_text("\n".join(out).rstrip() + "\n")
 
 
@@ -150,8 +222,11 @@ def write_readme(rows, gh_repo):
            "Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 7 tasks per batch. With "
            "`chain` on, each batch starts the next one from `queue.txt` when it ends; a task listed in `tasks.tsv` is "
            "never picked again.", "",
-           "**Accepted** = gate sound and both models failed all 3 runs (no run at 1.0). This is the trial outcome; "
-           "the official verdict is still `common/audit/audit_results.py` plus the failing-run audits and fairness.", "",
+           "**Accepted** = gate sound and both models failed all 3 runs (no run at 1.0). Each accepted task then gets "
+           "the final verdict steps: an audit of every failing run (Claude Opus, `common/audit/postmortem.py`) and the "
+           "fairness review (DeepSeek, `pipelines/sibling/9-fairness`). **FINAL BREAKER** = fairness READY and every "
+           "failing run audited trustworthy: these are the tasks to share. **NEEDS FIX** = a fault was found (fairfix, "
+           "GUIDE step 10). **PENDING** = a step has not finished.", "",
            f"## Totals ({len(latest)} tasks)", "", "| " + " | ".join(o for o in order if total[o]) + " |",
            "|" + "---|" * len([o for o in order if total[o]]), "| " + " | ".join(str(total[o]) for o in order if total[o]) + " |", "",
            "## Batches", "", "| Batch | Started | Tasks | Accepted | Rejected | Unsound / gate | Build failed | Other | Runs |",
@@ -163,10 +238,15 @@ def write_readme(rows, gh_repo):
                    f"{c('unsound', 'gate error', 'listing fail')} | {c('build failed')} | {c('incomplete', 'running')} | "
                    + ", ".join(f"[{x}](https://github.com/{gh_repo}/actions/runs/{x})" for x in sorted({r['run'] for r in b})) + " |")
     acc = [r for r in latest.values() if r["status"] == "accepted"]
-    out += ["", f"## Accepted tasks ({len(acc)})", "", "| Task | Batch | CWE | Language | Repo | DeepSeek | MiMo | What it is |",
-            "|---|---|---|---|---|---|---|---|"]
-    out += [f"| `{r['slug']}` | {r['batch']} | {r['cwe']} | {r['language']} | {r['repo']} | {r['deepseek']} | {r['mimo']} | "
-            f"{r['description']} |" for r in acc]
+    fin = defaultdict(int)
+    for r in acc:
+        fin[r["final"] or "PENDING"] += 1
+    out += ["", f"## Accepted tasks ({len(acc)}: " + ", ".join(f"{v} {k}" for k, v in sorted(fin.items())) + ")", "",
+            "| Task | Final verdict | Batch | CWE | Language | Repo | DeepSeek | MiMo | Fairness | Audits | What it is |",
+            "|---|---|---|---|---|---|---|---|---|---|---|"]
+    out += [f"| `{r['slug']}` | " + (f"[**{r['final']}**](verdicts/{r['slug']}.md)" if r["final"] else "PENDING")
+            + f" | {r['batch']} | {r['cwe']} | {r['language']} | {r['repo']} | {r['deepseek']} | {r['mimo']} | "
+            f"{r['fairness'] or '-'} | {r['audits'] or '-'} | {r['description']} |" for r in acc]
     out += ["", "Files: `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `queue.txt` (what to build next, "
             "in order; add slugs that have `build/<slug>/BUILD-PROMPT.md`)."]
     (REP / "README.md").write_text("\n".join(out) + "\n")
@@ -178,6 +258,8 @@ def main():
     a = sp.add_parser("pick"); a.add_argument("n", type=int)
     a = sp.add_parser("claim"); a.add_argument("slugs"); a.add_argument("run")
     a = sp.add_parser("summarize"); a.add_argument("slugs")
+    a = sp.add_parser("verdict"); a.add_argument("slugs")
+    a = sp.add_parser("record-verdict"); a.add_argument("json"); a.add_argument("--repo", default="sherazrazadev/swe-benching")
     a = sp.add_parser("record"); a.add_argument("json"); a.add_argument("--run", required=True)
     a.add_argument("--batch"); a.add_argument("--utc"); a.add_argument("--repo", default="sherazrazadev/swe-benching")
     x = ap.parse_args()
@@ -186,6 +268,10 @@ def main():
         pick(x.n)
     elif x.cmd == "claim":
         claim(split(x.slugs), x.run)
+    elif x.cmd == "verdict":
+        print(json.dumps([verdict(s) for s in split(x.slugs)], indent=1))
+    elif x.cmd == "record-verdict":
+        record_verdict(json.loads(Path(x.json).read_text()), x.repo)
     elif x.cmd == "summarize":
         print(json.dumps([result(s) for s in split(x.slugs)], indent=1))
     else:

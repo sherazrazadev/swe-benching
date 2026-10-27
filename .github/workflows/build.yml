@@ -135,11 +135,13 @@ jobs:
     needs: [plan, build, trials]
     if: always() && needs.build.result != 'skipped'
     runs-on: ubuntu-24.04
+    outputs: { accepted: "${{ steps.rec.outputs.accepted }}" }
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/collect
         with: { token: "${{ github.token }}" }
       - name: Record the batch in reports/actions (main)
+        id: rec
         env:
           SLUGS: ${{ join(fromJSON(needs.plan.outputs.slugs), ',') }}
           BATCH: ${{ needs.plan.outputs.batch }}
@@ -147,6 +149,7 @@ jobs:
         run: |
           python3 -I common/ci/batches.py summarize "$SLUGS" > /tmp/batch.json   # from the collected results
           jq -r '.[] | "\(.slug): \(.status) (DeepSeek \(.deepseek), MiMo \(.mimo))"' /tmp/batch.json | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "accepted=$(jq -r '[.[] | select(.status == "accepted") | .slug] | join(",")' /tmp/batch.json)" >> "$GITHUB_OUTPUT"
           git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for try in 1 2 3 4 5; do
             git fetch -q origin main && git reset -q --hard FETCH_HEAD
@@ -154,6 +157,13 @@ jobs:
             git add reports/actions && git commit -q -m "Actions batch $BATCH: results" && git push -q origin HEAD:main && break
             [ "$try" = 5 ] && exit 1; sleep $((RANDOM % 20 + 5))
           done
+
+  verdict:   # accepted tasks: fairness review + failing-run audits -> final verdict in reports/actions
+    needs: collect
+    if: always() && needs.collect.outputs.accepted != ''
+    uses: ./.github/workflows/verdict.yml
+    with: { slugs: "${{ needs.collect.outputs.accepted }}", run: "${{ github.run_id }}" }
+    secrets: inherit
 
   next:
     needs: [plan, collect]
