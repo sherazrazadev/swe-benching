@@ -65,20 +65,13 @@ jobs:
     env: { HAS_KEY: "${{ secrets.ANTHROPIC_API_KEY != '' }}" }
     steps:
       - uses: actions/checkout@v4
-        if: env.HAS_KEY == 'true'
       - name: Task files from branch runs/<run>
-        if: env.HAS_KEY == 'true'
         run: git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
       - uses: actions/download-artifact@v4
-        if: env.HAS_KEY == 'true'
         with: { pattern: "*trial-${{ matrix.slug }}-*", path: /tmp/art, run-id: "${{ inputs.run }}", github-token: "${{ github.token }}" }
-      - name: Audit every failing run (Claude Opus)
-        if: env.HAS_KEY == 'true'
-        env:
-          SLUG: ${{ matrix.slug }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Evidence folder of every failing run (common/audit/postmortem.py)
+        env: { SLUG: "${{ matrix.slug }}" }
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.302 >/dev/null
           python3 -I common/ci/ci.py collect /tmp/art --jobs
           J=$HOME/.tb-graders/cwe/jobs
           for job in $(python3 -I -c 'import json,sys
@@ -90,17 +83,29 @@ jobs:
               [ -f "$t/result.json" ] || continue
               d=$(ls -d "$t"postmortem-* 2>/dev/null | tail -1)
               { [ -n "$d" ] && [ -f "$d/AUDITOR_BRIEF.md" ]; } || d=$(python3 -I common/audit/postmortem.py prepare "$t" | tail -1)
-              echo "auditing $job -> $d"
-              timeout 2400 "$HOME/.local/bin/claude" -p "You are the independent auditor. Read $d/AUDITOR_BRIEF.md and follow it exactly, working only from $d (read-only). Write $d/verdict.json." \
-                --model claude-opus-5-5 --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$d" \
-                --no-session-persistence --output-format json > "$d/auditor-run.json" 2>&1 || echo "auditor failed for $job"
+              echo "${d%/}" >> /tmp/dirs.txt
             done
           done
+          echo "$(wc -l < /tmp/dirs.txt) failing runs to audit"; cat /tmp/dirs.txt
+      - name: Audit them (Claude Opus)
+        if: env.HAS_KEY == 'true'
+        env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.302 >/dev/null
+          while read -r d; do
+            timeout 2400 "$HOME/.local/bin/claude" -p "You are the independent auditor. Read $d/AUDITOR_BRIEF.md and follow it exactly, working only from $d (read-only). Write $d/verdict.json." \
+              --model claude-opus-5-5 --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$d" \
+              --no-session-persistence --output-format json > "$d/auditor-run.json" 2>&1 || echo "auditor failed: $d"
+          done < /tmp/dirs.txt
           python3 -I common/audit/postmortem.py record-ready || true
-          cd "$HOME/.tb-graders/cwe" && find jobs -path '*postmortem-*' \( -name 'POSTMORTEM.*' -o -name verdict.json \) -print0 \
-            | tar --null -czf "/tmp/audits-$SLUG.tgz" -T -
+      - name: Pack the audit folders
+        if: always()
+        env: { SLUG: "${{ matrix.slug }}" }
+        run: |
+          # evidence + brief (for audits made elsewhere) and any POSTMORTEM.json, as jobs/<job>/<trial>/postmortem-*/
+          if [ -s /tmp/dirs.txt ]; then sed "s#^$HOME/.tb-graders/cwe/##" /tmp/dirs.txt | tar -czf "/tmp/audits-$SLUG.tgz" -C "$HOME/.tb-graders/cwe" -T -; fi
       - uses: actions/upload-artifact@v4
-        if: always() && env.HAS_KEY == 'true'
+        if: always()
         with: { name: "audits-${{ matrix.slug }}", path: "/tmp/audits-*.tgz", retention-days: 30, if-no-files-found: warn }
 
   record:
