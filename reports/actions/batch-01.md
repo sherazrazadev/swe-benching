@@ -4,4 +4,4 @@ Started 2026-10-26T20:05Z. [run 40392574291](https://github.com/sherazrazadev/sw
 
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
-| `dottie.js-s3` | sound | 1 | 0.8276 | **rejected** |
+| `dottie.js-s3` | sound | 1 | 0.8276 | **REJECTED** |

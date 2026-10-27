@@ -20,14 +20,10 @@ Outcome (per task, from the trial records; the official verdict is still audit_r
     unsound / gate error / listing fail   the gate's marker
     build failed no gate marker (builder or runner died)
 
-Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-9; this is what is shared):
-    FINAL BREAKER  fairness READY and every failing run audited trustworthy (the model's own failure)
-    NEEDS FIX      fairness NOT_READY or an audit found a test or instruction fault (GUIDE step 10: fairfix)
-    NEEDS RE-RUN   no fault, but a model has fewer than 3 trustworthy failing runs (a run was excluded for an
-                   infra/provider problem): trial that model again
-    NEEDS HUMAN DECISION  all of the above pass, but the fairness review left a question for a person
-                   (answer it in build/<slug>/HUMAN-DECISION.md: DECISION: KEEP / REPAIR / DROP)
-    PENDING        an audit or the fairness review is missing or errored
+Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-10). Only these two are recorded:
+    ACCEPTED   fairness READY, every failing run audited as the model's own failure, owner's questions decided
+    REJECTED   a model solved it (also after a re-run), or the owner dropped it
+Until then the task shows as "in final checks"; `verdict` prints what it still needs (re-run, fix, owner decision).
 """
 import argparse
 import json
@@ -137,13 +133,20 @@ def audit_of(job):
 
 
 def verdict(slug):
+    """Where an accepted-on-trials task stands in the final checks. Only ACCEPTED / REJECTED are ever recorded;
+    the other states say what has to happen next and are printed, not written to the reports."""
     b = ROOT / "build" / slug
     fv = subprocess.run([sys.executable, "-I", str(ROOT / "common/fairness/fairness_verdict.py"), slug],
                         capture_output=True, text=True).stdout.strip() or "ERROR: no output"
-    audits = []
+    hd = b / "HUMAN-DECISION.md"
+    decision = next((l.split(":", 1)[1].strip().split()[0].upper() for l in (hd.read_text().splitlines() if hd.is_file() else [])
+                     if l.strip().upper().startswith("DECISION:") and l.split(":", 1)[1].strip()), "")
+    audits, solved = [], []
     for m in MODELS:
         f = b / f"trial_detail_{m}.json"
         for r in json.loads(f.read_text()).get("runs", []) if f.is_file() else []:
+            if r.get("reward") == 1.0:
+                solved.append(m)
             if r.get("reward") is None or r["reward"] == 1.0:
                 continue                      # ungraded runs never count; solves are not audited
             a = audit_of(r["job"]) or {}
@@ -153,37 +156,52 @@ def verdict(slug):
     fault = [a for a in audits if a["trustworthy"] is False and a["attribution"] in ("test-fault", "instruction-ambiguity")]
     missing = [a for a in audits if a["trustworthy"] is None]
     short = [m for m in MODELS if sum(a["model"] == m and a["trustworthy"] is True for a in audits) < 3]
-    if fv.startswith("NOT_READY") or fault:
-        final = "NEEDS FIX"
+    if solved:
+        state, reason = "REJECTED", f"solved by {', '.join(sorted(set(solved)))}"
+    elif decision == "DROP":
+        state, reason = "REJECTED", "dropped by the owner (HUMAN-DECISION.md)"
+    elif fv.startswith("NOT_READY") or fault:
+        state, reason = "needs fix", "fairness NOT_READY or an audit found a test/instruction fault"
     elif missing or not fv.startswith("READY"):
-        final = "PENDING"
+        state, reason = "pending", "an audit or the fairness review is missing"
     elif short:
-        final = "NEEDS RE-RUN"
+        state, reason = "needs re-run", f"{', '.join(short)}: fewer than 3 trustworthy failing runs"
+    elif "human question open" in fv:
+        state, reason = "needs owner decision", "fairness review asked a question"
     else:
-        final = "NEEDS HUMAN DECISION" if "human question open" in fv else "FINAL BREAKER"
+        state, reason = "ACCEPTED", "fairness READY, every failing run audited as the model's own failure"
     fair = b / "FAIRNESS.md"
     md = fair.read_text() if fair.is_file() else ""
     question = next((l.split(":", 1)[1].strip() for l in md.splitlines() if l.lower().startswith(("human review:", "**human review:**"))), "")
-    return {"slug": slug, "final": final, "fairness": fv, "audits": audits, "rerun": short,
+    return {"slug": slug, "final": state, "reason": reason, "fairness": fv, "audits": audits, "decision": decision,
             "human_question": question.strip("* "), "fairness_md": md}
 
 
 def record_verdict(items, gh_repo):
+    """Record only finished tasks (ACCEPTED / REJECTED); others are printed with what they still need."""
     rows = read_rows()
-    (REP / "verdicts").mkdir(parents=True, exist_ok=True)
     batches = set()
     for v in items:
+        for pm in [*JOBS.glob("*/*/postmortem-*/POSTMORTEM.json")]:     # keep the audits next to the reports
+            job = pm.parent.parent.parent.name
+            if any(job == a["job"] for a in v["audits"]):
+                d = REP / "audits" / job
+                d.mkdir(parents=True, exist_ok=True)
+                for f in ("POSTMORTEM.json", "POSTMORTEM.md"):
+                    shutil.copy2(pm.parent / f, d / f)
+        if v["final"] not in ("ACCEPTED", "REJECTED"):
+            print(f"{v['slug']}: not final yet ({v['final']}: {v['reason']}); nothing recorded")
+            continue
         row = [r for r in rows if r["slug"] == v["slug"]][-1]
         ok = sum(a["trustworthy"] is True and a["attribution"] == "model-failed" for a in v["audits"])
         row.update(final=v["final"], fairness=v["fairness"].split(" (")[0], audits=f"{ok}/{len(v['audits'])} trustworthy")
         batches.add(row["batch"])
-        out = [f"# `{v['slug']}`: {v['final']}", "", f"- {row['description']}",
+        (REP / "verdicts").mkdir(parents=True, exist_ok=True)
+        out = [f"# `{v['slug']}`: {v['final']}", "", f"**Why:** {v['reason']}.", "", f"- {row['description']}",
                f"- {row['cwe']}, {row['language']}, {row['repo']}", f"- Batch {row['batch']}, {links(row['run'], gh_repo)}",
-               f"- Trials: DeepSeek {row['deepseek']} / MiMo {row['mimo']} (no run at 1.0)", "",
-               f"## Fairness review: {v['fairness']}", "",
-               *([f"**Question for a person:** {v['human_question']}", ""] if v.get("human_question") else []),
-               *([f"**Re-run needed:** {', '.join(v['rerun'])} has fewer than 3 trustworthy failing runs.", ""]
-                 if v["final"] == "NEEDS RE-RUN" else []),
+               f"- Trials: DeepSeek {row['deepseek']} / MiMo {row['mimo']}", "",
+               f"## Fairness review: {v['fairness'].split(' (')[0]}", "",
+               *([f"Owner decision: **{v['decision']}** (`build/{v['slug']}/HUMAN-DECISION.md`)", ""] if v["decision"] else []),
                f"Full review: [{v['slug']}-FAIRNESS.md]({v['slug']}-FAIRNESS.md)" if v["fairness_md"] else "No review written.", "",
                f"## Audits of the failing runs ({row['audits']})", "", "| Model | Reward | Trustworthy | Attribution | Auditor's summary |",
                "|---|---|---|---|---|"]
@@ -192,17 +210,18 @@ def record_verdict(items, gh_repo):
         (REP / "verdicts" / f"{v['slug']}.md").write_text("\n".join(out) + "\n")
         if v["fairness_md"]:
             (REP / "verdicts" / f"{v['slug']}-FAIRNESS.md").write_text(v["fairness_md"])
-    for pm in JOBS.glob("*/*/postmortem-*/POSTMORTEM.json"):     # keep the audits next to the reports
-        job = pm.parent.parent.parent.name
-        if any(job == a["job"] for v in items for a in v["audits"]):
-            d = REP / "audits" / job
-            d.mkdir(parents=True, exist_ok=True)
-            for f in ("POSTMORTEM.json", "POSTMORTEM.md"):
-                shutil.copy2(pm.parent / f, d / f)
+        print(f"{v['slug']}: {v['final']} recorded")
     write_rows(rows)
     for n in batches:
         write_batch(int(n), [r for r in rows if r["batch"] == n], [], gh_repo)
     write_readme(rows, gh_repo)
+
+
+def outcome(r):
+    """What the reports show: the final ACCEPTED / REJECTED once a task has passed every step, else where it is."""
+    if r["status"] == "accepted":
+        return r["final"] if r["final"] in ("ACCEPTED", "REJECTED") else "in final checks"
+    return {"rejected": "REJECTED"}.get(r["status"], r["status"])
 
 
 def links(run, gh_repo):
@@ -211,20 +230,16 @@ def links(run, gh_repo):
 
 
 def write_batch(n, rows, results, gh_repo):
-    by_slug = {r["slug"]: r for r in results}
     runs = sorted({r["run"] for r in rows})
     out = [f"# Batch {n}", "", f"Started {min(r['utc'] for r in rows)}. " + "; ".join(links(r, gh_repo) for r in runs), "",
            "| Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |", "|---|---|---|---|---|"]
-    out += [f"| `{r['slug']}` | {r['gate'] or '-'} | {r['deepseek'] or '-'} | {r['mimo'] or '-'} | **{r['status']}** |" for r in rows]
-    acc = [r for r in rows if r["status"] == "accepted"]
+    out += [f"| `{r['slug']}` | {r['gate'] or '-'} | {r['deepseek'] or '-'} | {r['mimo'] or '-'} | **{outcome(r)}** |" for r in rows]
+    acc = [r for r in rows if outcome(r) == "ACCEPTED"]
     if acc:
         out += ["", "## Accepted tasks", ""]
         for r in acc:
-            a = by_slug.get(r["slug"], {})
-            out += [f"### `{r['slug']}`", "", f"- {r['description']}", f"- {r['cwe']}, {r['language']}, {r['repo']}"
-                    + (f" ({a['advisory']})" if a.get("advisory") else ""),
-                    f"- DeepSeek {r['deepseek']} / MiMo {r['mimo']}",
-                    f"- Final verdict: **{r['final'] or 'PENDING'}**" + (f" ([details](verdicts/{r['slug']}.md))" if r["final"] else ""), ""]
+            out += [f"### `{r['slug']}`", "", f"- {r['description']}", f"- {r['cwe']}, {r['language']}, {r['repo']}",
+                    f"- DeepSeek {r['deepseek']} / MiMo {r['mimo']}", f"- [Final verdict details](verdicts/{r['slug']}.md)", ""]
     (REP / f"batch-{n:02d}.md").write_text("\n".join(out).rstrip() + "\n")
 
 
@@ -232,10 +247,10 @@ def write_readme(rows, gh_repo):
     latest = {}
     for r in rows:
         latest[r["slug"]] = r          # last attempt of a task decides its outcome
-    order = ["accepted", "rejected", "incomplete", "unsound", "gate error", "listing fail", "build failed", "running"]
+    order = ["ACCEPTED", "REJECTED", "in final checks", "incomplete", "unsound", "gate error", "listing fail", "build failed", "running"]
     total = defaultdict(int)
     for r in latest.values():
-        total[r["status"]] += 1
+        total[outcome(r)] += 1
     batches = defaultdict(list)
     for r in rows:
         batches[int(r["batch"])].append(r)
@@ -243,35 +258,27 @@ def write_readme(rows, gh_repo):
            "Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 7 tasks per batch. With "
            "`chain` on, each batch starts the next one from `queue.txt` when it ends; a task listed in `tasks.tsv` is "
            "never picked again.", "",
-           "**Accepted** = gate sound and both models failed all 3 runs (no run at 1.0). Each accepted task then gets "
-           "the final verdict steps: an audit of every failing run (Claude Opus, `common/audit/postmortem.py`) and the "
-           "fairness review (DeepSeek, `pipelines/sibling/9-fairness`). **FINAL BREAKER** = fairness READY and every "
-           "failing run audited trustworthy: these are the tasks to share. **NEEDS HUMAN DECISION** = the same, but the "
-           "fairness review asked a person a question (answer in `build/<slug>/HUMAN-DECISION.md`). **NEEDS FIX** = a "
-           "fault was found (fairfix, GUIDE step 10). **NEEDS RE-RUN** = no fault, but a run was excluded (provider/infra) "
-           "so a model needs another trial. **PENDING** = a step has not finished.", "",
+           "**ACCEPTED** = gate sound, both models failed all 3 runs, every failing run audited as the model's own failure "
+           "(Claude Opus, `common/audit/postmortem.py`) and the fairness review READY (DeepSeek, `pipelines/sibling/9-fairness`), "
+           "with any open question decided by the owner. **REJECTED** = a model solved it, or the owner dropped it. "
+           "**in final checks** = passed the trials; audits, fairness, re-runs or fixes still under way, nothing recorded yet.", "",
            f"## Totals ({len(latest)} tasks)", "", "| " + " | ".join(o for o in order if total[o]) + " |",
            "|" + "---|" * len([o for o in order if total[o]]), "| " + " | ".join(str(total[o]) for o in order if total[o]) + " |", "",
-           "## Batches", "", "| Batch | Started | Tasks | Accepted | Rejected | Unsound / gate | Build failed | Other | Runs |",
+           "## Batches", "", "| Batch | Started | Tasks | Accepted | Rejected | In final checks | Unsound / gate | Build failed | Runs |",
            "|---|---|---|---|---|---|---|---|---|"]
     for n in sorted(batches):
         b = batches[n]
-        c = lambda *s: sum(r["status"] in s for r in b)
-        out.append(f"| [{n}](batch-{n:02d}.md) | {min(r['utc'] for r in b)} | {len(b)} | {c('accepted')} | {c('rejected')} | "
-                   f"{c('unsound', 'gate error', 'listing fail')} | {c('build failed')} | {c('incomplete', 'running')} | "
+        c = lambda *s: sum(outcome(r) in s for r in b)
+        out.append(f"| [{n}](batch-{n:02d}.md) | {min(r['utc'] for r in b)} | {len(b)} | {c('ACCEPTED')} | {c('REJECTED')} | "
+                   f"{c('in final checks', 'incomplete', 'running')} | {c('unsound', 'gate error', 'listing fail')} | {c('build failed')} | "
                    + ", ".join(f"[{x}](https://github.com/{gh_repo}/actions/runs/{x})" for x in sorted({r['run'] for r in b})) + " |")
-    acc = [r for r in latest.values() if r["status"] == "accepted"]
-    fin = defaultdict(int)
-    for r in acc:
-        fin[r["final"] or "PENDING"] += 1
-    out += ["", f"## Accepted tasks ({len(acc)}: " + ", ".join(f"{v} {k}" for k, v in sorted(fin.items())) + ")", "",
-            "| Task | Final verdict | Batch | CWE | Language | Repo | DeepSeek | MiMo | Fairness | Audits | What it is |",
-            "|---|---|---|---|---|---|---|---|---|---|---|"]
-    out += [f"| `{r['slug']}` | " + (f"[**{r['final']}**](verdicts/{r['slug']}.md)" if r["final"] else "PENDING")
-            + f" | {r['batch']} | {r['cwe']} | {r['language']} | {r['repo']} | {r['deepseek']} | {r['mimo']} | "
-            f"{r['fairness'] or '-'} | {r['audits'] or '-'} | {r['description']} |" for r in acc]
-    out += ["", "Files: `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `queue.txt` (what to build next, "
-            "in order; add slugs that have `build/<slug>/BUILD-PROMPT.md`)."]
+    acc = [r for r in latest.values() if outcome(r) == "ACCEPTED"]
+    out += ["", f"## Accepted tasks ({len(acc)})", "", "| Task | Batch | CWE | Language | Repo | DeepSeek | MiMo | What it is |",
+            "|---|---|---|---|---|---|---|---|"]
+    out += [f"| [`{r['slug']}`](verdicts/{r['slug']}.md) | {r['batch']} | {r['cwe']} | {r['language']} | {r['repo']} | "
+            f"{r['deepseek']} | {r['mimo']} | {r['description']} |" for r in acc]
+    out += ["", "Files: `tasks.tsv` (one row per task attempt), `batch-NN.md` (per batch), `verdicts/` (final verdict of each "
+            "accepted task), `audits/` (every failing run's audit), `queue.txt` (what to build next)."]
     (REP / "README.md").write_text("\n".join(out) + "\n")
 
 
