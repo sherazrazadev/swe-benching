@@ -18,7 +18,8 @@ review before model trials. Project root: /home/mara/cwe-bench. Task slug: ${SLU
 Read, in order: build/${SLUG}/FAIRNESS.md (the review, with a numbered 'Required changes' list),
 common/fairness/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
 tasks/${SLUG}/tests/ (all files), tasks/${SLUG}/solution/fix.patch, build/${SLUG}/manifest.json,
-build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch.
+build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch, and build/${SLUG}/AUDIT-FINDINGS.md if it exists
+(faults that independent audits of the model trials found: treat each like a 'Required' change).
 
 Apply EVERY 'Required' change in FAIRNESS.md (and any 'Recommended' change that is cheap and clearly
 safe). These typically mean: remove sentences in instruction.md that name a file/function/trap/

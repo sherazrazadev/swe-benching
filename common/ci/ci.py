@@ -11,8 +11,9 @@
         parallel run jobs are merged. --jobs also copies the Harbor job folders into ~/.tb-graders/cwe/.
     ci.py sound <dir>
         JSON list of slugs whose build artifact left build/<slug>/.sound.
-    ci.py next <dir> --models deepseek,mimo --runs 3
-        After run 1: JSON matrix of runs 2..N for every task that no model solved in run 1.
+    ci.py next <dir> --models deepseek,mimo --runs 3 [--first 1]
+        After the first run: JSON matrix of the remaining runs (first+1 .. first+runs-1) for every task that no
+        model solved in it.
 
 Verdicts are NOT computed here: they stay with common/trial/trial.py and common/audit/audit_results.py.
 """
@@ -179,7 +180,7 @@ def sound(where):
     print(json.dumps(out))
 
 
-def nxt(where, models, runs):
+def nxt(where, models, runs, first=1):
     solved, seen = set(), set()
     for tgz in artifacts(where):
         if not tgz.name.startswith("trial-"):
@@ -192,7 +193,7 @@ def nxt(where, models, runs):
                 solved.add(meta["slug"])
         shutil.rmtree(d)
     print(json.dumps([{"slug": s, "model": m, "run": r}
-                      for s in sorted(seen - solved) for m in models for r in range(2, runs + 1)]))
+                      for s in sorted(seen - solved) for m in models for r in range(first + 1, first + runs)]))
 
 
 def main():
@@ -203,7 +204,7 @@ def main():
     a = sp.add_parser("collect"); a.add_argument("dir"); a.add_argument("--jobs", action="store_true")
     a = sp.add_parser("sound"); a.add_argument("dir")
     a = sp.add_parser("next"); a.add_argument("dir"); a.add_argument("--models", default="deepseek,mimo")
-    a.add_argument("--runs", type=int, default=3)
+    a.add_argument("--runs", type=int, default=3); a.add_argument("--first", type=int, default=1)
     x = ap.parse_args()
     if x.cmd == "pack":
         pack(x.kind, x.slug, x.out, x.model, x.run)
@@ -212,7 +213,7 @@ def main():
     elif x.cmd == "sound":
         sound(x.dir)
     else:
-        nxt(x.dir, [m.strip() for m in x.models.split(",") if m.strip()], x.runs)
+        nxt(x.dir, [m.strip() for m in x.models.split(",") if m.strip()], x.runs, x.first)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@
                                         write those results into tasks.tsv, batch-<N>.md and README.md
     batches.py verdict <slugs>          JSON final-verdict inputs of accepted tasks: fairness (build/<slug>/FAIRNESS.md)
                                         and the audit of every failing run (~/.tb-graders/cwe/jobs/.../postmortem-*/)
+    batches.py keep <slugs>             copy the tasks' audits into build/<slug>/audits/<job>/ (saved on the results branch)
+    batches.py findings <json>          write build/<slug>/AUDIT-FINDINGS.md (audit faults) for each task to REPAIR
     batches.py record-verdict <json>    write them into tasks.tsv, verdicts/<slug>.md, batch-<N>.md and README.md
 
 A slug in tasks.tsv is never picked again (whatever its outcome), so no task is built twice. To build one again,
@@ -20,10 +22,16 @@ Outcome (per task, from the trial records; the official verdict is still audit_r
     unsound / gate error / listing fail   the gate's marker
     build failed no gate marker (builder or runner died)
 
-Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-10). Only these two are recorded:
-    ACCEPTED   fairness READY, every failing run audited as the model's own failure, owner's questions decided
-    REJECTED   a model solved it (also after a re-run), or the owner dropped it
-Until then the task shows as "in final checks"; `verdict` prints what it still needs (re-run, fix, owner decision).
+Final verdict of an accepted task (pipelines/sibling/GUIDE.md steps 8-10), decided automatically. Recorded:
+    ACCEPTED   fairness READY and every failing run audited, none finding a test or instruction fault
+    REJECTED   a model solved it, the owner dropped it, or it is still unfair after one repair
+Steps on the way (not recorded, the workflows act on them):
+    REPAIR     fairness NOT_READY or an audit found a fault: fairfix + re-gate + fresh trials (repair.yml), once
+    RERUN      a model has fewer than 3 trustworthy failing runs: extra runs of that model (repair.yml)
+    pending    audits or the fairness review missing (audits need Claude Opus: secret ANTHROPIC_API_KEY or
+               CLAUDE_CODE_OAUTH_TOKEN, else run them locally)
+An open fairness "human review" question does not stop the task: the audits of the actual runs decide it
+(owner rule 2026-10-27: no human review; only ACCEPTED or REJECTED, with repair + re-trial when needed).
 """
 import argparse
 import json
@@ -43,6 +51,8 @@ COLS = ["slug", "batch", "run", "utc", "status", "gate", "deepseek", "mimo", "cw
         "final", "fairness", "audits"]
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 MODELS = ("deepseek", "mimo")
+MAX_RUNS = 6          # runs per model before a task that cannot get 3 trustworthy failing runs is rejected
+MAX_REPAIRS = 1       # repair rounds before a task that is still unfair is rejected
 MARKERS = {".sound": "sound", ".unsound": "unsound", ".gate_error": "gate error", ".listing_fail": "listing fail"}
 
 
@@ -127,24 +137,27 @@ def record(results, run, batch, utc, gh_repo):
 
 def audit_of(job):
     """Newest recorded audit (POSTMORTEM.json) of a trial job, or None: from the Harbor job folder, or the copy
-    kept in reports/actions/audits/<job>/ (record-verdict saves one there)."""
-    pms = sorted((JOBS / job).glob("*/postmortem-*/POSTMORTEM.json")) or sorted((REP / "audits" / job).glob("POSTMORTEM*.json"))
+    kept in build/<slug>/audits/<job>/ (results branch) or reports/actions/audits/<job>/ (record-verdict)."""
+    pms = (sorted((JOBS / job).glob("*/postmortem-*/POSTMORTEM.json")) or sorted(ROOT.glob(f"build/*/audits/{job}/POSTMORTEM.json"))
+           or sorted((REP / "audits" / job).glob("POSTMORTEM*.json")))
     return json.loads(pms[-1].read_text()).get("verdict") if pms else None
 
 
 def verdict(slug):
-    """Where an accepted-on-trials task stands in the final checks. Only ACCEPTED / REJECTED are ever recorded;
-    the other states say what has to happen next and are printed, not written to the reports."""
+    """The automatic final decision of an accepted-on-trials task (see the module doc). Only ACCEPTED / REJECTED
+    are recorded; REPAIR / RERUN tell the workflows what to run next; pending waits for audits or fairness."""
     b = ROOT / "build" / slug
     fv = subprocess.run([sys.executable, "-I", str(ROOT / "common/fairness/fairness_verdict.py"), slug],
                         capture_output=True, text=True).stdout.strip() or "ERROR: no output"
     hd = b / "HUMAN-DECISION.md"
     decision = next((l.split(":", 1)[1].strip().split()[0].upper() for l in (hd.read_text().splitlines() if hd.is_file() else [])
                      if l.strip().upper().startswith("DECISION:") and l.split(":", 1)[1].strip()), "")
-    audits, solved = [], []
+    rnd = int((b / "repair_round.txt").read_text().strip() or 0) if (b / "repair_round.txt").is_file() else 0
+    audits, solved, last = [], [], {m: 0 for m in MODELS}
     for m in MODELS:
         f = b / f"trial_detail_{m}.json"
         for r in json.loads(f.read_text()).get("runs", []) if f.is_file() else []:
+            last[m] = max(last[m], int(r.get("run") or 0))
             if r.get("reward") == 1.0:
                 solved.append(m)
             if r.get("reward") is None or r["reward"] == 1.0:
@@ -152,30 +165,70 @@ def verdict(slug):
             a = audit_of(r["job"]) or {}
             audits.append({"model": m, "job": r["job"], "reward": r["reward"], "trustworthy": a.get("trustworthy"),
                            "attribution": a.get("attribution", "not audited"), "confidence": a.get("confidence", ""),
-                           "summary": a.get("summary", "")})
+                           "summary": a.get("summary", ""), "action": a.get("recommended_action", "")})
     fault = [a for a in audits if a["trustworthy"] is False and a["attribution"] in ("test-fault", "instruction-ambiguity")]
     missing = [a for a in audits if a["trustworthy"] is None]
-    short = [m for m in MODELS if sum(a["model"] == m and a["trustworthy"] is True for a in audits) < 3]
+    need = {m: 3 - sum(a["model"] == m and a["trustworthy"] is True for a in audits) for m in MODELS}
+    need = {m: n for m, n in need.items() if n > 0}
+    rerun = {}
     if solved:
         state, reason = "REJECTED", f"solved by {', '.join(sorted(set(solved)))}"
     elif decision == "DROP":
         why = next((l.split(":", 1)[1].strip() for l in hd.read_text().splitlines() if l.startswith("WHY:")), "")
         state, reason = "REJECTED", "dropped by the owner" + (f": {why.rstrip('.')}" if why else "")
-    elif fv.startswith("NOT_READY") or fault:
-        state, reason = "needs fix", "fairness NOT_READY or an audit found a test/instruction fault"
-    elif missing or not fv.startswith("READY"):
+    elif missing or fv.startswith("ERROR"):
         state, reason = "pending", "an audit or the fairness review is missing"
-    elif short:
-        state, reason = "needs re-run", f"{', '.join(short)}: fewer than 3 trustworthy failing runs"
-    elif "human question open" in fv:
-        state, reason = "needs owner decision", "fairness review asked a question"
+    elif (fv.startswith("NOT_READY") and decision != "KEEP") or fault:
+        what = "fairness review NOT_READY" if fv.startswith("NOT_READY") else ""
+        what = "; ".join(x for x in (what, f"{len(fault)} audit(s) found a test or instruction fault" if fault else "") if x)
+        if rnd >= MAX_REPAIRS:
+            state, reason = "REJECTED", f"still unfair after {rnd} repair(s): {what}"
+        else:
+            state, reason = "REPAIR", what
+    elif need:
+        over = [m for m, n in need.items() if last[m] + n > MAX_RUNS]
+        if over:
+            state, reason = "REJECTED", f"{', '.join(over)}: fewer than 3 trustworthy failing runs within {MAX_RUNS} runs"
+        else:
+            rerun = {m: {"first": last[m] + 1, "runs": n} for m, n in need.items()}
+            state, reason = "RERUN", "; ".join(f"{m}: {n} more run(s) needed" for m, n in need.items())
     else:
         state, reason = "ACCEPTED", "fairness READY, every failing run audited as the model's own failure"
+        if "human question open" in fv:
+            reason += " (the review's open question is answered by the audits: none found a fault)"
     fair = b / "FAIRNESS.md"
     md = fair.read_text() if fair.is_file() else ""
     question = next((l.split(":", 1)[1].strip() for l in md.splitlines() if l.lower().startswith(("human review:", "**human review:**"))), "")
     return {"slug": slug, "final": state, "reason": reason, "fairness": fv, "audits": audits, "decision": decision,
-            "human_question": question.strip("* "), "fairness_md": md}
+            "round": rnd, "rerun": rerun, "human_question": question.strip("* "), "fairness_md": md}
+
+
+def keep(slugs):
+    """Copy the audits of these tasks' runs into build/<slug>/audits/<job>/, which the workflows push to the results
+    branch, so a later re-run or repair of the task still has them."""
+    for slug in slugs:
+        for pm in JOBS.glob(f"{slug}-*/*/postmortem-*/POSTMORTEM.json"):
+            d = ROOT / "build" / slug / "audits" / pm.parent.parent.parent.name
+            d.mkdir(parents=True, exist_ok=True)
+            for f in ("POSTMORTEM.json", "POSTMORTEM.md"):
+                if (pm.parent / f).is_file():
+                    shutil.copy2(pm.parent / f, d / f)
+
+
+def findings(items):
+    """build/<slug>/AUDIT-FINDINGS.md for each task to REPAIR: the faults the audits found, read by the fairfix."""
+    for v in items:
+        if v["final"] != "REPAIR":
+            continue
+        out = [f"# Audit findings: {v['slug']}", "", "Independent Claude Opus audits of the model runs found these faults in the "
+               "task (tests that fail a correct fix, or requirements the instruction does not state). Fix each one like a "
+               "Required change in FAIRNESS.md, keeping the task's security bar.", ""]
+        for a in v["audits"]:
+            if a["trustworthy"] is False and a["attribution"] in ("test-fault", "instruction-ambiguity"):
+                out += [f"## {a['job']} ({a['attribution']}, reward {a['reward']:g})", "", a["summary"], "",
+                        f"Recommended action: {a['action']}", ""]
+        (ROOT / "build" / v["slug"] / "AUDIT-FINDINGS.md").write_text("\n".join(out))
+        print(f"{v['slug']}: wrote build/{v['slug']}/AUDIT-FINDINGS.md")
 
 
 def record_verdict(items, gh_repo):
@@ -183,17 +236,20 @@ def record_verdict(items, gh_repo):
     rows = read_rows()
     batches = set()
     for v in items:
-        for pm in [*JOBS.glob("*/*/postmortem-*/POSTMORTEM.json")]:     # keep the audits next to the reports
-            job = pm.parent.parent.parent.name
-            if any(job == a["job"] for a in v["audits"]):
-                d = REP / "audits" / job
+        for a in v["audits"]:                                           # keep the audits next to the reports
+            pms = sorted((JOBS / a["job"]).glob("*/postmortem-*/POSTMORTEM.json")) or \
+                  sorted((ROOT / "build" / v["slug"] / "audits" / a["job"]).glob("POSTMORTEM.json"))
+            if pms:
+                d = REP / "audits" / a["job"]
                 d.mkdir(parents=True, exist_ok=True)
                 for f in ("POSTMORTEM.json", "POSTMORTEM.md"):
-                    shutil.copy2(pm.parent / f, d / f)
+                    if (pms[-1].parent / f).is_file():
+                        shutil.copy2(pms[-1].parent / f, d / f)
         if v["final"] not in ("ACCEPTED", "REJECTED"):
             print(f"{v['slug']}: not final yet ({v['final']}: {v['reason']}); nothing recorded")
             continue
         row = [r for r in rows if r["slug"] == v["slug"]][-1]
+        row.update({m: x for m, x in result(v["slug"]).items() if m in MODELS and x != "-"})   # every run, incl. re-runs
         ok = sum(a["trustworthy"] is True and a["attribution"] == "model-failed" for a in v["audits"])
         row.update(final=v["final"], fairness=v["fairness"].split(" (")[0], audits=f"{ok}/{len(v['audits'])} trustworthy")
         batches.add(row["batch"])
@@ -261,8 +317,9 @@ def write_readme(rows, gh_repo):
            "never picked again.", "",
            "**ACCEPTED** = gate sound, both models failed all 3 runs, every failing run audited as the model's own failure "
            "(Claude Opus, `common/audit/postmortem.py`) and the fairness review READY (DeepSeek, `pipelines/sibling/9-fairness`), "
-           "with any open question decided by the owner. **REJECTED** = a model solved it, or the owner dropped it. "
-           "**in final checks** = passed the trials; audits, fairness, re-runs or fixes still under way, nothing recorded yet.", "",
+           "decided automatically. **REJECTED** = a model solved it, the owner dropped it, or it was still unfair after one repair "
+           "(fairfix, re-gate and fresh trials). **in final checks** = passed the trials; audits, fairness, a repair or extra "
+           "runs still under way, nothing recorded yet.", "",
            f"## Totals ({len(latest)} tasks)", "", "| " + " | ".join(o for o in order if total[o]) + " |",
            "|" + "---|" * len([o for o in order if total[o]]), "| " + " | ".join(str(total[o]) for o in order if total[o]) + " |", "",
            "## Batches", "", "| Batch | Started | Tasks | Accepted | Rejected | In final checks | Unsound / gate | Build failed | Runs |",
@@ -290,6 +347,8 @@ def main():
     a = sp.add_parser("claim"); a.add_argument("slugs"); a.add_argument("run")
     a = sp.add_parser("summarize"); a.add_argument("slugs")
     a = sp.add_parser("verdict"); a.add_argument("slugs")
+    a = sp.add_parser("keep"); a.add_argument("slugs")
+    a = sp.add_parser("findings"); a.add_argument("json")
     a = sp.add_parser("record-verdict"); a.add_argument("json"); a.add_argument("--repo", default="sherazrazadev/swe-benching")
     a = sp.add_parser("record"); a.add_argument("json"); a.add_argument("--run", required=True)
     a.add_argument("--batch"); a.add_argument("--utc"); a.add_argument("--repo", default="sherazrazadev/swe-benching")
@@ -301,6 +360,10 @@ def main():
         claim(split(x.slugs), x.run)
     elif x.cmd == "verdict":
         print(json.dumps([verdict(s) for s in split(x.slugs)], indent=1))
+    elif x.cmd == "keep":
+        keep(split(x.slugs))
+    elif x.cmd == "findings":
+        findings(json.loads(Path(x.json).read_text()))
     elif x.cmd == "record-verdict":
         record_verdict(json.loads(Path(x.json).read_text()), x.repo)
     elif x.cmd == "summarize":

@@ -1,0 +1,127 @@
+name: repair
+# Started by verdict.yml for a task accepted on trials that is not final yet (pipelines/sibling/GUIDE.md step 10):
+#   repair  the fairness review or an audit found a fault: fairfix (DeepSeek, pipelines/sibling/10-fairfix/run_fairfix.sh,
+#           reading FAIRNESS.md and AUDIT-FINDINGS.md), full re-gate (common/gate/gate_one_ds.sh), then fresh trials of
+#           both models (the old runs saw the old task; they stay in build/<slug>/round<N>/). One repair per task.
+#   rerun   a model has fewer than 3 trustworthy failing runs: extra runs of that model, merged with the earlier ones.
+# Then collect (branch runs/<this run>) and verdict.yml again, which records ACCEPTED / REJECTED or comes back here.
+on:
+  workflow_dispatch:
+    inputs:
+      slug: { description: "task slug", required: true }
+      run: { description: "run id whose branch runs/<id> holds the task, its trials, fairness and audits", required: true }
+      mode: { description: "repair or rerun", type: choice, options: [repair, rerun], default: repair }
+      models: { description: "trial models", default: "deepseek,mimo" }
+      first_run: { description: "number of the first new run (rerun: after the existing ones)", default: "1" }
+      runs: { description: "runs per model", default: "3" }
+      gate_slots: { description: "gate Harbor runs at once (2 is safe for heavy Java/Gradle repos)", default: "2" }
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    outputs: { sound: "${{ steps.p.outputs.sound }}", why: "${{ steps.p.outputs.why }}" }
+    env: { SLUG: "${{ inputs.slug }}", CI_MARK_FILE: /tmp/ci_mark }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: ./.github/actions/setup-runner
+        if: inputs.mode == 'repair'
+        with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}", gate_slots: "${{ inputs.gate_slots }}" }
+      - name: Task from branch runs/<run>
+        run: |
+          sleep 1; touch "$CI_MARK_FILE"; sleep 1
+          git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- "build/$SLUG" "tasks/$SLUG"
+          find "build/$SLUG" "tasks/$SLUG" -type f -exec touch {} +     # all of it goes into this run's build artifact
+      - name: Fairfix and re-gate
+        if: inputs.mode == 'repair'
+        timeout-minutes: 340
+        run: |
+          B=build/$SLUG; r=$(cat "$B/repair_round.txt" 2>/dev/null || echo 0)
+          export FAIRFIX_TIMEOUT=10800
+          bash common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh "$SLUG" || true
+          st=$(cat "$B/fairfix_status.txt" 2>/dev/null || echo "no status")
+          echo "$SLUG fairfix: $st" | tee -a "$GITHUB_STEP_SUMMARY"
+          # an unfinished fairfix is not the task's fault: fail visibly (dispatch repair.yml again), never reject
+          [ "$st" = ok ] || { echo "::error::fairfix did not finish ($st); run_fairfix.sh restored the task. Dispatch repair.yml again."; exit 1; }
+          # the old trials, fairness review and audits judged the old task: keep them aside, start fresh
+          mkdir -p "$B/round$r"
+          for f in trial_detail_*.json runs_*.log evidence FAIRNESS.md* fairness_* AUDIT-FINDINGS.md audits HUMAN-DECISION.md; do
+            for x in "$B"/$f; do [ -e "$x" ] && mv "$x" "$B/round$r/"; done
+          done
+          echo $((r + 1)) > "$B/repair_round.txt"
+          rm -f "$B/.sound" "$B/.unsound" "$B/.gate_error" "$B/.listing_fail"
+          bash common/gate/gate_one_ds.sh "$SLUG" || true
+          m=none; for x in .sound .unsound .gate_error; do [ -f "$B/$x" ] && m=$x; done
+          echo "$SLUG re-gate after the repair: $m" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$m" = .unsound ] && echo "re-gate after the repair: unsound" > /tmp/why
+          [ "$m" = .sound ] || [ "$m" = .unsound ] || { echo "::error::re-gate did not finish ($m): infrastructure, not the task. Dispatch repair.yml again."; exit 1; }
+      - name: Pack
+        id: p
+        if: always()
+        env: { DEEPSEEK_API_KEY: "${{ secrets.DEEPSEEK_API_KEY }}", MIMO_API_KEY: "${{ secrets.MIMO_API_KEY }}" }
+        run: |
+          mkdir -p /tmp/out
+          python3 -I common/ci/ci.py pack build "$SLUG" "/tmp/out/build-$SLUG.tgz"
+          if [ -f "build/$SLUG/.sound" ] && [ ! -s /tmp/why ]; then echo "sound=yes" >> "$GITHUB_OUTPUT"
+          else echo "sound=no" >> "$GITHUB_OUTPUT"; echo "why=$(cat /tmp/why 2>/dev/null)" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "build-${{ inputs.slug }}", path: "/tmp/out/build-*.tgz", retention-days: 30, if-no-files-found: warn }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "jobs-build-${{ inputs.slug }}", path: "/tmp/out/jobs-*.tgz", retention-days: 30, if-no-files-found: ignore }
+
+  trials:
+    needs: prepare
+    if: needs.prepare.outputs.sound == 'yes'
+    uses: ./.github/workflows/trial.yml
+    with:
+      slugs: ${{ inputs.slug }}
+      models: ${{ inputs.mode == 'repair' && 'deepseek,mimo' || inputs.models }}
+      runs: ${{ inputs.mode == 'repair' && '3' || inputs.runs }}
+      first_run: ${{ inputs.mode == 'repair' && '1' || inputs.first_run }}
+      build_run: ${{ github.run_id }}
+      collect: false
+    secrets: inherit
+
+  collect:
+    needs: [prepare, trials]
+    if: always() && needs.prepare.outputs.sound == 'yes' && needs.trials.result != 'skipped'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: ./.github/actions/collect
+        with: { token: "${{ github.token }}" }
+
+  verdict:
+    needs: collect
+    if: always() && needs.collect.result == 'success'
+    uses: ./.github/workflows/verdict.yml
+    with: { slugs: "${{ inputs.slug }}", run: "${{ github.run_id }}" }
+    secrets: inherit
+
+  reject:   # the repaired task failed its own gate (unsound): final REJECTED
+    needs: prepare
+    if: always() && startsWith(needs.prepare.outputs.why, 're-gate')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - name: Record REJECTED in reports/actions (main)
+        env: { SLUG: "${{ inputs.slug }}", WHY: "${{ needs.prepare.outputs.why }}" }
+        run: |
+          jq -n --arg s "$SLUG" --arg w "$WHY" '[{slug:$s, final:"REJECTED", reason:("repair failed: " + $w), fairness:"-",
+            audits:[], decision:"", round:0, rerun:{}, human_question:"", fairness_md:""}]' > /tmp/verdict.json
+          git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for try in 1 2 3 4 5; do
+            git fetch -q origin main && git reset -q --hard FETCH_HEAD
+            python3 -I common/ci/batches.py record-verdict /tmp/verdict.json --repo "$GITHUB_REPOSITORY"
+            git add reports/actions && git commit -q -m "Actions verdict: $SLUG REJECTED (repair failed)" && git push -q origin HEAD:main && break
+            [ "$try" = 5 ] && exit 1; sleep $((RANDOM % 20 + 5))
+          done
+          echo "$SLUG: REJECTED (repair failed: $WHY)" | tee -a "$GITHUB_STEP_SUMMARY"

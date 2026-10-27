@@ -1,8 +1,12 @@
 name: verdict
-# Final verdict of tasks accepted on trials (pipelines/sibling/GUIDE.md steps 8-9), recorded in reports/actions/ on main:
+# Final verdict of tasks accepted on trials (pipelines/sibling/GUIDE.md steps 8-10), decided automatically:
 #   fairness  DeepSeek fairness review per task (pipelines/sibling/9-fairness/run_fairness.sh + fairness_verdict.py)
-#   audits    Claude Opus audit of every failing run (common/audit/postmortem.py); needs secret ANTHROPIC_API_KEY,
-#             without it the audits stay PENDING (run them where Claude Opus is available, see common/ci/README.md)
+#   audits    Claude Opus audit of every failing run (common/audit/postmortem.py); needs secret ANTHROPIC_API_KEY or
+#             CLAUDE_CODE_OAUTH_TOKEN, without one the audits stay pending (run them locally, then dispatch this again)
+#   decide    common/ci/batches.py verdict: ACCEPTED / REJECTED are recorded in reports/actions/ on main;
+#             REPAIR (fairfix + re-gate + fresh trials) and RERUN (extra runs) start repair.yml, which ends here again.
+# Fairness results and audits are saved on the results branch runs/<run> (build/<slug>/), so a re-dispatch or a
+# repair reuses them instead of running them again.
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +18,7 @@ on:
       run: { type: string, required: true }
 permissions:
   contents: write
-  actions: read
+  actions: write   # decide starts repair.yml
 
 jobs:
   plan:
@@ -35,17 +39,24 @@ jobs:
       matrix: { slug: "${{ fromJSON(needs.plan.outputs.slugs) }}" }
     steps:
       - uses: actions/checkout@v4
+        with: { ref: main }
       - name: Task files from branch runs/<run>
-        run: git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
+        id: t
+        env: { SLUG: "${{ matrix.slug }}" }
+        run: |
+          git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
+          if [ -f "build/$SLUG/FAIRNESS.md" ]; then echo "done=yes" >> "$GITHUB_OUTPUT"; echo "$SLUG: fairness review already on the results branch"; fi
       - uses: ./.github/actions/setup-runner
+        if: steps.t.outputs.done != 'yes'
         with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}" }
       - name: Fairness review
+        if: steps.t.outputs.done != 'yes'
         env: { SLUG: "${{ matrix.slug }}" }
         run: |
           bash common/launch/drive.sh deepseek bash pipelines/sibling/9-fairness/run_fairness.sh "$SLUG" || true
           echo "$SLUG fairness: $(python3 -I common/fairness/fairness_verdict.py "$SLUG")" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.t.outputs.done != 'yes'
         with:
           name: fairness-${{ matrix.slug }}
           path: |
@@ -58,27 +69,29 @@ jobs:
     needs: plan
     name: audits ${{ matrix.slug }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix: { slug: "${{ fromJSON(needs.plan.outputs.slugs) }}" }
-    env: { HAS_KEY: "${{ secrets.ANTHROPIC_API_KEY != '' }}" }
+    env: { HAS_KEY: "${{ secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}" }
     steps:
       - uses: actions/checkout@v4
+        with: { ref: main }
       - name: Task files from branch runs/<run>
         run: git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
       - uses: actions/download-artifact@v4
         with: { pattern: "*trial-${{ matrix.slug }}-*", path: /tmp/art, run-id: "${{ inputs.run }}", github-token: "${{ github.token }}" }
-      - name: Evidence folder of every failing run (common/audit/postmortem.py)
+      - name: Evidence folder of every failing run not yet audited (common/audit/postmortem.py)
         env: { SLUG: "${{ matrix.slug }}" }
         run: |
           python3 -I common/ci/ci.py collect /tmp/art --jobs
-          J=$HOME/.tb-graders/cwe/jobs
+          J=$HOME/.tb-graders/cwe/jobs; touch /tmp/dirs.txt
           for job in $(python3 -I -c 'import json,sys
           for m in ("deepseek","mimo"):
               try: runs=json.load(open(f"build/{sys.argv[1]}/trial_detail_{m}.json"))["runs"]
               except OSError: continue
               print("\n".join(r["job"] for r in runs if r.get("reward") is not None and r["reward"] != 1.0))' "$SLUG"); do
+            [ -f "build/$SLUG/audits/$job/POSTMORTEM.json" ] && continue      # audited earlier (results branch)
             for t in "$J/$job"/*/; do
               [ -f "$t/result.json" ] || continue
               d=$(ls -d "$t"postmortem-* 2>/dev/null | tail -1)
@@ -89,8 +102,11 @@ jobs:
           echo "$(wc -l < /tmp/dirs.txt) failing runs to audit"; cat /tmp/dirs.txt
       - name: Audit them (Claude Opus)
         if: env.HAS_KEY == 'true'
-        env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          [ -s /tmp/dirs.txt ] || exit 0
           curl -fsSL https://claude.ai/install.sh | bash -s 2.1.302 >/dev/null
           while read -r d; do
             timeout 2400 "$HOME/.local/bin/claude" -p "You are the independent auditor. Read $d/AUDITOR_BRIEF.md and follow it exactly, working only from $d (read-only). Write $d/verdict.json." \
@@ -106,32 +122,69 @@ jobs:
           if [ -s /tmp/dirs.txt ]; then sed "s#^$HOME/.tb-graders/cwe/##" /tmp/dirs.txt | tar -czf "/tmp/audits-$SLUG.tgz" -C "$HOME/.tb-graders/cwe" -T -; fi
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: "audits-${{ matrix.slug }}", path: "/tmp/audits-*.tgz", retention-days: 30, if-no-files-found: warn }
+        with: { name: "audits-${{ matrix.slug }}", path: "/tmp/audits-*.tgz", retention-days: 30, if-no-files-found: ignore }
 
-  record:
+  decide:
     needs: [plan, fairness, audits]
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with: { ref: main }
       - name: Task files from branch runs/<run>
         run: git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- build tasks
       - uses: actions/download-artifact@v4
         with: { pattern: "fairness-*", path: /tmp/fair }
       - uses: actions/download-artifact@v4
         with: { pattern: "audits-*", path: /tmp/aud }
-      - name: Final verdicts into reports/actions (main)
+      - name: Decide
         env: { SLUGS: "${{ inputs.slugs }}" }
         run: |
           for d in /tmp/fair/fairness-*; do [ -d "$d" ] && cp -r "$d"/. "build/${d#/tmp/fair/fairness-}/"; done
           mkdir -p ~/.tb-graders/cwe; for f in /tmp/aud/*/*.tgz; do [ -f "$f" ] && tar -xzf "$f" -C ~/.tb-graders/cwe; done
+          python3 -I common/ci/batches.py keep "$SLUGS"
           python3 -I common/ci/batches.py verdict "$SLUGS" > /tmp/verdict.json
-          jq -r '.[] | "\(.slug): \(.final) (fairness \(.fairness); \([.audits[] | select(.trustworthy == true)] | length)/\(.audits | length) audits trustworthy)"' \
+          python3 -I common/ci/batches.py findings /tmp/verdict.json
+          jq -r '.[] | "\(.slug): \(.final) - \(.reason) (fairness \(.fairness); \([.audits[] | select(.trustworthy == true)] | length)/\(.audits | length) audits trustworthy)"' \
             /tmp/verdict.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save fairness and audits on the results branch
+        env: { SLUGS: "${{ inputs.slugs }}", RUN: "${{ inputs.run }}" }
+        run: |
+          git worktree add -q /tmp/rb FETCH_HEAD
+          for s in ${SLUGS//,/ }; do
+            mkdir -p "/tmp/rb/build/$s"
+            for f in build/$s/FAIRNESS.md* build/$s/fairness_* build/$s/AUDIT-FINDINGS.md build/$s/audits; do
+              [ -e "$f" ] && cp -r "$f" "/tmp/rb/build/$s/"
+            done
+          done
+          cd /tmp/rb && git add -A build
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Fairness and audits: $SLUGS" && git push -q origin "HEAD:refs/heads/runs/$RUN"
+      - name: Record ACCEPTED / REJECTED in reports/actions (main)
+        env: { SLUGS: "${{ inputs.slugs }}" }
+        run: |
+          jq -e 'any(.[]; .final == "ACCEPTED" or .final == "REJECTED")' /tmp/verdict.json >/dev/null || exit 0
           git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp -r build /tmp/build-now
           for try in 1 2 3 4 5; do
-            git fetch -q origin main && git reset -q --hard FETCH_HEAD
+            git fetch -q origin main && git reset -q --hard FETCH_HEAD && cp -r /tmp/build-now/. build/
             python3 -I common/ci/batches.py record-verdict /tmp/verdict.json --repo "$GITHUB_REPOSITORY"
             git add reports/actions && git commit -q -m "Actions verdicts: $SLUGS" && git push -q origin HEAD:main && break
             [ "$try" = 5 ] && exit 1; sleep $((RANDOM % 20 + 5))
+          done
+      - name: Start repairs and extra runs
+        env: { GH_TOKEN: "${{ github.token }}", RUN: "${{ inputs.run }}" }
+        run: |
+          jq -c '.[] | select(.final == "REPAIR" or .final == "RERUN")' /tmp/verdict.json | while read -r v; do
+            s=$(jq -r .slug <<<"$v")
+            if [ "$(jq -r .final <<<"$v")" = REPAIR ]; then
+              gh workflow run repair.yml -R "$GITHUB_REPOSITORY" --ref main -f slug="$s" -f run="$RUN" -f mode=repair
+            else
+              models=$(jq -r '.rerun | keys | join(",")' <<<"$v")
+              first=$(jq -r '[.rerun[].first] | max' <<<"$v"); runs=$(jq -r '[.rerun[].runs] | max' <<<"$v")
+              gh workflow run repair.yml -R "$GITHUB_REPOSITORY" --ref main -f slug="$s" -f run="$RUN" -f mode=rerun \
+                -f models="$models" -f first_run="$first" -f runs="$runs"
+            fi
+            echo "$s: started repair.yml ($(jq -r .final <<<"$v"))" | tee -a "$GITHUB_STEP_SUMMARY"
           done

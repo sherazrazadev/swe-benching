@@ -19,11 +19,23 @@ accepted tasks, `batch-NN.md`, `tasks.tsv`). Leave `slugs` empty to take the nex
 (cancel the running batch to stop). A task is claimed in `tasks.tsv` before it builds and never picked again
 (`common/ci/batches.py`).
 
-**Final verdict of accepted tasks:** after a batch records an accepted task (sound, both models 0/3 at 1.0), the
-`verdict` workflow runs the GUIDE's steps 8-9 on it: the DeepSeek fairness review and a Claude Opus audit of every
-failing run (only with secret `ANTHROPIC_API_KEY`; without it audits stay PENDING and are run where Opus is
-available, then recorded with `batches.py verdict` / `record-verdict`). Results: `reports/actions/README.md` (accepted
-table, final verdict column) and `reports/actions/verdicts/<slug>.md`.
+**Final verdict of accepted tasks (automatic):** after a batch records an accepted task (sound, no run at 1.0), the
+`verdict` workflow runs the GUIDE's steps 8-10 on it and `batches.py verdict` decides:
+
+| Result | When | What happens |
+|---|---|---|
+| ACCEPTED | fairness READY and every failing run audited, none finding a test or instruction fault | recorded |
+| REJECTED | a model solved it; or still unfair after one repair; or the repaired task is unsound | recorded |
+| REPAIR | fairness NOT_READY or an audit found a fault | `repair` workflow: fairfix (reads `FAIRNESS.md` + `AUDIT-FINDINGS.md`), full re-gate, 3 fresh runs per model, then `verdict` again |
+| RERUN | a model has fewer than 3 trustworthy failing runs (e.g. provider refusal) | `repair` workflow, mode rerun: extra runs of that model (up to 6 in all), then `verdict` again |
+| pending | an audit or the fairness review is missing | nothing; run the audits, then dispatch `verdict` again |
+
+An open "human review" question in the fairness review does not stop a task: the audits of the actual runs answer it.
+The audits need Claude Opus: secret `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. Without one, run them locally
+(`postmortem.py prepare` / Opus auditor / `record`), push `build/<slug>/audits/<job>/POSTMORTEM.json` to the results
+branch, and dispatch `verdict` again. Fairness results and audits are kept on the results branch `runs/<run>`, so a
+re-dispatch or a repair does not run them again. Only ACCEPTED / REJECTED reach `reports/actions/` (`README.md`,
+`verdicts/<slug>.md`). Trials use the GUIDE's 3 h agent limit (`CWE_AGENT_TIMEOUT_MULT=1.5`).
 
 **Inputs:** a slug must have `build/<slug>/BUILD-PROMPT.md` committed (prepare it on the VM/Mac as usual) and no
 `build/<slug>/pipeline.log` yet. A trial-only run needs `build/<slug>/.sound` and `tasks/<slug>/` committed, or a
