@@ -6,7 +6,7 @@ Started 2026-10-26T22:41Z. [run 40414311131](https://github.com/sherazrazadev/sw
 |---|---|---|---|---|
 | `comfyui-manager-s3` | sound | 0.9 0 0 | 0 0 0 | **REJECTED** |
 | `mlflow-s3` | unsound | - | - | **unsound** |
-| `langflow-s3` | sound | 0.9286 0.7857 0.7857 | 0.7143 0 0.9286 | **in final checks** |
+| `langflow-s3` | sound | 0.9286 0.7857 0.7857 | 0.7143 0 0.9286 | **REJECTED** |
 | `jenkins-s3` | sound | 0.6 0.6 0.6 | 0 0 0 | **in final checks** |
 | `avideo-s3` | sound | 0 0 0 | 0 0 0 | **REJECTED** |
 | `openremote-s3` | - | - | - | **build failed** |
