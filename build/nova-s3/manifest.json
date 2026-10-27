@@ -1,0 +1,266 @@
+{
+ "slug": "nova-s3",
+ "candidate": "screener-v2 entry s3-stk-nova-ghsaxc4g: GHSA-cm54-3vvf-f5p8 / GHSA-xc4g-7vw8-924h (openstack/nova)",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "d335457f48d09c3d780c92413fe777030c1335e2 (2012-07-02); all four fix commits fetched from upstream and read",
+  "entry_points": [
+   "nova.virt.disk.api.inject_files(image, files) - public API used for server-create and rebuild personality (the privileged loop mount is the only stub)",
+   "nova.virt.disk.api.inject_data(image, key, net, metadata, admin_password) - public API used for spawn-time injectables; reaches inject_data_into_fs",
+   "nova.virt.disk.api.inject_data_into_fs(fs, ...) - documented lower-level API for virt drivers that mount themselves (xenapi caller at nova/virt/xenapi/vm_utils.py:1812)"
+  ],
+  "sites": [
+   "nova/virt/disk/api.py:314 _inject_file_into_fs (landing, published)",
+   "nova/virt/disk/api.py:322 _inject_metadata_into_fs (published far site)",
+   "nova/virt/disk/api.py:330 _inject_key_into_fs (published far site)",
+   "nova/virt/disk/api.py:376 _inject_net_into_fs (published far site)",
+   "nova/virt/disk/api.py:389 _inject_admin_password_into_fs (published far site)",
+   "nova/virt/disk/api.py:354 _setup_selinux_for_keys (injected sibling, second write in key injection)",
+   "nova/virt/disk/api.py:412 password lock file touch (injected sibling, side effect before the rewrite)",
+   "nova/virt/disk/api.py:314 _join_and_check_path_within_fs (new helper in the oracle; readlink -nm run as root, prefix check with a trailing separator)"
+  ],
+  "routes": [
+   "personality traversal ../outside/..., prefix-collision ../<root-name>X/..., symlinked directory and symlinked final component",
+   "ssh key through a symlinked root/.ssh",
+   "network config through a symlinked etc/network",
+   "metadata through a symlinked meta.js",
+   "admin password through a symlinked etc/shadow",
+   "SELinux key context through a symlinked etc/rc.local and through a symlinked etc/rc.d branch",
+   "password lock file through a dangling etc/.pwd.lock symlink"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "built agent image: su agent -c 'cd /workspace && python -m unittest -v nova.tests.test_virt' -> 2 tests, OK (pinned commit + injection patch, one-commit git baseline, no regression tests)",
+   "probe image with the same base/apt/pip pins: same 2 tests OK before packaging"
+  ],
+  "local_runs": "built verifier image, test.sh end to end: vulnerable tree reward 0.0 (security 0/11 pass, functional 12/12 pass); oracle tree reward 1.0 (11/11, 12/12); 15 wrong-fix patches re-measured by the gate, all as declared; nop stage 11 security all failing and 12 functional all passing; oracle stage 3 runs all 1.0 and identical"
+ },
+ "leak_terms": [
+  "_join_and_check_path_within_fs",
+  "_inject_file_into_fs",
+  "_inject_metadata_into_fs",
+  "_inject_key_into_fs",
+  "_inject_net_into_fs",
+  "_inject_admin_password_into_fs",
+  "_setup_selinux_for_keys",
+  "_set_passwd",
+  "_DiskImage",
+  "inject_files",
+  "inject_data_into_fs",
+  "inject_data",
+  "readlink",
+  "realpath",
+  "mkdir",
+  "tee",
+  "touch",
+  "chown",
+  "chmod",
+  "authorized_keys",
+  "meta.js",
+  "rc.local",
+  "rc.d",
+  "selinux",
+  "restorecon",
+  "pwd.lock",
+  "passwd",
+  "shadow",
+  "root/.ssh",
+  "mount_dir",
+  "api.py",
+  "backend",
+  "helper",
+  "containment",
+  "canonical",
+  "symlink",
+  "symlinks",
+  "GHSA-cm54-3vvf-f5p8",
+  "GHSA-xc4g-7vw8-924h",
+  "CVE-2012-3361",
+  "CVE-2012-3360",
+  "CVE-2012-3447",
+  "1015531",
+  "1031311",
+  "d335457",
+  "2427d4a",
+  "b0feaff",
+  "ce4b2e2",
+  "d9577ce"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-landing-only.patch",
+   "expect": "security_fail",
+   "note": "guards only the reported personality writer; 7 security tests fail, functional all pass"
+  },
+  {
+   "patch": "sf-lexical.patch",
+   "expect": "security_fail",
+   "note": "checks the normalised string instead of the reached path; 9 security tests fail"
+  },
+  {
+   "patch": "sf-no-selinux.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the SELinux key-context write; 2 security tests fail"
+  },
+  {
+   "patch": "sf-no-lock.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the password lock-file check; 1 security test fails"
+  },
+  {
+   "patch": "sf-prefix-noslash.patch",
+   "expect": "security_fail",
+   "note": "prefix check without the trailing separator; the sibling-directory test fails"
+  },
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "published upstream fix only; the two injected siblings stay open (3 security tests fail)"
+  },
+  {
+   "patch": "sf-parent-only.patch",
+   "expect": "security_fail",
+   "note": "checks the parent directory but writes the unchecked final component; 2 security tests fail"
+  },
+  {
+   "patch": "ff-reject-dotdot.patch",
+   "expect": "functional_fail",
+   "note": "rejects every '..' segment, breaking a path that resolves inside"
+  },
+  {
+   "patch": "ff-overwrite-append.patch",
+   "expect": "functional_fail",
+   "note": "shared writer loses append semantics; earlier authorized keys are lost"
+  },
+  {
+   "patch": "ff-reject-symlink.patch",
+   "expect": "functional_fail",
+   "note": "refuses every symlink, breaking a location that resolves inside"
+  },
+  {
+   "patch": "ff-drop-selinux.patch",
+   "expect": "functional_fail",
+   "note": "removes the key-context behaviour instead of guarding it"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every file injection (feature removed)"
+  },
+  {
+   "patch": "ff-crash-all.patch",
+   "expect": "functional_fail",
+   "note": "raises on every injection request instead of a clean refusal of the bad one"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus input/location hardening; 1.0"
+  },
+  {
+   "patch": "pass-realpath.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "user-level os.path.realpath containment instead of the privileged readlink; 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "ff-crash-all.patch",
+  "wrong_resource": "sf-parent-only.patch",
+  "one_role_or_direction": "sf-landing-only.patch",
+  "reads_only": "n/a: every guarded operation in this API is a write into the image; there is no read-only path to the sink",
+  "check_after_adjustment": "sf-lexical.patch",
+  "unlisted_route": "sf-landing-only.patch",
+  "malformed_identity": "n/a: targets are plain Python strings; no parser, encoding or identity mapping whose mismatch could hide the target",
+  "missing_authority": "n/a: containment depends on the filesystem only, not on an authority, role or secret lookup that could fail open",
+  "adjacent_api": "ff-overwrite-append.patch"
+ },
+ "traps": [
+  {
+   "id": "L1-literal-writers-symlink-canonical",
+   "shape": "the four literal-name writers in the same library are reachable with an image that carries a symlinked directory or final component; a canonical (symlink-resolving) check over every writer is needed, and a bare string-prefix check must not accept a sibling directory that shares the mount root's name",
+   "where": "nova/virt/disk/api.py:314 (landing); 322, 330, 376, 389 (published far sites)",
+   "security_tests": [
+    "security.test_personality_files.TestPersonalityFileEscape::test_parent_directory_traversal",
+    "security.test_personality_files.TestPersonalityFileEscape::test_target_sharing_the_image_root_name",
+    "security.test_personality_files.TestPersonalityFileEscape::test_symlinked_directory_in_image",
+    "security.test_personality_files.TestPersonalityFileEscape::test_symlinked_target_file_in_image",
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_ssh_key_through_symlinked_ssh_directory",
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_network_config_through_symlinked_network_directory",
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_metadata_through_symlinked_metadata_file",
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_password_through_symlinked_shadow_file"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_absolute_path_is_written_inside",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_parent_segments_resolving_inside",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_existing_file_is_replaced_not_appended",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_entry_resolving_inside_is_still_writable",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_ssh_key_is_appended_and_earlier_keys_survive",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_network_config_is_replaced"
+   ],
+   "security_fail_patch": "sf-landing-only.patch (and sf-lexical.patch, sf-prefix-noslash.patch)",
+   "realistic_because": "real, unmodified upstream code: all five writers exist at the pinned commit; the canonicalisation refinement is the published CVE-2012-3447 follow-up"
+  },
+  {
+   "id": "L2-coupled-legit-paths-and-append",
+   "shape": "coupled must-keep-working: append versus overwrite, absolute and normalising-inside paths, a location reached through an entry inside the image, deep new directories and several files",
+   "where": "nova/virt/disk/api.py:314-421",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_absolute_path_is_written_inside",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_parent_segments_resolving_inside",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_deep_new_directory_is_created",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_several_files_in_one_request",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_existing_file_is_replaced_not_appended",
+    "functional.test_personality_legit.TestPersonalityFileLegit::test_entry_resolving_inside_is_still_writable",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_ssh_key_is_appended_and_earlier_keys_survive",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_network_config_is_replaced",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_metadata_is_replaced",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_password_rewrite_keeps_the_other_entries",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_ssh_directory_is_created_when_absent"
+   ],
+   "security_fail_patch": "n/a: this lever is enforced by the functional suite; ff-overwrite-append.patch, ff-reject-dotdot.patch and ff-reject-symlink.patch each break it",
+   "realistic_because": "the append/overwrite split and the inside-image behaviours are the pinned code's current behaviour"
+  },
+  {
+   "id": "L3-selinux-key-context",
+   "shape": "a second write inside key injection whose target is chosen from the image (etc/rc.local or etc/rc.d/rc.local) and appended; guarding only the key file leaves it open",
+   "where": "nova/virt/disk/api.py:354",
+   "security_tests": [
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_key_context_file_through_symlinked_rc_local",
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_key_context_file_through_symlinked_rc_directory"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_key_context_handling_appends_and_keeps_existing_rc_content",
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_ssh_key_is_appended_and_earlier_keys_survive"
+   ],
+   "security_fail_patch": "sf-no-selinux.patch",
+   "realistic_because": "SELinux key-context handling is real code from the later upstream release (2012.2), backported here in this tree's naive utils.execute('tee', ...) style"
+  },
+  {
+   "id": "L4-password-lock-side-effect",
+   "shape": "a lock file is touched before the password rewrite; a dangling symlink there creates a file on the host even when the passwd/shadow destinations are later checked",
+   "where": "nova/virt/disk/api.py:412",
+   "security_tests": [
+    "security.test_spawn_injectables.TestSpawnInjectableEscape::test_password_lock_file_through_symlink"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_spawn_legit.TestSpawnInjectableLegit::test_password_rewrite_keeps_the_other_entries"
+   ],
+   "security_fail_patch": "sf-no-lock.patch",
+   "realistic_because": "a lock-before-rewrite idiom, using touch which the same module already uses for a root-owned file"
+  }
+ ],
+ "status": "gate passed: static (everything except the not-yet-written blind patch), nop, oracle (3 identical 1.0 runs), patches (15/15 as declared)"
+}

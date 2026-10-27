@@ -1,0 +1,158 @@
+diff -ruN a/nova/virt/disk/api.py b/nova/virt/disk/api.py
+--- a/nova/virt/disk/api.py	2026-10-27 10:20:00.000000000 +0000
++++ b/nova/virt/disk/api.py	2026-10-27 10:30:59.968035239 +0000
+@@ -311,20 +311,55 @@
+         _inject_admin_password_into_fs(admin_password, fs, execute=execute)
+ 
+ 
+-def _inject_file_into_fs(fs, path, contents):
+-    absolute_path = os.path.join(fs, path.lstrip('/'))
++def _guest_fs_path(fs, *parts):
++    """Return the canonical path for a location under the mounted image.
++
++    Neither the image nor the path supplied by the caller can be trusted: the
++    path may carry '..' components and any entry already present in the image
++    may be a symlink pointing outside it.  Resolve every component (including
++    a symlink in the final position, even a dangling one) and refuse the
++    request unless the result really is below the mount root.  The resolved
++    path is returned so callers act on the destination the check approved.
++    """
++    root = os.path.realpath(fs)
++    # os.path.join(root, '') keeps a trailing separator for every root except
++    # '/' itself, which already acts as one.
++    root_prefix = os.path.join(root, '')
++    absolute_path = os.path.realpath(os.path.join(root, *parts))
++    if not absolute_path.startswith(root_prefix):
++        raise exception.Invalid(_('injected file path not valid'))
++    return absolute_path
++
++
++def _write_guest_path(absolute_path, contents, append=False):
++    """Write contents to an already-validated path inside the image."""
+     parent_dir = os.path.dirname(absolute_path)
+     utils.execute('mkdir', '-p', parent_dir, run_as_root=True)
+-    utils.execute('tee', absolute_path, process_input=contents,
+-          run_as_root=True)
++    args = ['-a', absolute_path] if append else [absolute_path]
++    utils.execute('tee', *args, process_input=contents, run_as_root=True)
++
++
++def _write_guest_file(fs, path, contents, append=False):
++    """Validate a guest-relative path, then write to it."""
++    _write_guest_path(_guest_fs_path(fs, path.lstrip('/')),
++                      contents, append=append)
++
++
++def _make_guest_dir(fs, *parts):
++    """Validate a guest directory path, create it and return its real path."""
++    directory = _guest_fs_path(fs, *parts)
++    utils.execute('mkdir', '-p', directory, run_as_root=True)
++    return directory
++
++
++def _inject_file_into_fs(fs, path, contents):
++    _write_guest_file(fs, path, contents)
+ 
+ 
+ def _inject_metadata_into_fs(metadata, fs, execute=None):
+-    metadata_path = os.path.join(fs, "meta.js")
+     metadata = dict([(m.key, m.value) for m in metadata])
+ 
+-    utils.execute('tee', metadata_path,
+-                  process_input=jsonutils.dumps(metadata), run_as_root=True)
++    _write_guest_file(fs, 'meta.js', jsonutils.dumps(metadata))
+ 
+ 
+ def _inject_key_into_fs(key, fs, execute=None):
+@@ -333,11 +368,9 @@
+     key is an ssh key string.
+     fs is the path to the base of the filesystem into which to inject the key.
+     """
+-    sshdir = os.path.join(fs, 'root', '.ssh')
+-    utils.execute('mkdir', '-p', sshdir, run_as_root=True)
++    sshdir = _make_guest_dir(fs, 'root', '.ssh')
+     utils.execute('chown', 'root', sshdir, run_as_root=True)
+     utils.execute('chmod', '700', sshdir, run_as_root=True)
+-    keyfile = os.path.join(sshdir, 'authorized_keys')
+     key_data = [
+         '\n',
+         '# The following ssh key was injected by Nova',
+@@ -345,8 +378,8 @@
+         key.strip(),
+         '\n',
+     ]
+-    utils.execute('tee', '-a', keyfile,
+-                  process_input=''.join(key_data), run_as_root=True)
++    _write_guest_file(fs, 'root/.ssh/authorized_keys',
++                      ''.join(key_data), append=True)
+ 
+     _setup_selinux_for_keys(fs)
+ 
+@@ -357,10 +390,11 @@
+     if not os.path.exists(se_cfg):
+         return
+ 
+-    rclocal = os.path.join(fs, 'etc', 'rc.local')
+-    rc_d = os.path.join(fs, 'etc', 'rc.d')
+-    if not os.path.exists(rclocal) and os.path.exists(rc_d):
+-        rclocal = os.path.join(rc_d, 'rc.local')
++    rclocal = _guest_fs_path(fs, 'etc', 'rc.local')
++    if not os.path.exists(rclocal):
++        rc_d = _guest_fs_path(fs, 'etc', 'rc.d')
++        if os.path.exists(rc_d):
++            rclocal = _guest_fs_path(fs, 'etc', 'rc.d', 'rc.local')
+ 
+     restorecon = [
+         '\n',
+@@ -368,8 +402,7 @@
+         'restorecon -RF /root/.ssh/ 2>/dev/null || :\n',
+     ]
+ 
+-    utils.execute('tee', '-a', rclocal,
+-                  process_input=''.join(restorecon), run_as_root=True)
++    _write_guest_path(rclocal, ''.join(restorecon), append=True)
+     utils.execute('chmod', 'a+x', rclocal, run_as_root=True)
+ 
+ 
+@@ -378,12 +411,10 @@
+ 
+     net is the contents of /etc/network/interfaces.
+     """
+-    netdir = os.path.join(os.path.join(fs, 'etc'), 'network')
+-    utils.execute('mkdir', '-p', netdir, run_as_root=True)
++    netdir = _make_guest_dir(fs, 'etc', 'network')
+     utils.execute('chown', 'root:root', netdir, run_as_root=True)
+     utils.execute('chmod', 755, netdir, run_as_root=True)
+-    netfile = os.path.join(netdir, 'interfaces')
+-    utils.execute('tee', netfile, process_input=net, run_as_root=True)
++    _write_guest_file(fs, 'etc/network/interfaces', net)
+ 
+ 
+ def _inject_admin_password_into_fs(admin_passwd, fs, execute=None):
+@@ -409,18 +440,21 @@
+     os.close(fd)
+ 
+     # Keep other password changes from racing with this rewrite.
+-    lock_path = os.path.join(fs, 'etc', '.pwd.lock')
++    lock_path = _guest_fs_path(fs, 'etc', '.pwd.lock')
+     utils.execute('touch', lock_path, run_as_root=True)
+ 
+-    utils.execute('cp', os.path.join(fs, 'etc', 'passwd'), tmp_passwd,
++    passwd_path = _guest_fs_path(fs, 'etc', 'passwd')
++    shadow_path = _guest_fs_path(fs, 'etc', 'shadow')
++
++    utils.execute('cp', passwd_path, tmp_passwd,
+                   run_as_root=True)
+-    utils.execute('cp', os.path.join(fs, 'etc', 'shadow'), tmp_shadow,
++    utils.execute('cp', shadow_path, tmp_shadow,
+                   run_as_root=True)
+     _set_passwd(admin_user, admin_passwd, tmp_passwd, tmp_shadow)
+-    utils.execute('cp', tmp_passwd, os.path.join(fs, 'etc', 'passwd'),
++    utils.execute('cp', tmp_passwd, passwd_path,
+                   run_as_root=True)
+     os.unlink(tmp_passwd)
+-    utils.execute('cp', tmp_shadow, os.path.join(fs, 'etc', 'shadow'),
++    utils.execute('cp', tmp_shadow, shadow_path,
+                   run_as_root=True)
+     os.unlink(tmp_shadow)
+ 

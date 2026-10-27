@@ -1,0 +1,125 @@
+diff -ruN pristine/routers/web/repo/release.go app/routers/web/repo/release.go
+--- a/routers/web/repo/release.go	2026-10-27 10:07:11.000000000 +0000
++++ b/routers/web/repo/release.go	2026-10-27 10:41:13.852543342 +0000
+@@ -461,6 +461,8 @@
+ 			ctx.JSONError(ctx.Tr("repo.release.tag_name_invalid"))
+ 		case release_service.IsErrProtectedTagName(err):
+ 			ctx.JSONError(ctx.Tr("repo.release.tag_name_protected"))
++		case upload.IsErrFileTypeForbidden(err):
++			ctx.JSONError(err.Error())
+ 		default:
+ 			ctx.ServerError("handleTagReleaseError", err)
+ 		}
+diff -ruN pristine/services/release/asset_policy.go app/services/release/asset_policy.go
+--- a/services/release/asset_policy.go	1970-01-01 00:00:00.000000000 +0000
++++ b/services/release/asset_policy.go	2026-10-27 10:41:02.735344806 +0000
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Gitea Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package release
++
++import (
++	"context"
++
++	repo_model "gitea.dev/models/repo"
++	"gitea.dev/modules/setting"
++	"gitea.dev/services/context/upload"
++)
++
++// checkReleaseAssetName reports whether a stored file name may be distributed as a release asset.
++//
++// The release section is the authoritative policy here, not the issue-attachment section: a
++// record may have been uploaded for another purpose, but once it is attached to a release it is a
++// release asset and only the release type set governs it. An empty set means "no restriction".
++func checkReleaseAssetName(name string) error {
++	return upload.Verify(nil, name, setting.Repository.Release.AllowedTypes)
++}
++
++// checkReleaseAssetAttachments verifies the stored names of already loaded attachments.
++//
++// It only reads state. Callers run it before the first write of a request so that a refused
++// request neither links a forbidden file nor disturbs assets that the release already has.
++func checkReleaseAssetAttachments(attachments []*repo_model.Attachment) error {
++	for _, attach := range attachments {
++		if err := checkReleaseAssetName(attach.Name); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// checkReleaseAssetUUIDs loads the stored attachments behind the given UUIDs and verifies them.
++// UUIDs that do not resolve to a row are ignored, matching how the linking code treats them.
++func checkReleaseAssetUUIDs(ctx context.Context, attachmentUUIDs []string) error {
++	if len(attachmentUUIDs) == 0 {
++		return nil
++	}
++	attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, attachmentUUIDs)
++	if err != nil {
++		return err
++	}
++	return checkReleaseAssetAttachments(attachments)
++}
+diff -ruN pristine/services/release/release.go app/services/release/release.go
+--- a/services/release/release.go	2026-10-27 10:07:20.000000000 +0000
++++ b/services/release/release.go	2026-10-27 10:41:12.105512160 +0000
+@@ -176,6 +176,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	attachments := make([]*repo_model.Attachment, 0, len(attachmentIDs))
+ 	for _, attachmentID := range attachmentIDs {
+ 		attach, err := repo_model.GetAttachmentByID(ctx, attachmentID)
+ 		if err != nil {
+@@ -187,6 +188,14 @@
+ 		if attach.ReleaseID != 0 {
+ 			return util.NewPermissionDeniedErrorf("release permission denied")
+ 		}
++		attachments = append(attachments, attach)
++	}
++	// Check the whole set before linking any of it, so a forbidden member cannot slip in and a
++	// refusal leaves the release unchanged.
++	if err := checkReleaseAssetAttachments(attachments); err != nil {
++		return err
++	}
++	for _, attach := range attachments {
+ 		if err := repo_model.UpdateAttachmentByUUID(ctx, &repo_model.Attachment{UUID: attach.UUID, ReleaseID: rel.ID}, "release_id"); err != nil {
+ 			return fmt.Errorf("update attachment [%d]: %w", attach.ID, err)
+ 		}
+@@ -221,6 +230,12 @@
+ 		attachments = append(attachments, attach)
+ 	}
+ 
++	// Refuse the requested set before the current assets are unlinked: otherwise a rejected
++	// request would still have changed the release.
++	if err := checkReleaseAssetAttachments(attachments); err != nil {
++		return err
++	}
++
+ 	for _, attach := range rel.Attachments {
+ 		if keep.Contains(attach.ID) {
+ 			continue
+@@ -239,6 +254,11 @@
+ 
+ // CreateRelease creates a new release of repository.
+ func CreateRelease(gitRepo *git.Repository, rel *repo_model.Release, attachmentUUIDs []string, msg string) error {
++	// The attachments are validated before the tag or the release row is created.
++	if err := checkReleaseAssetUUIDs(gitRepo.Ctx, attachmentUUIDs); err != nil {
++		return err
++	}
++
+ 	has, err := repo_model.IsReleaseExist(gitRepo.Ctx, rel.RepoID, rel.TagName)
+ 	if err != nil {
+ 		return err
+@@ -334,6 +354,10 @@
+ 	if rel.ID == 0 {
+ 		return errors.New("UpdateRelease only accepts an exist release")
+ 	}
++	// Refuse forbidden attachments before createTag or the transaction below can touch anything.
++	if err := checkReleaseAssetUUIDs(ctx, addAttachmentUUIDs); err != nil {
++		return err
++	}
+ 	isTagCreated, err := createTag(ctx, gitRepo, rel, "")
+ 	if err != nil {
+ 		return err

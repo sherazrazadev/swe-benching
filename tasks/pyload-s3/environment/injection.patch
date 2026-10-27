@@ -1,0 +1,107 @@
+diff --git a/src/pyload/core/config/default.cfg b/src/pyload/core/config/default.cfg
+index 2dfcde2a4..cab0efb63 100644
+--- a/src/pyload/core/config/default.cfg
++++ b/src/pyload/core/config/default.cfg
+@@ -45,6 +45,7 @@ webui - "Web Interface":
+     bool autologin : "Skip login if single user" = False
+     str prefix: "Path prefix" =
+     int session_lifetime : "Session lifetime (minutes)" = 44640
++    int trusted_proxies : "Trusted reverse proxy hops in front of the web interface" = 0
+     bool allow_iframe : "Allow embedding in iframe" = False
+ proxy - "Proxy":
+     bool enabled : "Activated" = False
+diff --git a/src/pyload/webui/app/__init__.py b/src/pyload/webui/app/__init__.py
+index 16daf751c..835bdd466 100644
+--- a/src/pyload/webui/app/__init__.py
++++ b/src/pyload/webui/app/__init__.py
+@@ -11,6 +11,7 @@ import os
+ 
+ import flask
+ import jinja2
++from werkzeug.middleware.proxy_fix import ProxyFix
+ from werkzeug.serving import WSGIRequestHandler
+ 
+ from .blueprints import BLUEPRINTS
+@@ -138,6 +139,11 @@ class App:
+     def _configure_api(cls, app, pycore):
+         app.config["PYLOAD_API"] = pycore.api
+ 
++    @classmethod
++    def _configure_proxy_fix(cls, app, trusted_proxy_count):
++        if trusted_proxy_count:
++            app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_count)
++
+     @classmethod
+     def _configure_logging(cls, app, pycore):
+         # Inject our custom logger
+@@ -149,6 +155,7 @@ class App:
+         cls._configure_logging(app, pycore)
+         cls._configure_api(app, pycore)
+         cls._configure_config(app, develop)
++        cls._configure_proxy_fix(app, pycore.config.get("webui", "trusted_proxies"))
+         cls._configure_templating(app)
+         cls._configure_json_encoding(app)
+         cls._configure_session(app, path_prefix or r"/")
+diff --git a/src/pyload/webui/app/blueprints/api_blueprint.py b/src/pyload/webui/app/blueprints/api_blueprint.py
+index 8725f6e22..f2409e9e4 100644
+--- a/src/pyload/webui/app/blueprints/api_blueprint.py
++++ b/src/pyload/webui/app/blueprints/api_blueprint.py
+@@ -102,6 +102,11 @@ def _parse_parameter(param: str) -> Any:
+             return literal_eval("\"" + param + "\"")
+ 
+ 
++def _log_docs_auth_failure(username):
++    client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
++    log.error(f"Documentation authentication failed for user '{username}' [CLIENT: {client_ip}]")
++
++
+ @bp.route("/api/openapi.json", methods=["GET"])
+ def api_docs():
+     """Return OpenAPI specification JSON"""
+@@ -113,6 +118,7 @@ def api_docs():
+     if basic_auth:
+         user_info = api.check_auth(basic_auth.username, basic_auth.password)
+         if not user_info:
++            _log_docs_auth_failure(basic_auth.username)
+             return "Forbidden", 403
+     elif not is_authenticated(s):
+         return "Authentication required", 401, {'WWW-Authenticate': 'Basic realm="Login Required"'}
+@@ -137,6 +143,7 @@ def swagger_ui():
+     if basic_auth:
+         user_info = api.check_auth(basic_auth.username, basic_auth.password)
+         if not user_info:
++            _log_docs_auth_failure(basic_auth.username)
+             return "Forbidden", 403
+     elif not is_authenticated(s):
+         return "Authentication required", 401, {'WWW-Authenticate': 'Basic realm="Login Required"'}
+diff --git a/src/pyload/webui/app/blueprints/json_blueprint.py b/src/pyload/webui/app/blueprints/json_blueprint.py
+index 0891b5789..119da8889 100644
+--- a/src/pyload/webui/app/blueprints/json_blueprint.py
++++ b/src/pyload/webui/app/blueprints/json_blueprint.py
+@@ -1,17 +1,26 @@
+ import os
+ import sys
+ from functools import wraps
++from logging import getLogger
+ 
+ import flask
+ from flask.json import jsonify
+ from werkzeug.utils import secure_filename
+ 
++from pyload import APPID
+ from pyload.core.api import Role
+ from pyload.core.utils import format, fs
+ 
+ from ..helpers import get_permission, login_required, permlist, render_template, set_permission
+ 
+ bp = flask.Blueprint("json", __name__)
++log = getLogger(APPID)
++
++
++@bp.before_request
++def log_request_client():
++    client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
++    log.info(f"Web client request to '{flask.request.path}' [CLIENT: {client_ip}]")
+ 
+ 
+ def expect_json(f):

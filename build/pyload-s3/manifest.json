@@ -1,0 +1,290 @@
+{
+ "slug": "pyload-s3",
+ "candidate": "screener-v2 entry 2566: GHSA-9Q47-3CM2-2RP8 (pyload/pyload)",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "2d03bea489d6cb4b1382ba3717f41c50bef261fa (parent of fix 5dc6b628e2d8b9f42dde82f396e5b7a2b513f6d1; no regression tests between them)",
+  "entry_points": [
+   "HTTP GET /api/status_server (and every /api/<func>) with a real API key, through the Flask test client of the real application built by Core/WebServerThread",
+   "HTTP POST /login (wrong credentials) through the real application",
+   "HTTP GET /json/status through the real application",
+   "HTTP GET /api/openapi.json with HTTP Basic credentials through the real application",
+   "HTTP GET /jdcheck.js with Host localhost:9666 through the real application (Click'N'Load local-only gate)",
+   "web-interface start-up: Core -> WebServerThread -> App with trusted_proxies=-1"
+  ],
+  "sites": [
+   "src/pyload/webui/app/helpers.py:449 (rate-limit bucket key) [published]",
+   "src/pyload/webui/app/helpers.py:360 (API-key audit entry) [published]",
+   "src/pyload/webui/app/blueprints/app_blueprint.py:86 (login audit entry) [published]",
+   "src/pyload/webui/app/blueprints/cnl_blueprint.py:33 + helpers.py:299-303 (local-only gate; pre-middleware peer) [published]",
+   "src/pyload/webui/app/__init__.py:143-147, 158 (proxy-aware application construction) [published, present here as injected scaffolding]",
+   "src/pyload/core/config/default.cfg:48 (trusted_proxies default) [published, present here as injected scaffolding]",
+   "src/pyload/webui/app/blueprints/json_blueprint.py:22 (web-client access audit entry) [injected sibling]",
+   "src/pyload/webui/app/blueprints/api_blueprint.py:106 (documentation auth-failure audit entry) [injected sibling]"
+  ],
+  "routes": [
+   "The local-only Click'N'Load gate (cnl_blueprint.local_check) is reachable through the real HTTP routes and is opened at the injected baseline when a remote peer sends a loopback forwarding value and one proxy hop is trusted; confirmed by a behavioural test on the injected tree.",
+   "The two injected audit entries are real request paths of the same application; each records the client-supplied value at the injected baseline; confirmed by behavioural tests."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/unit/test_api_rate_limit.py (minus the two pinned tests that assert the vulnerable first-hop behaviour, which the published fix itself rewrites): 46 cases/subtests pass on the injected baseline and on the oracle",
+   "tests/integration/test_api.py and tests/integration/test_cnl.py (pristine copies): pass on the injected baseline and on the oracle",
+   "local: injected baseline security 0/11, functional 52/52 (6 hidden + 46 project); oracle security 11/11, functional 52/52"
+  ],
+  "local_runs": "gate nop (Harbor, offline): security 0/11, functional 52/52, reward 0.0; oracle: see gate_report. Every checks/ patch reproduced its declared outcome in a local venv before the gate."
+ },
+ "leak_terms": [
+  "X-Forwarded-For",
+  "X-Real-IP",
+  "Forwarded",
+  "werkzeug.proxy_fix.orig",
+  "ProxyFix",
+  "proxy_fix",
+  "get_client_ip",
+  "rate_limit",
+  "apikey_auth",
+  "is_loopback_request",
+  "local_check",
+  "is_loopback_address",
+  "helpers",
+  "helpers.py",
+  "app_blueprint",
+  "cnl_blueprint",
+  "json_blueprint",
+  "api_blueprint",
+  "__init__",
+  "webserver_thread",
+  "default.cfg",
+  "parser.py",
+  "status_server",
+  "/login",
+  "/json",
+  "openapi.json",
+  "/jdcheck",
+  "/flash",
+  "ClickNLoad",
+  "CLIENT:",
+  "client_ip",
+  "REMOTE_ADDR",
+  "trusted proxy count",
+  "GHSA-9Q47-3CM2-2RP8",
+  "2d03bea489d6",
+  "5dc6b628e2d8"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-rate-limit.patch",
+   "expect": "security_fail",
+   "note": "leaves the per-client budget keyed by the client-supplied value"
+  },
+  {
+   "patch": "sf-takes-first-hop.patch",
+   "expect": "security_fail",
+   "note": "re-parses the client-supplied chain after proxy resolution"
+  },
+  {
+   "patch": "sf-none-fail-open.patch",
+   "expect": "security_fail",
+   "note": "keeps exempting a request whose peer is unknown"
+  },
+  {
+   "patch": "sf-no-audit-logs.patch",
+   "expect": "security_fail",
+   "note": "fixes throttling but leaves the API-key and login audit entries on the client-supplied value"
+  },
+  {
+   "patch": "sf-no-json-audit.patch",
+   "expect": "security_fail",
+   "note": "leaves the injected web-client audit entry on the client-supplied value"
+  },
+  {
+   "patch": "sf-no-docs-audit.patch",
+   "expect": "security_fail",
+   "note": "leaves the injected documentation audit entry on the client-supplied value"
+  },
+  {
+   "patch": "sf-no-cnl.patch",
+   "expect": "security_fail",
+   "note": "leaves the local-only gate reading the rewritten peer"
+  },
+  {
+   "patch": "sf-no-negative-check.patch",
+   "expect": "security_fail",
+   "note": "accepts a negative trusted-proxy count at start-up"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "note": "ignores configured trusted proxies, collapsing real clients behind one proxy"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every limited request"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus address validation and a type check on the configured hop count"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alt",
+   "note": "resolves the trusted hop in the application helper instead of the WSGI middleware"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "to be written by an independent blind agent from instruction.md and the repository (postbuild); no file is produced by this build, so the gate skips it"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: the security tests observe the remaining-request budget, audit-entry contents and the local gate's 4xx; an exception yields no budget header, no audit entry and a 5xx, so a crash cannot pass as a refusal",
+  "wrong_resource": "n/a: the protected object is a single client address, not a resource with a neighbouring or proxy object a fix could authorise by mistake",
+  "one_role_or_direction": "n/a: the same identity feeds throttling and recording; there are no roles, peers or directions of which a fix could cover only one",
+  "reads_only": "sf-no-audit-logs.patch",
+  "check_after_adjustment": "sf-takes-first-hop.patch",
+  "unlisted_route": "sf-no-json-audit.patch",
+  "malformed_identity": "sf-no-rate-limit.patch",
+  "missing_authority": "sf-none-fail-open.patch",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "forwarded_budget",
+   "pattern": "A",
+   "shape": "the per-client request budget key is the leftmost value of the client-supplied forwarding chain; default (no trusted proxy), one configured hop with a spoofed prefix, and malformed values each start a fresh budget",
+   "where": "src/pyload/webui/app/helpers.py:449",
+   "reason_to_dismiss": "none needed - this is the sink the report's example hits",
+   "security_tests": [
+    "security/test_identity.py::test_budget_ignores_rotating_forwarded_value",
+    "security/test_identity.py::test_budget_uses_only_the_trusted_hop",
+    "security/test_identity.py::test_budget_ignores_malformed_forwarded_value"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_each_peer_has_its_own_budget",
+    "functional/test_legit.py::test_reverse_proxy_deployment_keeps_per_client_identity"
+   ],
+   "security_fail_patch": "sf-takes-first-hop.patch"
+  },
+  {
+   "id": "unknown_peer_fail_open",
+   "pattern": "A",
+   "shape": "a request with no peer address is exempted from throttling instead of being charged to one fixed identity",
+   "where": "src/pyload/webui/app/helpers.py:449-451",
+   "reason_to_dismiss": "a request without a peer address reads as a non-attacker edge case rather than an input shape that must still be throttled",
+   "security_tests": [
+    "security/test_identity.py::test_unknown_peer_is_still_throttled"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_authenticated_request_still_works"
+   ],
+   "security_fail_patch": "sf-none-fail-open.patch"
+  },
+  {
+   "id": "local_gate_rewritten_peer",
+   "pattern": "A",
+   "shape": "the local-only gate compares the request's address after trusted-proxy middleware has rewritten it, so a remote peer that claims a loopback address satisfies it",
+   "where": "src/pyload/webui/app/blueprints/cnl_blueprint.py:33 and src/pyload/webui/app/helpers.py:299-303",
+   "reason_to_dismiss": "the local-only gate never reads a forwarding header, so it reads as unrelated to an advisory about forwarded identity; the screener itself dismissed it as a separate feature",
+   "security_tests": [
+    "security/test_identity.py::test_local_endpoint_rejects_forwarded_loopback"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_local_peer_reaches_local_endpoint_with_trusted_proxy",
+    "functional/test_legit.py::test_local_peer_reaches_local_endpoint_by_default"
+   ],
+   "security_fail_patch": "sf-no-cnl.patch"
+  },
+  {
+   "id": "audit_entries_published",
+   "pattern": "A",
+   "shape": "the API-key audit entries and the login audit entry record the client-supplied value instead of the resolved peer",
+   "where": "src/pyload/webui/app/helpers.py:360 and src/pyload/webui/app/blueprints/app_blueprint.py:86",
+   "reason_to_dismiss": "the report's example is the request budget; a fix of that one line leaves the recording consumers untouched in two other modules",
+   "security_tests": [
+    "security/test_identity.py::test_api_key_audit_records_the_peer",
+    "security/test_identity.py::test_login_audit_records_the_peer",
+    "security/test_identity.py::test_login_audit_uses_only_the_trusted_hop"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_audit_entries_are_still_written"
+   ],
+   "security_fail_patch": "sf-no-audit-logs.patch"
+  },
+  {
+   "id": "negative_hop_count",
+   "pattern": "A",
+   "shape": "a negative trusted-proxy count is accepted at start-up and produces a middleware that misreads the chain per request",
+   "where": "src/pyload/webui/app/__init__.py:143-147",
+   "reason_to_dismiss": "a negative deployment setting reads as operator error rather than an input that must be refused",
+   "security_tests": [
+    "security/test_identity.py::test_negative_trusted_proxy_count_prevents_start"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_authenticated_request_still_works"
+   ],
+   "security_fail_patch": "sf-no-negative-check.patch"
+  },
+  {
+   "id": "sibling_web_client_audit",
+   "pattern": "injected",
+   "shape": "a web-client access audit entry in the browser data routes records the client-supplied forwarding value",
+   "where": "src/pyload/webui/app/blueprints/json_blueprint.py:22",
+   "reason_to_dismiss": "the browser data routes are session routes beside the RPC API the report names, so their audit entry reads as a different feature",
+   "security_tests": [
+    "security/test_identity.py::test_web_client_audit_records_the_peer"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_audit_entries_are_still_written"
+   ],
+   "security_fail_patch": "sf-no-json-audit.patch",
+   "realistic_because": "a maintainer logging browser data-route access would plausibly copy the same client-address expression used by the other audit entries; injected into our copy only, registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "sibling_documentation_audit",
+   "pattern": "injected",
+   "shape": "the documentation endpoint's HTTP Basic authentication failure audit entry records the client-supplied forwarding value",
+   "where": "src/pyload/webui/app/blueprints/api_blueprint.py:106",
+   "reason_to_dismiss": "HTTP Basic on the documentation endpoint is a different authentication mechanism from the API-key and session flows the report shows",
+   "security_tests": [
+    "security/test_identity.py::test_documentation_audit_records_the_peer"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_audit_entries_are_still_written"
+   ],
+   "security_fail_patch": "sf-no-docs-audit.patch",
+   "realistic_because": "a maintainer adding a failed-authentication audit line to the documentation views would reuse the client-address expression already present in the other audit lines; injected into our copy only, registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "coupled_proxy_identity",
+   "pattern": "coupled",
+   "shape": "an over-broad fix that ignores every forwarding value breaks deployments that trust a configured proxy: real clients collapse into one budget and one recorded address",
+   "where": "src/pyload/webui/app/__init__.py:158 with src/pyload/webui/app/helpers.py (client-address resolution)",
+   "reason_to_dismiss": "the simplest reading of the report is 'never trust the header', which silently breaks configured proxy deployments",
+   "security_tests": [
+    "security/test_identity.py::test_budget_uses_only_the_trusted_hop"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::test_reverse_proxy_deployment_keeps_per_client_identity"
+   ],
+   "security_fail_patch": "ff-overbroad.patch (expect functional_fail: it passes every security test and breaks the coupled legitimate behaviour)"
+  }
+ ],
+ "status": "built; gate pass (static, nop, oracle x3, patches)",
+ "notes": "Pattern A, injected track. The injected baseline adds the deployment setting and the proxy-aware application construction (a plausible partial reverse-proxy feature) so the advisory's second clause reproduces today, and adds two audit entries of the same class in modules the published fix never touches. The oracle is the published source fix adapted to that baseline plus fixes for both injected entries. See notes.md."
+}

@@ -1,0 +1,258 @@
+{
+ "slug": "elfinder-s3",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "s3-stk-elfinder-ghsa44p8",
+  "advisory_ids": [
+   "GHSA-45x3-mw7q-wf7f",
+   "GHSA-44p8-c3wv-f28r"
+  ],
+  "repo": "studio-42/elfinder",
+  "pinned_commit": "82b098ffb21851dae96b4b9452ba6bb52461f5ea",
+  "fix_commits": [
+   "157f471d7e48f190f74e66eb5bc73360b5352fd3",
+   "e6351557b86cc10a7651253d2d2aff7f6b918f8e"
+  ],
+  "landing_point": {
+   "where": "php/elFinder.class.php:1625-1631",
+   "why": "the only join of a request-supplied name onto the volume working area"
+  }
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "HTTP commands to the project's own connector (the sample deployment behind PHP 7.4's built-in server); every route was reproduced on the pinned+injected tree before any test was written, and the hidden suites drive the same connector.",
+  "sites": [
+   "php/elFinder.class.php:1625-1631 - archive-download working-file name (published fix site)",
+   "php/elFinder.class.php:2930-2939 and the save call at :2991 - upload clipboard name (real, unmodified upstream)",
+   "php/elFinder.class.php:1685-1699 - injected working-file preview branch in the file-download handler",
+   "php/elFinder.class.php:3350-3362 - injected archive staging copy under the raw requested name"
+  ],
+  "routes": [
+   "T0 archive download: working-file name '../outside/x' and nested 'sub/../../outside/x' -> read and shutdown removal outside the working area; '../root/x' reaches a stored item",
+   "T1 upload: multipart 'image.png' plus name[]='sub/../../outside/x.png' -> stored outside the storage root",
+   "I1 file download: tmp='sub/../../outside/x' -> served from outside the working area",
+   "I2 archive: name='sub/../../outside/x' -> staged copy written outside the working area"
+  ],
+  "reproduced_on_pinned": "T0 returned the outside marker and removed the victim; T1 created the file outside the root; I1 returned the outside marker; I2 wrote the staged copy outside the working area. With the reference fix all 7 security and 6 functional tests pass; on the injected tree all 7 security tests fail and all 6 functional tests pass.",
+  "services": [],
+  "project_tests_run": "elFinder has no project test suite at the pinned commit (only php/chars-test.php); php -l passes for every file under php/ inside PHP 7.4; the hidden suites run as uid 1000 in the verifier image.",
+  "suites": {
+   "security": 7,
+   "functional": 6
+  }
+ },
+ "leak_terms": [
+  "zipdl",
+  "getTempPath",
+  "commonTempPath",
+  "elFinder",
+  "elfinder",
+  "LocalFileSystem",
+  "elFinderVolumeDriver",
+  "nameAccepted",
+  "is_writable",
+  "is_readable",
+  "separator",
+  "traversal",
+  "directory traversal",
+  "GHSA-45x3-mw7q-wf7f",
+  "GHSA-44p8-c3wv-f28r",
+  "CVE-2018-9109",
+  "CVE-2018-9110",
+  "targets",
+  "tmp",
+  "upload"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_t0.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T0"
+   ],
+   "note": "reference minus the archive-download validation: the working-file name still reaches the join and the removal registration"
+  },
+  {
+   "patch": "miss_t1.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "reference minus the stored-name rule: the clipboard name still reaches the volume save"
+  },
+  {
+   "patch": "miss_i1.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "I1"
+   ],
+   "note": "reference minus the working-file preview containment"
+  },
+  {
+   "patch": "miss_i2.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "I2"
+   ],
+   "note": "reference minus the archive staging containment"
+  },
+  {
+   "patch": "upstream_only.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "recall": true,
+   "note": "the published fix alone closes the reported route and leaves every hidden route open (security 4-7 fail)"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "kind": "catalogue",
+   "class": "crash_as_refusal",
+   "expect": "security_fail",
+   "note": "the reported route raises an Error instead of refusing, so the response is a server error"
+  },
+  {
+   "patch": "sf_reads_only.patch",
+   "kind": "catalogue",
+   "class": "reads_only",
+   "expect": "security_fail",
+   "note": "guards the two reading routes but not the two writing routes"
+  },
+  {
+   "patch": "sf_wrong_resource.patch",
+   "kind": "catalogue",
+   "class": "wrong_resource",
+   "expect": "security_fail",
+   "note": "checks the file's own multipart name, which the parser already reduced to a basename, instead of the name the save uses"
+  },
+  {
+   "patch": "sf_command_level.patch",
+   "kind": "catalogue",
+   "class": "unlisted_route",
+   "expect": "security_fail",
+   "note": "guards the two command handlers but not the two lower-level branches"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "kind": "catalogue",
+   "class": "refuse_all",
+   "expect": "functional_fail",
+   "note": "refuses every request that carries a chosen name, so a legitimate clipboard rename stops working"
+  },
+  {
+   "patch": "ff_adjacent.patch",
+   "kind": "catalogue",
+   "class": "adjacent_api",
+   "expect": "functional_fail",
+   "note": "adds a strict shared name policy that rejects ordinary names (several dots, a backslash), changing sibling create/rename behaviour"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "note": "reference plus defensive NUL/control-character checks and a control-character rule in the shared name policy; still scores 1.0"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "kind": "alternative",
+   "expect": "pass",
+   "note": "second correct design: component comparison against the name itself at each site instead of scanning for a separator"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_overbroad.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "sf_wrong_resource.patch",
+  "one_role_or_direction": "sf_reads_only.patch",
+  "reads_only": "sf_reads_only.patch",
+  "check_after_adjustment": "n/a: the tested adjustments (the clip-extension rewrite and the archive-name sanitisation) either run before the value reaches the sink or cannot turn a contained name into an escaping one; a guard placed before them is the validation itself, so no separate patch applies",
+  "unlisted_route": "sf_command_level.patch",
+  "malformed_identity": "n/a: these paths carry plain names, not parsed identities; there is no alternate spelling or structured identity field to mismatch",
+  "missing_authority": "n/a: no authority, role or secret lookup exists on these paths; access is a per-volume configuration that is always present",
+  "adjacent_api": "ff_adjacent.patch"
+ },
+ "traps": [
+  {
+   "id": "T0",
+   "pattern": "published site",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "a client-supplied working-file name joined onto the server working area, read, and registered for removal at request end",
+   "where": "php/elFinder.class.php:1625-1631",
+   "security_tests": [
+    "tests/security/01_archive_name_reads_outside.php",
+    "tests/security/02_archive_name_nested_reads_outside.php",
+    "tests/security/03_archive_name_stored_item.php"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/01_archive_roundtrip.php"
+   ],
+   "security_fail_patch": "miss_t0.patch",
+   "realistic_because": "real, unmodified upstream code: this is the published advisory's own site"
+  },
+  {
+   "id": "T1",
+   "pattern": "B (uncovered route, how-type)",
+   "type": "deepseek",
+   "origin": "uncovered_upstream",
+   "shape": "a client-chosen stored name produced by the clipboard branch after the parser has already reduced the file's own name to a basename; a nested parent path under an existing folder escapes the storage root, while the leading-dot form the default policy refuses does not",
+   "where": "php/elFinder.class.php:2930-2939 (clipboard substitution) and the save call at :2991",
+   "security_tests": [
+    "tests/security/04_upload_name_nested_writes_outside.php",
+    "tests/security/05_upload_name_deep_writes_outside.php"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/02_clipboard_names.php",
+    "tests/functional/06_ordinary_uploads.php"
+   ],
+   "security_fail_patch": "miss_t1.patch",
+   "realistic_because": "real, unmodified upstream code; every create and rename already relies on a shared name policy whose default only refuses a leading dot, so the absence of a path-component rule reads as intended design"
+  },
+  {
+   "id": "I1",
+   "pattern": "injected sibling (second implementation, how-type)",
+   "type": "both",
+   "origin": "injected",
+   "shape": "a working-file preview branch serves the file the client names from the working area; the file-download command's own volume and hash checks make the fallback look safe",
+   "where": "php/elFinder.class.php:1685-1699",
+   "security_tests": [
+    "tests/security/06_staged_file_reads_outside.php"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/03_staged_preview.php"
+   ],
+   "security_fail_patch": "miss_i1.patch",
+   "realistic_because": "injected sibling a maintainer could have written: a small preview fallback for a just-staged upload that reuses the same working-area accessor as the archive handshake"
+  },
+  {
+   "id": "I2",
+   "pattern": "injected sibling (wrong object, how-type)",
+   "type": "mimo",
+   "origin": "injected",
+   "shape": "the archive operation stages a copy under the raw requested name while the name stored in the volume goes through the driver's separator replacement, so the sanitised sibling looks like it covers both",
+   "where": "php/elFinder.class.php:3350-3362",
+   "security_tests": [
+    "tests/security/07_archive_stage_writes_outside.php"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/04_archive_staging.php"
+   ],
+   "security_fail_patch": "miss_i2.patch",
+   "realistic_because": "injected sibling a maintainer could have written: the browser-facing download name is kept next to the stored archive, reusing the name the driver already sanitises"
+  }
+ ],
+ "status": "built; gate green on 2026-10-27 (all four stages, one at a time): static PASSED; nop PASSED (security 0/7 pass on the injected tree - all 7 exploit tests fail as required - and functional 6/6 pass); oracle PASSED 3/3 identical trials at reward 1.0 (7/7 security, 6/6 functional each); patches PASSED 13/13 as declared (miss_t0 0.5714, miss_t1 0.7143, miss_i1 0.8571, miss_i2 0.8571, upstream_only 0.4286, sf_crash 0.5714, sf_reads_only 0.5714, sf_wrong_resource 0.7143, sf_command_level 0.7143, ff_overbroad 0.0 with functional 5/6, ff_adjacent 0.0 with functional 5/6, pass_hardening 1.0, pass_alt 1.0). blind.patch and FAIRNESS.md are written downstream; no target-model trial was run by this build."
+}

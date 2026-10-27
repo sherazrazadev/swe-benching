@@ -1,0 +1,224 @@
+{
+ "slug": "jsonpath-s3",
+ "candidate": {
+  "entry_id": "s3-stk-jsonpath-ghsahw8r",
+  "advisory_ids": [
+   "GHSA-pppg-cpfq-h7wr",
+   "GHSA-hw8r-x6gr-5gjp"
+  ],
+  "repo": "jsonpath-plus/jsonpath",
+  "pinned_commit": "f20be141062453c26281e8d5ee8684cad62a1e35",
+  "fix_commits": [
+   "6b2f1b4c234292c75912b790bf7e2d7339d4ccd3",
+   "b70aa713553caf838a63bac923195a5bc541fd72",
+   "73ad72e5ee788d8287dea6e8283a3f16f63c9eb8",
+   "30942896d27cb8a806b965a5ca9ef9f686be24ee"
+  ],
+  "screener_version": "screener-v2"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit_relationship": "f20be141062453c26281e8d5ee8684cad62a1e35 is an ancestor of every listed fix commit (git merge-base --is-ancestor); the four fixes land in order 6b2f1b4c, b70aa713, 73ad72e5, 30942896. environment/injection.patch applies cleanly to the pinned tree (patch -p1 --dry-run), and solution/fix.patch applies cleanly to the injected tree (git apply --check).",
+  "regression_tests_absent_at_pin": "The advisory's security cases were added to test/test.safe-eval.js by 73ad72e5 and 30942896; that file at the pinned commit has no security-tests block (verified by git diff pin..30942896 -- test/test.safe-eval.js).",
+  "entry_points": [
+   "package root import (jsonpath-plus -> dist/index-node-esm.js) and the default JSONPath evaluation path",
+   "browser bundle (dist/index-browser-esm.js)",
+   "edge/worker subpath build (jsonpath-plus/edge -> dist/index-edge-esm.js, injected)",
+   "lower-level exported script class from the package root",
+   "public ahead-of-time preparation helper on the exported class (injected)"
+  ],
+  "sites": [
+   "src/jsonpath-node.js:5 (reported alias of the safe evaluation mode to the host VM)",
+   "src/jsonpath-node.js:7-11 (lower-level script export)",
+   "src/jsonpath.js:645-682 (cache lookup and evaluator dispatch)",
+   "src/jsonpath.js:693-740 (public script cache and injected preparation helper)",
+   "src/jsonpath-browser.js:44-203,266-274 (second AST evaluator and its public export)",
+   "src/jsonpath-edge.js:1-38 (injected edge build with a Function-based safe evaluator)",
+   "src/Safe-Script.js (shared interpreter added by the reference fix)"
+  ],
+  "routes": "13 security tests fail on the pinned+injected image and pass with the reference fix; 39 functional tests pass on both. The isolated wrong-fix patches leave 1-3 security tests failing (or break 1-38 functional tests) exactly as declared.",
+  "services": "none; the image is built with network, everything after that is offline",
+  "project_tests_run": "npm run mocha (test/, including test.safe-eval.js and test.eval.js) at image build: 265 passing at the pinned tree and 265 passing with the reference fix",
+  "injection": "environment/injection.patch adds a public ahead-of-time preparation helper to the library's existing script cache (src/jsonpath.js), a Function-based safe evaluator for an edge/worker subpath build (src/jsonpath-edge.js plus rollup/package.json/README wiring). These files/regions are never modified by the published fix. The reference fix additionally guards cache consumption and removes the edge override."
+ },
+ "leak_terms": [
+  "SafeScript",
+  "Safe-Script.js",
+  "SafeEval",
+  "EdgeScript",
+  "safeVm",
+  "jsonpath.js",
+  "jsonpath-node.js",
+  "jsonpath-browser.js",
+  "jsonpath-edge.js",
+  "jsonpath-plus/edge",
+  "JSONPath.prepare",
+  "JSONPath.cache",
+  "scriptCacheKey",
+  "constructor",
+  "__proto__",
+  "jsep",
+  "vm",
+  "rollup",
+  "node_modules",
+  "GHSA-pppg-cpfq-h7wr",
+  "GHSA-hw8r-x6gr-5gjp",
+  "6b2f1b4c",
+  "73ad72e5",
+  "b70aa713",
+  "30942896"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_member_only.patch",
+   "expect": "security_fail",
+   "note": "T1: member-name denylist only; identifier lookup still walks the sandbox prototype and reaches the host function constructor through descriptors"
+  },
+  {
+   "patch": "sf_nonstring_missing.patch",
+   "expect": "security_fail",
+   "note": "T1 shape: the guard checks the raw computed key instead of the string the property access uses"
+  },
+  {
+   "patch": "sf_node_only.patch",
+   "expect": "security_fail",
+   "note": "T2: the Node entry fixed, the browser bundle left on its own evaluator"
+  },
+  {
+   "patch": "sf_export_kept.patch",
+   "expect": "security_fail",
+   "note": "T3: the safe path fixed, the lower-level script export still aliases the host VM"
+  },
+  {
+   "patch": "sf_trusts_cache.patch",
+   "expect": "security_fail",
+   "note": "T4: the safe evaluator fixed, a cache entry produced by the preparation helper is still trusted"
+  },
+  {
+   "patch": "sf_edge_kept.patch",
+   "expect": "security_fail",
+   "note": "T5: every other surface fixed, the edge build keeps its Function-based safe evaluator"
+  },
+  {
+   "patch": "ff_refuse_all_evaluation.patch",
+   "expect": "functional_fail",
+   "note": "refuses every expression, so legitimate filters and selectors stop working"
+  },
+  {
+   "patch": "ff_block_calls.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: refuses all function calls, breaking sandbox helpers and value methods"
+  },
+  {
+   "patch": "ff_native_broken.patch",
+   "expect": "functional_fail",
+   "note": "adjacent API: the explicitly requested native evaluation mode is disabled too"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a wider blocked-prototype-name set; still scores 1.0"
+  },
+  {
+   "patch": "pass_alt_producer.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "second valid design: the preparation helper stores a safe script instead of the check rejecting foreign cache entries"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all_evaluation.patch",
+  "crash_as_refusal": "n/a: the library refuses by throwing an evaluation error, and the security tests accept any error with no side effect; there is no separate crash status to distinguish",
+  "wrong_resource": "n/a: there is no per-object authority; the protected outcome is the evaluation itself, over the caller's expression and the host process",
+  "one_role_or_direction": "sf_node_only.patch",
+  "reads_only": "n/a: the flaw is expression evaluation rather than a read/write split on a resource, so there is no read-only variant that leaves a write surface open",
+  "check_after_adjustment": "sf_nonstring_missing.patch",
+  "unlisted_route": "sf_trusts_cache.patch",
+  "malformed_identity": "sf_member_only.patch",
+  "missing_authority": "n/a: no secret, role or authority lookup decides the outcome; the evaluator must always decide on the expression itself",
+  "adjacent_api": "ff_native_broken.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-interpreter-mechanism",
+   "shape": "how-type main lever: the safe interpreter must not expose the host through identifier lookup or key coercion. A member-name denylist misses a bare identifier resolved through the sandbox object's prototype that reaches the host function constructor through property descriptors, and a computed key that is an array coerces to a blocked name only when the property is read, after the check.",
+   "where": "src/jsonpath-node.js:5 (reported alias); the existing browser interpreter a solver reuses or copies is src/jsonpath-browser.js:133-151; the shared interpreter is src/Safe-Script.js",
+   "security_tests": [
+    "tests/security/node-safe-eval.test.mjs (7 tests)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/node-safe-eval.test.mjs: typeof/null/undefined literals, array includes, sandbox helper calls, multi-statement filters, arithmetic, ternary and bitwise operators",
+    "tests/functional/node-safe-eval.test.mjs: native mode, disabled evaluation, caller-supplied evaluator class and function"
+   ],
+   "security_fail_patch": "sf_member_only.patch, sf_nonstring_missing.patch",
+   "reason_to_dismiss": "the reported vector is a member read, so blocking constructor/__proto__ names on member expressions looks complete, and the browser interpreter already exists and looks safe",
+   "realistic_because": "published fix sites; the identifier and non-string shapes are the adversarial inputs the upstream hardening later had to add"
+  },
+  {
+   "id": "T2-browser-second-implementation",
+   "shape": "pattern A far site: the browser bundle carries its own AST evaluator, a separate implementation that resolves members without own-property or blocked-name checks and exports its script class",
+   "where": "src/jsonpath-browser.js:44-203,266-274",
+   "security_tests": [
+    "tests/security/browser-safe-eval.test.mjs (2 tests)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/browser-safe-eval.test.mjs (9 tests: multi-statement, path, sandbox, ternary, unary, array method, bit shift)"
+   ],
+   "security_fail_patch": "sf_node_only.patch",
+   "reason_to_dismiss": "the advisory's example runs in Node and the browser build already avoids eval/Function, so it looks like a safe second implementation and out of scope",
+   "realistic_because": "real, unmodified upstream code; the published fix replaces this evaluator with the shared hardened one"
+  },
+  {
+   "id": "T3-lower-level-script-export",
+   "shape": "pattern A far site: the package's lower-level exported script class is the host VM's script class, so a caller-supplied expression evaluated through that public API runs natively and never reaches the JSONPath safe path",
+   "where": "src/jsonpath-node.js:7-11; the browser entry exports the same class at src/jsonpath-browser.js:274",
+   "security_tests": [
+    "tests/security/script-export.test.mjs (1 test)"
+   ],
+   "coupled_functional_tests": [
+    "none: the reference fix removes the export, which is the closed route; no documented product call depends on it"
+   ],
+   "security_fail_patch": "sf_export_kept.patch",
+   "reason_to_dismiss": "it reads as an internal helper export equivalent to the platform's own script class rather than the evaluation entry the report shows",
+   "realistic_because": "real upstream site; the published fix removes the export from both entries"
+  },
+  {
+   "id": "T4-prepared-cache-producer",
+   "shape": "how-type producer off the check's path: the public preparation helper compiles expressions with the native compiler into the package-global script cache; the safe evaluation path reuses a cache entry without checking who produced it, so an expression accepted and stored earlier runs later",
+   "where": "src/jsonpath.js:693-740 (cache and preparation helper); consumed at src/jsonpath.js:645-682",
+   "security_tests": [
+    "tests/security/prepared-query.test.mjs (1 test)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/prepared-query.test.mjs (5 tests: prepared filter, dynamic property, sandbox, current path, repeated evaluation)"
+   ],
+   "security_fail_patch": "sf_trusts_cache.patch",
+   "reason_to_dismiss": "preparation looks like an internal performance helper for trusted stored queries, while the report describes a live path string",
+   "realistic_because": "the project already exposes a public script cache; ahead-of-time preparation is a plausible maintainer addition, and the published fix never changes the cache consumption path"
+  },
+  {
+   "id": "T5-edge-build-never-protected",
+   "shape": "route where the protection never existed (injected): the package's edge/worker build installs its own Function-based script class as the safe evaluator, so the default evaluation mode runs the expression bytes in the host realm",
+   "where": "src/jsonpath-edge.js:1-38",
+   "security_tests": [
+    "tests/security/edge-build.test.mjs (2 tests)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/edge-build.test.mjs (6 tests: comparison, array method, sandbox helper, typeof, ternary, property comparison)"
+   ],
+   "security_fail_patch": "sf_edge_kept.patch",
+   "reason_to_dismiss": "a separate build for runtimes without the Node VM looks like an opt-in platform path rather than the reported entry, and worker platforms are assumed to be isolated already",
+   "realistic_because": "injected sibling: plausible maintainer code for a runtime without vm, mirroring the browser adapter pattern the project already ships"
+  }
+ ],
+ "status": "gate-green 2026-10-27: static PASSED (conformance conforming; the blind patch is declared and is written by the pipeline's blind-fix step); nop PASSED (13/13 security tests fail on the pinned+injected tree, 39/39 functional pass); oracle PASSED 3/3 identical trials at reward 1.0 (13/13 security + 39/39 functional each); patches PASSED 11/11 as declared (security_fail: sf_member_only 0.7692, sf_nonstring_missing 0.8462, sf_node_only 0.8462, sf_export_kept 0.9231, sf_trusts_cache 0.9231, sf_edge_kept 0.8462; functional_fail: ff_refuse_all 0.0, ff_block_calls 0.0, ff_native_broken 0.0; pass: pass_hardening 1.0, pass_alt_producer 1.0)."
+}

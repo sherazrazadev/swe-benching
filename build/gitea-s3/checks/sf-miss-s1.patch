@@ -1,0 +1,93 @@
+diff --git a/routers/web/repo/release.go b/routers/web/repo/release.go
+index f8757ee..86f486d 100644
+--- a/routers/web/repo/release.go
++++ b/routers/web/repo/release.go
+@@ -461,6 +461,8 @@ func NewReleasePost(ctx *context.Context) {
+ 			ctx.JSONError(ctx.Tr("repo.release.tag_name_invalid"))
+ 		case release_service.IsErrProtectedTagName(err):
+ 			ctx.JSONError(ctx.Tr("repo.release.tag_name_protected"))
++		case upload.IsErrFileTypeForbidden(err):
++			ctx.JSONError(err.Error())
+ 		default:
+ 			ctx.ServerError("handleTagReleaseError", err)
+ 		}
+diff --git a/services/release/release.go b/services/release/release.go
+index db5346a..144eaf5 100644
+--- a/services/release/release.go
++++ b/services/release/release.go
+@@ -167,6 +167,25 @@ func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Rel
+ 	return created, nil
+ }
+ 
++// verifyReleaseAttachmentTypes checks every attachment against the types configured for release assets.
++func verifyReleaseAttachmentTypes(ctx context.Context, attachmentUUIDs []string) error {
++	attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, attachmentUUIDs)
++	if err != nil {
++		return err
++	}
++	return verifyReleaseAttachmentNames(attachments)
++}
++
++// verifyReleaseAttachmentNames checks stored attachment names against the release asset type policy.
++func verifyReleaseAttachmentNames(attachments []*repo_model.Attachment) error {
++	for _, attach := range attachments {
++		if err := upload.Verify(nil, attach.Name, setting.Repository.Release.AllowedTypes); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
+ // LinkReleaseAttachments links already stored attachments, identified by their database IDs, to a release.
+ func LinkReleaseAttachments(ctx context.Context, releaseID int64, attachmentIDs []int64) error {
+ 	if len(attachmentIDs) == 0 {
+@@ -176,6 +195,7 @@ func LinkReleaseAttachments(ctx context.Context, releaseID int64, attachmentIDs
+ 	if err != nil {
+ 		return err
+ 	}
++	attachments := make([]*repo_model.Attachment, 0, len(attachmentIDs))
+ 	for _, attachmentID := range attachmentIDs {
+ 		attach, err := repo_model.GetAttachmentByID(ctx, attachmentID)
+ 		if err != nil {
+@@ -187,6 +207,9 @@ func LinkReleaseAttachments(ctx context.Context, releaseID int64, attachmentIDs
+ 		if attach.ReleaseID != 0 {
+ 			return util.NewPermissionDeniedErrorf("release permission denied")
+ 		}
++		attachments = append(attachments, attach)
++	}
++	for _, attach := range attachments {
+ 		if err := repo_model.UpdateAttachmentByUUID(ctx, &repo_model.Attachment{UUID: attach.UUID, ReleaseID: rel.ID}, "release_id"); err != nil {
+ 			return fmt.Errorf("update attachment [%d]: %w", attach.ID, err)
+ 		}
+@@ -221,6 +244,10 @@ func ReplaceReleaseAttachments(ctx context.Context, releaseID int64, attachmentI
+ 		attachments = append(attachments, attach)
+ 	}
+ 
++	if err := verifyReleaseAttachmentNames(attachments); err != nil {
++		return err
++	}
++
+ 	for _, attach := range rel.Attachments {
+ 		if keep.Contains(attach.ID) {
+ 			continue
+@@ -239,6 +266,10 @@ func ReplaceReleaseAttachments(ctx context.Context, releaseID int64, attachmentI
+ 
+ // CreateRelease creates a new release of repository.
+ func CreateRelease(gitRepo *git.Repository, rel *repo_model.Release, attachmentUUIDs []string, msg string) error {
++	if err := verifyReleaseAttachmentTypes(gitRepo.Ctx, attachmentUUIDs); err != nil {
++		return err
++	}
++
+ 	has, err := repo_model.IsReleaseExist(gitRepo.Ctx, rel.RepoID, rel.TagName)
+ 	if err != nil {
+ 		return err
+@@ -334,6 +365,9 @@ func UpdateRelease(ctx context.Context, doer *user_model.User, gitRepo *git.Repo
+ 	if rel.ID == 0 {
+ 		return errors.New("UpdateRelease only accepts an exist release")
+ 	}
++	if err := verifyReleaseAttachmentTypes(ctx, addAttachmentUUIDs); err != nil {
++		return err
++	}
+ 	isTagCreated, err := createTag(ctx, gitRepo, rel, "")
+ 	if err != nil {
+ 		return err

@@ -1,0 +1,139 @@
+diff --git a/README.md b/README.md
+index 3ab361e..c424e6f 100644
+--- a/README.md
++++ b/README.md
+@@ -187,6 +187,8 @@ evaluate method (as the first argument) include:
+   with `code` and `context` as arguments to return the evaluated value.
+   `class`: A class which is created with `code` as constructor argument and code
+   is evaluated by calling `runInNewContext` with `context`.
++  Edge and worker runtimes which do not provide NodeJS' `vm` module can import
++  the `jsonpath-plus/edge` entry; it honours the same `eval` setting.
+   ``
+ - ***ignoreEvalErrors*** (**default: false**) - Ignore errors encountered during
+   script evaluation.
+diff --git a/package.json b/package.json
+index 780e59b..3d2fb0e 100644
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,10 @@
+       "import": "./dist/index-node-esm.js",
+       "require": "./dist/index-node-cjs.cjs",
+       "default": "./dist/index-browser-esm.js"
++    },
++    "./edge": {
++      "import": "./dist/index-edge-esm.js",
++      "default": "./dist/index-edge-esm.js"
+     }
+   },
+   "module": "dist/index-node-esm.js",
+diff --git a/rollup.config.js b/rollup.config.js
+index 89c0b6c..0bb42ca 100644
+--- a/rollup.config.js
++++ b/rollup.config.js
+@@ -96,5 +96,9 @@ export default [
+     //     external: ['fs/promises', 'vm']
+     // }),
+     ...getRollupObjectByEnv({minifying: false, environment: 'browser'}),
+-    ...getRollupObjectByEnv({minifying: true, environment: 'browser'})
++    ...getRollupObjectByEnv({minifying: true, environment: 'browser'}),
++    getRollupObject({
++        input: 'src/jsonpath-edge.js', minifying: false,
++        environment: 'edge', format: 'esm'
++    })
+ ];
+diff --git a/src/jsonpath-edge.js b/src/jsonpath-edge.js
+new file mode 100644
+index 0000000..9beeb2a
+--- /dev/null
++++ b/src/jsonpath-edge.js
+@@ -0,0 +1,38 @@
++import {JSONPath} from './jsonpath.js';
++
++/**
++ * Evaluation script class for edge and worker runtimes, which do not provide
++ * NodeJS' `vm` module.
++ */
++class EdgeScript {
++    /**
++     * @param {string} expr Expression to evaluate
++     */
++    constructor (expr) {
++        this.code = expr;
++    }
++
++    /**
++     * @param {Record<string, any>} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    runInNewContext (context) {
++        const keys = Object.keys(context);
++        const values = keys.map((key) => {
++            return context[key];
++        });
++        // eslint-disable-next-line no-new-func -- Runs where `vm` is unavailable
++        const script = new Function(
++            ...keys,
++            '"use strict"; return (' + this.code + ');'
++        );
++        return script(...values);
++    }
++}
++
++JSONPath.prototype.safeVm = {
++    Script: EdgeScript
++};
++
++export {JSONPath};
+diff --git a/src/jsonpath.js b/src/jsonpath.js
+index 4179e72..09b1f23 100644
+--- a/src/jsonpath.js
++++ b/src/jsonpath.js
+@@ -692,6 +692,47 @@ JSONPath.prototype._eval = function (
+ // Could store the cache object itself
+ JSONPath.cache = {};
+ 
++/**
++ * Compiles the evaluating parts of a path ahead of time so repeated evaluations
++ * of a stored path can reuse them.
++ * @param {string} expr JSONPath expression
++ * @returns {string[]} The cache keys that were prepared
++ */
++JSONPath.prepare = function (expr) {
++    const prepared = [];
++    if (!JSONPath.prototype.vm) {
++        return prepared;
++    }
++    const exprList = JSONPath.toPathArray(expr);
++    for (const loc of exprList) {
++        let code;
++        if (loc.indexOf('?(') === 0) {
++            code = loc.replace(/^\?\((.*?)\)$/u, '$1');
++        } else if (loc[0] === '(') {
++            code = loc;
++        } else {
++            continue;
++        }
++        const scriptCacheKey = 'safeScript:' + code;
++        if (!JSONPath.cache[scriptCacheKey]) {
++            const containsPath = code.includes('@path');
++            let script = code
++                .replace(/@parentProperty/gu, '_$_parentProperty')
++                .replace(/@parent/gu, '_$_parent')
++                .replace(/@property/gu, '_$_property')
++                .replace(/@root/gu, '_$_root')
++                .replace(/@([.\s)[])/gu, '_$_v$1');
++            if (containsPath) {
++                script = script.replace(/@path/gu, '_$_path');
++            }
++            JSONPath.cache[scriptCacheKey] =
++                new JSONPath.prototype.vm.Script(script);
++        }
++        prepared.push(scriptCacheKey);
++    }
++    return prepared;
++};
++
+ /**
+  * @param {string[]} pathArr Array to convert
+  * @returns {string} The path string

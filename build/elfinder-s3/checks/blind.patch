@@ -1,0 +1,135 @@
+diff -ruN a/php/elFinder.class.php b/php/elFinder.class.php
+--- a/php/elFinder.class.php	2026-10-27 10:04:31.000000000 +0000
++++ b/php/elFinder.class.php	2026-10-27 10:15:37.592712872 +0000
+@@ -1578,6 +1578,51 @@
+ 	}
+ 	
+ 	/**
++	 * Return true when a client-supplied value is a plain name and not a path
++	 *
++	 * A name selects one entry inside the folder it belongs to, or one file inside the
++	 * server working area. It must never address a directory entry ('.', '..'), carry
++	 * a path separator or hide a NUL byte that would cut the path it is joined into.
++	 *
++	 * @param  mixed  $name
++	 * @return bool
++	 **/
++	public static function isSingleName($name) {
++		if (!is_string($name) || $name === '' || $name === '.' || $name === '..') {
++			return false;
++		}
++		if (strpos($name, "\0") !== false || strpos($name, '/') !== false) {
++			return false;
++		}
++		// on this platform the directory separator may be a second spelling of '/'
++		return DIRECTORY_SEPARATOR === '/' || strpos($name, DIRECTORY_SEPARATOR) === false;
++	}
++
++	/**
++	 * Resolve a client-supplied working-file name against a server working directory
++	 *
++	 * Returns the resolved path only when the value is a plain name and really addresses
++	 * a file inside $dir; returns false for a path, a missing entry or a link that
++	 * resolves outside the directory.
++	 *
++	 * @param  string  $dir   working directory
++	 * @param  string  $name  client-supplied name
++	 * @return string|false
++	 **/
++	protected static function resolveWorkFile($dir, $name) {
++		if (!self::isSingleName($name)) {
++			return false;
++		}
++		$realDir = realpath($dir);
++		$real = realpath(rtrim($dir, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.$name);
++		if ($realDir === false || $real === false) {
++			return false;
++		}
++		$realDir = rtrim($realDir, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR;
++		return (strpos($real, $realDir) === 0)? $real : false;
++	}
++
++	/**
+ 	 * Download files/folders as an archive file
+ 	 * 
+ 	 * 1st: Return srrsy contains download archive file info
+@@ -1623,12 +1668,13 @@
+ 				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 			}
+ 			$file = $targets[1];
+-			$path = $volume->getTempPath().DIRECTORY_SEPARATOR.$file;
+-			// register auto delete on shutdown
+-			$GLOBALS['elFinderTempFiles'][$path] = true;
+-			if (!is_readable($path)) {
++			// the working-file name selects one file inside the working area, never a path
++			$path = self::resolveWorkFile($volume->getTempPath(), $file);
++			if ($path === false || !is_file($path) || !is_readable($path)) {
+ 				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 			}
++			// register auto delete on shutdown (only a file that was inside the working area)
++			$GLOBALS['elFinderTempFiles'][$path] = true;
+ 			$name = $targets[2];
+ 			$mime = $targets[3];
+ 			
+@@ -1684,8 +1730,12 @@
+ 
+ 		// Preview a file the upload handler has staged in the working area and not saved yet
+ 		if (!empty($args['tmp']) && ($stagedDir = $volume->getTempPath())) {
+-			$staged = $stagedDir.DIRECTORY_SEPARATOR.$args['tmp'];
+-			if (is_file($staged) && ($sfp = fopen($staged, 'rb'))) {
++			// the tmp value selects one staged file in the working area; it is never a path
++			if (!self::isSingleName($args['tmp'])) {
++				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
++			}
++			$staged = self::resolveWorkFile($stagedDir, $args['tmp']);
++			if ($staged !== false && is_file($staged) && ($sfp = fopen($staged, 'rb'))) {
+ 				$sstat = fstat($sfp);
+ 				return array(
+ 					'pointer' => $sfp,
+@@ -2938,6 +2988,12 @@
+ 				$name .= $ext;
+ 			}
+ 			
++			// a name the client chose selects one entry and is never a path
++			if (!self::isSingleName($name)) {
++				$result['warning'] = $this->error(self::ERROR_UPLOAD_FILE, $name, self::ERROR_INVALID_NAME);
++				continue;
++			}
++			
+ 			// do hook function 'upload.presave'
+ 			if (! empty($this->listeners['upload.presave'])) {
+ 				foreach($this->listeners['upload.presave'] as $handler) {
+@@ -3343,13 +3399,18 @@
+ 			return $this->error(self::ERROR_ARCHIVE, self::ERROR_TRGDIR_NOT_FOUND);
+ 		}
+ 		
++		// a chosen archive name selects one file; it is never a path
++		if ($name !== '' && !self::isSingleName($name)) {
++			return array('error' => $this->error(self::ERROR_ARCHIVE, self::ERROR_INVALID_NAME));
++		}
++		
+ 		foreach($targets as $target) {
+ 			$this->itemLock($target);
+ 		}
+ 		
+ 		if (($file = $volume->archive($targets, $args['type'], $name))) {
+ 			// keep a copy under the requested name so the browser saves it as chosen
+-			if ($name !== '' && ($stageDir = $volume->getTempPath())) {
++			if ($name !== '' && self::isSingleName($name) && ($stageDir = $volume->getTempPath())) {
+ 				$stage = $stageDir.DIRECTORY_SEPARATOR.$name;
+ 				$source = $volume->realpath($file['hash']);
+ 				if ($source && is_file($source)) {
+diff -ruN a/php/elFinderVolumeDriver.class.php b/php/elFinderVolumeDriver.class.php
+--- a/php/elFinderVolumeDriver.class.php	2026-10-27 10:04:29.000000000 +0000
++++ b/php/elFinderVolumeDriver.class.php	2026-10-27 10:13:55.012365746 +0000
+@@ -3575,6 +3575,10 @@
+ 		if (json_encode($name)===false) {
+ 			return false;
+ 		}
++		// a name selects one entry in its folder; a path is not a name
++		if (!elFinder::isSingleName($name)) {
++			return false;
++		}
+ 		$nameValidator = $isDir? $this->dirnameValidator : $this->nameValidator;
+ 		if ($nameValidator) {
+ 			if (is_callable($nameValidator)) {

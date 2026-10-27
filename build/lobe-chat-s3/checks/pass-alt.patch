@@ -1,0 +1,192 @@
+diff --git a/src/app/api/files/image/route.ts b/src/app/api/files/image/route.ts
+index d6ccb67..b47ea71 100644
+--- a/src/app/api/files/image/route.ts
++++ b/src/app/api/files/image/route.ts
+@@ -1,10 +1,12 @@
++import { safeFetch } from '@/libs/ssrf/safeFetch';
++
+ import { Imgur } from './imgur';
+ 
+ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+   let imageBlob: Blob;
+ 
+   if (url) {
+-    const res = await fetch(url);
++    const res = await safeFetch(url);
+     imageBlob = await res.blob();
+   } else if (blob) {
+     imageBlob = blob;
+@@ -21,13 +23,20 @@ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+ export const POST = async (req: Request) => {
+   const { url } = await req.json();
+ 
+-  const cdnUrl = await updateByImgur({ url });
++  try {
++    const cdnUrl = await updateByImgur({ url });
+ 
+-  return new Response(JSON.stringify({ url: cdnUrl }));
++    return new Response(JSON.stringify({ url: cdnUrl }));
++  } catch (error) {
++    return new Response(JSON.stringify({ error: (error as Error).message }), {
++      headers: { 'content-type': 'application/json' },
++      status: 400,
++    });
++  }
+ };
+ // import { Imgur } from './imgur';
+ 
+-export const runtime = 'edge';
++export const runtime = 'nodejs';
+ 
+ // export const POST = async (req: Request) => {
+ //   const { url } = await req.json();
+diff --git a/src/app/api/proxy/manifest.ts b/src/app/api/proxy/manifest.ts
+index 3b77261..b1eb3ee 100644
+--- a/src/app/api/proxy/manifest.ts
++++ b/src/app/api/proxy/manifest.ts
+@@ -1,3 +1,5 @@
++import { safeFetch } from '@/libs/ssrf/safeFetch';
++
+ const OPENAPI_FIELD = 'openapi';
+ 
+ /**
+@@ -21,7 +23,7 @@ export const includeManifestDependencies = async (res: Response): Promise<Respon
+ 
+   if (typeof openapi !== 'string' || !openapi) return res;
+ 
+-  const documentResponse = await fetch(openapi);
++  const documentResponse = await safeFetch(openapi);
+   const document = await documentResponse.text();
+ 
+   return new Response(
+diff --git a/src/app/api/proxy/route.ts b/src/app/api/proxy/route.ts
+index 26fa9b0..2c4f5a5 100644
+--- a/src/app/api/proxy/route.ts
++++ b/src/app/api/proxy/route.ts
+@@ -1,3 +1,5 @@
++import { assertPublicUrl, safeFetch } from '@/libs/ssrf/safeFetch';
++
+ import { downloadDirect, isDownloadRequest } from './download';
+ import { includeManifestDependencies } from './manifest';
+ import { resolveProxyTarget } from './target';
+@@ -8,9 +10,18 @@ export const runtime = 'nodejs';
+  * just for a proxy
+  */
+ export const POST = async (req: Request) => {
+-  const url = await resolveProxyTarget(req);
++  try {
++    const url = await resolveProxyTarget(req);
+ 
+-  const res = isDownloadRequest(url) ? await downloadDirect(url) : await fetch(url);
++    const res = isDownloadRequest(url)
++      ? await downloadDirect((await assertPublicUrl(url)).toString())
++      : await safeFetch(url);
+ 
+-  return includeManifestDependencies(res);
++    return await includeManifestDependencies(res);
++  } catch (error) {
++    return new Response(JSON.stringify({ error: (error as Error).message }), {
++      headers: { 'content-type': 'application/json' },
++      status: 400,
++    });
++  }
+ };
+diff --git a/src/libs/ssrf/safeFetch.ts b/src/libs/ssrf/safeFetch.ts
+new file mode 100644
+index 0000000..3c4dff8
+--- /dev/null
++++ b/src/libs/ssrf/safeFetch.ts
+@@ -0,0 +1,93 @@
++import { BlockList, isIP } from 'node:net';
++import { lookup } from 'node:dns/promises';
++
++const blocked = new BlockList();
++
++const IPV4_RANGES: Array<[string, number]> = [
++  ['0.0.0.0', 8],
++  ['10.0.0.0', 8],
++  ['100.64.0.0', 10],
++  ['127.0.0.0', 8],
++  ['169.254.0.0', 16],
++  ['172.16.0.0', 12],
++  ['192.0.0.0', 24],
++  ['192.0.2.0', 24],
++  ['192.168.0.0', 16],
++  ['198.18.0.0', 15],
++  ['198.51.100.0', 24],
++  ['203.0.113.0', 24],
++  ['224.0.0.0', 4],
++  ['240.0.0.0', 4],
++];
++
++const IPV6_RANGES: Array<[string, number]> = [
++  ['fc00::', 7],
++  ['fe80::', 10],
++  ['ff00::', 8],
++  ['2001:db8::', 32],
++];
++
++for (const [network, prefix] of IPV4_RANGES) blocked.addSubnet(network, prefix, 'ipv4');
++for (const [network, prefix] of IPV6_RANGES) blocked.addSubnet(network, prefix, 'ipv6');
++blocked.addAddress('::', 'ipv6');
++blocked.addAddress('::1', 'ipv6');
++
++const normalize = (address: string): string => {
++  const value = address.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase();
++  const dottedMapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(value);
++
++  if (dottedMapped) return dottedMapped[1];
++
++  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(value);
++
++  if (hexMapped) {
++    const high = parseInt(hexMapped[1], 16);
++    const low = parseInt(hexMapped[2], 16);
++
++    return [high >> 8, high & 255, low >> 8, low & 255].join('.');
++  }
++
++  return value;
++};
++
++export const isPublicAddress = (address: string): boolean => {
++  const value = normalize(address);
++  const family = isIP(value);
++
++  if (family === 4) return !blocked.check(value, 'ipv4');
++  if (family === 6) return !blocked.check(value, 'ipv6');
++
++  return false;
++};
++
++export const resolveAddresses = async (hostname: string): Promise<string[]> => {
++  if (isIP(hostname)) return [hostname];
++
++  const answers = await lookup(hostname, { all: true });
++
++  return answers.map((answer) => answer.address);
++};
++
++export const assertPublicUrl = async (input: string | URL): Promise<URL> => {
++  const url = input instanceof URL ? input : new URL(input);
++
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++    throw new Error('the proxy only supports http and https destinations');
++  }
++
++  const hostname = url.hostname.replace(/^\[/, '').replace(/\]$/, '');
++  const addresses = await resolveAddresses(hostname);
++
++  if (addresses.length === 0 || addresses.some((address) => !isPublicAddress(address))) {
++    throw new Error('the proxy cannot reach a non-public destination');
++  }
++
++  return url;
++};
++
++export const safeFetch = async (input: string | URL, init: RequestInit = {}): Promise<Response> => {
++  const url = await assertPublicUrl(input);
++
++  // Refuse to follow any redirect at all: a redirect target is never fetched.
++  return await fetch(url, { ...init, redirect: 'error' });
++};

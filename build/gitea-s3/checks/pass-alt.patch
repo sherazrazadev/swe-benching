@@ -1,0 +1,99 @@
+diff --git a/routers/api/v1/repo/release.go b/routers/api/v1/repo/release.go
+index 9992488..1e95f38 100644
+--- a/routers/api/v1/repo/release.go
++++ b/routers/api/v1/repo/release.go
+@@ -11,6 +11,7 @@ import (
+ 	repo_model "gitea.dev/models/repo"
+ 	"gitea.dev/models/unit"
+ 	"gitea.dev/modules/git"
++	"gitea.dev/modules/setting"
+ 	api "gitea.dev/modules/structs"
+ 	"gitea.dev/modules/web"
+ 	"gitea.dev/routers/api/v1/utils"
+@@ -378,6 +379,17 @@ func EditRelease(ctx *context.APIContext) {
+ 	}
+ 
+ 	if len(form.AttachmentIDs) > 0 {
++		for _, attachmentID := range form.AttachmentIDs {
++			attach, err := repo_model.GetAttachmentByID(ctx, attachmentID)
++			if err != nil {
++				ctx.APIErrorNotFound()
++				return
++			}
++			if err := upload.Verify(nil, attach.Name, setting.Repository.Release.AllowedTypes); err != nil {
++				ctx.APIError(http.StatusUnprocessableEntity, err.Error())
++				return
++			}
++		}
+ 		if err := release_service.ReplaceReleaseAttachments(ctx, rel.ID, form.AttachmentIDs); err != nil {
+ 			if upload.IsErrFileTypeForbidden(err) {
+ 				ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+diff --git a/routers/api/v1/repo/release_attachment.go b/routers/api/v1/repo/release_attachment.go
+index 54ce743..308d3dc 100644
+--- a/routers/api/v1/repo/release_attachment.go
++++ b/routers/api/v1/repo/release_attachment.go
+@@ -289,6 +289,18 @@ func LinkReleaseAttachments(ctx *context.APIContext) {
+ 		return
+ 	}
+ 
++	for _, attachmentID := range form.AttachmentIDs {
++		attach, err := repo_model.GetAttachmentByID(ctx, attachmentID)
++		if err != nil {
++			ctx.APIErrorNotFound()
++			return
++		}
++		if err := upload.Verify(nil, attach.Name, setting.Repository.Release.AllowedTypes); err != nil {
++			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
++			return
++		}
++	}
++
+ 	if err := release_service.LinkReleaseAttachments(ctx, release.ID, form.AttachmentIDs); err != nil {
+ 		if upload.IsErrFileTypeForbidden(err) {
+ 			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+diff --git a/routers/web/repo/release.go b/routers/web/repo/release.go
+index f8757ee..6d7a96d 100644
+--- a/routers/web/repo/release.go
++++ b/routers/web/repo/release.go
+@@ -485,6 +485,20 @@ func NewReleasePost(ctx *context.Context) {
+ 
+ 	attachmentUUIDs := util.Iif(setting.Attachment.Enabled, form.Files, nil)
+ 
++	if len(attachmentUUIDs) > 0 {
++		attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, attachmentUUIDs)
++		if err != nil {
++			ctx.ServerError("GetAttachmentsByUUIDs", err)
++			return
++		}
++		for _, attach := range attachments {
++			if err := upload.Verify(nil, attach.Name, setting.Repository.Release.AllowedTypes); err != nil {
++				ctx.JSONError(err.Error())
++				return
++			}
++		}
++	}
++
+ 	// no existing release, create a new release
+ 	if rel == nil {
+ 		rel = &repo_model.Release{
+@@ -622,6 +636,20 @@ func EditReleasePost(ctx *context.Context) {
+ 	rel.Note = form.Content
+ 	rel.IsDraft = len(form.Draft) > 0
+ 	rel.IsPrerelease = form.Prerelease
++	if len(addAttachmentUUIDs) > 0 {
++		attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, addAttachmentUUIDs)
++		if err != nil {
++			ctx.ServerError("GetAttachmentsByUUIDs", err)
++			return
++		}
++		for _, attach := range attachments {
++			if err := upload.Verify(nil, attach.Name, setting.Repository.Release.AllowedTypes); err != nil {
++				ctx.JSONError(err.Error())
++				return
++			}
++		}
++	}
++
+ 	if err = release_service.UpdateRelease(ctx, ctx.Doer, ctx.Repo.GitRepo,
+ 		rel, addAttachmentUUIDs, delAttachmentUUIDs, editAttachments); err != nil {
+ 		if upload.IsErrFileTypeForbidden(err) {

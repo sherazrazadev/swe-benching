@@ -1,0 +1,583 @@
+diff -ruN pristine/pkg/engine/apicall/apiCall.go app/pkg/engine/apicall/apiCall.go
+--- a/pkg/engine/apicall/apiCall.go	2026-10-27 10:06:08.000000000 +0000
++++ b/pkg/engine/apicall/apiCall.go	2026-10-27 10:39:30.472866436 +0000
+@@ -3,11 +3,13 @@
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 
+ 	"github.com/go-logr/logr"
+ 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+ 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
+ 	"github.com/kyverno/kyverno/pkg/engine/variables"
+ )
+@@ -27,12 +29,13 @@
+ 	jsonCtx enginecontext.Interface,
+ 	client ClientInterface,
+ 	apiCallConfig APICallConfiguration,
++	policyScopes ...scope.NamespaceScope,
+ ) (*apiCall, error) {
+ 	if entry.APICall == nil {
+ 		return nil, fmt.Errorf("missing APICall in context entry %v", entry)
+ 	}
+ 
+-	executor := NewExecutor(logger, entry.Name, client, apiCallConfig)
++	executor := NewExecutor(logger, entry.Name, client, apiCallConfig, policyScopes...)
+ 
+ 	return &apiCall{
+ 		logger:   logger,
+@@ -64,6 +67,12 @@
+ 	}
+ 	data, err := a.Execute(ctx, &call.APICall)
+ 	if err != nil {
++		// A refusal caused by the policy namespace boundary is final: the
++		// configured default value must not hide it and re-bind foreign data.
++		var refusal *scope.RefusalError
++		if errors.As(err, &refusal) {
++			return nil, err
++		}
+ 		if data == nil && a.entry.APICall.Default != nil {
+ 			data = a.entry.APICall.Default.Raw
+ 			a.logger.V(4).Info("failed to substitute variable data for APICall, using default value", "default", data, "name", a.entry.Name, "URLPath", a.entry.APICall.URLPath, "error", err)
+diff -ruN pristine/pkg/engine/apicall/executor.go app/pkg/engine/apicall/executor.go
+--- a/pkg/engine/apicall/executor.go	2026-10-27 10:06:08.000000000 +0000
++++ b/pkg/engine/apicall/executor.go	2026-10-27 10:39:27.336882837 +0000
+@@ -13,6 +13,7 @@
+ 
+ 	"github.com/go-logr/logr"
+ 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/tracing"
+ 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+ )
+@@ -22,10 +23,11 @@
+ }
+ 
+ type executor struct {
+-	logger logr.Logger
+-	name   string
+-	client ClientInterface
+-	config APICallConfiguration
++	logger           logr.Logger
++	name             string
++	client           ClientInterface
++	config           APICallConfiguration
++	namespacedPolicy scope.NamespaceScope
+ }
+ 
+ func NewExecutor(
+@@ -33,17 +35,30 @@
+ 	name string,
+ 	client ClientInterface,
+ 	apiCallConfig APICallConfiguration,
++	policyScopes ...scope.NamespaceScope,
+ ) *executor {
++	policyScope := scope.ClusterScope()
++	if len(policyScopes) > 0 {
++		policyScope = policyScopes[0]
++	}
+ 	return &executor{
+-		logger: logger,
+-		name:   name,
+-		client: client,
+-		config: apiCallConfig,
++		logger:           logger,
++		name:             name,
++		client:           client,
++		config:           apiCallConfig,
++		namespacedPolicy: policyScope,
+ 	}
+ }
+ 
+ func (a *executor) Execute(ctx context.Context, call *kyvernov1.APICall) ([]byte, error) {
+ 	if call.URLPath != "" {
++		// Every Kubernetes API request, whether its path was declared verbatim or
++		// composed from typed fields, passes through here after variable
++		// substitution. A policy that belongs to a namespace may only reach its
++		// own namespace.
++		if err := a.namespacedPolicy.CheckAPIPath(call.URLPath); err != nil {
++			return nil, err
++		}
+ 		return a.executeK8sAPICall(ctx, call.URLPath, call.Method, call.Data)
+ 	}
+ 	return a.executeServiceCall(ctx, call)
+diff -ruN pristine/pkg/engine/context/loaders/apicall.go app/pkg/engine/context/loaders/apicall.go
+--- a/pkg/engine/context/loaders/apicall.go	2026-10-27 10:06:08.000000000 +0000
++++ b/pkg/engine/context/loaders/apicall.go	2026-10-27 10:39:55.934727767 +0000
+@@ -9,18 +9,20 @@
+ 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+ 	"github.com/kyverno/kyverno/pkg/engine/apicall"
+ 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
+ )
+ 
+ type apiLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	enginectx enginecontext.Interface
+-	jp        jmespath.Interface
+-	client    engineapi.RawClient
+-	config    apicall.APICallConfiguration
+-	data      []byte
++	ctx            context.Context //nolint:containedctx
++	logger         logr.Logger
++	entry          kyvernov1.ContextEntry
++	enginectx      enginecontext.Interface
++	jp             jmespath.Interface
++	client         engineapi.RawClient
++	config         apicall.APICallConfiguration
++	namespaceScope scope.NamespaceScope
++	data           []byte
+ }
+ 
+ func NewAPILoader(
+@@ -31,15 +33,17 @@
+ 	jp jmespath.Interface,
+ 	client engineapi.RawClient,
+ 	apiCallConfig apicall.APICallConfiguration,
++	namespaceScope scope.NamespaceScope,
+ ) enginecontext.Loader {
+ 	return &apiLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		enginectx: enginectx,
+-		jp:        jp,
+-		client:    client,
+-		config:    apiCallConfig,
++		ctx:            ctx,
++		logger:         logger,
++		entry:          entry,
++		enginectx:      enginectx,
++		jp:             jp,
++		client:         client,
++		config:         apiCallConfig,
++		namespaceScope: namespaceScope,
+ 	}
+ }
+ 
+@@ -48,7 +52,7 @@
+ }
+ 
+ func (a *apiLoader) LoadData() error {
+-	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config)
++	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config, a.namespaceScope)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initiaize APICal: %w", err)
+ 	}
+diff -ruN pristine/pkg/engine/context/loaders/configmap.go app/pkg/engine/context/loaders/configmap.go
+--- a/pkg/engine/context/loaders/configmap.go	2026-10-27 10:06:08.000000000 +0000
++++ b/pkg/engine/context/loaders/configmap.go	2026-10-27 10:39:42.117804491 +0000
+@@ -9,16 +9,18 @@
+ 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+ 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+ 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/engine/variables"
+ )
+ 
+ type configMapLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	resolver  engineapi.ConfigmapResolver
+-	enginectx enginecontext.Interface
+-	data      []byte
++	ctx            context.Context //nolint:containedctx
++	logger         logr.Logger
++	entry          kyvernov1.ContextEntry
++	resolver       engineapi.ConfigmapResolver
++	enginectx      enginecontext.Interface
++	namespaceScope scope.NamespaceScope
++	data           []byte
+ }
+ 
+ func NewConfigMapLoader(
+@@ -27,13 +29,15 @@
+ 	entry kyvernov1.ContextEntry,
+ 	resolver engineapi.ConfigmapResolver,
+ 	enginectx enginecontext.Interface,
++	namespaceScope scope.NamespaceScope,
+ ) enginecontext.Loader {
+ 	return &configMapLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		resolver:  resolver,
+-		enginectx: enginectx,
++		ctx:            ctx,
++		logger:         logger,
++		entry:          entry,
++		resolver:       resolver,
++		enginectx:      enginectx,
++		namespaceScope: namespaceScope,
+ 	}
+ }
+ 
+@@ -73,23 +77,49 @@
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.name %s: %v", entryName, cmName, err)
+ 	}
++	nameStr, ok := name.(string)
++	if !ok {
++		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.name %s: expected string, got %T", entryName, cmName, name)
++	}
+ 	namespace, err := variables.SubstituteAll(logger, cml.enginectx, cml.entry.ConfigMap.Namespace)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.namespace %s: %v", entryName, cmNamespace, err)
+ 	}
+-	if namespace == "" {
+-		namespace = "default"
++	namespaceStr, ok := namespace.(string)
++	if !ok {
++		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.namespace %s: expected string, got %T", entryName, cmNamespace, namespace)
++	}
++	if namespaceStr == "" {
++		// A namespaced policy defaults to its own namespace; a cluster-scoped
++		// policy keeps the historical "default" namespace.
++		if cml.namespaceScope.Enforced() && cml.namespaceScope.Namespace() != "" {
++			namespaceStr = cml.namespaceScope.Namespace()
++		} else {
++			namespaceStr = "default"
++		}
++	}
++	// Refuse a request that aims outside the policy namespace before it reaches
++	// the resolver.
++	if err := cml.namespaceScope.CheckNamespace(namespaceStr); err != nil {
++		return nil, fmt.Errorf("context entry %s: %w", entryName, err)
+ 	}
+-	obj, err := cml.resolver.Get(cml.ctx, namespace.(string), name.(string))
++	obj, err := cml.resolver.Get(cml.ctx, namespaceStr, nameStr)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to get configmap %s/%s : %v", namespace, name, err)
++		return nil, fmt.Errorf("failed to get configmap %s/%s : %v", namespaceStr, nameStr, err)
++	}
++	// The resolver can answer with an object from another namespace (the
++	// client-based resolver falls back to the shared namespace when the object is
++	// absent locally), so the object actually returned is checked too. Only an
++	// object that lives where the policy may read is bound.
++	if cml.namespaceScope.Enforced() && obj.Namespace != "" && obj.Namespace != namespaceStr {
++		return nil, fmt.Errorf("context entry %s: resolved configMap %s/%s from namespace %q, outside the policy namespace", entryName, namespaceStr, nameStr, obj.Namespace)
+ 	}
+ 	// extract configmap data
+ 	contextData["data"] = obj.Data
+ 	contextData["metadata"] = obj.ObjectMeta
+ 	data, err := json.Marshal(contextData)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to unmarshal configmap %s/%s: %v", namespace, name, err)
++		return nil, fmt.Errorf("failed to unmarshal configmap %s/%s: %v", namespaceStr, nameStr, err)
+ 	}
+ 	return data, nil
+ }
+diff -ruN pristine/pkg/engine/context/loaders/resource.go app/pkg/engine/context/loaders/resource.go
+--- a/pkg/engine/context/loaders/resource.go	2026-10-27 10:06:17.000000000 +0000
++++ b/pkg/engine/context/loaders/resource.go	2026-10-27 10:39:46.734782251 +0000
+@@ -10,19 +10,21 @@
+ 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+ 	"github.com/kyverno/kyverno/pkg/engine/apicall"
+ 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
+ 	"github.com/kyverno/kyverno/pkg/engine/variables"
+ )
+ 
+ type resourceLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	enginectx enginecontext.Interface
+-	jp        jmespath.Interface
+-	client    engineapi.RawClient
+-	config    apicall.APICallConfiguration
+-	data      []byte
++	ctx            context.Context //nolint:containedctx
++	logger         logr.Logger
++	entry          kyvernov1.ContextEntry
++	enginectx      enginecontext.Interface
++	jp             jmespath.Interface
++	client         engineapi.RawClient
++	config         apicall.APICallConfiguration
++	namespaceScope scope.NamespaceScope
++	data           []byte
+ }
+ 
+ func NewResourceLoader(
+@@ -33,15 +35,17 @@
+ 	jp jmespath.Interface,
+ 	client engineapi.RawClient,
+ 	apiCallConfig apicall.APICallConfiguration,
++	namespaceScope scope.NamespaceScope,
+ ) enginecontext.Loader {
+ 	return &resourceLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		enginectx: enginectx,
+-		jp:        jp,
+-		client:    client,
+-		config:    apiCallConfig,
++		ctx:            ctx,
++		logger:         logger,
++		entry:          entry,
++		enginectx:      enginectx,
++		jp:             jp,
++		client:         client,
++		config:         apiCallConfig,
++		namespaceScope: namespaceScope,
+ 	}
+ }
+ 
+@@ -90,8 +94,15 @@
+ 		return nil, fmt.Errorf("failed to substitute variables in context %s resource.name %s: expected string, got %T", rl.entry.Name, ref.Name, name)
+ 	}
+ 
++	// The path is composed from typed fields, so a check on a declared URLPath
++	// would never see it. The namespace is confined to the policy namespace
++	// here, and the composed path is validated again by the executor.
++	if err := rl.namespaceScope.CheckNamespace(namespaceStr); err != nil {
++		return nil, fmt.Errorf("context entry %s: %w", rl.entry.Name, err)
++	}
++
+ 	path := resourceAPIPath(ref.Group, ref.Version, ref.Resource, namespaceStr, nameStr)
+-	executor := apicall.NewExecutor(rl.logger, rl.entry.Name, rl.client, rl.config)
++	executor := apicall.NewExecutor(rl.logger, rl.entry.Name, rl.client, rl.config, rl.namespaceScope)
+ 	data, err := executor.Execute(rl.ctx, &kyvernov1.APICall{URLPath: path, Method: kyvernov1.Method("GET")})
+ 	if err != nil {
+ 		return nil, err
+diff -ruN pristine/pkg/engine/context/scope/scope.go app/pkg/engine/context/scope/scope.go
+--- a/pkg/engine/context/scope/scope.go	1970-01-01 00:00:00.000000000 +0000
++++ b/pkg/engine/context/scope/scope.go	2026-10-27 10:39:23.083903325 +0000
+@@ -0,0 +1,139 @@
++// Package scope describes the namespace boundary that a policy's context data
++// sources must stay inside. A cluster-scoped policy is unrestricted; a policy
++// that belongs to a namespace may only read Kubernetes data from that same
++// namespace.
++package scope
++
++import (
++	"fmt"
++	"net/url"
++	"path"
++	"strings"
++)
++
++// NamespaceScope is the namespace boundary for one policy. The zero value is
++// the unrestricted scope used by cluster-scoped policies.
++type NamespaceScope struct {
++	enforced  bool
++	namespace string
++}
++
++// ClusterScope returns the unrestricted scope used by cluster-scoped policies.
++func ClusterScope() NamespaceScope {
++	return NamespaceScope{}
++}
++
++// NewNamespaceScope returns the scope of a policy that belongs to namespace.
++func NewNamespaceScope(namespace string) NamespaceScope {
++	return NamespaceScope{enforced: true, namespace: namespace}
++}
++
++// Enforced reports whether the scope limits data access at all.
++func (s NamespaceScope) Enforced() bool {
++	return s.enforced
++}
++
++// Namespace returns the namespace the scope is confined to. It is empty for an
++// unrestricted scope.
++func (s NamespaceScope) Namespace() string {
++	return s.namespace
++}
++
++// RefusalError marks a fetch refused because it left the policy namespace. It is
++// a distinct type so that a configured fallback value can never mask a refusal.
++type RefusalError struct {
++	message string
++}
++
++func (e *RefusalError) Error() string {
++	return e.message
++}
++
++func refuse(format string, args ...interface{}) error {
++	return &RefusalError{message: fmt.Sprintf(format, args...)}
++}
++
++// CheckNamespace reports a refusal when namespace is not the policy's own.
++func (s NamespaceScope) CheckNamespace(namespace string) error {
++	if !s.enforced {
++		return nil
++	}
++	if s.namespace == "" {
++		return fmt.Errorf("the policy has no namespace, so no namespace can be read")
++	}
++	if namespace != s.namespace {
++		return fmt.Errorf("namespace %q is different from the policy namespace %q", namespace, s.namespace)
++	}
++	return nil
++}
++
++// CheckAPIPath validates a fully resolved Kubernetes API path. It only accepts a
++// path that names a resource inside the policy namespace; cluster-scoped paths,
++// all-namespace collections, dot segments and namespace-prefix lookalikes are
++// refused.
++func (s NamespaceScope) CheckAPIPath(rawPath string) error {
++	if !s.enforced {
++		return nil
++	}
++	namespace, err := s.namespaceOfPath(rawPath)
++	if err != nil {
++		return refuse("path %q is not a namespaced Kubernetes API path in the policy namespace %q: %v", rawPath, s.namespace, err)
++	}
++	if s.namespace == "" {
++		return refuse("path %q cannot be read by a policy that has no namespace", rawPath)
++	}
++	if namespace != s.namespace {
++		return refuse("path %q targets namespace %q, outside the policy namespace %q", rawPath, namespace, s.namespace)
++	}
++	return nil
++}
++
++// namespaceOfPath extracts the namespace an API path is scoped to. The path must
++// be absolute and take the form /api/<version>/namespaces/<ns>/<resource>[...] or
++// /apis/<group>/<version>/namespaces/<ns>/<resource>[...]. A path that stops at
++// the namespace object itself (a cluster-scoped object) is not namespaced.
++func (s NamespaceScope) namespaceOfPath(rawPath string) (string, error) {
++	if !strings.HasPrefix(rawPath, "/") {
++		return "", fmt.Errorf("not an absolute path")
++	}
++	// The query string is not part of the path scoping.
++	if i := strings.IndexByte(rawPath, '?'); i >= 0 {
++		rawPath = rawPath[:i]
++	}
++	rawSegments := strings.Split(rawPath, "/")
++	for _, segment := range rawSegments {
++		decoded, err := url.PathUnescape(segment)
++		if err != nil {
++			return "", fmt.Errorf("malformed path segment %q", segment)
++		}
++		// Encoded separators and dot segments would change the path meaning once
++		// the API server decodes it, so they are never accepted.
++		if decoded == "." || decoded == ".." || strings.ContainsAny(decoded, `/\`) {
++			return "", fmt.Errorf("ambiguous path segment %q", segment)
++		}
++	}
++	segments := strings.Split(path.Clean(rawPath), "/")
++	switch {
++	case len(segments) > 1 && segments[1] == "api":
++		return namespacedResource(segments, 3, rawPath)
++	case len(segments) > 1 && segments[1] == "apis":
++		return namespacedResource(segments, 4, rawPath)
++	default:
++		return "", fmt.Errorf("unknown API prefix")
++	}
++}
++
++// namespacedResource finds the namespace at keyword+1 and requires a non-empty
++// resource segment at keyword+2.
++func namespacedResource(segments []string, keyword int, rawPath string) (string, error) {
++	if keyword+2 >= len(segments) {
++		return "", fmt.Errorf("no resource after the namespace")
++	}
++	if segments[keyword] != "namespaces" {
++		return "", fmt.Errorf("not a namespaced path")
++	}
++	if segments[keyword+2] == "" {
++		return "", fmt.Errorf("no resource after the namespace")
++	}
++	return segments[keyword+1], nil
++}
+diff -ruN pristine/pkg/engine/factories/contextloaderfactory.go app/pkg/engine/factories/contextloaderfactory.go
+--- a/pkg/engine/factories/contextloaderfactory.go	2026-10-27 10:06:17.000000000 +0000
++++ b/pkg/engine/factories/contextloaderfactory.go	2026-10-27 10:39:53.029751541 +0000
+@@ -10,6 +10,7 @@
+ 	"github.com/kyverno/kyverno/pkg/engine/apicall"
+ 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
+ 	"github.com/kyverno/kyverno/pkg/engine/context/loaders"
++	"github.com/kyverno/kyverno/pkg/engine/context/scope"
+ 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
+ 	"github.com/kyverno/kyverno/pkg/logging"
+ 	"github.com/kyverno/kyverno/pkg/toggle"
+@@ -18,10 +19,11 @@
+ type ContextLoaderFactoryOptions func(*contextLoader)
+ 
+ func DefaultContextLoaderFactory(cmResolver engineapi.ConfigmapResolver, opts ...ContextLoaderFactoryOptions) engineapi.ContextLoaderFactory {
+-	return func(_ kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
++	return func(policy kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
+ 		cl := &contextLoader{
+-			logger:     logging.WithName("DefaultContextLoaderFactory"),
+-			cmResolver: cmResolver,
++			logger:         logging.WithName("DefaultContextLoaderFactory"),
++			cmResolver:     cmResolver,
++			namespaceScope: policyNamespaceScope(policy),
+ 		}
+ 		for _, o := range opts {
+ 			o(cl)
+@@ -30,6 +32,16 @@
+ 	}
+ }
+ 
++// policyNamespaceScope derives the data-access boundary from the policy that
++// owns the context entries. A cluster-scoped policy (or an absent policy, as the
++// cleanup controller builds one) stays unrestricted.
++func policyNamespaceScope(policy kyvernov1.PolicyInterface) scope.NamespaceScope {
++	if policy == nil || !policy.IsNamespaced() {
++		return scope.ClusterScope()
++	}
++	return scope.NewNamespaceScope(policy.GetNamespace())
++}
++
+ func WithInitializer(initializer engineapi.Initializer) ContextLoaderFactoryOptions {
+ 	return func(cl *contextLoader) {
+ 		cl.initializers = append(cl.initializers, initializer)
+@@ -49,11 +61,12 @@
+ }
+ 
+ type contextLoader struct {
+-	logger        logr.Logger
+-	cmResolver    engineapi.ConfigmapResolver
+-	initializers  []engineapi.Initializer
+-	apiCallConfig apicall.APICallConfiguration
+-	gctxStore     loaders.Store
++	logger         logr.Logger
++	cmResolver     engineapi.ConfigmapResolver
++	initializers   []engineapi.Initializer
++	apiCallConfig  apicall.APICallConfiguration
++	gctxStore      loaders.Store
++	namespaceScope scope.NamespaceScope
+ }
+ 
+ func (l *contextLoader) Load(
+@@ -100,7 +113,7 @@
+ ) (enginecontext.DeferredLoader, error) {
+ 	if entry.ConfigMap != nil {
+ 		if l.cmResolver != nil {
+-			ldr := loaders.NewConfigMapLoader(ctx, l.logger, entry, l.cmResolver, jsonContext)
++			ldr := loaders.NewConfigMapLoader(ctx, l.logger, entry, l.cmResolver, jsonContext, l.namespaceScope)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of ConfigMap context entry", "name", entry.Name)
+@@ -108,7 +121,7 @@
+ 		}
+ 	} else if entry.APICall != nil {
+ 		if client != nil {
+-			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig)
++			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig, l.namespaceScope)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of APICall context entry", "name", entry.Name)
+@@ -116,7 +129,7 @@
+ 		}
+ 	} else if entry.Resource != nil {
+ 		if client != nil {
+-			ldr := loaders.NewResourceLoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig)
++			ldr := loaders.NewResourceLoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig, l.namespaceScope)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of Resource context entry", "name", entry.Name)

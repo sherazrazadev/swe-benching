@@ -1,0 +1,235 @@
+{
+ "slug": "kyverno-s3",
+ "candidate": {
+  "entry_id": "s3-stk-kyverno-ghsacvq5",
+  "repo": "kyverno/kyverno",
+  "advisory_ids": [
+   "GHSA-8p9x-46gm-qfx2",
+   "GHSA-cvq5-hhx3-f99p"
+  ],
+  "cwe": "CWE-863",
+  "pinned_commit": "99260bd2900290d7d898933c421d2a51d01172a6",
+  "fix_commits": [
+   "eba60fa856c781bcb9c3be066061a3df03ae4e3e",
+   "e0ba4de4f1e0ca325066d5095db51aec45b1407b",
+   "bbf3e5c01391d612968440659028ae98e565a777"
+  ],
+  "track": "injected"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The shared context-loader factory the engine builds for the policy under evaluation (factories.DefaultContextLoaderFactory), driven through its Load call with deferred loading disabled; the ConfigMap shared-namespace case additionally uses the product's own client-backed ConfigMap resolver. Every fix layer (factory, loader, apicall, executor, resolver) is exercised through these product entry points.",
+  "sites": [
+   "pkg/engine/apicall/apiCall.go:57-81 (URLPath confinement missing at pinned)",
+   "pkg/engine/context/loaders/apicall.go:26-51 (loader does not carry the policy namespace)",
+   "pkg/engine/factories/contextloaderfactory.go:20-30 (policy argument discarded at pinned)",
+   "pkg/engine/context/loaders/configmap.go:65-95 (ConfigMap namespace taken from the entry, empty defaults to 'default')",
+   "pkg/engine/context/loaders/resource.go (injected typed source composes its own API path)",
+   "pkg/engine/context/resolvers/resolvers.go (injected shared-namespace fallback in the client resolver)"
+  ],
+  "routes": [
+   "L1: namespaced policy raw path with another namespace, dot segments, a namespace-name prefix, an all-namespace list, a cluster-scoped object, a post-substitution namespace, and a write",
+   "L2: namespaced policy ConfigMap entry with another namespace, and with an empty substituted namespace",
+   "L3: namespaced policy typed object source with another namespace, no namespace, and a post-substitution namespace",
+   "L4: namespaced policy ConfigMap requested in its own namespace that only the shared 'default' namespace defines"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./pkg/engine/apicall ./pkg/engine/context/loaders ./pkg/engine/factories ./pkg/engine/context/resolvers -count=1 on the pinned+injected tree and on the oracle; go test ./pkg/validation/policy and ./api/kyverno/v1 on the injected tree. All pass."
+ },
+ "leak_terms": [
+  "apiCall",
+  "APICall",
+  "URLPath",
+  "ConfigMap",
+  "configMap",
+  "ContextLoaderFactory",
+  "DefaultContextLoaderFactory",
+  "NewAPILoader",
+  "NewConfigMapLoader",
+  "NewResourceLoader",
+  "ResourceReference",
+  "policyNamespace",
+  "sharedConfigNamespace",
+  "resolvers",
+  "executor",
+  "namespacePathRegex",
+  "resourceAPIPath",
+  "path.Clean",
+  "WithPolicyNamespace",
+  "GlobalReference",
+  "CleanupPolicy"
+ ],
+ "traps": [
+  {
+   "id": "L1",
+   "pattern": "A",
+   "type": "how",
+   "origin": "published_fix_site",
+   "shape": "the raw API path guard must run after variable substitution and on the resolved path: dot segments, a namespace-name prefix, an all-namespace list, a cluster-scoped object path and a write are refused, while own-namespace core/group reads, post-substitution own-namespace reads and cluster-scoped policies keep working",
+   "where": "pkg/engine/apicall/apiCall.go:60-81; pkg/engine/context/loaders/apicall.go:26-51; pkg/engine/factories/contextloaderfactory.go:20-30",
+   "security_tests": [
+    "vtesting::TestSec_APICallCrossNamespace",
+    "vtesting::TestSec_APICallDotSegment",
+    "vtesting::TestSec_APICallNamespacePrefixCollision",
+    "vtesting::TestSec_APICallClusterWideList",
+    "vtesting::TestSec_APICallClusterScopedObject",
+    "vtesting::TestSec_APICallSubstitutedNamespace",
+    "vtesting::TestSec_APICallWriteCrossNamespace"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceAPICall",
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceGroupAPICall",
+    "vtesting::TestFunc_NamespacedPolicySubstitutedOwnNamespaceAPICall",
+    "vtesting::TestFunc_ClusterPolicyUnrestrictedAPICall"
+   ],
+   "security_fail_patch": "miss_apicall.patch",
+   "realistic_because": "published fix site (GHSA-8p9x-46gm-qfx2); the path shapes and keep-working cases are the advisory's own surface"
+  },
+  {
+   "id": "L2",
+   "pattern": "A",
+   "type": "where",
+   "origin": "published_fix_far_site",
+   "shape": "a second, typed data source resolves a ConfigMap namespace taken from the policy entry with no comparison to the policy namespace; an empty or substituted namespace falls back to 'default' instead of the policy's namespace, and a non-string substitution is rejected rather than type-asserted",
+   "where": "pkg/engine/context/loaders/configmap.go:65-95",
+   "security_tests": [
+    "vtesting::TestSec_ConfigMapCrossNamespace",
+    "vtesting::TestSec_ConfigMapEmptySubstitutedNamespace"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceConfigMap",
+    "vtesting::TestFunc_ClusterPolicyDefaultNamespaceConfigMap",
+    "vtesting::TestFunc_ClusterPolicyCrossNamespaceConfigMap"
+   ],
+   "security_fail_patch": "miss_configmap.patch",
+   "realistic_because": "published fix site (GHSA-cvq5-hhx3-f99p): the second implementation the first advisory fix missed"
+  },
+  {
+   "id": "L3",
+   "pattern": "B",
+   "type": "how",
+   "origin": "injected",
+   "shape": "a typed context source reads a Kubernetes object or collection from group/version/resource/namespace/name and composes the API path itself, so a guard on a declared URLPath never sees it; the namespace it uses is substituted from context and must be confined to the policy namespace",
+   "where": "pkg/engine/context/loaders/resource.go (composed path); wiring in pkg/engine/factories/contextloaderfactory.go; api/kyverno/v1/common_types.go",
+   "security_tests": [
+    "vtesting::TestSec_ResourceCrossNamespace",
+    "vtesting::TestSec_ResourceClusterWide",
+    "vtesting::TestSec_ResourceSubstitutedNamespace"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceResource",
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceGroupResource",
+    "vtesting::TestFunc_ClusterPolicyUnrestrictedResource"
+   ],
+   "security_fail_patch": "miss_resource.patch",
+   "realistic_because": "a typed lookup is a natural convenience to add beside the raw path; it carried no check when added, and it lives in a file the published fixes never touch. A guard at the shared executor also closes it, so a correct fix at either layer passes."
+  },
+  {
+   "id": "L4",
+   "pattern": "B",
+   "type": "how",
+   "origin": "injected",
+   "shape": "the client-backed ConfigMap data source falls back to the shared 'default' namespace when the requested namespace has no such object, so a check on the requested namespace passes while a foreign object's data is bound; the object actually returned must be checked, not only the request",
+   "where": "pkg/engine/context/resolvers/resolvers.go (fallback); the check belongs in the loader or the data source",
+   "security_tests": [
+    "vtesting::TestSec_ConfigMapSharedNamespaceFallback"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_NamespacedPolicyOwnNamespaceConfigMapLiveResolver",
+    "vtesting::TestFunc_ClusterPolicyCrossNamespaceConfigMap"
+   ],
+   "security_fail_patch": "miss_resolver.patch",
+   "realistic_because": "a shared-configuration fallback is a plausible low-level convenience in the resolver layer, which no published fix touches; the requested namespace looks checked, so the mismatch is only visible in the object that comes back."
+  }
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_apicall.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "L1"
+   ]
+  },
+  {
+   "patch": "miss_configmap.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "L2"
+   ]
+  },
+  {
+   "patch": "miss_resource.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "L3"
+   ]
+  },
+  {
+   "patch": "miss_resolver.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "L4"
+   ]
+  },
+  {
+   "patch": "reads_only.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "malformed_identity.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "functional_overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "adjacent_api.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "check_before_substitution.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "alt_correct_fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "functional_overbroad.patch",
+  "crash_as_refusal": "n/a: every refusal is a returned error; a panic aborts the Go test process and cannot score 1.0",
+  "wrong_resource": "miss_resolver.patch",
+  "one_role_or_direction": "n/a: this surface has no roles, peers or directions; reads and writes share one guard",
+  "reads_only": "reads_only.patch",
+  "check_after_adjustment": "n/a: variable substitution is the only adjustment; check_before_substitution.patch proves a pre-substitution guard is caught (the mirror case)",
+  "unlisted_route": "miss_resource.patch",
+  "malformed_identity": "malformed_identity.patch",
+  "missing_authority": "n/a: no credential or role authority is consulted on this surface; the owning policy object supplies the namespace",
+  "adjacent_api": "adjacent_api.patch"
+ },
+ "status": "built; gate PASSED stage by stage on 2026-10-27 (static; nop: 13/13 security fail, 33/33 functional pass; oracle: 3/3 reward 1.0 identical; patches: all 11 declared outcomes). blind patch and FAIRNESS.md are written downstream by the pipeline."
+}

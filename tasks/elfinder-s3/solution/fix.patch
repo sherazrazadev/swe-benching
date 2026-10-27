@@ -1,0 +1,60 @@
+diff --git a/php/elFinder.class.php b/php/elFinder.class.php
+index 72ca31223..8471f0269 100644
+--- a/php/elFinder.class.php
++++ b/php/elFinder.class.php
+@@ -1623,10 +1623,14 @@ class elFinder {
+ 				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 			}
+ 			$file = $targets[1];
++			// checking the validity of the file parameter
++			if (strpos(str_replace('/', DIRECTORY_SEPARATOR, $file), DIRECTORY_SEPARATOR) !== false) {
++				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
++			}
+ 			$path = $volume->getTempPath().DIRECTORY_SEPARATOR.$file;
+ 			// register auto delete on shutdown
+ 			$GLOBALS['elFinderTempFiles'][$path] = true;
+-			if (!is_readable($path)) {
++			if (!is_writable($path)) {
+ 				return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 			}
+ 			$name = $targets[2];
+@@ -1685,7 +1689,11 @@ class elFinder {
+ 		// Preview a file the upload handler has staged in the working area and not saved yet
+ 		if (!empty($args['tmp']) && ($stagedDir = $volume->getTempPath())) {
+ 			$staged = $stagedDir.DIRECTORY_SEPARATOR.$args['tmp'];
+-			if (is_file($staged) && ($sfp = fopen($staged, 'rb'))) {
++			$realDir = realpath($stagedDir);
++			$realStaged = realpath($staged);
++			if ($realDir && $realStaged
++			&& strpos($realStaged, rtrim($realDir, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR) === 0
++			&& is_file($realStaged) && ($sfp = fopen($realStaged, 'rb'))) {
+ 				$sstat = fstat($sfp);
+ 				return array(
+ 					'pointer' => $sfp,
+@@ -2937,7 +2945,15 @@ class elFinder {
+ 				}
+ 				$name .= $ext;
+ 			}
+-			
++
++			// a client-supplied name selects one entry and is never a path
++			if ($name === '' || $name === '.' || $name === '..'
++			|| strpos($name, '/') !== false || strpos($name, DIRECTORY_SEPARATOR) !== false
++			|| strpos($name, "\0") !== false) {
++				$result['warning'] = $this->error(self::ERROR_UPLOAD_FILE, $name, self::ERROR_INVALID_NAME);
++				continue;
++			}
++
+ 			// do hook function 'upload.presave'
+ 			if (! empty($this->listeners['upload.presave'])) {
+ 				foreach($this->listeners['upload.presave'] as $handler) {
+@@ -3349,7 +3365,8 @@ class elFinder {
+ 		
+ 		if (($file = $volume->archive($targets, $args['type'], $name))) {
+ 			// keep a copy under the requested name so the browser saves it as chosen
+-			if ($name !== '' && ($stageDir = $volume->getTempPath())) {
++			if ($name !== '' && strpos($name, '/') === false && strpos($name, DIRECTORY_SEPARATOR) === false
++			&& strpos($name, "\0") === false && ($stageDir = $volume->getTempPath())) {
+ 				$stage = $stageDir.DIRECTORY_SEPARATOR.$name;
+ 				$source = $volume->realpath($file['hash']);
+ 				if ($source && is_file($source)) {

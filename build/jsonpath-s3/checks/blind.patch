@@ -1,0 +1,687 @@
+diff -ruN '--exclude=node_modules' '--exclude=.htests' pristine/src/jsonpath-browser.js app/src/jsonpath-browser.js
+--- a/src/jsonpath-browser.js	2026-10-27 10:07:53.000000000 +0000
++++ b/src/jsonpath-browser.js	2026-10-27 10:22:01.455153190 +0000
+@@ -1,7 +1,3 @@
+-/* eslint-disable no-bitwise */
+-import jsep from 'jsep';
+-import jsepRegex from '@jsep-plugin/regex';
+-import jsepAssignment from '@jsep-plugin/assignment';
+ import {JSONPath} from './jsonpath.js';
+ 
+ /**
+@@ -38,170 +34,6 @@
+     }
+ };
+ 
+-// register plugins
+-jsep.plugins.register(jsepRegex, jsepAssignment);
+-
+-const SafeEval = {
+-    /**
+-     * @param {jsep.Expression} ast
+-     * @param {Record<string, any>} subs
+-     */
+-    evalAst (ast, subs) {
+-        switch (ast.type) {
+-        case 'BinaryExpression':
+-        case 'LogicalExpression':
+-            return SafeEval.evalBinaryExpression(ast, subs);
+-        case 'Compound':
+-            return SafeEval.evalCompound(ast, subs);
+-        case 'ConditionalExpression':
+-            return SafeEval.evalConditionalExpression(ast, subs);
+-        case 'Identifier':
+-            return SafeEval.evalIdentifier(ast, subs);
+-        case 'Literal':
+-            return SafeEval.evalLiteral(ast, subs);
+-        case 'MemberExpression':
+-            return SafeEval.evalMemberExpression(ast, subs);
+-        case 'UnaryExpression':
+-            return SafeEval.evalUnaryExpression(ast, subs);
+-        case 'ArrayExpression':
+-            return SafeEval.evalArrayExpression(ast, subs);
+-        case 'CallExpression':
+-            return SafeEval.evalCallExpression(ast, subs);
+-        case 'AssignmentExpression':
+-            return SafeEval.evalAssignmentExpression(ast, subs);
+-        default:
+-            throw SyntaxError('Unexpected expression', ast);
+-        }
+-    },
+-    evalBinaryExpression (ast, subs) {
+-        const result = {
+-            '||': (a, b) => a || b(),
+-            '&&': (a, b) => a && b(),
+-            '|': (a, b) => a | b(),
+-            '^': (a, b) => a ^ b(),
+-            '&': (a, b) => a & b(),
+-            // eslint-disable-next-line eqeqeq
+-            '==': (a, b) => a == b(),
+-            // eslint-disable-next-line eqeqeq
+-            '!=': (a, b) => a != b(),
+-            '===': (a, b) => a === b(),
+-            '!==': (a, b) => a !== b(),
+-            '<': (a, b) => a < b(),
+-            '>': (a, b) => a > b(),
+-            '<=': (a, b) => a <= b(),
+-            '>=': (a, b) => a >= b(),
+-            '<<': (a, b) => a << b(),
+-            '>>': (a, b) => a >> b(),
+-            '>>>': (a, b) => a >>> b(),
+-            '+': (a, b) => a + b(),
+-            '-': (a, b) => a - b(),
+-            '*': (a, b) => a * b(),
+-            '/': (a, b) => a / b(),
+-            '%': (a, b) => a % b()
+-        }[ast.operator](
+-            SafeEval.evalAst(ast.left, subs),
+-            () => SafeEval.evalAst(ast.right, subs)
+-        );
+-        return result;
+-    },
+-    evalCompound (ast, subs) {
+-        let last;
+-        for (let i = 0; i < ast.body.length; i++) {
+-            if (
+-                ast.body[i].type === 'Identifier' &&
+-                ['var', 'let', 'const'].includes(ast.body[i].name) &&
+-                ast.body[i + 1] &&
+-                ast.body[i + 1].type === 'AssignmentExpression'
+-            ) {
+-                // var x=2; is detected as
+-                // [{Identifier var}, {AssignmentExpression x=2}]
+-                // eslint-disable-next-line @stylistic/max-len -- Long
+-                // eslint-disable-next-line sonarjs/updated-loop-counter -- Convenient
+-                i += 1;
+-            }
+-            const expr = ast.body[i];
+-            last = SafeEval.evalAst(expr, subs);
+-        }
+-        return last;
+-    },
+-    evalConditionalExpression (ast, subs) {
+-        if (SafeEval.evalAst(ast.test, subs)) {
+-            return SafeEval.evalAst(ast.consequent, subs);
+-        }
+-        return SafeEval.evalAst(ast.alternate, subs);
+-    },
+-    evalIdentifier (ast, subs) {
+-        if (ast.name in subs) {
+-            return subs[ast.name];
+-        }
+-        throw ReferenceError(`${ast.name} is not defined`);
+-    },
+-    evalLiteral (ast) {
+-        return ast.value;
+-    },
+-    evalMemberExpression (ast, subs) {
+-        const prop = ast.computed
+-            ? SafeEval.evalAst(ast.property) // `object[property]`
+-            : ast.property.name; // `object.property` property is Identifier
+-        const obj = SafeEval.evalAst(ast.object, subs);
+-        const result = obj[prop];
+-        if (typeof result === 'function') {
+-            return result.bind(obj); // arrow functions aren't affected by bind.
+-        }
+-        return result;
+-    },
+-    evalUnaryExpression (ast, subs) {
+-        const result = {
+-            '-': (a) => -SafeEval.evalAst(a, subs),
+-            '!': (a) => !SafeEval.evalAst(a, subs),
+-            '~': (a) => ~SafeEval.evalAst(a, subs),
+-            // eslint-disable-next-line no-implicit-coercion
+-            '+': (a) => +SafeEval.evalAst(a, subs)
+-        }[ast.operator](ast.argument);
+-        return result;
+-    },
+-    evalArrayExpression (ast, subs) {
+-        return ast.elements.map((el) => SafeEval.evalAst(el, subs));
+-    },
+-    evalCallExpression (ast, subs) {
+-        const args = ast.arguments.map((arg) => SafeEval.evalAst(arg, subs));
+-        const func = SafeEval.evalAst(ast.callee, subs);
+-        return func(...args);
+-    },
+-    evalAssignmentExpression (ast, subs) {
+-        if (ast.left.type !== 'Identifier') {
+-            throw SyntaxError('Invalid left-hand side in assignment');
+-        }
+-        const id = ast.left.name;
+-        const value = SafeEval.evalAst(ast.right, subs);
+-        subs[id] = value;
+-        return subs[id];
+-    }
+-};
+-
+-/**
+- * A replacement for NodeJS' VM.Script which is also {@link https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP | Content Security Policy} friendly.
+- */
+-class SafeScript {
+-    /**
+-     * @param {string} expr Expression to evaluate
+-     */
+-    constructor (expr) {
+-        this.code = expr;
+-        this.ast = jsep(this.code);
+-    }
+-
+-    /**
+-     * @param {PlainObject} context Object whose items will be added
+-     *   to evaluation
+-     * @returns {EvaluatedResult} Result of evaluated code
+-     */
+-    runInNewContext (context) {
+-        const keyMap = {...context};
+-        return SafeEval.evalAst(this.ast, keyMap);
+-    }
+-}
+-
+ /**
+  * In-browser replacement for NodeJS' VM.Script.
+  */
+@@ -267,8 +99,4 @@
+     Script
+ };
+ 
+-JSONPath.prototype.safeVm = {
+-    Script: SafeScript
+-};
+-
+-export {JSONPath, SafeScript};
++export {JSONPath};
+diff -ruN '--exclude=node_modules' '--exclude=.htests' pristine/src/jsonpath-edge.js app/src/jsonpath-edge.js
+--- a/src/jsonpath-edge.js	2026-10-27 10:08:09.000000000 +0000
++++ b/src/jsonpath-edge.js	2026-10-27 10:20:03.296042131 +0000
+@@ -1,38 +1,5 @@
+ import {JSONPath} from './jsonpath.js';
+ 
+-/**
+- * Evaluation script class for edge and worker runtimes, which do not provide
+- * NodeJS' `vm` module.
+- */
+-class EdgeScript {
+-    /**
+-     * @param {string} expr Expression to evaluate
+-     */
+-    constructor (expr) {
+-        this.code = expr;
+-    }
+-
+-    /**
+-     * @param {Record<string, any>} context Object whose items will be added
+-     *   to evaluation
+-     * @returns {any} Result of evaluated code
+-     */
+-    runInNewContext (context) {
+-        const keys = Object.keys(context);
+-        const values = keys.map((key) => {
+-            return context[key];
+-        });
+-        // eslint-disable-next-line no-new-func -- Runs where `vm` is unavailable
+-        const script = new Function(
+-            ...keys,
+-            '"use strict"; return (' + this.code + ');'
+-        );
+-        return script(...values);
+-    }
+-}
+-
+-JSONPath.prototype.safeVm = {
+-    Script: EdgeScript
+-};
+-
++// The edge/worker build has no host `vm`, so it keeps the default safe
++// interpreter installed by `jsonpath.js` and offers only the native-free API.
+ export {JSONPath};
+diff -ruN '--exclude=node_modules' '--exclude=.htests' pristine/src/jsonpath-node.js app/src/jsonpath-node.js
+--- a/src/jsonpath-node.js	2026-10-27 10:07:53.000000000 +0000
++++ b/src/jsonpath-node.js	2026-10-27 10:20:02.852045732 +0000
+@@ -2,11 +2,7 @@
+ import {JSONPath} from './jsonpath.js';
+ 
+ JSONPath.prototype.vm = vm;
+-JSONPath.prototype.safeVm = vm;
+-
+-const SafeScript = vm.Script;
+ 
+ export {
+-    JSONPath,
+-    SafeScript
++    JSONPath
+ };
+diff -ruN '--exclude=node_modules' '--exclude=.htests' pristine/src/jsonpath.js app/src/jsonpath.js
+--- a/src/jsonpath.js	2026-10-27 10:08:09.000000000 +0000
++++ b/src/jsonpath.js	2026-10-27 10:22:05.570146010 +0000
+@@ -1,5 +1,7 @@
+ /* eslint-disable camelcase, unicorn/prefer-string-replace-all,
+   unicorn/prefer-at */
++import {SafeExpression} from './safe-expression.js';
++
+ const {hasOwnProperty: hasOwnProp} = Object.prototype;
+ 
+ /**
+@@ -97,7 +99,7 @@
+ */
+ 
+ /**
+- * @typedef {typeof import('./jsonpath-browser').SafeScript} EvalClass
++ * @typedef {typeof SafeExpression} EvalClass
+  */
+ 
+ /**
+@@ -628,6 +630,26 @@
+     return ret;
+ };
+ 
++/**
++ * Rewrites the shorthand an expression body may use (`@.x`, `@property`,
++ * `@path`, ...) into the names the evaluation sandbox exposes.
++ * @param {string} code Expression body
++ * @param {boolean} containsPath Whether the body refers to `@path`
++ * @returns {string} Rewritten expression body
++ */
++const rewriteExpression = function (code, containsPath) {
++    let script = code
++        .replace(/@parentProperty/gu, '_$_parentProperty')
++        .replace(/@parent/gu, '_$_parent')
++        .replace(/@property/gu, '_$_property')
++        .replace(/@root/gu, '_$_root')
++        .replace(/@([.\s)[])/gu, '_$_v$1');
++    if (containsPath) {
++        script = script.replace(/@path/gu, '_$_path');
++    }
++    return script;
++};
++
+ JSONPath.prototype._eval = function (
+     code, _v, _vname, path, parent, parentPropName
+ ) {
+@@ -642,35 +664,37 @@
+         this.currSandbox._$_path = JSONPath.toPathString(path.concat([_vname]));
+     }
+ 
++    const safeMode = this.currEval === 'safe' ||
++        this.currEval === true ||
++        this.currEval === undefined;
+     const scriptCacheKey = this.currEval + 'Script:' + code;
+-    if (!JSONPath.cache[scriptCacheKey]) {
+-        let script = code
+-            .replace(/@parentProperty/gu, '_$_parentProperty')
+-            .replace(/@parent/gu, '_$_parent')
+-            .replace(/@property/gu, '_$_property')
+-            .replace(/@root/gu, '_$_root')
+-            .replace(/@([.\s)[])/gu, '_$_v$1');
+-        if (containsPath) {
+-            script = script.replace(/@path/gu, '_$_path');
+-        }
+-        if (
+-            this.currEval === 'safe' ||
+-            this.currEval === true ||
+-            this.currEval === undefined
+-        ) {
+-            JSONPath.cache[scriptCacheKey] = new this.safeVm.Script(script);
+-        } else if (this.currEval === 'native') {
+-            JSONPath.cache[scriptCacheKey] = new this.vm.Script(script);
++    let script = JSONPath.cache[scriptCacheKey];
++    if (safeMode) {
++        // In safe mode only an interpreter instance may be reused.  A cache
++        // entry produced by any other path -- ahead-of-time preparation, a
++        // compile under another mode, or a caller poking the cache -- is
++        // discarded instead of run.
++        // eslint-disable-next-line no-restricted-syntax -- Prototype identity
++        if (!(script instanceof SafeExpression)) {
++            script = JSONPath.cache[scriptCacheKey] = new SafeExpression(
++                rewriteExpression(code, containsPath)
++            );
++        }
++    } else if (!script) {
++        const rewritten = rewriteExpression(code, containsPath);
++        if (this.currEval === 'native') {
++            script = JSONPath.cache[scriptCacheKey] =
++                new this.vm.Script(rewritten);
+         } else if (
+             typeof this.currEval === 'function' &&
+             this.currEval.prototype &&
+             hasOwnProp.call(this.currEval.prototype, 'runInNewContext')
+         ) {
+             const CurrEval = this.currEval;
+-            JSONPath.cache[scriptCacheKey] = new CurrEval(script);
++            script = JSONPath.cache[scriptCacheKey] = new CurrEval(rewritten);
+         } else if (typeof this.currEval === 'function') {
+-            JSONPath.cache[scriptCacheKey] = {
+-                runInNewContext: (context) => this.currEval(script, context)
++            script = JSONPath.cache[scriptCacheKey] = {
++                runInNewContext: (context) => this.currEval(rewritten, context)
+             };
+         } else {
+             throw new TypeError(`Unknown "eval" property "${this.currEval}"`);
+@@ -678,7 +702,7 @@
+     }
+ 
+     try {
+-        return JSONPath.cache[scriptCacheKey].runInNewContext(this.currSandbox);
++        return script.runInNewContext(this.currSandbox);
+     } catch (e) {
+         if (this.ignoreEvalErrors) {
+             return false;
+@@ -714,19 +738,12 @@
+             continue;
+         }
+         const scriptCacheKey = 'safeScript:' + code;
+-        if (!JSONPath.cache[scriptCacheKey]) {
++        // eslint-disable-next-line no-restricted-syntax -- Prototype identity
++        if (!(JSONPath.cache[scriptCacheKey] instanceof SafeExpression)) {
+             const containsPath = code.includes('@path');
+-            let script = code
+-                .replace(/@parentProperty/gu, '_$_parentProperty')
+-                .replace(/@parent/gu, '_$_parent')
+-                .replace(/@property/gu, '_$_property')
+-                .replace(/@root/gu, '_$_root')
+-                .replace(/@([.\s)[])/gu, '_$_v$1');
+-            if (containsPath) {
+-                script = script.replace(/@path/gu, '_$_path');
+-            }
+-            JSONPath.cache[scriptCacheKey] =
+-                new JSONPath.prototype.vm.Script(script);
++            JSONPath.cache[scriptCacheKey] = new SafeExpression(
++                rewriteExpression(code, containsPath)
++            );
+         }
+         prepared.push(scriptCacheKey);
+     }
+@@ -818,4 +835,9 @@
+     return cache[expr].concat();
+ };
+ 
++// Every build evaluates `safe` mode with the same interpreter.
++JSONPath.prototype.safeVm = {
++    Script: SafeExpression
++};
++
+ export {JSONPath};
+diff -ruN '--exclude=node_modules' '--exclude=.htests' pristine/src/safe-expression.js app/src/safe-expression.js
+--- a/src/safe-expression.js	1970-01-01 00:00:00.000000000 +0000
++++ b/src/safe-expression.js	2026-10-27 10:21:23.811469805 +0000
+@@ -0,0 +1,281 @@
++/* eslint-disable no-bitwise -- Operators of the expression language */
++import jsep from 'jsep';
++import jsepRegex from '@jsep-plugin/regex';
++import jsepAssignment from '@jsep-plugin/assignment';
++
++// Register the grammar extensions once for every build that reuses this file.
++jsep.plugins.register(jsepRegex, jsepAssignment);
++jsep.addUnaryOp('typeof');
++jsep.addLiteral('null', null);
++jsep.addLiteral('undefined', undefined);
++
++/**
++ * Names that resolve to a native function object when they are read through
++ * the prototype chain.  Reading such a name from an object that does not own
++ * it is what lets a filter climb from document data back to the host's
++ * function constructor, so those reads are refused.  Own data properties are
++ * unaffected: a document may legitimately carry a key with one of these names.
++ * @type {Set<string>}
++ */
++const INHERITED_HOST_KEYS = new Set([
++    'constructor',
++    '__proto__',
++    '__defineGetter__',
++    '__defineSetter__',
++    '__lookupGetter__',
++    '__lookupSetter__'
++]);
++
++/**
++ * @param {object|Function} object Value to inspect
++ * @param {string} key Property name
++ * @returns {boolean} Whether the value carries the property itself
++ */
++const owns = function (object, key) {
++    return Object.hasOwn(object, key);
++};
++
++/**
++ * @param {jsep.Expression} ast
++ * @param {Record<string, any>} scope Own values visible to the expression
++ * @returns {any} Evaluated value
++ */
++const evaluate = function (ast, scope) {
++    const handler = AST_HANDLERS[ast.type];
++    if (!handler) {
++        // Same wording the package has always reported for an unsupported node.
++        throw new SyntaxError('Unexpected expression');
++    }
++    return handler(ast, scope);
++};
++
++/**
++ * @param {jsep.BinaryExpression|jsep.LogicalExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Evaluated value
++ */
++const evaluateBinary = function (ast, scope) {
++    const operator = BINARY_OPERATORS[ast.operator];
++    if (!operator) {
++        throw new SyntaxError(`Unsupported operator: ${ast.operator}`);
++    }
++    return operator(
++        evaluate(ast.left, scope),
++        () => evaluate(ast.right, scope)
++    );
++};
++
++/**
++ * @param {jsep.Compound} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Value of the last statement
++ */
++const evaluateCompound = function (ast, scope) {
++    let last;
++    for (let i = 0; i < ast.body.length; i++) {
++        // `var x = 2;` is parsed as [{Identifier var}, {AssignmentExpression}].
++        if (
++            ast.body[i].type === 'Identifier' &&
++            ['var', 'let', 'const'].includes(ast.body[i].name) &&
++            ast.body[i + 1] &&
++            ast.body[i + 1].type === 'AssignmentExpression'
++        ) {
++            i += 1;
++        }
++        last = evaluate(ast.body[i], scope);
++    }
++    return last;
++};
++
++/**
++ * @param {jsep.ConditionalExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Evaluated value
++ */
++const evaluateConditional = function (ast, scope) {
++    return evaluate(ast.test, scope)
++        ? evaluate(ast.consequent, scope)
++        : evaluate(ast.alternate, scope);
++};
++
++/**
++ * @param {jsep.Identifier} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} The value bound to the name
++ */
++const evaluateIdentifier = function (ast, scope) {
++    if (owns(scope, ast.name)) {
++        return scope[ast.name];
++    }
++    throw new ReferenceError(`${ast.name} is not defined`);
++};
++
++/**
++ * The property name a member expression actually reads.  A computed key is
++ * coerced to a string here, before any check, so that a key such as
++ * `["constructor"]` cannot slip past a name check and then be coerced to
++ * `constructor` by the property read itself.
++ * @param {jsep.MemberExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {string} Property name
++ */
++const evaluateMemberKey = function (ast, scope) {
++    return String(
++        ast.computed ? evaluate(ast.property, scope) : ast.property.name
++    );
++};
++
++/**
++ * @param {jsep.MemberExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Evaluated value
++ */
++const evaluateMember = function (ast, scope) {
++    const key = evaluateMemberKey(ast, scope);
++    const object = evaluate(ast.object, scope);
++    if (object === null || object === undefined) {
++        throw new TypeError(
++            `Cannot read properties of ${object} (reading '${key}')`
++        );
++    }
++    if (INHERITED_HOST_KEYS.has(key) && !owns(object, key)) {
++        throw new TypeError(
++            `Cannot read properties of ${object} (reading '${key}')`
++        );
++    }
++    const value = object[key];
++    // Arrow functions are unaffected by bind, so this only rebinds methods.
++    return typeof value === 'function' ? value.bind(object) : value;
++};
++
++/**
++ * @param {jsep.UnaryExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Evaluated value
++ */
++const evaluateUnary = function (ast, scope) {
++    const operator = UNARY_OPERATORS[ast.operator];
++    if (!operator) {
++        throw new SyntaxError(`Unsupported operator: ${ast.operator}`);
++    }
++    return operator(ast.argument, scope);
++};
++
++/**
++ * @param {jsep.ArrayExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any[]} Evaluated elements
++ */
++const evaluateArray = function (ast, scope) {
++    return ast.elements.map((element) => evaluate(element, scope));
++};
++
++/**
++ * @param {jsep.CallExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Return value of the called function
++ */
++const evaluateCall = function (ast, scope) {
++    const args = ast.arguments.map((argument) => evaluate(argument, scope));
++    const func = evaluate(ast.callee, scope);
++    return func(...args);
++};
++
++/**
++ * @param {jsep.AssignmentExpression} ast
++ * @param {Record<string, any>} scope
++ * @returns {any} Assigned value
++ */
++const evaluateAssignment = function (ast, scope) {
++    if (ast.left.type !== 'Identifier') {
++        throw new SyntaxError('Invalid left-hand side in assignment');
++    }
++    const value = evaluate(ast.right, scope);
++    scope[ast.left.name] = value;
++    return value;
++};
++
++/**
++ * @type {Record<string, (ast: any, scope: Record<string, any>) => any>}
++ */
++const AST_HANDLERS = {
++    BinaryExpression: evaluateBinary,
++    LogicalExpression: evaluateBinary,
++    Compound: evaluateCompound,
++    ConditionalExpression: evaluateConditional,
++    Identifier: evaluateIdentifier,
++    Literal: (ast) => ast.value,
++    MemberExpression: evaluateMember,
++    UnaryExpression: evaluateUnary,
++    ArrayExpression: evaluateArray,
++    CallExpression: evaluateCall,
++    AssignmentExpression: evaluateAssignment
++};
++
++/**
++ * @type {Record<string, (a: any, b: () => any) => any>}
++ */
++const BINARY_OPERATORS = {
++    '||': (a, b) => a || b(),
++    '&&': (a, b) => a && b(),
++    '|': (a, b) => a | b(),
++    '^': (a, b) => a ^ b(),
++    '&': (a, b) => a & b(),
++    // eslint-disable-next-line eqeqeq -- Expression semantics
++    '==': (a, b) => a == b(),
++    // eslint-disable-next-line eqeqeq -- Expression semantics
++    '!=': (a, b) => a != b(),
++    '===': (a, b) => a === b(),
++    '!==': (a, b) => a !== b(),
++    '<': (a, b) => a < b(),
++    '>': (a, b) => a > b(),
++    '<=': (a, b) => a <= b(),
++    '>=': (a, b) => a >= b(),
++    '<<': (a, b) => a << b(),
++    '>>': (a, b) => a >> b(),
++    '>>>': (a, b) => a >>> b(),
++    '+': (a, b) => a + b(),
++    '-': (a, b) => a - b(),
++    '*': (a, b) => a * b(),
++    '/': (a, b) => a / b(),
++    '%': (a, b) => a % b()
++};
++
++/**
++ * @type {Record<string, (argument: any, scope: Record<string, any>) => any>}
++ */
++const UNARY_OPERATORS = {
++    '-': (argument, scope) => -evaluate(argument, scope),
++    '!': (argument, scope) => !evaluate(argument, scope),
++    '~': (argument, scope) => ~evaluate(argument, scope),
++    // eslint-disable-next-line no-implicit-coercion -- Expression semantics
++    '+': (argument, scope) => +evaluate(argument, scope),
++    typeof: (argument, scope) => typeof evaluate(argument, scope)
++};
++
++/**
++ * A CSP-friendly replacement for a host script object: it parses the
++ * expression once and interprets the resulting tree without ever handing the
++ * expression text to the host runtime.
++ */
++class SafeExpression {
++    /**
++     * @param {string} expression Expression to evaluate
++     */
++    constructor (expression) {
++        this.code = expression;
++        this.ast = jsep(expression);
++    }
++
++    /**
++     * @param {Record<string, any>} context Values the expression may read
++     * @returns {any} Evaluated value
++     */
++    runInNewContext (context) {
++        // A prototype-less scope means an unknown name can never be found on
++        // the scope object's own prototype chain.
++        return evaluate(this.ast, Object.assign(Object.create(null), context));
++    }
++}
++
++export {SafeExpression};

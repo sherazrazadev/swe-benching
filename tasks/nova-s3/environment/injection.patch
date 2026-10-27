@@ -1,0 +1,46 @@
+diff --git a/nova/virt/disk/api.py b/nova/virt/disk/api.py
+index 42d9d91..1ff59ab 100644
+--- a/nova/virt/disk/api.py
++++ b/nova/virt/disk/api.py
+@@ -348,6 +348,30 @@ def _inject_key_into_fs(key, fs, execute=None):
+     utils.execute('tee', '-a', keyfile,
+                   process_input=''.join(key_data), run_as_root=True)
+ 
++    _setup_selinux_for_keys(fs)
++
++
++def _setup_selinux_for_keys(fs):
++    """Get selinux guests to ensure correct context on injected keys."""
++    se_cfg = os.path.join(fs, 'etc', 'selinux')
++    if not os.path.exists(se_cfg):
++        return
++
++    rclocal = os.path.join(fs, 'etc', 'rc.local')
++    rc_d = os.path.join(fs, 'etc', 'rc.d')
++    if not os.path.exists(rclocal) and os.path.exists(rc_d):
++        rclocal = os.path.join(rc_d, 'rc.local')
++
++    restorecon = [
++        '\n',
++        '# Added by Nova to ensure injected ssh keys have the right context\n',
++        'restorecon -RF /root/.ssh/ 2>/dev/null || :\n',
++    ]
++
++    utils.execute('tee', '-a', rclocal,
++                  process_input=''.join(restorecon), run_as_root=True)
++    utils.execute('chmod', 'a+x', rclocal, run_as_root=True)
++
+ 
+ def _inject_net_into_fs(net, fs, execute=None):
+     """Inject /etc/network/interfaces into the filesystem rooted at fs.
+@@ -384,6 +408,10 @@ def _inject_admin_password_into_fs(admin_passwd, fs, execute=None):
+     fd, tmp_shadow = tempfile.mkstemp()
+     os.close(fd)
+ 
++    # Keep other password changes from racing with this rewrite.
++    lock_path = os.path.join(fs, 'etc', '.pwd.lock')
++    utils.execute('touch', lock_path, run_as_root=True)
++
+     utils.execute('cp', os.path.join(fs, 'etc', 'passwd'), tmp_passwd,
+                   run_as_root=True)
+     utils.execute('cp', os.path.join(fs, 'etc', 'shadow'), tmp_shadow,

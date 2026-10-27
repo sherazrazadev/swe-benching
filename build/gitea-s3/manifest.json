@@ -1,0 +1,229 @@
+{
+ "slug": "gitea-s3",
+ "candidate": "15116",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "advisory": [
+  "GHSA-25GQ-J9JX-43PG",
+  "CVE-2026-58428",
+  "GO-2026-6028"
+ ],
+ "repo": "go-gitea/gitea",
+ "vulnerable_commit": "d2bd1589fedd4baa371d5c8d9a1872d9a2cf3cba",
+ "fix_commit": "f69e15afe7496cc62e96dab244629c69eb31a7bf",
+ "verified": {
+  "pinned_is_parent_of_published_bundle": true,
+  "advisory_named_path_already_fixed_before_pin": "The advisory names the web release edit rename (attachment-edit-<uuid>) as unvalidated. That check is present at the pinned commit: it was added by e4ef995f2a16 (#38314), authored 2026-07-04, before the pin. The published bundle referenced by the advisory (f69e15a, parent d2bd158) does not touch any release/attachment-type file. The protection is still defeatable at the pin through the link path, which is what this task tests.",
+  "entry_point": "HTTP POST /{owner}/{repo}/releases/edit/* and /{owner}/{repo}/releases/new (web forms carrying attachment UUIDs), POST /api/v1/repos/{owner}/{repo}/releases/{id}/assets/link and PATCH /api/v1/repos/{owner}/{repo}/releases/{id} (injected API operations linking stored attachments)",
+  "sites": [
+   "services/release/release.go:331 UpdateRelease (web edit and tag conversion)",
+   "services/release/release.go:241 CreateRelease (web new release)",
+   "routers/web/repo/release.go:416 NewReleasePost (client-error mapping for the creation path)",
+   "routers/web/repo/release.go:577 EditReleasePost (reported landing point)",
+   "services/release/release.go:171 LinkReleaseAttachments (injected API link)",
+   "services/release/release.go:198 ReplaceReleaseAttachments (injected API replace)",
+   "models/repo/release.go:180 AddReleaseAttachments (the model operation every real link path reaches; it cannot import the upload checker)"
+  ],
+  "routes": "Real (unmodified upstream): edit form add list, new-release form add list, tag-to-release conversion. Injected siblings (track=injected): API link-by-ID and API replace-asset-set. The migration importer is a real second implementation but is admin-facing and not tested (see notes).",
+  "services": [
+   "SQLite in-process (project integration harness)",
+   "no external service, no network"
+  ],
+  "project_tests_run": "TestAttachments, TestDownloadReleaseAttachment, TestEditReleaseAttachmentRejectsForbiddenRename pass on the injected pinned tree and on the oracle.",
+  "offline_grade_verified": true
+ },
+ "leak_terms": [
+  "AddReleaseAttachments",
+  "LinkReleaseAttachments",
+  "ReplaceReleaseAttachments",
+  "UpdateRelease",
+  "CreateRelease",
+  "EditReleasePost",
+  "NewReleasePost",
+  "upload.Verify",
+  "AllowedTypes",
+  "release_id",
+  "attachment_ids",
+  "attachment-edit",
+  "LegacyAttachmentMissingRepoIDCutoff",
+  "gitea.dev"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-l1.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "L1"
+  },
+  {
+   "patch": "sf-miss-l2.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "L2"
+  },
+  {
+   "patch": "sf-miss-s1.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "S1"
+  },
+  {
+   "patch": "sf-miss-s2.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "S2"
+  },
+  {
+   "patch": "sf-ordering.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T-ordering"
+  },
+  {
+   "patch": "sf-wrong-policy.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T-wrong-policy"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: a deny-everything fix keeps every attack out but fails the positive controls TestFunc_UnrestrictedReleaseTypesAllowAnyAttachment and TestFunc_AllowedAttachmentLinksViaEditForm; the nearest over-block is ff-overbroad.patch (functional_fail)",
+  "crash_as_refusal": "n/a: every security test requires a 4xx, so a 500/panic on the attacked path fails the security tests rather than passing them",
+  "wrong_resource": "sf-wrong-policy.patch",
+  "one_role_or_direction": "n/a: one rule applies to every caller and every stored file; there is no role or read/write split, and the per-path partials sf-miss-l1/l2/s1/s2 cover one-sided fixes",
+  "reads_only": "n/a: the guarded operation is a write (making an attachment part of a release); no read path carries the outcome",
+  "check_after_adjustment": "sf-ordering.patch",
+  "unlisted_route": "sf-miss-s1.patch",
+  "malformed_identity": "n/a: an unknown UUID is silently dropped and an unknown numeric ID is an error, so a malformed identifier resolves to no stored attachment and cannot carry a forbidden file into a release",
+  "missing_authority": "n/a: the policy is local configuration read synchronously; no external authority can return no answer",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "L1",
+   "shape": "real alternate path (Pattern B): a stored attachment is linked into a release by UUID through the release edit form; the type policy is enforced on upload and on rename but never when the link is made",
+   "where": "routers/web/repo/release.go:577 -> services/release/release.go:331 (UpdateRelease) -> models/repo/release.go:180 (AddReleaseAttachments)",
+   "security_tests": [
+    "TestSec_EditReleaseFormRefusesForbiddenLinkedAttachment",
+    "TestSec_EditReleaseFormRefusesMixedAttachmentList",
+    "TestSec_RefusedLinkLeavesStoredNameUnchanged"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_AllowedAttachmentLinksViaEditForm",
+    "TestFunc_UnrestrictedReleaseTypesAllowAnyAttachment",
+    "TestFunc_ReleaseAttachmentRenameStillValidated"
+   ],
+   "security_fail_patch": "sf-miss-l1.patch",
+   "realistic_because": "real, unmodified upstream code: the handler only carries UUIDs, and the dropzone uploads through the type-checked endpoint, so the link looks already vetted"
+  },
+  {
+   "id": "L2",
+   "shape": "real uncovered route (Pattern B): the same sink is reached while creating a release (and while converting a tag), in a different handler whose refusal is not mapped to a client error",
+   "where": "routers/web/repo/release.go:416 (NewReleasePost) -> services/release/release.go:241 (CreateRelease)",
+   "security_tests": [
+    "TestSec_NewReleaseFormRefusesForbiddenLinkedAttachment",
+    "TestSec_TagConversionRefusesForbiddenLinkedAttachment"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_AllowedAttachmentLinksViaNewReleaseForm"
+   ],
+   "security_fail_patch": "sf-miss-l2.patch",
+   "realistic_because": "real, unmodified upstream code: the new-release page uploads through the checked dropzone, so the form's UUID list is assumed vetted"
+  },
+  {
+   "id": "S1",
+   "shape": "injected sibling, second implementation in another transport: an API operation links stored attachments by their numeric IDs, writing the linkage itself instead of using the model operation the web path uses",
+   "where": "routers/api/v1/repo/release_attachment.go:271 -> services/release/release.go:171 (LinkReleaseAttachments)",
+   "security_tests": [
+    "TestSec_ApiLinkRefusesForbiddenAttachment"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_ApiLinkAllowsAllowedAttachment"
+   ],
+   "security_fail_patch": "sf-miss-s1.patch",
+   "realistic_because": "the API already mirrors every web release action and addresses attachments by numeric ID; a fix placed on the web/Service UUID path leaves it untouched",
+   "injected": true
+  },
+  {
+   "id": "S2",
+   "shape": "injected sibling, second implementation with a different operation: a release edit accepts an attachment-ID set and replaces the release's assets, writing the linkage itself",
+   "where": "routers/api/v1/repo/release.go:381 -> services/release/release.go:198 (ReplaceReleaseAttachments)",
+   "security_tests": [
+    "TestSec_ApiReplaceRefusesForbiddenAttachment"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_ApiReplaceLinksAllowedAttachment"
+   ],
+   "security_fail_patch": "sf-miss-s2.patch",
+   "realistic_because": "a bulk 'sync the asset set' API is ordinary tooling; it looks like bookkeeping over assets that were already accepted",
+   "injected": true
+  },
+  {
+   "id": "T-ordering",
+   "shape": "ordering (how-type): the replace operation unlinks the release's current assets before validating the requested ones, so a refusal leaves the release changed",
+   "where": "services/release/release.go:198 (unlink loop before the name check)",
+   "security_tests": [
+    "TestSec_ApiReplaceRefusesForbiddenAttachment"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_ApiReplaceLinksAllowedAttachment"
+   ],
+   "security_fail_patch": "sf-ordering.patch",
+   "realistic_because": "validating while linking each requested attachment is the natural loop placement; the side effect on the old set is invisible unless the refusal path is exercised"
+  },
+  {
+   "id": "T-wrong-policy",
+   "shape": "wrong object (how-type): the link check decides against the attachment type set used for uploads instead of the set configured for release assets",
+   "where": "services/release/release.go:181 (verifyReleaseAttachmentNames selecting the policy)",
+   "security_tests": [
+    "TestSec_EditReleaseFormRefusesForbiddenLinkedAttachment",
+    "TestSec_NewReleaseFormRefusesForbiddenLinkedAttachment",
+    "TestSec_ApiLinkRefusesForbiddenAttachment",
+    "TestSec_ApiReplaceRefusesForbiddenAttachment"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_AllowedAttachmentLinksViaEditForm",
+    "TestFunc_UnrestrictedReleaseTypesAllowAnyAttachment"
+   ],
+   "security_fail_patch": "sf-wrong-policy.patch",
+   "realistic_because": "the attachment table and its upload checks are shared by every purpose, so the nearest allowlist is the upload one; the release-specific set is configured separately"
+  },
+  {
+   "id": "T-coupled",
+   "shape": "coupled must-keep-working value (how-type): the empty configuration means 'no restriction', and rows written before the owning repository was recorded are adopted when linked; an over-broad fix breaks both",
+   "where": "services/context/upload/upload.go:51-53 (empty list allows everything); models/repo/release.go:193 (legacy adoption)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "TestFunc_UnrestrictedReleaseTypesAllowAnyAttachment",
+    "TestFunc_LegacyAttachmentStillAdopted",
+    "TestFunc_ReleaseAttachmentRenameStillValidated"
+   ],
+   "security_fail_patch": "ff-overbroad.patch (functional_fail, not security_fail)",
+   "realistic_because": "a hardening fix naturally treats 'no configuration' as 'deny' and validates every stored row before adoption, which changes behaviour a default install and older data depend on"
+  }
+ ],
+ "status": "built; gate static/nop/oracle/patches PASS (3 oracle runs at reward 1.0, identical); blind patch and FAIRNESS.md are downstream"
+}

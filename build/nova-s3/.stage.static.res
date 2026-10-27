@@ -1,0 +1,1 @@
+task	manifest.patch_checks has no expect=pass patch with kind='blind' || full evidence: /home/runner/work/swe-benching/swe-benching/build/nova-s3/evidence/20261027T102921Z-gate-static.txt

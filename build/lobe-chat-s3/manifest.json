@@ -1,0 +1,274 @@
+{
+ "slug": "lobe-chat-s3",
+ "candidate": "s3-stk-lobe-chat-ghsa3fc8",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "advisory": [
+  "GHSA-mxhq-xw3g-rphc",
+  "GHSA-3fc8-2r3f-8wrg"
+ ],
+ "repo": "lobehub/lobe-chat",
+ "vulnerable_commit": "68057529be17572cab577dcf517e61f1138c4708",
+ "fix_commit": "465665a735556669ee30446c7ea9049a20cc7c37, e960a23b0c69a5762eb27d776d33dac443058faf",
+ "verified": {
+  "pinned_is_parent_of_fix": true,
+  "entry_point": "HTTP POST to the proxy route handler. The hidden security and functional suites load the product's exported App Router POST handlers from the submitted /workspace and drive them with real Request objects; the image-import route is driven the same way.",
+  "sites": [
+   "src/app/api/proxy/route.ts:10-15 (injected): reads the requested location and fetches it with the platform client, or hands it to the direct-download client",
+   "src/app/api/proxy/manifest.ts:24 (injected): fetches the OpenAPI document a manifest references",
+   "src/app/api/proxy/download.ts:18-38 (injected): raw node:http/node:https download client used for binary paths",
+   "src/app/api/proxy/target.ts:8-18 (injected): reads the location from the body, a request header, or the query string",
+   "src/app/api/files/image/route.ts:7 (real upstream): fetches the client-supplied URL and uploads the result to Imgur"
+  ],
+  "routes": [
+   "L1 base (report-led): a non-public destination named directly, as an address literal or as a name that resolves to one",
+   "L2 redirect hop (how-type): the public origin redirects to a non-public destination and the platform client follows it",
+   "L3 image import (real, unmodified upstream code): the image route fetches a client-supplied URL with no destination check",
+   "S1 derived document (injected): the manifest helper fetches the document the first response references",
+   "S2 direct-download client (injected): the binary path uses a second HTTP client that a fetch-only guard misses",
+   "S3 alternate carrier (injected): the location can arrive in a request header or the query string, not only the body"
+  ],
+  "services": "none; the verifier runs offline. A loopback DNS server answers the declared names, an in-process origin serves public destinations, and loopback listeners record any client that bypasses the stand-in.",
+  "project_tests_run": "src/services/__tests__/tool.test.ts (11 cases) and src/services/file/client.test.ts (4 cases) are restored from pristine copies at grade time and run with the project's own vitest configuration; all 15 pass on the pinned+injected tree, on the reference fix and on every check patch. Two project cases share one JUnit name, so the scorer counts 13 distinct project names.",
+  "offline_grade_verified": true
+ },
+ "leak_terms": [
+  "GHSA-mxhq-xw3g-rphc",
+  "GHSA-3fc8-2r3f-8wrg",
+  "CVE-2024-32964",
+  "CVE-2024-47066",
+  "isPrivate",
+  "request-filtering-agent",
+  "dns.lookup",
+  "nip.io",
+  "realpath",
+  "safeFetch",
+  "assertPublicUrl",
+  "resolveAddresses",
+  "isPublicAddress",
+  "resolveProxyTarget",
+  "includeManifestDependencies",
+  "downloadDirect",
+  "isDownloadRequest",
+  "X-Proxy-Target",
+  "openapi",
+  "manifest",
+  "imgur",
+  "files/image",
+  "api/proxy",
+  "node-fetch",
+  "stream",
+  "header",
+  "redirect",
+  "SSRF"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-literal.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "L1"
+  },
+  {
+   "patch": "sf-miss-redirect.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "L2"
+  },
+  {
+   "patch": "sf-miss-image.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "L3"
+  },
+  {
+   "patch": "sf-miss-derived.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "S1"
+  },
+  {
+   "patch": "sf-miss-stream.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "S2"
+  },
+  {
+   "patch": "sf-miss-carrier.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "S3"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "ff-crash.patch",
+   "expect": "functional_fail",
+   "kind": "crash"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "ff-crash.patch",
+  "wrong_resource": "n/a: the decision is made on the exact destination the server would connect to, so there is no neighbouring or proxy object to authorise instead",
+  "one_role_or_direction": "sf-miss-image.patch",
+  "reads_only": "n/a: the guarded operation is a single outbound fetch; there is no read/write split to cover only one side of",
+  "check_after_adjustment": "sf-miss-redirect.patch",
+  "unlisted_route": "sf-miss-carrier.patch",
+  "malformed_identity": "sf-miss-literal.patch",
+  "missing_authority": "n/a: no authority returns a secret or role; the fail-closed case is an unresolvable or non-public destination",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "L1",
+   "pattern": "B",
+   "lever": "base flaw, report-led (real upstream route)",
+   "shape": "a request names a non-public destination directly, as an address literal or as a name that resolves to one, and the server fetches it and returns the answer",
+   "where": "src/app/api/proxy/route.ts:10-15",
+   "reason_to_dismiss": "none: this is the site the report leads to",
+   "realistic_because": "real, unmodified upstream code",
+   "security_tests": [
+    "security::proxy refuses a loopback address supplied as the location",
+    "security::proxy refuses a name whose answer is a loopback address",
+    "security::proxy refuses an IPv6 loopback address",
+    "security::proxy refuses an IPv4 address written in IPv6 form",
+    "security::proxy refuses a name whose answer is a private address",
+    "security::proxy refuses a name whose answer is link-local"
+   ],
+   "coupled_functional_tests": [
+    "functional::a plain-HTTP public asset is still retrieved",
+    "functional::a public asset on a non-standard port is still retrieved",
+    "functional::an HTTPS public asset is still retrieved"
+   ],
+   "security_fail_patch": "sf-miss-literal.patch"
+  },
+  {
+   "id": "L2",
+   "pattern": "B",
+   "lever": "how-type: the destination actually connected to is not the location first named",
+   "shape": "the first location is a public origin, which answers with a redirect to a non-public destination; the platform client follows it and the server returns the answer",
+   "where": "src/app/api/proxy/route.ts:13 (the platform client follows redirects)",
+   "reason_to_dismiss": "the first location was validated, and following a redirect is what the platform client normally does",
+   "realistic_because": "real, unmodified upstream code; the second published advisory exists because the first fix ignored redirects",
+   "security_tests": [
+    "security::proxy does not follow a redirect from a public origin to a non-public one"
+   ],
+   "coupled_functional_tests": [
+    "functional::a plain-HTTP public asset is still retrieved"
+   ],
+   "security_fail_patch": "sf-miss-redirect.patch"
+  },
+  {
+   "id": "L3",
+   "pattern": "B",
+   "lever": "uncovered route: a second server-side fetch of a client-supplied URL",
+   "shape": "the image-import route fetches the URL in its JSON body server-side and uploads the result, with no destination check; the answer is blind but the request is made",
+   "where": "src/app/api/files/image/route.ts:7",
+   "reason_to_dismiss": "it is the image-upload helper, not the proxy, and the fetched body is not returned to the caller",
+   "realistic_because": "real, unmodified upstream code in a different feature directory",
+   "security_tests": [
+    "security::image import refuses a non-public location"
+   ],
+   "coupled_functional_tests": [
+    "functional::a public image is still imported from its URL"
+   ],
+   "security_fail_patch": "sf-miss-image.patch"
+  },
+  {
+   "id": "S1",
+   "pattern": "injected",
+   "lever": "how-type: a location derived from an earlier answer",
+   "shape": "the proxy inlines the document a plugin manifest references by fetching it server-side; the referenced URL never appears in the request",
+   "where": "src/app/api/proxy/manifest.ts:24",
+   "reason_to_dismiss": "the location came from the plugin's own manifest, which was already fetched, not from the caller",
+   "realistic_because": "a plausible maintainer addition that saves the browser a second proxy round trip; the client already fetches the same referenced document",
+   "injected": true,
+   "security_tests": [
+    "security::proxy does not fetch a location it derives from an earlier answer when that location is non-public"
+   ],
+   "coupled_functional_tests": [
+    "functional::a public manifest still has its referenced document resolved"
+   ],
+   "security_fail_patch": "sf-miss-derived.patch"
+  },
+  {
+   "id": "S2",
+   "pattern": "injected",
+   "lever": "how-type: a second HTTP client for the same feature",
+   "shape": "binary paths are downloaded with a raw node:http/node:https client instead of the platform fetch, so a guard written around fetch does not apply",
+   "where": "src/app/api/proxy/download.ts:18-38, chosen at src/app/api/proxy/route.ts:13",
+   "reason_to_dismiss": "it is a separate streaming client used only for large binary files; the stated guard is about the proxy fetch",
+   "realistic_because": "a plausible maintainer addition for large plugin and image bundles; node-fetch and raw node clients are already project dependencies",
+   "injected": true,
+   "security_tests": [
+    "security::proxy refuses a non-public location on the streaming path"
+   ],
+   "coupled_functional_tests": [
+    "functional::a public bundle on the streaming path is still retrieved"
+   ],
+   "security_fail_patch": "sf-miss-stream.patch"
+  },
+  {
+   "id": "S3",
+   "pattern": "injected",
+   "lever": "ordering/carrier: the checked value is not the value used",
+   "shape": "the location may arrive in the request body, a request header, or the query string; a check applied only to the body leaves the other carriers unchecked",
+   "where": "src/app/api/proxy/target.ts:8-18, consumed at src/app/api/proxy/route.ts:11",
+   "reason_to_dismiss": "only the request body is the documented input; the other carriers are for legacy clients that cannot attach a body",
+   "realistic_because": "a plausible maintainer compatibility path; the route already resolves the location in one helper",
+   "injected": true,
+   "security_tests": [
+    "security::proxy refuses a non-public location named in a request header",
+    "security::proxy refuses a non-public location named in the query string"
+   ],
+   "coupled_functional_tests": [
+    "functional::a public destination named outside the body is still retrieved"
+   ],
+   "security_fail_patch": "sf-miss-carrier.patch"
+  },
+  {
+   "id": "F1",
+   "pattern": "B",
+   "lever": "coupled must-keep-working behaviour (over-hardening)",
+   "shape": "a fix that refuses plain HTTP, refuses non-standard ports, strips response headers, or removes the derived-document behaviour closes the flaw by breaking legitimate use",
+   "where": "the shared guard and every public destination the suites exercise",
+   "reason_to_dismiss": "hardening that refuses more looks strictly safer",
+   "realistic_because": "over-hardening is the recorded failure mode of one target model",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional::a plain-HTTP public asset is still retrieved",
+    "functional::a public asset on a non-standard port is still retrieved",
+    "functional::an HTTPS public asset is still retrieved",
+    "functional::a public asset with a path and query is still retrieved",
+    "functional::a public destination named outside the body is still retrieved",
+    "functional::a public bundle on the streaming path is still retrieved",
+    "functional::a public manifest still has its referenced document resolved",
+    "functional::a public image is still imported from its URL"
+   ],
+   "security_fail_patch": "ff-overbroad.patch"
+  }
+ ],
+ "status": "built; gate PASS on 2026-10-27: static PASS; nop PASS (12 security tests fail on the pinned+injected tree, 21 collected functional results pass); oracle PASS (3 strict runs, reward 1.0, identical); patches PASS (all 10 declared checks behaved as declared: 6 security_fail, 2 functional_fail, 2 pass at 1.0). blind.patch and FAIRNESS.md are produced downstream."
+}

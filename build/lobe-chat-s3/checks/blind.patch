@@ -1,0 +1,362 @@
+diff -ruN a/src/app/api/files/image/route.ts b/src/app/api/files/image/route.ts
+--- a/src/app/api/files/image/route.ts	2026-10-27 10:13:26.000000000 +0000
++++ b/src/app/api/files/image/route.ts	2026-10-27 10:35:47.703511539 +0000
+@@ -1,10 +1,12 @@
++import { fetchFromPublicUrl } from '@/libs/outbound/public-only';
++
+ import { Imgur } from './imgur';
+ 
+ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+   let imageBlob: Blob;
+ 
+   if (url) {
+-    const res = await fetch(url);
++    const res = await fetchFromPublicUrl(url);
+     imageBlob = await res.blob();
+   } else if (blob) {
+     imageBlob = blob;
+@@ -19,15 +21,22 @@
+ };
+ 
+ export const POST = async (req: Request) => {
+-  const { url } = await req.json();
++  try {
++    const { url } = await req.json();
+ 
+-  const cdnUrl = await updateByImgur({ url });
++    const cdnUrl = await updateByImgur({ url });
+ 
+-  return new Response(JSON.stringify({ url: cdnUrl }));
++    return new Response(JSON.stringify({ url: cdnUrl }));
++  } catch (error) {
++    return new Response(
++      JSON.stringify({ error: error instanceof Error ? error.message : 'the request was refused' }),
++      { headers: { 'content-type': 'application/json' }, status: 400 },
++    );
++  }
+ };
+ // import { Imgur } from './imgur';
+ 
+-export const runtime = 'edge';
++export const runtime = 'nodejs';
+ 
+ // export const POST = async (req: Request) => {
+ //   const { url } = await req.json();
+diff -ruN a/src/app/api/proxy/download.ts b/src/app/api/proxy/download.ts
+--- a/src/app/api/proxy/download.ts	2026-10-27 10:13:28.000000000 +0000
++++ b/src/app/api/proxy/download.ts	2026-10-27 10:35:39.182905496 +0000
+@@ -1,6 +1,8 @@
+ import http from 'node:http';
+ import https from 'node:https';
+ 
++import { assertPublicUrl } from '@/libs/outbound/public-only';
++
+ // Binary plugin and image bundles can be large, so they are streamed through the platform
+ // client instead of being buffered by fetch.
+ const DOWNLOAD_EXTENSIONS = ['.gz', '.jpeg', '.jpg', '.pdf', '.png', '.tgz', '.webp', '.zip'];
+@@ -15,11 +17,15 @@
+   }
+ };
+ 
+-export const downloadDirect = (url: string): Promise<Response> =>
+-  new Promise((resolve, reject) => {
+-    const client = url.startsWith('https:') ? https : http;
++export const downloadDirect = async (url: string): Promise<Response> => {
++  // This path uses its own client, so the destination check has to live here rather than in
++  // the caller; the URL handed to the client is the one that was checked.
++  const checked = (await assertPublicUrl(url)).toString();
++
++  return new Promise((resolve, reject) => {
++    const client = checked.startsWith('https:') ? https : http;
+ 
+-    const request = client.get(url, (response) => {
++    const request = client.get(checked, (response) => {
+       const chunks: Buffer[] = [];
+ 
+       response.on('data', (chunk) => chunks.push(chunk as Buffer));
+@@ -36,3 +42,4 @@
+ 
+     request.on('error', reject);
+   });
++};
+diff -ruN a/src/app/api/proxy/manifest.ts b/src/app/api/proxy/manifest.ts
+--- a/src/app/api/proxy/manifest.ts	2026-10-27 10:13:28.000000000 +0000
++++ b/src/app/api/proxy/manifest.ts	2026-10-27 10:35:44.850643450 +0000
+@@ -1,8 +1,11 @@
++import { fetchFromPublicUrl } from '@/libs/outbound/public-only';
++
+ const OPENAPI_FIELD = 'openapi';
+ 
+ /**
+  * Plugin manifests may reference an OpenAPI document. Fetching it together with the manifest
+- * saves the browser a second round trip through the proxy.
++ * saves the browser a second round trip through the proxy. The referenced location is a
++ * destination the server connects to, so it is held to the same rule as the manifest itself.
+  */
+ export const includeManifestDependencies = async (res: Response): Promise<Response> => {
+   const contentType = res.headers.get('content-type') || '';
+@@ -21,7 +24,7 @@
+ 
+   if (typeof openapi !== 'string' || !openapi) return res;
+ 
+-  const documentResponse = await fetch(openapi);
++  const documentResponse = await fetchFromPublicUrl(openapi);
+   const document = await documentResponse.text();
+ 
+   return new Response(
+diff -ruN a/src/app/api/proxy/route.ts b/src/app/api/proxy/route.ts
+--- a/src/app/api/proxy/route.ts	2026-10-27 10:13:28.000000000 +0000
++++ b/src/app/api/proxy/route.ts	2026-10-27 10:35:43.962684507 +0000
+@@ -1,16 +1,28 @@
++import { fetchFromPublicUrl } from '@/libs/outbound/public-only';
++
+ import { downloadDirect, isDownloadRequest } from './download';
+ import { includeManifestDependencies } from './manifest';
+ import { resolveProxyTarget } from './target';
+ 
+ export const runtime = 'nodejs';
+ 
++const refuse = (error: unknown) =>
++  new Response(
++    JSON.stringify({ error: error instanceof Error ? error.message : 'the request was refused' }),
++    { headers: { 'content-type': 'application/json' }, status: 400 },
++  );
++
+ /**
+  * just for a proxy
+  */
+ export const POST = async (req: Request) => {
+-  const url = await resolveProxyTarget(req);
++  try {
++    const url = await resolveProxyTarget(req);
+ 
+-  const res = isDownloadRequest(url) ? await downloadDirect(url) : await fetch(url);
++    const res = isDownloadRequest(url) ? await downloadDirect(url) : await fetchFromPublicUrl(url);
+ 
+-  return includeManifestDependencies(res);
++    return await includeManifestDependencies(res);
++  } catch (error) {
++    return refuse(error);
++  }
+ };
+diff -ruN a/src/libs/outbound/public-only.ts b/src/libs/outbound/public-only.ts
+--- a/src/libs/outbound/public-only.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/src/libs/outbound/public-only.ts	2026-10-27 10:35:30.040327961 +0000
+@@ -0,0 +1,217 @@
++import { lookup } from 'node:dns/promises';
++import { isIP } from 'node:net';
++
++/**
++ * Destinations the server is allowed to reach on behalf of a request.
++ *
++ * Everything here is deliberately independent of any particular route: the check answers one
++ * question only, "is the address this name would connect to publicly routable?", and callers
++ * apply it immediately before every outbound connection they make.
++ */
++
++export class NonPublicDestinationError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'NonPublicDestinationError';
++  }
++}
++
++const bare = (value: string) => value.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase();
++
++const isPublicIPv4 = (octets: number[]): boolean => {
++  const [first, second, third] = octets;
++
++  if (first === 0) return false; // "this" network
++  if (first === 10) return false; // RFC 1918
++  if (first === 100 && second >= 64 && second <= 127) return false; // carrier-grade NAT
++  if (first === 127) return false; // loopback
++  if (first === 169 && second === 254) return false; // link-local
++  if (first === 172 && second >= 16 && second <= 31) return false; // RFC 1918
++  if (first === 192 && second === 0 && third === 0) return false; // protocol assignments
++  if (first === 192 && second === 0 && third === 2) return false; // TEST-NET-1
++  if (first === 192 && second === 168) return false; // RFC 1918
++  if (first === 198 && (second === 18 || second === 19)) return false; // benchmarking
++  if (first === 198 && second === 51 && third === 100) return false; // TEST-NET-2
++  if (first === 203 && second === 0 && third === 113) return false; // TEST-NET-3
++  if (first >= 224) return false; // multicast, reserved and broadcast space
++
++  return true;
++};
++
++/**
++ * Expand a textual IPv6 address into its eight 16-bit groups. A trailing dotted-quad is folded
++ * into the final two groups first, so the embedded forms are handled by the same code.
++ */
++const expandIPv6 = (input: string): number[] | null => {
++  let text = bare(input);
++
++  const dotted = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
++
++  if (dotted) {
++    const octets = [dotted[1], dotted[2], dotted[3], dotted[4]].map(Number);
++
++    if (octets.some((octet) => octet > 255)) return null;
++
++    const high = (octets[0] << 8) | octets[1];
++    const low = (octets[2] << 8) | octets[3];
++    text = `${text.slice(0, dotted.index)}${high.toString(16)}:${low.toString(16)}`;
++  }
++
++  const halves = text.split('::');
++
++  if (halves.length > 2) return null;
++
++  const left = halves[0] ? halves[0].split(':') : [];
++  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
++  const padding = halves.length === 2 ? 8 - left.length - right.length : 0;
++
++  if (padding < 0) return null;
++  if (halves.length === 1 && left.length !== 8) return null;
++
++  const groups = [...left, ...Array.from({ length: padding }, () => '0'), ...right];
++
++  if (groups.length !== 8) return null;
++
++  const numbers = groups.map((group) => (/^[0-9a-f]{1,4}$/.test(group) ? parseInt(group, 16) : Number.NaN));
++
++  return numbers.some((number) => Number.isNaN(number)) ? null : numbers;
++};
++
++const asDottedQuad = (groups: number[]): number[] => [
++  groups[6] >> 8,
++  groups[6] & 0xff,
++  groups[7] >> 8,
++  groups[7] & 0xff,
++];
++
++const isPublicIPv6 = (groups: number[]): boolean => {
++  const [first, second] = groups;
++
++  // NAT64 (64:ff9b::/32 and the local-use 64:ff9b:1::/48) carries a literal IPv4 address.
++  if (first === 0x0064 && second === 0xff9b) return isPublicIPv4(asDottedQuad(groups));
++
++  // 6to4 (2002::/16) embeds the IPv4 endpoint in the next two groups.
++  if (first === 0x2002) {
++    const embedded = [(groups[1] >> 8) & 0xff, groups[1] & 0xff, (groups[2] >> 8) & 0xff, groups[2] & 0xff];
++
++    return isPublicIPv4(embedded);
++  }
++
++  // IPv4-compatible (::/96), IPv4-mapped (::ffff:0:0/96) and IPv4-translated (::ffff:0:0:0/96).
++  const noPrefix = groups.slice(0, 5).every((group) => group === 0);
++  const mapped = noPrefix && groups[5] === 0xffff;
++  const translated = groups.slice(0, 4).every((group) => group === 0) && groups[4] === 0xffff && groups[5] === 0;
++
++  if (noPrefix || mapped || translated) return isPublicIPv4(asDottedQuad(groups));
++
++  if (groups.every((group) => group === 0)) return false; // unspecified
++  if (first === 0 && groups.slice(1, 7).every((group) => group === 0) && groups[7] === 1) return false; // loopback
++  if ((first & 0xfe00) === 0xfc00) return false; // unique-local
++  if ((first & 0xffc0) === 0xfe80) return false; // link-local
++  if ((first & 0xffc0) === 0xfec0) return false; // deprecated site-local
++  if ((first & 0xff00) === 0xff00) return false; // multicast
++  if (first === 0x2001 && second === 0x0db8) return false; // documentation
++  if (first === 0x0100 && second === 0 && groups[2] === 0 && groups[3] === 0) return false; // discard-only
++
++  return true;
++};
++
++/** True only when the literal address belongs to globally routable unicast space. */
++export const isPublicAddress = (address: string): boolean => {
++  const value = bare(address);
++  const family = isIP(value);
++
++  if (family === 4) {
++    const octets = value.split('.').map(Number);
++
++    if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet) || octet > 255)) return false;
++
++    return isPublicIPv4(octets);
++  }
++
++  if (family === 6) {
++    const groups = expandIPv6(value);
++
++    return groups ? isPublicIPv6(groups) : false;
++  }
++
++  return false;
++};
++
++/** Resolve a hostname to every address a connection could use. An empty answer is an error. */
++export const resolveAddresses = async (hostname: string): Promise<string[]> => {
++  const host = bare(hostname).replace(/\.$/, '');
++
++  if (!host) throw new NonPublicDestinationError('the destination does not name a host');
++  if (isIP(host)) return [host];
++
++  let records: Array<{ address: string; family: number }>;
++
++  try {
++    records = await lookup(host, { all: true });
++  } catch {
++    throw new NonPublicDestinationError('the destination could not be resolved');
++  }
++
++  return records.map((record) => record.address);
++};
++
++/**
++ * Refuse unless every address the host resolves to is publicly routable. Resolving to no
++ * address at all also refuses: without an answer nothing can be established.
++ */
++export const assertPublicUrl = async (input: string | URL): Promise<URL> => {
++  let url: URL;
++
++  try {
++    url = input instanceof URL ? input : new URL(input);
++  } catch {
++    throw new NonPublicDestinationError('the destination is not a valid absolute URL');
++  }
++
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++    throw new NonPublicDestinationError('only http and https destinations are supported');
++  }
++
++  const addresses = await resolveAddresses(url.hostname);
++
++  if (addresses.length === 0 || addresses.some((address) => !isPublicAddress(address))) {
++    throw new NonPublicDestinationError('the destination is not publicly routable');
++  }
++
++  return url;
++};
++
++const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
++const MAX_REDIRECTS = 8;
++
++/**
++ * Fetch a resource, re-checking the destination at every hop. The platform client is asked not
++ * to follow redirects so that a public origin cannot hand the server a non-public next hop.
++ */
++export const fetchFromPublicUrl = async (
++  input: string | URL,
++  init: RequestInit = {},
++): Promise<Response> => {
++  let destination = await assertPublicUrl(input);
++  let hops = 0;
++
++  // The loop always either returns a response or throws.
++  for (;;) {
++    const response = await fetch(destination, { ...init, redirect: 'manual' });
++
++    if (!REDIRECT_STATUS.has(response.status)) return response;
++
++    const location = response.headers.get('location');
++
++    if (!location) return response;
++
++    if (hops >= MAX_REDIRECTS) {
++      throw new NonPublicDestinationError('the destination redirected too many times');
++    }
++
++    hops += 1;
++    destination = await assertPublicUrl(new URL(location, destination));
++    await response.body?.cancel();
++  }
++};

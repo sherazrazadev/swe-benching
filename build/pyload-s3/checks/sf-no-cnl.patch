@@ -1,0 +1,153 @@
+diff --git a/src/pyload/webui/app/__init__.py b/src/pyload/webui/app/__init__.py
+index 835bdd466..f94846d91 100644
+--- a/src/pyload/webui/app/__init__.py
++++ b/src/pyload/webui/app/__init__.py
+@@ -141,6 +141,9 @@ class App:
+ 
+     @classmethod
+     def _configure_proxy_fix(cls, app, trusted_proxy_count):
++        if trusted_proxy_count < 0:
++            raise ValueError("Trusted proxy count must not be negative")
++
+         if trusted_proxy_count:
+             app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_count)
+ 
+diff --git a/src/pyload/webui/app/blueprints/api_blueprint.py b/src/pyload/webui/app/blueprints/api_blueprint.py
+index f2409e9e4..36b085419 100644
+--- a/src/pyload/webui/app/blueprints/api_blueprint.py
++++ b/src/pyload/webui/app/blueprints/api_blueprint.py
+@@ -11,7 +11,7 @@ from flask.json import jsonify
+ from pyload import APPID
+ 
+ from ..api_docs.openapi_specification_generator import OpenAPISpecificationGenerator
+-from ..helpers import apikey_auth, csrf_exempt, is_authenticated, rate_limit
++from ..helpers import apikey_auth, csrf_exempt, get_client_ip, is_authenticated, rate_limit
+ 
+ bp = flask.Blueprint("api", __name__)
+ log = getLogger(APPID)
+@@ -103,8 +103,7 @@ def _parse_parameter(param: str) -> Any:
+ 
+ 
+ def _log_docs_auth_failure(username):
+-    client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
+-    log.error(f"Documentation authentication failed for user '{username}' [CLIENT: {client_ip}]")
++    log.error(f"Documentation authentication failed for user '{username}' [CLIENT: {get_client_ip()}]")
+ 
+ 
+ @bp.route("/api/openapi.json", methods=["GET"])
+diff --git a/src/pyload/webui/app/blueprints/app_blueprint.py b/src/pyload/webui/app/blueprints/app_blueprint.py
+index 92ba2fa36..ce6ea285a 100644
+--- a/src/pyload/webui/app/blueprints/app_blueprint.py
++++ b/src/pyload/webui/app/blueprints/app_blueprint.py
+@@ -13,9 +13,10 @@ import flask
+ from pyload import APPID, PKGDIR
+ from pyload.core.utils import format, fs
+ 
+-from ..helpers import (clear_session, get_permission, get_redirect_url,
+-                       is_authenticated, login_required, permlist, render_base,
+-                       render_template, set_session, static_file_url)
++from ..helpers import (clear_session, get_client_ip, get_permission,
++                       get_redirect_url, is_authenticated, login_required,
++                       permlist, render_base, render_template, set_session,
++                       static_file_url)
+ 
+ _RE_LOGLINE = re.compile(r"\[([\d\-]+) ([\d:]+)\] +([A-Z]+) +(.+?) (.*)")
+ 
+@@ -83,7 +84,7 @@ def login():
+         password = flask.request.form["password"]
+         user_info = api.check_auth(user, password)
+ 
+-        client_ip = flask.request.headers.get("X-Forwarded-For", "").split(',')[0].strip() or flask.request.remote_addr
++        client_ip = get_client_ip()
+ 
+         sanitized_user = user.replace("\n", "\\n").replace("\r", "\\r")
+         if not user_info:
+diff --git a/src/pyload/webui/app/blueprints/cnl_blueprint.py b/src/pyload/webui/app/blueprints/cnl_blueprint.py
+index 40494d206..8e7ae6ac0 100644
+--- a/src/pyload/webui/app/blueprints/cnl_blueprint.py
++++ b/src/pyload/webui/app/blueprints/cnl_blueprint.py
+@@ -14,7 +14,7 @@ from pyload.core.api import Destination
+ from pyload.core.utils.convert import to_str
+ from pyload.core.utils.misc import eval_js
+ 
+-from ..helpers import config_check, csrf_exempt, is_loopback_request
++from ..helpers import config_check, csrf_exempt, get_client_ip, is_loopback_request
+ 
+ #: url_prefix here is intentional since it should not be affected by path prefix
+ bp = flask.Blueprint("flash", __name__, url_prefix="/")
+@@ -22,6 +22,7 @@ bp = flask.Blueprint("flash", __name__, url_prefix="/")
+ 
+ #: decorators
+ def local_check(func):
++    """Restrict Click'N'Load endpoints to requests from the local machine."""
+     @wraps(func)
+     def wrapper(*args, **kwargs):
+         http_host = flask.request.environ.get("HTTP_HOST")
+diff --git a/src/pyload/webui/app/blueprints/json_blueprint.py b/src/pyload/webui/app/blueprints/json_blueprint.py
+index 119da8889..9f1a0f528 100644
+--- a/src/pyload/webui/app/blueprints/json_blueprint.py
++++ b/src/pyload/webui/app/blueprints/json_blueprint.py
+@@ -11,7 +11,7 @@ from pyload import APPID
+ from pyload.core.api import Role
+ from pyload.core.utils import format, fs
+ 
+-from ..helpers import get_permission, login_required, permlist, render_template, set_permission
++from ..helpers import get_client_ip, get_permission, login_required, permlist, render_template, set_permission
+ 
+ bp = flask.Blueprint("json", __name__)
+ log = getLogger(APPID)
+@@ -19,8 +19,7 @@ log = getLogger(APPID)
+ 
+ @bp.before_request
+ def log_request_client():
+-    client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
+-    log.info(f"Web client request to '{flask.request.path}' [CLIENT: {client_ip}]")
++    log.info(f"Web client request to '{flask.request.path}' [CLIENT: {get_client_ip()}]")
+ 
+ 
+ def expect_json(f):
+diff --git a/src/pyload/webui/app/helpers.py b/src/pyload/webui/app/helpers.py
+index 427453c9a..1abfa5906 100644
+--- a/src/pyload/webui/app/helpers.py
++++ b/src/pyload/webui/app/helpers.py
+@@ -303,6 +303,17 @@ def is_loopback_request(request=flask.request, check_source=True):
+     return is_loopback_address(remote_addr)
+ 
+ 
++def get_client_ip(request=flask.request, ignore_proxyfix=False):
++    remote_addr = request.remote_addr or "unknown"
++
++    if ignore_proxyfix:
++        #: the TCP peer before any trusted-proxy middleware rewrote it
++        proxy_fix_original = request.environ.get("werkzeug.proxy_fix.orig", {})
++        return proxy_fix_original.get("REMOTE_ADDR", remote_addr)
++
++    return remote_addr
++
++
+ def login_required(perm):
+     def decorator(func):
+         @wraps(func)
+@@ -356,8 +367,8 @@ def apikey_auth(func):
+         api = flask.current_app.config["PYLOAD_API"]
+         log = flask.current_app.logger
+ 
+-        # Get client IP, safely handling X-Forwarded-For
+-        client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
++        # Get client IP, handling X-Forwarded-For for proxies
++        client_ip = get_client_ip()
+ 
+         # Check for API key in header
+         api_key = flask.request.headers.get("X-API-Key", None)
+@@ -446,10 +457,7 @@ def rate_limit(count=100, period=60):
+         @wraps(func)
+         def wrapper(*args, **kwargs):
+             # Get client IP, handling X-Forwarded-For for proxies
+-            client_ip = flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or flask.request.remote_addr
+-            if not client_ip:
+-                # If we can't determine IP, allow the request (fail open)
+-                return func(*args, **kwargs)
++            client_ip = get_client_ip()
+ 
+             current_time = time.time()
+             cutoff_time = current_time - period

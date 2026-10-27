@@ -1,0 +1,64 @@
+diff --git a/php/elFinder.class.php b/php/elFinder.class.php
+index 84b5852eb..72ca31223 100644
+--- a/php/elFinder.class.php
++++ b/php/elFinder.class.php
+@@ -231,7 +231,7 @@ class elFinder {
+ 		'tree'      => array('target' => true),
+ 		'parents'   => array('target' => true, 'until' => false),
+ 		'tmb'       => array('targets' => true),
+-		'file'      => array('target' => true, 'download' => false),
++		'file'      => array('target' => true, 'download' => false, 'tmp' => false),
+ 		'zipdl'     => array('targets' => true, 'download' => false),
+ 		'size'      => array('targets' => true),
+ 		'mkdir'     => array('target' => true, 'name' => false, 'dirs' => false),
+@@ -1678,10 +1678,26 @@ class elFinder {
+ 		$h404     = 'HTTP/1.0 404 Not Found';
+ 		$h304     = 'HTTP/1.1 304 Not Modified';
+ 
+-		if (($volume = $this->volume($target)) == false) { 
++		if (($volume = $this->volume($target)) == false) {
+ 			return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 		}
+-		
++
++		// Preview a file the upload handler has staged in the working area and not saved yet
++		if (!empty($args['tmp']) && ($stagedDir = $volume->getTempPath())) {
++			$staged = $stagedDir.DIRECTORY_SEPARATOR.$args['tmp'];
++			if (is_file($staged) && ($sfp = fopen($staged, 'rb'))) {
++				$sstat = fstat($sfp);
++				return array(
++					'pointer' => $sfp,
++					'header'  => array(
++						'Content-Type: application/octet-stream',
++						'Content-Length: '.$sstat['size'],
++						'Connection: close'
++					)
++				);
++			}
++		}
++
+ 		if (($file = $volume->file($target)) == false) {
+ 			return array('error' => 'File not found', 'header' => $h404, 'raw' => true);
+ 		}
+@@ -3331,9 +3347,18 @@ class elFinder {
+ 			$this->itemLock($target);
+ 		}
+ 		
+-		return ($file = $volume->archive($targets, $args['type'], $name))
+-			? array('added' => array($file))
+-			: array('error' => $this->error(self::ERROR_ARCHIVE, $volume->error()));
++		if (($file = $volume->archive($targets, $args['type'], $name))) {
++			// keep a copy under the requested name so the browser saves it as chosen
++			if ($name !== '' && ($stageDir = $volume->getTempPath())) {
++				$stage = $stageDir.DIRECTORY_SEPARATOR.$name;
++				$source = $volume->realpath($file['hash']);
++				if ($source && is_file($source)) {
++					@copy($source, $stage);
++				}
++			}
++			return array('added' => array($file));
++		}
++		return array('error' => $this->error(self::ERROR_ARCHIVE, $volume->error()));
+ 	}
+ 	
+ 	/**

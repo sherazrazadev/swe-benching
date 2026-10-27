@@ -1,0 +1,130 @@
+diff --git a/src/app/api/proxy/download.ts b/src/app/api/proxy/download.ts
+new file mode 100644
+index 0000000..acca2f7
+--- /dev/null
++++ b/src/app/api/proxy/download.ts
+@@ -0,0 +1,38 @@
++import http from 'node:http';
++import https from 'node:https';
++
++// Binary plugin and image bundles can be large, so they are streamed through the platform
++// client instead of being buffered by fetch.
++const DOWNLOAD_EXTENSIONS = ['.gz', '.jpeg', '.jpg', '.pdf', '.png', '.tgz', '.webp', '.zip'];
++
++export const isDownloadRequest = (url: string): boolean => {
++  try {
++    const { pathname } = new URL(url);
++
++    return DOWNLOAD_EXTENSIONS.some((extension) => pathname.toLowerCase().endsWith(extension));
++  } catch {
++    return false;
++  }
++};
++
++export const downloadDirect = (url: string): Promise<Response> =>
++  new Promise((resolve, reject) => {
++    const client = url.startsWith('https:') ? https : http;
++
++    const request = client.get(url, (response) => {
++      const chunks: Buffer[] = [];
++
++      response.on('data', (chunk) => chunks.push(chunk as Buffer));
++      response.on('end', () => {
++        resolve(
++          new Response(Buffer.concat(chunks), {
++            headers: response.headers as Record<string, string>,
++            status: response.statusCode || 200,
++          }),
++        );
++      });
++      response.on('error', reject);
++    });
++
++    request.on('error', reject);
++  });
+diff --git a/src/app/api/proxy/manifest.ts b/src/app/api/proxy/manifest.ts
+new file mode 100644
+index 0000000..3b77261
+--- /dev/null
++++ b/src/app/api/proxy/manifest.ts
+@@ -0,0 +1,31 @@
++const OPENAPI_FIELD = 'openapi';
++
++/**
++ * Plugin manifests may reference an OpenAPI document. Fetching it together with the manifest
++ * saves the browser a second round trip through the proxy.
++ */
++export const includeManifestDependencies = async (res: Response): Promise<Response> => {
++  const contentType = res.headers.get('content-type') || '';
++
++  if (!contentType.includes('application/json')) return res;
++
++  let manifest: Record<string, unknown>;
++
++  try {
++    manifest = await res.clone().json();
++  } catch {
++    return res;
++  }
++
++  const openapi = manifest?.[OPENAPI_FIELD];
++
++  if (typeof openapi !== 'string' || !openapi) return res;
++
++  const documentResponse = await fetch(openapi);
++  const document = await documentResponse.text();
++
++  return new Response(
++    JSON.stringify({ ...manifest, openapiDocument: document }),
++    { headers: { 'content-type': 'application/json' }, status: res.status },
++  );
++};
+diff --git a/src/app/api/proxy/route.ts b/src/app/api/proxy/route.ts
+index c17dde1..26fa9b0 100644
+--- a/src/app/api/proxy/route.ts
++++ b/src/app/api/proxy/route.ts
+@@ -1,12 +1,16 @@
+-export const runtime = 'edge';
++import { downloadDirect, isDownloadRequest } from './download';
++import { includeManifestDependencies } from './manifest';
++import { resolveProxyTarget } from './target';
++
++export const runtime = 'nodejs';
+ 
+ /**
+  * just for a proxy
+  */
+ export const POST = async (req: Request) => {
+-  const url = await req.text();
++  const url = await resolveProxyTarget(req);
+ 
+-  const res = await fetch(url);
++  const res = isDownloadRequest(url) ? await downloadDirect(url) : await fetch(url);
+ 
+-  return new Response(res.body, { headers: res.headers });
++  return includeManifestDependencies(res);
+ };
+diff --git a/src/app/api/proxy/target.ts b/src/app/api/proxy/target.ts
+new file mode 100644
+index 0000000..6210f1d
+--- /dev/null
++++ b/src/app/api/proxy/target.ts
+@@ -0,0 +1,18 @@
++/**
++ * Work out the absolute location this request wants the server to retrieve.
++ *
++ * The browser posts the location as the whole request body. Some non-browser clients and
++ * embedded webviews cannot attach a body, so they name the location in a request header or
++ * in the query string instead.
++ */
++export const resolveProxyTarget = async (req: Request): Promise<string> => {
++  const body = (await req.text()).trim();
++
++  if (body) return body;
++
++  const fromHeader = req.headers.get('X-Proxy-Target');
++
++  if (fromHeader) return fromHeader;
++
++  return new URL(req.url).searchParams.get('url') || '';
++};
