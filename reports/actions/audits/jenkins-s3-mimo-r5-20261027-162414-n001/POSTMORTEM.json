@@ -1,0 +1,77 @@
+{
+ "trial": "jenkins-s3__mTceCk9",
+ "task": "jenkins-s3",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T18:12:07+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-27T18:16:22+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.0 is driven by two regressions in the project's own test-module hudson.util.RobustReflectionConverterTest (testRestInterfaceFailure fail, testCliFailure error). Per build-notes these pass on the vulnerable tree, the oracle and the alternative fix. The model rewrote exactly the paths they exercise: REST config.xml and CLI update-job reach AbstractItem.updateByXml, which now has rollback-by-reload, and doConfigDotXml, which now turns failures into a 400. The model never ran that test-module class, only the core-module class of the same name. Even without the functional failures, 4 of 10 security tests fail for real reasons. The model's forbidden list omits jenkins.security.ResourceDomainRootAction$Redirection and $InternalResourceRequest, so both request-routing objects are still recreated. Its XStreamTypeCheck takes the element type from the field's generic signature without resolving type variables against the concrete class, so a DescribableGroupViewProperty<Entry> still keeps an AttackType. It also over-blocks every hudson.Plugin subclass, which drops the legitimate Plugin payload in the plugin-wrapper test. The grader is fair. The exact stack trace for the two functional failures was not available (test-stdout tail is empty), hence medium confidence.",
+  "items": [
+   {
+    "test": "bench.SecurityRoutingObjectsTest::requestRedirectionIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "XStream2.FORBIDDEN_INFRASTRUCTURE_NAME_PREFIXES/HIERARCHIES (changes.patch ~L611-667) list Stapler and plugin classes but not jenkins.security.ResourceDomainRootAction$Redirection; no readResolve guard added. The payload under the Object-typed field is recreated.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::internalResourceRequestIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "ResourceDomainRootAction$InternalResourceRequest is likewise absent from the model's deny-list and gets no guard, so it is recreated from the submitted view document.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityRoutingObjectsTest::pluginWrapperIsNotRecreated",
+    "outcome": "fail",
+    "model_behaviour": "The model blocks every hudson.Plugin subclass (prefix 'hudson.Plugin' plus hierarchy hudson.Plugin.class). determineType throws ConversionException inside RobustReflectionConverter's per-field try, so the whole payload (a legitimate hudson.Plugin$DummyImpl) is silently dropped. The test requires the Plugin to be kept and only its PluginWrapper refused. Plugin instances are themselves loaded from configuration XML, so blocking them over-reaches 'keep legitimate use working'. A slight ambiguity exists in whether 'describe/manage a plugin' covers hudson.Plugin, but the reference fix (guard on PluginWrapper only) is the natural reading.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "bench.SecurityGenericGroupTypeTest::unrelatedTypeInGroupEntriesIsNotKept",
+    "outcome": "fail",
+    "model_behaviour": "XStreamTypeCheck.collectionElementType erases the declared type argument of the field's generic signature. For DescribableList<T, Descriptor<T>> declared on the generic base DescribableGroupViewProperty, T erases to Describable, so AttackType (a Describable) is accepted. No resolution against the concrete class bench.Group (T=Entry), unlike the reference extractElementType (fix.patch L170-195).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "hudson.util.RobustReflectionConverterTest::testRestInterfaceFailure",
+    "outcome": "fail",
+    "model_behaviour": "This is the project's own test-module regression test (POST job config.xml with a bad critical field). The model changed AbstractItem.doConfigDotXml (catches IOException and sends 400) and AbstractItem.updateByXml (on failure re-unmarshals the on-disk config into the live item via a new rollbackFromConfigFile). It never ran this test-module class; transcript L278/L372/L474 run only the core-module class of the same name. The class passes on the vulnerable tree and on both the oracle and alternative fixes (build-notes 'nop'/'patches'), so the regression comes from the model's edits. The exact assertion is not visible because test-stdout.tail.txt is empty.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "hudson.util.RobustReflectionConverterTest::testCliFailure",
+    "outcome": "fail",
+    "model_behaviour": "Errored (a non-assertion exception). CLI update-job goes through the same AbstractItem.updateByXml that the model changed with a rollback/reload. Same reasoning as testRestInterfaceFailure: the baseline, oracle and alternative fix pass it, and the model never ran it. Graded status is 'error'; the stack trace is not available.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript and the full agent log contain no access to /tests, .htests or the hidden suite names, and no network lookups. The model designed its own deny-list approach, which differs from upstream's readResolve guards.",
+  "evidence": [
+   "grading/results.json: security fails = GenericGroup, Redirection, InternalResourceRequest, PluginWrapper; functional: RobustReflectionConverterTest testCliFailure=error, testRestInterfaceFailure=fail -> score.py gives reward 0 when any functional test fails",
+   "build-notes.md 'Gate': nop passes all 14 functional tests incl. 3 RobustReflectionConverterTest; oracle 24/24; alt_correct_fix passes, so a correct fix at a different layer passes",
+   "changes.patch ~L611-667: forbidden prefixes and hierarchies contain no ResourceDomainRootAction classes; they include 'hudson.Plugin' and hudson.Plugin.class",
+   "changes.patch ~L516-520 / L561: forbidden-type check inside the per-field try in doUnmarshal/determineType means the payload is silently dropped, not refused",
+   "changes.patch XStreamTypeCheck.collectionElementType: Types.erasure of the field's type argument, no TypeVariable resolution; fix.patch L170-195 resolves T against runtimeClass",
+   "changes.patch L22-55: AbstractItem.updateByXml rollbackFromConfigFile + doConfigDotXml 400 conversion, the paths exercised by RobustReflectionConverterTest REST/CLI tests",
+   "transcript.md L278, L372, L474: model ran only core-module RobustReflectionConverterTest; it never ran the test-module class that the grader uses",
+   "run.json: no tool calls during grading window; exception_info null; grading/test-stdout.tail.txt empty (exact functional stack traces unavailable)",
+   "instruction.md: property 2 explicitly covers objects that route/dispatch requests 'even when supplied under a field whose declared type would otherwise admit it'; 'close the properties, not the examples'"
+  ],
+  "recommended_action": "Accept reward 0.0 as a genuine model failure. Optionally keep the verifier's functional log (mvn-functional.log) in future postmortems so the exact RobustReflectionConverterTest stack trace can be confirmed."
+ }
+}
