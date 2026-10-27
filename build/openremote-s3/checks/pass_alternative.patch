@@ -1,0 +1,180 @@
+diff --git a/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java b/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java
+index 6027ae3..6c3eb9b 100644
+--- a/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java
++++ b/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java
+@@ -510,6 +510,11 @@ public class MQTTBrokerService extends RouteBuilder implements ContainerService,
+         ((SecurityStoreImpl)server.getActiveMQServer().getSecurityStore()).invalidateAuthorizationCache();
+     }
+ 
++    public String getSessionUserId(String connectionID) {
++        RemotingConnection connection = connectionIDConnectionMap.get(connectionID);
++        return connection == null ? null : IdentityProvider.getSubjectId(connection.getSubject());
++    }
++
+     public boolean disconnectSession(String connectionID) {
+         RemotingConnection connection = connectionIDConnectionMap.get(connectionID);
+         if (connection != null) {
+diff --git a/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java b/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java
+index 7cffaa6..de90a8f 100644
+--- a/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java
++++ b/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java
+@@ -100,6 +100,10 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+ 
+     @Override
+     public User get(RequestParams requestParams, String realm, String userId) {
++        if (!mayReachUser(realm, userId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -122,7 +126,7 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+         if (!isAuthenticated()) {
+             throw new ForbiddenException("Must be authenticated");
+         }
+-        return get(requestParams, getRequestRealmName(), getUserId());
++        return get(requestParams, getAuthenticatedRealmName(), getUserId());
+     }
+ 
+     @Override
+@@ -278,7 +282,7 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+             throw new ForbiddenException("Must be authenticated");
+         }
+ 
+-        return getUserClientRoles(requestParams, getRequestRealmName(), getUserId(), clientId);
++        return getUserClientRoles(requestParams, getAuthenticatedRealmName(), getUserId(), clientId);
+     }
+ 
+     @Override
+@@ -287,11 +291,15 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+             throw new ForbiddenException("Must be authenticated");
+         }
+ 
+-        return getUserRealmRoles(requestParams, getRequestRealmName(), getUserId());
++        return getUserRealmRoles(requestParams, getAuthenticatedRealmName(), getUserId());
+     }
+ 
+     @Override
+     public String[] getUserClientRoles(@BeanParam RequestParams requestParams, String realm, String userId, String clientId) {
++        if (!mayReachUser(realm, userId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -311,6 +319,10 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+ 
+     @Override
+     public String[] getUserRealmRoles(RequestParams requestParams, String realm, String userId) {
++        if (!mayReachUser(realm, userId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -365,6 +377,10 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+ 
+     @Override
+     public Role[] getClientRoles(RequestParams requestParams, String realm, String clientId) {
++        if (!isSuperUser() && !Objects.equals(getAuthenticatedRealmName(), realm)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
+         try {
+             return identityService.getIdentityProvider().getClientRoles(
+                 realm,
+@@ -416,6 +432,10 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+ 
+     @Override
+     public UserSession[] getUserSessions(RequestParams requestParams, String realm, String userId) {
++        if (!mayReachUser(realm, userId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -431,9 +451,17 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+ 
+     @Override
+     public void disconnectUserSession(RequestParams requestParams, String realm, String sessionID) {
+-        if (!mqttBrokerService.disconnectSession(sessionID)) {
++        String sessionUserId = mqttBrokerService.getSessionUserId(sessionID);
++
++        if (sessionUserId == null) {
+             throw new NotFoundException("User session not found");
+         }
++
++        if (!mayReachUser(realm, sessionUserId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
++
++        mqttBrokerService.disconnectSession(sessionID);
+     }
+ 
+     protected void throwIfIllegalMasterAdminUserDeletion(RequestParams requestParams, String realm, String userId) throws WebApplicationException {
+@@ -480,6 +508,11 @@ public class UserResourceImpl extends ManagerWebResource implements UserResource
+         }
+     }
+ 
++    protected boolean mayReachUser(String realm, String userId) {
++        return (isSuperUser() || Objects.equals(getAuthenticatedRealmName(), realm))
++            && identityService.getIdentityProvider().isUserInRealm(userId, realm);
++    }
++
+     protected void throwIfCannotAdminRealm(String realm) throws WebApplicationException {
+         AuthContext authContext = getAuthContext();
+         if (authContext == null) {
+diff --git a/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java b/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java
+index 73311ce..2e7c711 100644
+--- a/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java
++++ b/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java
+@@ -19,6 +19,7 @@
+  */
+ package org.openremote.manager.security.admin;
+ 
++import jakarta.ws.rs.BadRequestException;
+ import jakarta.ws.rs.NotAllowedException;
+ import jakarta.ws.rs.NotAuthorizedException;
+ import jakarta.ws.rs.NotFoundException;
+@@ -57,9 +58,11 @@ public class UserAdminResourceImpl extends WebResource implements UserAdminResou
+ 
+         if (userIds != null) {
+             for (String userId : userIds) {
+-                User user = identityService.getIdentityProvider().getUser(userId);
+-                if (user != null) {
+-                    users.add(user);
++                if (mayReachUser(realm, userId)) {
++                    User user = identityService.getIdentityProvider().getUser(userId);
++                    if (user != null) {
++                        users.add(user);
++                    }
+                 }
+             }
+         }
+@@ -69,7 +72,9 @@ public class UserAdminResourceImpl extends WebResource implements UserAdminResou
+ 
+     @Override
+     public UserOverview overview(RequestParams requestParams, String realm, String userId) {
+-        throwIfCannotAdminRealm(realm);
++        if (!mayReachUser(realm, userId)) {
++            throw new BadRequestException("Request crosses a realm boundary");
++        }
+ 
+         User user = identityService.getIdentityProvider().getUser(userId);
+ 
+@@ -89,6 +94,11 @@ public class UserAdminResourceImpl extends WebResource implements UserAdminResou
+         return overview;
+     }
+ 
++    protected boolean mayReachUser(String realm, String userId) {
++        return (isSuperUser() || java.util.Objects.equals(getAuthenticatedRealmName(), realm))
++            && identityService.getIdentityProvider().isUserInRealm(userId, realm);
++    }
++
+     protected void throwIfCannotAdminRealm(String realm) throws WebApplicationException {
+         AuthContext authContext = getAuthContext();
+         if (authContext == null) {

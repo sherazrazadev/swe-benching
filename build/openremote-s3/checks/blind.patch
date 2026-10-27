@@ -1,0 +1,170 @@
+diff -ruN pristine/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java app/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java
+--- a/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java	2026-10-27 01:54:29.000000000 +0000
++++ b/manager/src/main/java/org/openremote/manager/mqtt/MQTTBrokerService.java	2026-10-27 02:43:36.216926023 +0000
+@@ -510,6 +510,19 @@
+         ((SecurityStoreImpl)server.getActiveMQServer().getSecurityStore()).invalidateAuthorizationCache();
+     }
+ 
++    /**
++     * The realm in which the broker authenticated the user owning {@code connectionID},
++     * or <code>null</code> when no live connection with that identifier is known.
++     */
++    public String getSessionRealm(String connectionID) {
++        RemotingConnection connection = connectionIDConnectionMap.get(connectionID);
++        if (connection == null) {
++            return null;
++        }
++        TokenPrincipal principal = getTokenPrincipal(connection.getSubject());
++        return principal != null ? principal.getAuthenticatedRealmName() : null;
++    }
++
+     public boolean disconnectSession(String connectionID) {
+         RemotingConnection connection = connectionIDConnectionMap.get(connectionID);
+         if (connection != null) {
+diff -ruN pristine/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java app/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java
+--- a/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java	2026-10-27 01:54:29.000000000 +0000
++++ b/manager/src/main/java/org/openremote/manager/security/UserResourceImpl.java	2026-10-27 02:43:33.839927355 +0000
+@@ -100,6 +100,8 @@
+ 
+     @Override
+     public User get(RequestParams requestParams, String realm, String userId) {
++        throwIfCannotReachUser(realm, userId);
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -122,7 +124,7 @@
+         if (!isAuthenticated()) {
+             throw new ForbiddenException("Must be authenticated");
+         }
+-        return get(requestParams, getRequestRealmName(), getUserId());
++        return get(requestParams, getAuthenticatedRealmName(), getUserId());
+     }
+ 
+     @Override
+@@ -278,7 +280,7 @@
+             throw new ForbiddenException("Must be authenticated");
+         }
+ 
+-        return getUserClientRoles(requestParams, getRequestRealmName(), getUserId(), clientId);
++        return getUserClientRoles(requestParams, getAuthenticatedRealmName(), getUserId(), clientId);
+     }
+ 
+     @Override
+@@ -287,11 +289,13 @@
+             throw new ForbiddenException("Must be authenticated");
+         }
+ 
+-        return getUserRealmRoles(requestParams, getRequestRealmName(), getUserId());
++        return getUserRealmRoles(requestParams, getAuthenticatedRealmName(), getUserId());
+     }
+ 
+     @Override
+     public String[] getUserClientRoles(@BeanParam RequestParams requestParams, String realm, String userId, String clientId) {
++        throwIfCannotReachUser(realm, userId);
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -311,6 +315,8 @@
+ 
+     @Override
+     public String[] getUserRealmRoles(RequestParams requestParams, String realm, String userId) {
++        throwIfCannotReachUser(realm, userId);
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -365,6 +371,8 @@
+ 
+     @Override
+     public Role[] getClientRoles(RequestParams requestParams, String realm, String clientId) {
++        throwIfCannotAdminRealm(realm);
++
+         try {
+             return identityService.getIdentityProvider().getClientRoles(
+                 realm,
+@@ -416,6 +424,8 @@
+ 
+     @Override
+     public UserSession[] getUserSessions(RequestParams requestParams, String realm, String userId) {
++        throwIfCannotReachUser(realm, userId);
++
+         boolean hasAdminReadRole = hasResourceRole(ClientRole.READ_ADMIN.getValue(), Constants.KEYCLOAK_CLIENT_ID);
+ 
+         if (!hasAdminReadRole && !Objects.equals(getUserId(), userId)) {
+@@ -431,6 +441,15 @@
+ 
+     @Override
+     public void disconnectUserSession(RequestParams requestParams, String realm, String sessionID) {
++        throwIfCannotAdminRealm(realm);
++
++        // The protected object is the session's owner, so the owner's realm (taken from
++        // broker state, not from the request) decides whether this realm may act on it.
++        String sessionRealm = mqttBrokerService.getSessionRealm(sessionID);
++        if (sessionRealm != null && !Objects.equals(sessionRealm, realm)) {
++            throw new NotAllowedException("Cannot disconnect a session of a user in a different realm");
++        }
++
+         if (!mqttBrokerService.disconnectSession(sessionID)) {
+             throw new NotFoundException("User session not found");
+         }
+@@ -480,6 +499,19 @@
+         }
+     }
+ 
++    /**
++     * Reading a user's data through {@code realm} is only permissible when the caller can
++     * reach that realm and the user genuinely belongs to it; the realm segment of the
++     * request must not be able to address a user of some other realm.
++     */
++    protected void throwIfCannotReachUser(String realm, String userId) throws WebApplicationException {
++        throwIfCannotAdminRealm(realm);
++
++        if (!identityService.getIdentityProvider().isUserInRealm(userId, realm)) {
++            throw new NotAllowedException("User does not belong to the realm of the request");
++        }
++    }
++
+     protected void throwIfCannotAdminRealm(String realm) throws WebApplicationException {
+         AuthContext authContext = getAuthContext();
+         if (authContext == null) {
+diff -ruN pristine/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java app/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java
+--- a/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java	2026-10-27 01:54:32.000000000 +0000
++++ b/manager/src/main/java/org/openremote/manager/security/admin/UserAdminResourceImpl.java	2026-10-27 02:43:38.261924721 +0000
+@@ -57,6 +57,7 @@
+ 
+         if (userIds != null) {
+             for (String userId : userIds) {
++                throwIfCannotReachUser(realm, userId);
+                 User user = identityService.getIdentityProvider().getUser(userId);
+                 if (user != null) {
+                     users.add(user);
+@@ -69,7 +70,7 @@
+ 
+     @Override
+     public UserOverview overview(RequestParams requestParams, String realm, String userId) {
+-        throwIfCannotAdminRealm(realm);
++        throwIfCannotReachUser(realm, userId);
+ 
+         User user = identityService.getIdentityProvider().getUser(userId);
+ 
+@@ -89,6 +90,18 @@
+         return overview;
+     }
+ 
++    /**
++     * The user named by {@code userId} must belong to {@code realm}, and the caller must be
++     * able to reach that realm; the identifier alone is not a key inside the named realm.
++     */
++    protected void throwIfCannotReachUser(String realm, String userId) throws WebApplicationException {
++        throwIfCannotAdminRealm(realm);
++
++        if (!identityService.getIdentityProvider().isUserInRealm(userId, realm)) {
++            throw new NotAllowedException("User does not belong to the realm of the request");
++        }
++    }
++
+     protected void throwIfCannotAdminRealm(String realm) throws WebApplicationException {
+         AuthContext authContext = getAuthContext();
+         if (authContext == null) {
