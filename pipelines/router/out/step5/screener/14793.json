@@ -1,0 +1,121 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "14793",
+  "advisory_ids": ["GHSA-X6JW-M9V5-85VH", "CVE-2026-102828"],
+  "repo": "steveukx/git-js",
+  "pinned_commit": "76f308ed445013d8dd973bc515e7815b59426e3e",
+  "fix_commits": ["d762810c13b331ff1e5eb24c0b434646d2a8d1b3"],
+  "trust_decision": {
+    "summary": "The unsafe-operations denylist in packages/argv-parser decides, before any git child process is spawned, whether a given argv + env is refused; at the pinned commit it neither classifies trailer.<token>.cmd / trailer.<token>.command config writes nor rebase -x / --exec as unsafe, so callers that pass unsanitised input through simpleGit().raw / addConfig / rebase let git run an attacker-named command.",
+    "evidence": [
+      "packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts:39-72",
+      "packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts:65-79",
+      "packages/argv-parser/src/tokens/flag-specs.ts:43-91",
+      "simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts:13",
+      "packages/argv-parser/src/config/analyse-config.ts:52-64"
+    ]
+  },
+  "landing_point": {
+    "where": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts:70",
+    "why": "the report names a trailer command configuration key, and the only place config keys are classified is this flat denylist, where the nearest sibling row is preventExpandedConfigBuilder('tar.command', 'allowUnsafeCommandBinaries')"
+  },
+  "fix_sites": [
+    {
+      "where": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts:70",
+      "entry_point": "simpleGit().addConfig(key, value) and raw('config', key, value), plus the inline -c/--config and GIT_CONFIG_COUNT routes that feed the same config.write list",
+      "module_kind": "vulnerability denylist (config-write keys)"
+    },
+    {
+      "where": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts:71",
+      "entry_point": "simpleGit().rebase(['--exec', cmd]) / raw('rebase', '-x', cmd)",
+      "module_kind": "vulnerability denylist (argv flags)"
+    },
+    {
+      "where": "packages/argv-parser/src/tokens/flag-specs.ts:87-91",
+      "entry_point": "simpleGit().rebase(['-qx', cmd]) - the flag denylist only sees rebase switches once this tokeniser option table declares them",
+      "module_kind": "tokeniser option table (lower-level parsing schema)"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "packages/argv-parser/src/tokens/flag-specs.ts:43-91"
+  },
+  "O3_reason_to_dismiss": "The docs present the blocks as a non-exhaustive safety net that 'do not protect against every possible injection or misuse' (docs/PLUGIN-UNSAFE-ACTIONS.md:11-12), so any route the report does not show can be argued outside the guard's promise; and the rebase half is a separately credited report bundled in the same commit, so it can be dismissed as a different vulnerability than the trailer one.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Rebase's own switches must stay usable: -qm / -i / -s <strategy> / -X <option> may cluster or take values, and `push --exec` must keep raising allowUnsafePack (not allowUnsafeExec). A task-agnostic /--exec/ or a blanket short-flag cluster matcher makes push --exec emit two vulnerabilities (breaking the single-error test) and can consume -s/-X values as commands.",
+    "where": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts:69-73"
+  },
+  "O6_input_shapes": [
+    "config key with a subsection token: trailer.<token>.cmd and trailer.<token>.command, as well as the bare two-part trailer.cmd / trailer.command",
+    "write-route variants: positional `git config key value`, inline `-c key=value` / `--config`, `--config-env=key=ENV`, and GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n",
+    "rebase short switch: -x on its own, clustered as -qx / -ix, and with the command embedded as -xcmd",
+    "rebase long switch including git's unambiguous abbreviations: --exec, --exec=cmd, --exe, --ex"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "packages/argv-parser/src/tokens/flag-specs.ts:43-91",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "`git config --rename-section evil trailer` renames a section, so an attacker-written unguarded `evil.cmd` becomes `trailer.cmd`; only the source section name is recorded as the written key, so no denylist row matches and the sink is reached.",
+      "where": "packages/argv-parser/src/config/detect-config-action.ts:42-55",
+      "reason_to_dismiss": "it is a section-level structural edit rather than a `trailer.<token>.cmd` write, the report only shows writes in the plain `key value` form, and the docs say the blocks cover known high-risk patterns only",
+      "distance": "same package, different module: vulnerabilities/ denylist vs config/detect-config-action.ts + config/config-operands.ts (2 files from the landing point), 0 packages",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "packages/argv-parser/src/config/detect-config-action.ts:42-55",
+      "sibling": "record `--rename-section`'s destination section (and refuse renames into a guarded section) as well as the source section",
+      "why_realistic": "git materialises the destination section's keys during the rename, so a maintainer extending key-based write detection would naturally record both operands; the same shape already exists for --rename-section in CONFIG_WRITE_FLAGS"
+    },
+    {
+      "where": "packages/argv-parser/src/tokens/flag-specs.ts:87-91",
+      "sibling": "a second per-command option table (e.g. for `am`, `send-email` or `filter-branch`) modelled on the rebase entry this fix adds",
+      "why_realistic": "the table is populated incrementally as each command's clustering problems surface, and the rebase entry in this very fix is the precedent for adding one"
+    },
+    {
+      "where": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts:70-71",
+      "sibling": "a further expanded command-binary config key of the same shape (e.g. tar.<format>.command, difftool.<tool>.command) next to the tar.command row",
+      "why_realistic": "the list is a flat denylist appended one row per git feature, and the fix adds two trailer rows in exactly that style"
+    }
+  ],
+  "O9_family": "incomplete denylist (CWE-184) in an unsafe-argv guard leading to OS command execution (CWE-78)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "pnpm 11 workspace on node (.nvmrc), vite 7 + tsc for builds, vitest 3 for tests, biome for lint",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "packages/argv-parser/test/*.spec.ts (vulnerability-analysis, attack-vectors, parse-config-write/inline/read, parse-env, vulnerability-check) and simple-git/test/unit/plugins/plugin.unsafe.spec.ts plus simple-git/test/integration/vulnerabilities/*.spec.ts; unit tests drive a fixture child process, so no network is needed"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts, packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts, packages/argv-parser/src/tokens/flag-specs.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "add only `preventExpandedConfigBuilder('trailer.cmd', ...)` and a rebase `/^-x$|--exec/` matcher, leaving trailer.<token>.command, the -qx cluster and the --ex/--exe abbreviations open because the rebase option table is never extended"
+  },
+  "out_of_scope_notes": [
+    "The same commit also ships `.changeset/safe-rebase-exec.md`, credited to a different reporter: `rebase -x/--exec` is the sibling advisory's own half. I counted its two source sites as fix sites because it is the same unsafe-operation denylist and the same published diff, but the trailer config-write is the half this advisory names.",
+    "simple-git's typed task surface (simpleGit/src/lib/tasks/*, simple-git/src/git.mjs) is only a wrapper: every route funnels through the single spawn.args guard at simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts:13, so no second guard implementation was found and nothing else was pursued."
+  ],
+  "unverified": [
+    "repo size in MB (no shell available for du); the source tree is a multi-package TypeScript monorepo with ~360 tracked files, so tiny_repo/giant_repo could not be decided and neither flag is asserted",
+    "present_in_latest and latest_where for the O8 route: no latest release or latest tree was supplied",
+    "whether the hidden behavioural tests need a real git binary at runtime (the project's own unit tests use fixture child-process streams)"
+  ]
+}

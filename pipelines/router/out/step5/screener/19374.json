@@ -1,0 +1,136 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "19374",
+  "advisory_ids": ["GHSA-VH4V-2XQ2-G5CG", "GO-2026-5884"],
+  "repo": "oras-project/oras-go",
+  "pinned_commit": "cc323e564d90c6b5b4bdd71d3c8d2ee2713b37e5",
+  "fix_commits": ["3c2e884e12ea52b6bff60c97f1edb7df7d0e0909"],
+  "trust_decision": {
+    "summary": "Whether the caller's registry credential (Authorization header, or username/password fetched for the registry) may travel to a different HTTP origin is decided per hop in auth.(*Client).send (a CheckRedirect wrapper drops Authorization when scheme or canonical host:port changes) and once per 401 in auth.(*Client).Do (credentials are neither resolved nor sent when resp.Request.URL is not the origin that was originally requested), using sameHTTPOrigin/canonicalHost.",
+    "evidence": [
+      "registry/remote/auth/client.go:136-141",
+      "registry/remote/auth/client.go:251-262",
+      "registry/remote/auth/client.go:303-316",
+      "fix.diff:14-57",
+      "fix.diff:71-81"
+    ]
+  },
+  "landing_point": {
+    "where": "registry/remote/auth/client.go:140",
+    "why": "send() is the single point every outbound request passes through and the only place where redirect following happens (c.client().Do(req)); the summary 'forwards registry credentials across registry redirects' points an engineer straight at this Do call."
+  },
+  "fix_sites": [
+    {
+      "where": "registry/remote/auth/client.go:136-141",
+      "entry_point": "auth.(*Client).Do (and the token fetches that reuse send), reached from every remote.Repository/remote.Registry operation",
+      "module_kind": "public_api"
+    },
+    {
+      "where": "registry/remote/auth/client.go:228-230",
+      "entry_point": "auth.(*Client).Do with a caller-built request whose Host field is empty: the credential/cache key falls back to URL.Host",
+      "module_kind": "public_api"
+    },
+    {
+      "where": "registry/remote/auth/client.go:251-262",
+      "entry_point": "auth.(*Client).Do: after a 401, credentials are resolved only if the challenging response came from the original origin",
+      "module_kind": "public_api"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "registry/remote/repository.go:876-893"
+  },
+  "O3_reason_to_dismiss": "Blob-upload Location handling is a manual follow in a different package (registry/remote) that already validates host and port with its own sameUploadHost predicate, so it looks like it is outside the auth-client redirect advisory and safe to leave alone.",
+  "O4_distance": {
+    "files": 1,
+    "packages": 1,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "A challenge whose bearer realm is on a different public host must still receive the credential (Docker Hub's auth.docker.io pattern); validateRealm deliberately allows cross-host realms, so an over-broad 'never send credentials to another origin' fix breaks real registries. Same-origin path redirects must also keep the credential, and the neighbouring blob-upload path depends on implicit :443 normalization (repository.go:906-916).",
+    "where": "registry/remote/auth/client.go:174-201"
+  },
+  "O6_input_shapes": [
+    "redirect after authentication to the same hostname on a different port (stdlib strips only on hostname change)",
+    "redirect before authentication, then a 401 whose challenge originates on the redirect target",
+    "scheme change on the same host (http vs https)",
+    "implicit default ports normalised (example.com vs example.com:443, :80 for http)",
+    "case-varied host names compared case-insensitively",
+    "request with an empty req.Host field, so the origin must come from URL.Host",
+    "caller-provided CheckRedirect callback that must still be invoked"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "registry/remote/auth/cache.go:74-97",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Pagination continuation: an absolute URL taken from the server's Link header (resolved in parseLink) becomes the next request URL and is sent through the same auth client, with no origin comparison on this path; if the callers' CredentialFunc answers for that host, credentials are attached.",
+      "where": "registry/remote/utils.go:54-58",
+      "reason_to_dismiss": "Link is a same-registry pagination continuation defined by the distribution spec, not an HTTP redirect, and the client asks the caller's CredentialFunc about the host it is about to contact.",
+      "distance": "other package (registry/remote vs registry/remote/auth), ~2 hops from the auth sink; call sites repository.go:450, repository.go:589, registry.go:180",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Bearer challenge on a same-origin 401 plants a realm on any public host; the registry's username/password are then sent to that realm (Basic auth on the distribution token request, or the OAuth2 password-grant body) with no relation to the registry's origin.",
+      "where": "registry/remote/auth/client.go:364-371",
+      "reason_to_dismiss": "The distribution spec puts the token service on a separate host (auth.docker.io), validateRealm explicitly permits cross-host realms, and the advisory is about redirects, so this is the documented exception rather than the bug.",
+      "distance": "same file as the fix (client.go), reached through fetchBearerToken at client.go:343-356",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "registry/remote/repository.go:902-925",
+      "sibling": "A second Location-following upload step (e.g. chunked/resumable PATCH then PUT) that re-attaches the Authorization header by hand.",
+      "why_realistic": "The monolithic path already does exactly this manual follow and header copy at repository.go:942-945, so a maintainer adding resumable upload would copy the same shape and its own sameUploadHost check."
+    },
+    {
+      "where": "registry/remote/utils.go:40-58",
+      "sibling": "A referrers/catalog continuation helper that follows a server-supplied absolute Location instead of only a Link.",
+      "why_realistic": "parseLink already turns a server header into an absolute request URL; extending it to Location-bearing referrers responses is a natural small change in this repo."
+    },
+    {
+      "where": "registry/remote/retry/client.go:27-31",
+      "sibling": "A redirect-aware client wrapper in the retry package that needs the same origin rule for header preservation.",
+      "why_realistic": "retry.NewClient is the documented underlying client for auth.DefaultClient (auth/client.go:41); a maintainer tightening redirect policy at the transport/wrapper layer would land there, in a different package from the auth check."
+    }
+  ],
+  "O9_family": "credential exposure on cross-origin redirect/challenge (CWE-522 insufficiently protected credentials, CWE-200 information exposure)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 (go.mod:3); three module deps (opencontainers/go-digest, opencontainers/image-spec, golang.org/x/sync)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "registry/remote/auth/client_test.go (large table-driven auth-flow suite: cached tokens, basic/bearer challenges, realm validation); registry/remote/repository_test.go (blob push, port-443 Location workaround, cross-host Location test)"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "registry/remote/auth/client.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap the underlying http.Client's CheckRedirect and delete the Authorization header whenever the next hop's host differs, which stops the post-auth header copy but leaves the pre-auth path where the redirect target's 401 challenge plants a bearer realm and the origin's username/password are then posted to it."
+  },
+  "out_of_scope_notes": [
+    "registry/reference.go:241-242 normalises docker.io to registry-1.docker.io when building repository URLs, so the library's own Repository paths never rely on the docker.io redirect that StaticCredential (auth/client.go:70-83) is written for; not part of this advisory.",
+    "repository.go:917-925 carries a separate, earlier advisory's Location validation (GHSA-jxpm-75mh-9fp7) that is already present at the pinned commit and is not part of this fix."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured (no shell available); the tree has ~150 Go files, so tiny_repo (<5 MB of source) is plausible but not asserted.",
+    "Go 1.25 toolchain availability on the grading image was not checked (no running of tooling).",
+    "O13 write-up breadth is an offline estimate: the advisory has a GHSA and GO id but no CVE id, and no release is given for latest-code comparison, hence present_in_latest is unknown."
+  ]
+}

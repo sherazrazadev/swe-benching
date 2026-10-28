@@ -1,0 +1,120 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "5847",
+  "advisory_ids": ["GHSA-VQG6-3FW6-J9JG", "CVE-2026-57179", "PYSEC-2026-4168"],
+  "repo": "python-social-auth/social-core",
+  "pinned_commit": "6fcde2c2bf16b6fefb15316e4c9f7a9d9ddfd95b",
+  "fix_commits": ["0418782454ac7bbc6a9230ea21f7f5066fe89686"],
+  "trust_decision": {
+    "summary": "A stored partial pipeline may be resumed only by the client session that created it, unless that pipeline step was recorded as an intentional external-resume flow (email validation) and the strategy confirms the external resume; the decision is made at resume time in social_core/utils.py:partial_pipeline_data by resolving the token and comparing it with PARTIAL_TOKEN_SESSION_NAME in the session.",
+    "evidence": [
+      "social_core/utils.py:185-189",
+      "social_core/utils.py:191-216",
+      "social_core/actions.py:96-100",
+      "social_core/actions.py:176-182",
+      "social_core/strategy.py:130-134",
+      "fix.diff:1006-1011"
+    ]
+  },
+  "landing_point": {
+    "where": "social_core/utils.py:185-189",
+    "why": "The advisory summary says partial-pipeline/session fixation, so an engineer looks at the token resolution in partial_pipeline_data: it takes partial_token from request data (or the explicit argument) and never compares it with the token stored in the session, then loads and returns that partial."
+  },
+  "fix_sites": [
+    {"where": "social_core/utils.py:173-217", "entry_point": "social_core.utils.partial_pipeline_data (public utility API called by framework views)", "module_kind": "shared utility / public API"},
+    {"where": "social_core/actions.py:96-104", "entry_point": "social_core.actions.do_complete (framework complete view)", "module_kind": "action handler"},
+    {"where": "social_core/actions.py:176-186", "entry_point": "social_core.actions.do_disconnect (framework disconnect view)", "module_kind": "action handler"},
+    {"where": "social_core/pipeline/partial.py:8-59", "entry_point": "partial_step decorator / partial alias applied to every partial pipeline step", "module_kind": "decorator / wrapper"},
+    {"where": "social_core/pipeline/mail.py:13-37", "entry_point": "pipeline step social_core.pipeline.mail.mail_validation, reached from the auth pipeline and the email-validation link", "module_kind": "pipeline step"},
+    {"where": "social_core/strategy.py:130-134", "entry_point": "BaseStrategy.clean_partial_pipeline plus the new external-resume confirmation hooks (framework strategy extension point)", "module_kind": "strategy base class / extension point"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "social_core/pipeline/partial.py:8-59"},
+  "O3_reason_to_dismiss": "The partial_step decorator (and the mail_validation step that uses it) only records pipeline state and looks like a trusted internal helper rather than a request entry point, so a solver can treat the stored resume-policy flag as an implementation detail and leave the decorator, and the email-validation step's allow flag, untouched.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Resuming a halted pipeline from an emailed validation link in a fresh session (partial_token + verification_code in the request, no matching session token) must keep working; the fix keeps it alive by stamping allow_external_resume=True on that step's stored record only, so a blanket session-ownership check breaks email validation while a blanket allow reopens the hole.",
+    "where": "social_core/pipeline/mail.py:13-37"
+  },
+  "O6_input_shapes": [
+    "partial_token as a plain string in request body or query string",
+    "MultiValueDict/QueryDict request data with list values, flattened with to_plain_dict and encoded with to_session_value",
+    "no partial_token in the request at all, token only from PARTIAL_TOKEN_SESSION_NAME (ordinary in-session resume)",
+    "partial_token passed as an explicit argument to partial_pipeline_data by a framework view",
+    "custom token parameter name via SOCIAL_AUTH_PARTIAL_PIPELINE_TOKEN_NAME",
+    "confirmation round trip: partial_pipeline_confirm parameter plus the pending token and original request data replayed from the session",
+    "stored partial records with and without the allow_external_resume data flag",
+    "stored partial whose backend/uid does not match the current backend or request"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "social_core/pipeline/utils.py:60-71", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "strategy.partial_load(token) followed by backend.continue_pipeline(partial) resumes a stored pipeline straight from a token with no session-ownership check; the fix guarded the actions/utils callers but left this sink and loader unchanged",
+      "where": "social_core/backends/base.py:269-275",
+      "reason_to_dismiss": "It is a lower-level library API used by framework integrations and by the project's own test harness, not a user-facing web route, so it can be argued outside the advisory's complete/disconnect handlers.",
+      "distance": "same package, two files from the landing point (social_core/backends/base.py vs social_core/utils.py); loader at social_core/strategy.py:127-128",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "BaseOpenID.continue_pipeline override resumes the stored partial (and replays the OpenID assertion) without any session-ownership check, bypassing partial_pipeline_data entirely",
+      "where": "social_core/backends/open_id.py:189-200",
+      "reason_to_dismiss": "Legacy OpenID 2.0 backend with its own continue_pipeline override — an easy 'neighbouring/legacy path, not the login CSRF flow' dismissal.",
+      "distance": "same top package, social_core/backends/open_id.py vs social_core/utils.py",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "social_core/pipeline/partial.py:45-50",
+      "sibling": "A second external-resume step (e.g. phone/OTP validation) decorated with allow_external_resume=True, storing its own policy flag in the partial record.",
+      "why_realistic": "The published fix sets the precedent that a pipeline step can opt into external resume, so a maintainer adding another out-of-band verification flow would copy the mail_validation pattern."
+    },
+    {
+      "where": "social_core/backends/base.py:269-275",
+      "sibling": "A second continue_pipeline override in another backend that reloads and resumes a partial from request-supplied token material.",
+      "why_realistic": "open_id already overrides it; any backend that completes a deferred assertion would naturally override the same hook."
+    },
+    {
+      "where": "social_core/actions.py:82-165",
+      "sibling": "A sibling action handler (register/associate/email-validation) that calls partial_pipeline_data directly for a different framework view.",
+      "why_realistic": "do_complete and do_disconnect are thin framework-agnostic actions; social-django/social-flask add their own views on top of the same helpers, so another action is the natural extension point."
+    },
+    {
+      "where": "social_core/strategy.py:130-155",
+      "sibling": "Another strategy-level override of the external-resume confirmation hooks for a different framework strategy.",
+      "why_realistic": "The fix ships no-op confirmation hooks on BaseStrategy, explicitly inviting framework strategies to implement them; a second implementation is expected."
+    }
+  ],
+  "O9_family": "Session fixation (CWE-384): login CSRF via cross-session resume of a stored partial pipeline token",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.10)",
+    "toolchain": "setuptools build backend, pytest 9 + pytest-cov/pytest-xdist, tox/uv in CI, optional libxmlsec1-dev for the SAML extra",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "social_core/tests/test_utils.py (PartialPipelineData), social_core/tests/test_partial.py, social_core/tests/actions/test_login.py, social_core/tests/actions/test_disconnect.py, social_core/tests/backends/base.py:147-175 (do_partial_pipeline); HTTP is mocked with responses"
+  },
+  "O11_fix_minutes": 75,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "social_core/actions.py, social_core/utils.py, social_core/pipeline/partial.py, social_core/pipeline/mail.py, social_core/strategy.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Require the request partial_token to equal the session token (or reject any token supplied in the request) inside partial_pipeline_data — which kills emailed validation links and session-only resume, and still leaves the public partial_load + continue_pipeline route unguarded."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo source size in MB could not be measured (no shell in this session); the tree has ~370 files so it is probably a few MB but tiny_repo is left unset",
+    "no latest release code was provided ('none'), so present_in_latest for both O8 routes is unknown",
+    "advisory text beyond the one-line summary was not available; the trust decision was derived from the fix diff and commit message"
+  ]
+}

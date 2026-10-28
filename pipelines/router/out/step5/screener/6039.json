@@ -1,0 +1,99 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "6039", "advisory_ids": ["GHSA-W8P5-MX5W-CPQJ", "CVE-2026-11332", "PYSEC-2026-3458"],
+  "repo": "ansible/ansible", "pinned_commit": "31b3cc35e6b35fdb80feecd1d4b3422f400fa07a",
+  "fix_commits": ["edee59aa15abcc74d920bb3e9c3835ab8db05a2f"],
+  "trust_decision": {
+    "summary": "Decided in lib/ansible/utils/galaxy.py:75: fields taken from an ansible-galaxy requirement (src, name) are data, not options, so the git argv must end option parsing with '--' before them; one hunk inserts it.",
+    "evidence": ["lib/ansible/utils/galaxy.py:64-75", "lib/ansible/utils/galaxy.py:42-53", "fix.diff:22", "fix.diff:12"]
+  },
+  "landing_point": {
+    "where": "lib/ansible/galaxy/role.py:243-247",
+    "why": "The summary says 'ansible-galaxy role install'; GalaxyRole.install() is the scm branch of that command and calls RoleRequirement.scm_archive_role, which is a one-line forward to the helper that builds the git argv."
+  },
+  "fix_sites": [
+    {
+      "where": "lib/ansible/utils/galaxy.py:75",
+      "entry_point": "ansible-galaxy role install (positional role spec, -r/requirements.yml, or a role dependency read from an installed role's meta/main.yml) reaching GalaxyRole.install -> RoleRequirement.scm_archive_role -> scm_archive_resource",
+      "module_kind": "shared library helper (subprocess argv builder) called from a CLI command handler"
+    }
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "lib/ansible/galaxy/collection/concrete_artifact_manager.py:423-449"},
+  "O3_reason_to_dismiss": "Collection install is a different CLI subcommand and a different package (ansible.galaxy.collection, not ansible.playbook/ansible.utils), the advisory and its changelog say 'role install' and 'role requirements', and a collection `source` is normally an operator-chosen URL rather than metadata shipped by a third-party role - so a solver can argue the collection clone was never in the advisory's scope.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "--ignore-certs / GALAXY_IGNORE_CERTS must keep adding `-c http.sslVerify=false` (and `--insecure` for hg) as real options ahead of the source; a fix that puts '--' before that option, or that rejects/strips any argv element starting with '-', silently breaks TLS-skipping installs. The same coupling is sharper in the collection copy, where the option is appended after the positional args.",
+    "where": "lib/ansible/utils/galaxy.py:66-75"
+  },
+  "O6_input_shapes": [
+    "dict-form requirement with the payload in `src` (src: -ccore.sshCommand=... , scm: git)",
+    "dict-form requirement with the payload in `name` (the second positional, used both as clone destination and as the directory joined afterwards)",
+    "string-form requirement line 'src,version,name' and bare 'git+URL' CLI argument",
+    "both SCMs: git (`-c` option) and hg (`--insecure`-style options) go through the same argv builder",
+    "requirements pulled transitively from a role's meta/main.yml dependencies"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "lib/ansible/galaxy/collection/concrete_artifact_manager.py:396-420",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "ansible-galaxy collection install/download of a 'git+'-prefixed source builds `git clone [--depth=1] <git_url> <dest>` with no '--', so a requirements `source` such as `git+-ccore.sshCommand=sh -c ...` is parsed by git as a config option and executes; parse_scm strips only 'git+' and the fragment, leaving the leading '-' intact.",
+      "where": "lib/ansible/galaxy/collection/concrete_artifact_manager.py:440-442",
+      "reason_to_dismiss": "different subcommand and package, advisory names role install only, and a collection source URL is treated as operator-supplied rather than untrusted role metadata",
+      "distance": "other package (ansible.galaxy.collection) reached through dependency_resolution/dataclasses.py is_scm and galaxy/collection/__init__.py install()/download_collections() - two modules away from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "lib/ansible/galaxy/collection/concrete_artifact_manager.py:443-446",
+      "sibling": "`git clone --branch <version> <url> <dest>` with the requirement's version passed raw",
+      "why_realistic": "the FIXME on that line literally plans to add '--branch', version; a maintainer adding it would append the attacker-shaped value next to the URL without revisiting the '--' rule"
+    },
+    {
+      "where": "lib/ansible/utils/galaxy.py:36-37",
+      "sibling": "scm_archive_collection wrapper growing its own copy of the clone command for collections",
+      "why_realistic": "it already hardcodes scm='git' arguments; adding depth/branch/refspec handling there is a natural edit that reintroduces a raw positional"
+    },
+    {
+      "where": "lib/ansible/utils/galaxy.py:95-99",
+      "sibling": "git archive/checkout invoked with an unvalidated version positional",
+      "why_realistic": "version is appended raw to two more argv vectors in the same function, so a maintainer extending these commands would plausibly treat option parsing as already handled"
+    }
+  ],
+  "O9_family": "argument/option injection into an external VCS command (CWE-88) leading to code execution",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (ansible-core)",
+    "toolchain": "pure Python, no compile step; pip install -e . ; git (and optionally hg) executables required on PATH at runtime",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "integration: test/integration/targets/ansible-galaxy-role/tasks/main.yml -> dir-traversal.yml, valid-role-symlinks.yml (ansible-test integration ansible-galaxy-role); unit: test/units/galaxy/test_role_requirements.py and test/units/galaxy/test_collection_install.py:122-213, which assert the exact clone argv tuple. The fix adds tasks/git-config-injection.yml, which installs the git package and clones git@github.com:ansible/nosuchrepo.git, so that upstream test needs network; the behaviour itself is exercisable against a local repo."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/ansible/utils/galaxy.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Insert '--' at utils/galaxy.py:75 for the role clone only (the exact published hunk) and stop, possibly also rejecting a src that starts with '-' in role_yaml_parse, which would leave the collection clone open and break legitimate srcs."
+  },
+  "out_of_scope_notes": [
+    "lib/ansible/modules/git.py:592-644 builds `git clone ... <repo> <dest>` with the same missing '--', but repo/dest there come from a playbook the operator wrote, a different trust boundary from third-party galaxy requirements - not pursued."
+  ],
+  "unverified": [
+    "repo_mb: no shell in this session, so the checkout size could not be measured; source tree is clearly above 5 MB and well below 1.5 GB by file count.",
+    "present_in_latest for the collection route: no latest release tree was provided ('none'), so unknown.",
+    "O13: write-up volume for CVE-2026-11332 was not checked against any external source (no network).",
+    "The version positional in `git checkout` (lib/ansible/utils/galaxy.py:79-81) and `git archive` (95-99) was read and judged not to reach the same protected sink, because those subcommands take no config-injection option; this is argued, not empirically proven."
+  ]
+}

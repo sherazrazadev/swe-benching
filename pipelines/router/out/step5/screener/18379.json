@@ -1,0 +1,131 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18379",
+  "advisory_ids": ["GHSA-MF5C-HW34-4HPP", "CVE-2026-55569", "GO-2026-6314"],
+  "repo": "aquaproj/aqua",
+  "pinned_commit": "d6b9448fc421c58d83ae2fa372e61122f14620f5",
+  "fix_commits": ["d5b02b220188de376a661b3aabfa912202a1a59a"],
+  "trust_decision": {
+    "summary": "Extraction trusted the archive: the destination path was built with filepath.Join(dest, entry) and written with no check that it stayed under dest, and any symlink entry target was created verbatim, so a later entry at the same path wrote through the planted link outside the install directory. The whole decision lives in handler.HandleFile in pkg/unarchive/archives.go; the fix adds a lexical withinDest check on both the entry destination and the resolved symlink target.",
+    "evidence": [
+      "pkg/unarchive/archives.go:26",
+      "pkg/unarchive/archives.go:41-49",
+      "pkg/unarchive/archives.go:58",
+      "fix.diff:33-35",
+      "fix.diff:60-94"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/unarchive/archives.go:25",
+    "why": "HandleFile is the single callback that maps archive entry names to paths inside the install directory; the summary 'extraction follows attacker-planted symlinks' points an engineer straight here."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/unarchive/archives.go:33",
+      "entry_point": "aqua install / aqua exec lazy install / aqua cp -> installpackage.Installer.download -> unarchive.Unarchiver.Unarchive -> handler.HandleFile",
+      "module_kind": "cli-installer (Go library pkg/unarchive)"
+    },
+    {
+      "where": "pkg/unarchive/archives.go:42",
+      "entry_point": "same path; the symlink branch of HandleFile (handleSymlink + symlinkTargetWithinDest, fix.diff:60-82)",
+      "module_kind": "cli-installer (Go library pkg/unarchive)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "pkg/unarchive/dmg.go:56"
+  },
+  "O3_reason_to_dismiss": "DMG extraction copies a mounted volume with osfile.Copy (dmg.go:56) instead of going through HandleFile, so a solver can argue the advisory is about tar/zip archive entries and that a macOS-only hdiutil path is a different, unsupported combination.",
+  "O4_distance": {
+    "files": 2,
+    "packages": 0,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "Packages legitimately ship symlinks inside the install directory, including dangling and relative ones (e.g. libfoo.so.1 -> libfoo.so.1.2.3). The symlink branch must keep creating them; an over-broad fix that rejects every symlink entry, or that resolves targets with filepath.EvalSymlinks (which errors on dangling links), breaks normal packages.",
+    "where": "pkg/unarchive/archives.go:41-49"
+  },
+  "O6_input_shapes": [
+    "regular-file entry name containing '..' (path traversal)",
+    "entry name that is an absolute path (neutralised by filepath.Join, but the check must not regress)",
+    "Windows-style backslash-separated entry name, rewritten by normalizePath before the check (archives.go:83-90)",
+    "symlink entry with an absolute target outside the install directory",
+    "symlink entry with a relative target escaping the install directory via '..' (resolved against the link's own directory)",
+    "symlink entry whose target is the install directory itself or inside it (must still be created)",
+    "both tar and zip style extractors, since the check sits in the shared handler called by extractor.Extract (archives.go:104-113)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "pkg/unarchive/archives.go:109",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "PKG extraction delegates to `pkgutil --expand-full <file> <dest>` and the expanded tree lands in the install directory with no withinDest check on any entry or link",
+      "where": "pkg/unarchive/pkg.go:32",
+      "reason_to_dismiss": "macOS-only, delegated to an external tool, and the published fix targeted the archives.Extractor handler, so a solver can call it a different unsupported path",
+      "distance": "same package, one file from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "DMG extraction copies the mounted volume into the install directory with osfile.Copy / otiai10 copy, so a link in the image is reproduced without any symlinkTargetWithinDest check",
+      "where": "pkg/unarchive/dmg.go:56",
+      "reason_to_dismiss": "macOS-only and needs a mountable image, so it is argued to be outside the archive-extraction advisory",
+      "distance": "same package, one file from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/unarchive/archives.go:41-49",
+      "sibling": "A hardlink branch (f.Mode()&os.ModeHardlink with LinkTarget set) calling os.Link(f.LinkTarget, dstPath) beside the symlink branch, without the withinDest check",
+      "why_realistic": "mholt/archives reports tar hardlink entries the same way it reports symlinks, and today they are silently skipped at archives.go:48; a maintainer adding hardlink support would copy the symlink branch shape and forget the target check"
+    },
+    {
+      "where": "pkg/unarchive/archives.go:120-138",
+      "sibling": "A second decompressor writer that joins a non-base'd name into dest (the current one is safe only because unarchive.go:59 base's the filename first)",
+      "why_realistic": "The decompress path is a separate writer into the same directory that already duplicates the MkdirAll-then-Create shape; a variant supporting an inner name would reuse it"
+    },
+    {
+      "where": "pkg/installpackage/check_file.go:79",
+      "sibling": "The aqua cp copy step that writes extracted files to an arbitrary --dest, resolving the source with fs.Stat first",
+      "why_realistic": "It is the natural place a maintainer would add 'copy the resolved binary out' handling and would reach the same follow-a-link sink from a different package"
+    }
+  ],
+  "O9_family": "path traversal / symlink following leading to arbitrary file write (CWE-22, CWE-59)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.4 (go.mod:3), module github.com/aquaproj/aqua/v2, standard `go build ./...` / `go test ./...`; no code generation needed for this package",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/unarchive/unarchive_test.go holds TestIsUnarchived and TestUnarchiver_Unarchive only at the pinned commit; two of its subtests fetch tarballs from github.com, so that file is not fully offline even though local tar extraction is. Installer and controller (install/exec/cp) tests use afero and the project mocks."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/unarchive/archives.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Reject entry names containing '..' at the top of HandleFile (or refuse all symlink entries) and stop there, leaving the planted-symlink chain, the relative-target resolution base and the backslash-normalised names unhandled."
+  },
+  "out_of_scope_notes": [
+    "pkg/installpackage/check_file.go:143 chmods and check_file.go:130 stats a path taken from file_src inside the installed package dir, so a link planted there is followed for chmod/read; that is a consequence of the same planted link, not the advisory's write-outside property, and the extraction fix removes the planting step."
+  ],
+  "unverified": [
+    "repo size in MB could not be measured without a shell; the tree has 425+ Go files plus website docs and testdata, so tiny_repo/giant_repo are implausible but repo_mb is left null",
+    "whether the dmg/go and pkg.go routes still lack the check at today's HEAD (no latest checkout provided); the fix diff does not touch them, so they still lack it at the fix commit",
+    "whether otiai10/copy (the DMG copy at osfile/copy.go:14) follows an already-created symlink when writing a later entry; the dependency source was not read, so the DMG route is recorded as 'protection never applied there' rather than as a confirmed escape",
+    "no build was run (screening forbids it); go build/test success is inferred from go.mod and the package's imports only"
+  ]
+}

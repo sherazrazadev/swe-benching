@@ -1,0 +1,137 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "31052",
+  "advisory_ids": ["GHSA-24X4-J6X9-RFW5", "CVE-2026-55790"],
+  "repo": "craftcms/cms",
+  "pinned_commit": "3219a2ed290062d1075fc461e4a54b1ffbec58f7",
+  "fix_commits": ["6bbb66038a268552180ca5c8eed9f46ea25a4417"],
+  "trust_decision": {
+    "summary": "Untrusted text returned by a third-party API (the issue/result title) and the support form's server-side validation errors are concatenated into HTML strings in the browser; the decision is whether that text is escaped before it reaches the `html:` property of the result anchor and the `$('<li>')` error list item, and it is made in the CraftSupport widget JS (`handleSearchSuccess`, `parseSupportResponse`) that ships as a built bundle.",
+    "evidence": [
+      "src/web/assets/craftsupport/src/CraftSupportWidget.js:382",
+      "src/web/assets/craftsupport/src/CraftSupportWidget.js:555",
+      "fix.diff:46",
+      "fix.diff:55-57"
+    ]
+  },
+  "landing_point": {
+    "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:382",
+    "why": "The advisory summary names the GitHub issue title, and this line is where `getSearchResultText()` (i.e. `result.title`, returned at :655 for GitHub and :621 for StackExchange) is concatenated unescaped into the `html:` string of the result anchor."
+  },
+  "fix_sites": [
+    {
+      "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:382",
+      "entry_point": "Craft Support dashboard widget search results rendered by `handleSearchSuccess`; reached from the Help screen (api.stackexchange.com) and the Feedback screen (api.github.com), both opened from the widget's home screen (`body.twig:154,159`)",
+      "module_kind": "CP browser asset (jQuery `html:` property of a created element)"
+    },
+    {
+      "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:555",
+      "entry_point": "POST `dashboard/send-support-request` (form at `src/templates/_components/widgets/CraftSupport/body.twig:90`) -> `DashboardController::actionSendSupportRequest` (`src/controllers/DashboardController.php:284`) -> `response.twig` iframe -> `parseSupportResponse`",
+      "module_kind": "CP browser asset (string concatenation into `$('<li>')`), fed by a server-side controller and template"
+    },
+    {
+      "where": "src/web/assets/craftsupport/dist/CraftSupportWidget.js:1",
+      "entry_point": "Same widget; this minified file is the only JS that `CraftSupportAsset` serves to the browser (`src/web/assets/craftsupport/CraftSupportAsset.php:22,42`)",
+      "module_kind": "generated/minified asset bundle, built by webpack from the src file (`webpack.config.js:10`, `package.json:7`)"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/web/assets/craftsupport/dist/CraftSupportWidget.js:1 - the minified bundle is the code actually served (`src/web/assets/craftsupport/CraftSupportAsset.php:22,42`); fixing only `src/` changes nothing at runtime unless the bundle is rebuilt, and the published fix had to patch it as a third site."
+  },
+  "O3_reason_to_dismiss": "`dist/` is a generated, minified artifact, so 'the source fix is the real fix; the build will regenerate the bundle' is a plausible reason to leave it alone - and the bundle is in a different directory from the report's landing point.",
+  "O4_distance": {"files": 3, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The `html:` property is used deliberately to render the result markup: a `<span class=\"status ...\">` dot plus a real `<a>` link. Escaping the whole concatenated string (or switching the option to `text:`) renders the span tag literally and loses the anchor, breaking the search-results UI; only the title fragment may be escaped.",
+    "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:373-386"
+  },
+  "O6_input_shapes": [
+    "a single result-title string containing HTML, e.g. `result.title` from either API (`src/web/assets/craftsupport/src/CraftSupportWidget.js:621,655`)",
+    "a results array of up to 20 items iterated before the sink (`src/web/assets/craftsupport/src/CraftSupportWidget.js:371-372`)",
+    "`response.errors` as an object of arrays of message strings, iterated per attribute (`src/web/assets/craftsupport/src/CraftSupportWidget.js:551-557`)",
+    "strings carrying quotes, `&` and `<...>` sequences, since the same error values are also emitted into an inline `<script>` (`src/templates/_components/widgets/CraftSupport/response.twig:5`)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "src/templates/_components/widgets/CraftSupport/response.twig:3-6 serializes the controller's `errors` array with `json_encode|raw` into an inline script, and :2 interpolates the request's `widgetId`; the escaped check (`parseSupportResponse`) never calls or sees the template that produces the state it renders.",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "The `widgetId` POST body param is pasted unescaped into an inline script (`widgets[{{ widgetId }}]`), giving JS-context injection on the same iframe response page the support form renders.",
+      "where": "src/templates/_components/widgets/CraftSupport/response.twig:2 (value read at src/controllers/DashboardController.php:290)",
+      "reason_to_dismiss": "widgetId is an internal integer sent by the widget's own form, the POST is CSRF-protected and admin-only, and the advisory is about the issue title - so 'not our sink, not our input'.",
+      "distance": "1 file from the JS sink, in the template layer, plus one controller line",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "`getSearchResultUrl(result)` is assigned to the anchor's `href`; a `javascript:` or `data:` URL returned by the API becomes clickable script execution.",
+      "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:376",
+      "reason_to_dismiss": "href is a jQuery attribute assignment on a created element, not the HTML string the fix escapes, and the advisory names the title text.",
+      "distance": "same expression as the fix, one line above the escaped title",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "`getSearchResultStatus(result)` is concatenated unescaped into the `class=\"status ...\"` attribute of the same HTML string.",
+      "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:379-381",
+      "reason_to_dismiss": "the only shipped subclasses return the fixed literals 'green'/'red'/'' (`:617`, `:651`), so there is no untrusted value in practice.",
+      "distance": "same expression as the fix",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:596-657",
+      "sibling": "A third `BaseSearchScreen` subclass (e.g. a docs or plugin-store search) whose `getSearchResultText()` returns a remote field, reusing `handleSearchSuccess`.",
+      "why_realistic": "The base class already has exactly one abstract text method per screen and two concrete subclasses (Help = StackExchange, Feedback = GitHub), so a maintainer adding a third API by copying HelpScreen is the natural extension."
+    },
+    {
+      "where": "src/templates/_components/widgets/CraftSupport/response.twig:3-6",
+      "sibling": "A second response field (a ticket URL or a server message) emitted into the inline script and rendered by the widget.",
+      "why_realistic": "The response page is a hand-built JSON bridge; each new field is another raw emission into the same iframe, and nothing in the template escapes for the JS context."
+    },
+    {
+      "where": "src/web/assets/pluginstore/src/js/components/ChangelogRelease.vue:16",
+      "sibling": "Remote release notes rendered with `v-html` (`release.notes`).",
+      "why_realistic": "The same 'show text fetched from craftcms.com/GitHub as HTML' idiom already exists elsewhere in the CP's plugin store; a maintainer moved this pattern between features."
+    }
+  ],
+  "O9_family": "CWE-79 cross-site scripting (DOM-based, unsafe HTML string construction)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "JavaScript (ES6 sources compiled to an ES5 browser bundle) for the affected code, PHP 8 for the server route",
+    "toolchain": "npm + webpack 5 (`package.json:7` `npm run build`; `src/web/assets/craftsupport/webpack.config.js:3,10` uses `@craftcms/webpack` from `packages/craftcms-webpack`)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "None for this area: `tests/` holds Codeception suites and Playwright is a devDependency, but grepping `tests/` for `CraftSupport` finds nothing, and the fix diff adds or changes no test file."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/web/assets/craftsupport/src/CraftSupportWidget.js, src/web/assets/craftsupport/dist/CraftSupportWidget.js (rebuilt bundle), plus the generated source map",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Escape only the GitHub title string at `src/CraftSupportWidget.js:382` and stop, leaving the support-error list item, the served minified bundle, and the response template untouched."
+  },
+  "out_of_scope_notes": [
+    "src/web/assets/pluginstore/src/js/components/ChangelogRelease.vue:16 renders remote plugin-store release notes with `v-html`; same idiom, different feature and not this advisory's protection - not pursued.",
+    "src/controllers/DashboardController.php:269 `actionCacheFeedData` stores a caller-supplied `url`/`data` under a cache key; noticed only, not part of this advisory, not pursued."
+  ],
+  "unverified": [
+    "The full GHSA/CVE text was not available offline; scope was taken from the supplied summary ('DOM XSS via GitHub issue title in CraftSupport widget') and the fix diff.",
+    "Repository size in MB could not be measured (no shell in this session); `repo_mb` is null. Craft CMS is far above 5 MB of source and far below 1.5 GB on file count, so neither size flag is claimed.",
+    "O10 offline_after_build is true only because `handleSearchSuccess(response)` / `parseSupportResponse(response)` can be driven with a stubbed response; the live search path calls api.github.com and api.stackexchange.com at runtime.",
+    "`present_in_latest` is unknown for every O8 route: no latest release/code location was supplied for this candidate."
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "21634",
+  "advisory_ids": ["GHSA-X5MV-8WGW-29HG", "CVE-2026-55093", "RUSTSEC-2026-0217"],
+  "repo": "sonos/tract",
+  "pinned_commit": "bee4349bee53862f52e4db13fb2ee0278770c94d",
+  "fix_commits": ["34c7df2c9bd2a36583e09b52f3e6319bf23102e8"],
+  "trust_decision": {
+    "summary": "The `.dat` header (rank plus up to 8 `u32` dims) is attacker-controlled; whether the dims fit a `usize` element count, and the resulting bit/byte size, must be decided before any allocation. The published fix makes that decision in `read_tensor` at nnef/src/tensors.rs:64-79 with `checked_mul` and a bail, but leaves the allocate-time byte arithmetic and the block-quant branch's own multiply unchecked.",
+    "evidence": ["nnef/src/tensors.rs:62-64", "nnef/src/tensors.rs:66-79", "nnef/src/tensors.rs:142-146", "nnef/src/tensors.rs:284-287", "data/src/tensor.rs:282", "fix.diff:13-16", "fix.diff:30-32"]
+  },
+  "landing_point": {
+    "where": "nnef/src/tensors.rs:64",
+    "why": "The summary names an integer overflow in the NNEF `.dat` tensor parser; the first unchecked product over header-derived dims an engineer sees is `shape.iter().product::<usize>()` in `read_tensor`, the exact line the fix's first hunk rewrites."
+  },
+  "fix_sites": [
+    {"where": "nnef/src/tensors.rs:64-67", "entry_point": "tract_nnef::tensors::read_tensor (pub, nnef/src/lib.rs:13); also reached by DatLoader on model load (nnef/src/resource.rs:98) and by the CLI --input-from-nnef path (cli/src/params.rs:423,426)", "module_kind": "public deserialization module (.dat tensor parser, nnef crate)"},
+    {"where": "nnef/src/tensors.rs:78", "entry_point": "tract_nnef::tensors::read_tensor, plain/quantized item-type branch", "module_kind": "public deserialization module (.dat tensor parser, nnef crate)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "Block-quant item types 0x2040/0x3040/0x3080 are an internal GGML-style tract extension, so a solver can argue the advisory covers only the plain NNEF tensor types the report names, and the allocator's byte-count multiply in tract-data can be dismissed as shared core code used by every op rather than the parser.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate block-quant and string `.dat` tensors set `bits_per_item = u32::MAX`, which deliberately skips the byte-size comparison at :77-79; the writer emits exactly that for String (nnef/src/tensors.rs:218-221) and for block quant (nnef/src/tensors.rs:311-315). An over-broad fix that demands `len * bytes_per_item == data_size_bytes` for every tensor rejects every quantized or string tensor tract writes; the 1-byte slack for bool/1-bit tensors at :69 must also be preserved.",
+    "where": "nnef/src/tensors.rs:77-79"
+  },
+  "O6_input_shapes": [
+    "rank 0 (empty dims -> product 1)",
+    "rank 1..8 with dims up to u32::MAX",
+    "zero-length dims (product 0)",
+    "element-count product overflowing usize (caught by the new try_fold)",
+    "subsequent overflow in len * bits_per_item (bool, item_type 5)",
+    "subsequent overflow in len * (bits_per_item / 8) (plain item types)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "nnef/src/tensors.rs:43-58 (Header::read; called from read_tensor at nnef/src/tensors.rs:62)",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Block-quant `.dat` header (item_type 0x3080): read_block_quant_value recomputes expected_len = (q_m*q_k)/block_len*block_bytes with plain arithmetic; a shape whose element count fits usize but whose block-byte size wraps can still match the u32 data_size_bytes and yields a short Blob for a huge logical shape, with the identical unchecked expression at linalg/src/frame/block_quant/storage.rs:21 so the constructor's `ensure!` passes too.",
+      "where": "nnef/src/tensors.rs:284-287",
+      "reason_to_dismiss": "Block-quant item types are an internal GGML-style tract extension (and the reader here already disagrees with the writer's 0x3081), so this branch can be argued never to have been in the advisory's scope.",
+      "distance": "same file, about 220 lines below the landing point; separate branch entered at nnef/src/tensors.rs:142-146",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "String `.dat` tensor: with bits_per_item = u32::MAX both size checks at :66-86 are skipped, and Tensor::zero_dt -> uninitialized_aligned_dt computes bytes = shape.product() * dt.size_of() with a plain `*` (data/src/tensor.rs:282); a smooth element count whose byte count wraps gives a short Blob for a huge shape, and as_slice_mut then builds a slice of `len` items over it (data/src/tensor/plain_view.rs:279-285).",
+      "where": "nnef/src/tensors.rs:171-174 -> data/src/tensor.rs:282",
+      "reason_to_dismiss": "The unchecked multiply is in tract-data's shared tensor allocator, used by every op and backend, and the new element-count check makes the allocation look already bounded.",
+      "distance": "one package away (tract-nnef -> tract-data), 1 file",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "nnef/src/tensors.rs:274-287", "sibling": "A newly added block-quant format branch (the writer already emits 0x3081 at :315, which read_block_quant_value does not accept at :276-279) copying the same (q_m*q_k)/block_len*block_bytes computation.", "why_realistic": "The file already contains one such branch with its own shape arithmetic, and the reader/writer item-type sets already disagree, so a maintainer adding Q8_1 or a new GGML type would extend this match arm."},
+    {"where": "nnef/src/resource.rs:86-104", "sibling": "Another ResourceLoader (a `.dat` variant, a compressed or legacy header format) that parses its own header and allocates a Tensor from its dims.", "why_realistic": "Nnef::default registers five loaders side by side (nnef/src/framework.rs:31-37), so a new loader is a natural place for the author to add format-specific parsing."},
+    {"where": "onnx/src/tensor.rs:144-149", "sibling": "The same job in another package: create_tensor builds a Tensor from model-declared dims and raw bytes, where a shape/size overflow check could be omitted the same way.", "why_realistic": "Every format crate has its own proxy-tensor-to-Tensor conversion; a maintainer porting a checked-sizing fix would plausibly apply it there as well."}
+  ],
+  "O9_family": "CWE-190 integer overflow in a header-derived size computation, leading to CWE-125 out-of-bounds read on model load",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo, rustc >= 1.91 (workspace rust-version, Cargo.toml:121; edition 2024)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "nnef/src/tensors.rs:321-385 (header_is_128_bytes; serde_tensor_complex_* round-trips, complex feature only); nnef/tests/parse.rs and nnef/tests/scatter_round_trip.rs exercise the text graph, not .dat header overflow; no overflow test for this path at the pinned commit."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "nnef/src/tensors.rs",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Replace `shape.iter().product::<usize>()` at nnef/src/tensors.rs:64 with a checked_mul try_fold (the line the report names), add the two checked_mul comparisons, and stop there."
+  },
+  "out_of_scope_notes": [
+    "nnef/src/tensors.rs:200-204 write_tensor casts tensor dims and byte length to u32 with `as` (truncating) and read_tensor never calls it; this is a save/reload corruption path, not an OOB read, so it is noted and not pursued.",
+    "nnef/src/tensors.rs:69 `real_bit_size - 8` underflows when data_size_bytes < 1 for bool tensors (panic in debug builds); an adjacent panic-only issue, not the advisory's OOB read, noted and not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell/du in this session); the pinned tree has roughly 1.8k files over 15 workspace crates, so tiny_repo is not plausible.",
+    "Reachability of both O8 routes was reasoned statically, not constructed or run: the block-quant route needs data_size_bytes to equal the wrapped 36*len/32 residue (tunable over ~1.2e8 candidate dims) and the String route needs the wrapped 24*len to be small and non-zero; neither header was built or executed.",
+    "Latest released code is 'none' per the input, so present_in_latest stays unknown for all O8 routes.",
+    "The fix's third change compares `len.checked_mul(bits/8) != Some(data_size_bytes)`; for odd bits_per_item (e.g. 1-bit bool) integer division makes that comparison inexact, which the fix does not change - not examined further.",
+    "Only the one-line advisory summary was available, so the scope read ('reject overflowing tensor dims on load') is inferred from the summary plus the fix."
+  ]
+}

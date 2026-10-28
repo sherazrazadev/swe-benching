@@ -1,0 +1,87 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "10507",
+  "advisory_ids": ["GHSA-C2J3-45GR-MQC4", "CVE-2026-66010"],
+  "repo": "cure53/dompurify",
+  "pinned_commit": "0cae5187403132f96a6d357649e4b15633fc210a",
+  "fix_commits": ["a9ca1e537422319a557a9a2aa61f003b23b4a197"],
+  "trust_decision": {
+    "summary": "A custom element kept alive by CUSTOM_ELEMENT_HANDLING.tagNameCheck must still pass through the afterSanitizeElements hook exactly like an allowlisted element, so when _sanitizeDisallowedNode returns false (kept) the caller must run _executeHooks(hooks.afterSanitizeElements, ...) before returning; the decision is made in _sanitizeElements, which is the single sink for the string, IN_PLACE and shadow-DOM walks.",
+    "evidence": [
+      "src/purify.ts:1677-1691",
+      "src/purify.ts:1787",
+      "src/purify.ts:1825",
+      "src/purify.ts:2188",
+      "src/purify.ts:2506",
+      "fix.diff:2948-2967"
+    ]
+  },
+  "landing_point": {
+    "where": "src/purify.ts:1787",
+    "why": "Grepping the advisory's two identifiers (CUSTOM_ELEMENT_HANDLING, afterSanitizeElements) converges here: this is the only place where the result of the custom-element keep decision is returned directly, ahead of the hook call at src/purify.ts:1825."
+  },
+  "fix_sites": [
+    {"where": "src/purify.ts:1787", "entry_point": "DOMPurify.sanitize(dirty[, config]) - string, RETURN_DOM/RETURN_DOM_FRAGMENT and IN_PLACE node forms; the same call also serves the template/shadow-DOM walk at src/purify.ts:2188", "module_kind": "core sanitizer / hook pipeline (src)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "The pinned code's own doc comment at src/purify.ts:1661-1666 says the afterSanitizeElements hook is 'intentionally skipped' for kept custom elements, so a solver can argue the skip is designed behaviour and that the shadow-DOM/template call at src/purify.ts:2188 is a separate legacy walk rather than a route of its own.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Kept custom elements must stay in the output and keep skipping the namespace and fallback-tag removal checks (the false return exits _sanitizeElements before _checkValidNamespace), and their attributes must still be sanitized by the following _sanitizeAttributes pass; an over-broad fix that fires afterSanitizeElements for every node leaving the disallowed branch would also fire it on the elements _sanitizeDisallowedNode just _forceRemove'd (1738-1739), while a fix that removes or re-checks kept custom elements breaks the documented CUSTOM_ELEMENT_HANDLING passthrough.",
+    "where": "src/purify.ts:1661-1666,1677-1691,1738-1739,1787-1788; README.md:317-326"
+  },
+  "O6_input_shapes": [
+    "custom element kept via a RegExp CUSTOM_ELEMENT_HANDLING.tagNameCheck (src/purify.ts:1679-1683)",
+    "custom element kept via a predicate Function tagNameCheck (src/purify.ts:1685-1690)",
+    "HTML string input versus a Node with IN_PLACE, both walked by the same _sanitizeElements call (src/purify.ts:2492,2506)",
+    "custom element inside <template> content or an attached shadow root, reached through _sanitizeShadowDOM (src/purify.ts:2188,2197-2219)",
+    "custom element that also matches FORBID_TAGS is removed rather than kept, so the hook question does not arise (src/purify.ts:1677,1780-1787)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "src/purify.ts:2637-2654 (DOMPurify.addHook pushes the caller's afterSanitizeElements handler into the registry at src/purify.ts:125; the check invokes it through _executeHooks at src/purify.ts:1598-1610)",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/purify.ts:1677-1691", "sibling": "a third custom-element keep branch (a new CUSTOM_ELEMENT_HANDLING option, or an `if (isCustomElement) return false` fast path) beside the two existing tagNameCheck branches", "why_realistic": "This is the one place where a non-allowlisted element is deliberately kept, and the function already has two parallel RegExp/Function branches, so extending CUSTOM_ELEMENT_HANDLING would naturally add another early false return and re-create the skipped-hook bug."},
+    {"where": "src/purify.ts:2183-2192", "sibling": "a keep/skip decision inside _sanitizeShadowDOM that continues past hook-bearing work for custom elements", "why_realistic": "The shadow walker is a second, independently maintained loop with its own uponSanitizeShadowNode hook and recursion, so a maintainer hardening shadow-DOM custom elements could add a local fast path instead of relying on _sanitizeElements."},
+    {"where": "src/purify.ts:1873-1898", "sibling": "an early return in _isValidAttribute for custom-element attributes that skips the uponSanitizeAttribute/afterSanitizeAttributes lifecycle", "why_realistic": "Custom-element attributes are the one place where CUSTOM_ELEMENT_HANDLING.attributeNameCheck makes an allow decision, so an optimisation there could accept the attribute before the attribute hooks, the same mistake in the attribute layer."}
+  ],
+  "O9_family": "sanitizer hook-lifecycle / protection-mechanism bypass (CWE-693 protection mechanism failure, CWE-184 incomplete blacklist, CWE-79 XSS): CUSTOM_ELEMENT_HANDLING keeps a node but skips afterSanitizeElements",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript (src/*.ts, built to JavaScript)",
+    "toolchain": "Node >=20; npm ci; rollup 4 with @rollup/plugin-typescript and babel; `npm run build` regenerates dist/purify.js, dist/purify.cjs.js, dist/purify.es.mjs and dist/purify.min.js; QUnit tests run through jsdom/happy-dom/Playwright",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/test-suite.js (QUnit, 5981 lines) has an existing 'Config - CUSTOM_ELEMENT_HANDLING' module and hook tests, but no afterSanitizeElements-on-kept-custom-element test; the four GHSA-c2j3-45gr-mqc4 regression tests exist only in the fix diff (fix.diff:3384-3453). test/jsdom-node.js requires ../dist/purify.cjs, so `npm run build` must run before `npm run test:jsdom`."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["single_site", "tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "none",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "src/purify.ts (plus regenerated dist/purify.js, dist/purify.cjs.js, dist/purify.es.mjs, dist/purify.min.js as build outputs)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add `_executeHooks(hooks.afterSanitizeElements, currentNode, null)` unconditionally before `return _sanitizeDisallowedNode(currentNode, tagName)` at src/purify.ts:1787, which also fires the hook on the nodes that branch just removed, or simply stop keeping custom elements."
+  },
+  "out_of_scope_notes": [
+    "The supplied fix commit is the whole `release: 3.4.12 (#1537)` commit (fix.diff:1-2): besides this advisory it bundles unrelated protections - declarative-partial-updates `for`/`patchsrc` stripping, IN_PLACE neutralization/patch-linkage and teardown changes (fix.diff:2765-3092), hook-detach handling (fix.diff:2904-2941), and two SVG presentation attributes (fix.diff:2745-2760) - none of which were assessed.",
+    "dist/*.js are committed but generated from src by rollup; the release diff updates them mechanically, so they are treated as build outputs rather than a separate implementation."
+  ],
+  "unverified": [
+    "Whether the benchmark's hidden tests cover only the GHSA-c2j3-45gr-mqc4 tests (fix.diff:3384-3453) or every test added by the whole 3.4.12 release commit; if the latter, the report describes only one of several required unrelated changes and the task would be unfair.",
+    "Whether the test harness runs `npm run build` before the tests: the jsdom runner imports dist/purify.cjs, so a src-only edit left unbuilt would not be observed by the tests.",
+    "Repository size in MB could not be measured (no shell in this session); src is 4,327 lines across 8 files and test is 8,836 lines, so tiny_repo was judged from the source line count.",
+    "Whether hidden tests assert that afterSanitizeElements must NOT fire on removed nodes; the four regression tests in the diff do not, so the over-broad unconditional hook call may still pass them.",
+    "O1 was counted from the public API surface: DOMPurify.sanitize is the only exported entry point and the string, IN_PLACE and shadow-DOM walks are internal modes of it."
+  ]
+}

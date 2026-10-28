@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "15195",
+  "advisory_ids": ["GHSA-2FP4-5V5C-4448", "CVE-2026-49339", "GO-2026-5825"],
+  "repo": "sentriz/gonic",
+  "pinned_commit": "37090aa71c5e0bb7a322313fc8622c828fd9916b",
+  "fix_commits": ["6dd71e6a3c966867ef8c900d359a7df75789f410", "0824bed88f6bbc490ba28bf09d28e5dfeb07b445"],
+  "trust_decision": {
+    "summary": "The decision is whether a caller may read/write/delete a given playlist file, and the handlers take it from Playlist.UserID (server/ctrlsubsonic/handlers_playlist.go:84,138) - a value that playlist.Store.Read rebuilds on every load from the client-supplied base64 relative path at playlist/playlist.go:108 via userIDFromPath (playlist/playlist.go:218-220), before any containment check, so containment and identity re-derivation must both live in the store layer rather than in the handlers.",
+    "evidence": [
+      "server/ctrlsubsonic/handlers_playlist.go:57",
+      "server/ctrlsubsonic/handlers_playlist.go:79",
+      "server/ctrlsubsonic/handlers_playlist.go:138",
+      "server/ctrlsubsonic/handlers_playlist.go:183",
+      "playlist/playlist.go:95",
+      "playlist/playlist.go:108",
+      "playlist/playlist.go:218-220",
+      "fileutil/fileutil.go:63-65",
+      "fix.diff:58-66"
+    ]
+  },
+  "landing_point": {
+    "where": "server/ctrlsubsonic/handlers_playlist.go:57",
+    "why": "The summary names the playlist `id` and an ownership bypass on read/delete; the first line a reader lands on decodes the id and hands it straight to the store with no owner check, right next to the ownership pattern the codebase already uses at handlers_playlist.go:38 and :84."
+  },
+  "fix_sites": [
+    {"where": "fileutil/fileutil.go:69-76 (new SafeJoin; fix.diff:31-37)", "entry_point": "playlist.Store.Read/Write/Delete (package API used by all playlist handlers)", "module_kind": "library helper"},
+    {"where": "playlist/playlist.go:95-99", "entry_point": "/getPlaylist, /createPlaylist, /updatePlaylist, /deletePlaylist, /getPlaylists", "module_kind": "storage layer (fix.diff:46-50)"},
+    {"where": "playlist/playlist.go:105-113", "entry_point": "every handler that reads a playlist (identity and name taken from the cleaned rel path)", "module_kind": "storage layer / identity reconstruction (fix.diff:58-72)"},
+    {"where": "playlist/playlist.go:153-157", "entry_point": "/createPlaylist, /updatePlaylist", "module_kind": "storage layer (fix.diff:80-89)"},
+    {"where": "playlist/playlist.go:206-213", "entry_point": "/deletePlaylist", "module_kind": "storage layer (fix.diff:94-99)"},
+    {"where": "server/ctrlsubsonic/handlers_playlist.go:79", "entry_point": "/createPlaylist (ServeCreateOrUpdatePlaylist)", "module_kind": "HTTP handler (fix.diff:111-112)"},
+    {"where": "server/ctrlsubsonic/handlers_playlist.go:51-60", "entry_point": "/getPlaylist (ServeGetPlaylist)", "module_kind": "HTTP handler (fix.diff:186-197)"},
+    {"where": "server/ctrlsubsonic/handlers_playlist.go:177-190", "entry_point": "/deletePlaylist (ServeDeletePlaylist)", "module_kind": "HTTP handler (fix.diff:204-220)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "playlist/playlist.go:88-207 (playlist.Store.Read/Write/Delete)"},
+  "O3_reason_to_dismiss": "The advisory describes an ownership-check bypass, so the bug reads as handler authentication, and the playlist package is a storage API that simply joins whatever relative path it is given; a solver can also argue a store-level check is redundant once the handlers deny non-owners.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Public playlists must stay readable by other users: /getPlaylists deliberately lists another user's playlist when IsPublic (handlers_playlist.go:38) and the golden test test_get_playlists_alt_sees_public pins alt seeing admin's `1/shared.m3u`; a `playlist.UserID != user.ID` deny without the `!playlist.IsPublic` exception breaks sharing. Nested playlists `1/sub/name.m3u` (server/ctrlsubsonic/handlers_raw_test.go:78) and names containing dots (fileutil.Safe keeps dots, fileutil/fileutil.go:15-24) must also keep resolving.",
+    "where": "server/ctrlsubsonic/handlers_playlist.go:38"
+  },
+  "O6_input_shapes": [
+    "relative path whose `..` segments escape the playlist base, e.g. `../injected.m3u` on create (fix.diff:149)",
+    "relative path whose `..` segments stay inside the base but make the first segment claim another user's id, e.g. `2/../1/private.m3u` on get and `2/../1/shared.m3u` on delete (fix.diff:147-148)",
+    "empty id on create, where the server generates `<user id>/<name>-<unixmilli>.m3u` (server/ctrlsubsonic/handlers_playlist.go:105-108)",
+    "legitimate nested paths `<user id>/**/<name>.m3u` returned by Store.List (playlist/playlist.go:60-85), which the fix must not reject"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "playlist/playlist.go:108 with playlist/playlist.go:218-220 (userIDFromPath -> firstPathEl -> strconv.Atoi over the raw relative path; UserID is never serialized by Write at playlist/playlist.go:185-190, so it is re-derived from the path on every load)", "check_calls_producer": true},
+  "O8_uncovered_routes": [
+    {
+      "route": "/getCoverArt with a `pl-...` id reaches coverForPlaylist, which joins playlistStore.BasePath() with filepath.Dir(playlistPath) from the decoded client id and os.Open's a cover there: no containment and no owner/public check, so any user can list another user's playlist directory and read its cover, including via an in-base traversal id like `2/../1/x.m3u`.",
+      "where": "server/ctrlsubsonic/handlers_raw.go:243-269",
+      "reason_to_dismiss": "It is a cover-art image lookup, not a playlist read, it only lists a directory and needs a file whose base name matches the playlist, and the advisory and its tests name getPlaylist/deletePlaylist/createPlaylist only.",
+      "distance": "same package, different file and route; reaches the playlist base path directly instead of through playlist.Store (no SafeJoin, no Store.Read, no ownership check)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "server/ctrlsubsonic/handlers_playlist.go:196-199", "sibling": "A new endpoint that decodes `playlistId` and hand-builds a filesystem path instead of calling the store (cover upload, share link, export).", "why_realistic": "coverForPlaylist already does exactly that at server/ctrlsubsonic/handlers_raw.go:243-245, so a maintainer adding a playlist-adjacent feature would copy the decode-and-join pattern."},
+    {"where": "playlist/playlist.go:201-207", "sibling": "A Store.Rename / Store.Copy / Store.Stat added next to Delete, joining basePath with the caller's relative path.", "why_realistic": "Subsonic has a playlist rename verb; the obvious implementation is a copy of Delete, which at the pinned commit is a bare filepath.Join (playlist/playlist.go:206) and only got contained because this advisory happened to touch it."},
+    {"where": "db/migrations.go:527-554", "sibling": "A follow-up m3u format migration that walks the playlists base and rewrites each file by the path it walked.", "why_realistic": "The existing migration already builds a playlist.Store and writes every row by path from the startup path, outside any HTTP handler and therefore outside any handler-level check; the `#GONIC-IS-PUBLIC` attribute (playlist/playlist.go:249-253) is the kind of serialized state such a migration would re-interpret."}
+  ],
+  "O9_family": "path traversal (CWE-22) enabling cross-user playlist access / authorization bypass (CWE-639)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26.0 (go.mod:3); `go build ./...` and `go test ./...` per .github/workflows/test.yaml:24; SQLite via cgo-free github.com/ncruces/go-sqlite3/wazero (deps/deps.go:8-9), so no cgo needed",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "server/ctrlsubsonic/handlers_playlist_test.go (TestGetPlaylists/TestGetPlaylist/TestCreateOrUpdatePlaylist/TestUpdatePlaylist/TestDeletePlaylist with golden JSON in server/ctrlsubsonic/testdata/), server/ctrlsubsonic/handlers_raw_test.go (TestCoverForPlaylist incl. nested paths), playlist/playlist_test.go, and a shared fixture in server/ctrlsubsonic/ctrl_test.go using temp dirs and mockfs; the fixed-commit tests extend the same fixture (ctrl_test.go:447-449 already provides sharedPlaylistID)."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "fileutil/fileutil.go, playlist/playlist.go, server/ctrlsubsonic/handlers_playlist.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add `playlist.UserID != user.ID` checks to getPlaylist/deletePlaylist (or reject any `..` substring in the id), which still leaves `2/../1/x.m3u` resolving inside the base while userIDFromPath reports the attacker's id 2 - the store must also contain the path and re-derive identity from the cleaned relative path."
+  },
+  "out_of_scope_notes": [
+    "Not pursued (outside this advisory's containment property): relative item lines inside a .m3u are resolved against the playlist's directory at playlist/playlist.go:137-140 and later looked up by specidpaths.Lookup.",
+    "Not pursued: ServeUpdatePlaylist returns a successful empty response rather than error 50 when the owner check fails (server/ctrlsubsonic/handlers_playlist.go:138-140), and playlistIDDecode ignores the base64 decode error (handlers_playlist.go:196-199)."
+  ],
+  "unverified": [
+    "repo_mb: no shell in this session, so the checkout could not be measured; neither tiny_repo nor giant_repo is asserted.",
+    "present_in_latest: no latest release/tree was provided for O8, so whether coverForPlaylist still lacks containment today is unknown.",
+    "Buildability was assessed from go.mod, deps/deps.go and .github/workflows/test.yaml only; no build or test was run.",
+    "O13 recall_risk is a judgement from the advisory being public (GHSA/CVE/GO entry, public two-commit fix in a popular self-hosted server); no write-ups could be checked offline."
+  ]
+}
