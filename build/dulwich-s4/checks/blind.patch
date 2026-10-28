@@ -1,0 +1,258 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x .pytest_cache pristine/dulwich/filter_branch.py app/dulwich/filter_branch.py
+--- a/dulwich/filter_branch.py	2026-10-28 16:33:03.000000000 +0000
++++ b/dulwich/filter_branch.py	2026-10-28 16:44:51.699454009 +0000
+@@ -33,9 +33,9 @@
+ from collections.abc import Callable, Sequence
+ from typing import TypedDict
+ 
+-from .index import Index, build_index_from_tree, validate_path_element_ntfs
+-from .object_store import BaseObjectStore
+-from .objects import Commit, ObjectID, Tag, Tree
++from .index import Index, IndexEntry
++from .object_store import BaseObjectStore, iter_tree_contents
++from .objects import S_ISGITLINK, Commit, ObjectID, Tag, Tree
+ from .refs import Ref, RefsContainer, local_tag_name
+ 
+ 
+@@ -208,14 +208,35 @@
+             tmp_index_path = tmp_index.name
+ 
+         try:
+-            # Build index from tree
+-            build_index_from_tree(
+-                ".",
+-                tmp_index_path,
+-                self.object_store,
+-                tree_sha,
+-                validate_path_element=validate_path_element_ntfs,
+-            )
++            # Populate the index directly from the tree.  An index filter only
++            # needs the paths, modes and object ids, so there is no reason to
++            # materialise the tree in the process directory (which is where the
++            # reported escape happened) and no reason to touch the disk at all
++            # beyond the index file itself.
++            index = Index(tmp_index_path, read=False)
++            for entry in iter_tree_contents(self.object_store, tree_sha):
++                assert (
++                    entry.path is not None
++                    and entry.mode is not None
++                    and entry.sha is not None
++                )
++                if S_ISGITLINK(entry.mode):
++                    # A gitlink names a commit that need not be in this store.
++                    size = 0
++                else:
++                    size = self.object_store[entry.sha].raw_length()
++                index[entry.path] = IndexEntry(
++                    ctime=0,
++                    mtime=0,
++                    dev=0,
++                    ino=0,
++                    mode=entry.mode,
++                    uid=0,
++                    gid=0,
++                    size=size,
++                    sha=entry.sha,
++                )
++            index.write()
+ 
+             # Run index filter
+             new_tree_sha = self.index_filter(tree_sha, tmp_index_path)
+diff -ruN -x __pycache__ -x '*.pyc' -x .pytest_cache pristine/dulwich/index.py app/dulwich/index.py
+--- a/dulwich/index.py	2026-10-28 16:33:03.000000000 +0000
++++ b/dulwich/index.py	2026-10-28 16:46:25.199144038 +0000
+@@ -2192,6 +2192,9 @@
+         if not validate_path(entry.path, validate_path_element):
+             raise InvalidPathError(entry.path)
+         full_path = _tree_to_fs_path(root_path, entry.path, tree_encoding)
++        # A directory symlink left over from an earlier checkout must not be
++        # followed while this tree is being materialised.
++        ensure_no_symlinked_parents(root_path, full_path)
+ 
+         if not os.path.exists(os.path.dirname(full_path)):
+             os.makedirs(os.path.dirname(full_path))
+@@ -2365,6 +2368,61 @@
+         os.makedirs(parent_dir)
+ 
+ 
++def ensure_no_symlinked_parents(
++    root_path: str | bytes, full_path: str | bytes
++) -> None:
++    """Refuse a write reached through a symlinked directory.
++
++    Repository content is materialised by walking tree paths and writing each
++    one below a directory the caller chose.  If a directory component of the
++    destination is a symbolic link left in place by an earlier operation, the
++    write would land wherever that link points, which may be outside the
++    target directory entirely.  Raising here keeps the content recorded in a
++    repository from escaping the directory it is being placed into.
++
++    Only the *parent* components are inspected.  A symlink at the final
++    component is not an escape: :func:`build_file_from_blob` replaces it when a
++    regular file is written there and creates a new link when a symlink entry
++    is written there.
++
++    Args:
++      root_path: Directory the caller is confining the write to.
++      full_path: Path that is about to be written.
++
++    Raises:
++      OSError: If ``full_path`` is not below ``root_path`` or if any directory
++        component between ``root_path`` and the final component is a symbolic
++        link.
++    """
++    root = os.path.abspath(os.fsdecode(root_path))
++    parent = os.path.dirname(os.path.abspath(os.fsdecode(full_path)))
++    try:
++        relative = os.path.relpath(parent, root)
++    except ValueError:
++        # Different drives (Windows): certainly not confined.
++        raise OSError(f"refusing to write outside {root!r}: {full_path!r}") from None
++
++    if relative == os.curdir:
++        return
++
++    parts = relative.split(os.sep)
++    if parts[0] == os.pardir:
++        raise OSError(f"refusing to write outside {root!r}: {full_path!r}")
++
++    current = root
++    for part in parts:
++        current = os.path.join(current, part)
++        try:
++            info = os.lstat(current)
++        except FileNotFoundError:
++            # The rest of the chain will be created by us; nothing to follow.
++            return
++        if stat.S_ISLNK(info.st_mode):
++            raise OSError(
++                f"refusing to write through symlinked directory {current!r}"
++            )
++
++
+ def _remove_file_with_readonly_handling(path: bytes) -> None:
+     """Remove a file, handling read-only files on Windows.
+ 
+@@ -2974,6 +3032,9 @@
+                 continue
+ 
+             full_path = _tree_to_fs_path(repo_path, path, tree_encoding)
++            # Deleting through a leftover directory symlink would remove a
++            # file outside the working tree just as writing through it would.
++            ensure_no_symlinked_parents(repo_path, full_path)
+             try:
+                 delete_stat: os.stat_result | None = os.lstat(full_path)
+             except FileNotFoundError:
+@@ -3004,6 +3065,8 @@
+             if not validate_path(path, validate_path_element):
+                 raise InvalidPathError(path)
+             full_path = _tree_to_fs_path(repo_path, path, tree_encoding)
++            # A leftover directory symlink must not redirect this write.
++            ensure_no_symlinked_parents(repo_path, full_path)
+             try:
+                 modify_stat: os.stat_result | None = os.lstat(full_path)
+             except FileNotFoundError:
+diff -ruN -x __pycache__ -x '*.pyc' -x .pytest_cache pristine/dulwich/porcelain/__init__.py app/dulwich/porcelain/__init__.py
+--- a/dulwich/porcelain/__init__.py	2026-10-28 16:33:06.000000000 +0000
++++ b/dulwich/porcelain/__init__.py	2026-10-28 16:45:01.959428046 +0000
+@@ -368,6 +368,7 @@
+     _fs_to_tree_path,
+     blob_from_path_and_stat,
+     build_file_from_blob,
++    ensure_no_symlinked_parents,
+     get_unstaged_changes,
+     symlink,
+     update_working_tree,
+@@ -5658,6 +5659,9 @@
+                     # Defense in depth: refuse a path that would escape the
+                     # work tree before creating directories or writing.
+                     file_path = _checked_worktree_path(r, path)
++                    # A symlink left in the work tree at a parent component
++                    # must not redirect the write outside it.
++                    ensure_no_symlinked_parents(r.path, file_path)
+ 
+                     # Create directories if needed
+                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
+@@ -5819,6 +5823,7 @@
+                         # Defense in depth: refuse a path that would escape
+                         # the work tree.
+                         full_path = _checked_worktree_path(r, tree_path)
++                        ensure_no_symlinked_parents(r.path, full_path)
+                         mode = index_entry.mode
+ 
+                         # Use build_file_from_blob to write the file
+@@ -5857,6 +5862,7 @@
+ 
+             # Defense in depth: refuse a path that would escape the work tree.
+             full_path = _checked_worktree_path(r, tree_path)
++            ensure_no_symlinked_parents(r.path, full_path)
+ 
+             if worktree:
+                 # Use build_file_from_blob to restore to working tree
+@@ -6027,6 +6033,7 @@
+     file_entry = tree.lookup_path(repo.object_store.__getitem__, tree_path)
+     # Defense in depth: refuse a path that would escape the work tree.
+     full_path = _checked_worktree_path(repo, tree_path)
++    ensure_no_symlinked_parents(repo.path, full_path)
+     blob = repo.object_store[file_entry[1]]
+     assert isinstance(blob, Blob)
+     mode = file_entry[0]
+@@ -6078,6 +6085,7 @@
+             if not validate_path(tree_path, validator):
+                 raise Error(f"refusing to write unsafe path: {tree_path!r}")
+             full_path = os.path.join(prefix_path, tree_path)
++            ensure_no_symlinked_parents(prefix_path, full_path)
+             parent_dir = os.path.dirname(full_path)
+             if parent_dir and not os.path.isdir(parent_dir):
+                 os.makedirs(parent_dir)
+diff -ruN -x __pycache__ -x '*.pyc' -x .pytest_cache pristine/dulwich/sparse_patterns.py app/dulwich/sparse_patterns.py
+--- a/dulwich/sparse_patterns.py	2026-10-28 16:33:03.000000000 +0000
++++ b/dulwich/sparse_patterns.py	2026-10-28 16:46:29.292146879 +0000
+@@ -38,7 +38,7 @@
+ from typing import TYPE_CHECKING
+ 
+ from .file import ensure_dir_exists
+-from .index import Index, IndexEntry
++from .index import Index, IndexEntry, ensure_no_symlinked_parents
+ from .objects import Blob
+ from .repo import Repo
+ 
+@@ -219,6 +219,9 @@
+         if entry.skip_worktree:
+             # Excluded => remove if safe
+             if os.path.exists(full_path):
++                # Removing through a leftover directory symlink would delete a
++                # file outside the working tree.
++                ensure_no_symlinked_parents(repo.path, full_path)
+                 if not force and local_modifications_exist(full_path, entry):
+                     raise SparseCheckoutConflictError(
+                         f"Local modifications in {full_path} would be overwritten "
+@@ -242,6 +245,7 @@
+                     raise BlobNotFoundError(
+                         f"Blob {entry.sha.hex()} not found for {path_bytes.decode('utf-8')}."
+                     )
++                ensure_no_symlinked_parents(repo.path, full_path)
+                 ensure_dir_exists(os.path.dirname(full_path))
+                 # Apply checkout normalization if normalizer is available
+                 if normalizer and isinstance(blob, Blob):
+diff -ruN -x __pycache__ -x '*.pyc' -x .pytest_cache pristine/dulwich/stash.py app/dulwich/stash.py
+--- a/dulwich/stash.py	2026-10-28 16:33:03.000000000 +0000
++++ b/dulwich/stash.py	2026-10-28 16:45:25.244368563 +0000
+@@ -38,6 +38,7 @@
+     _tree_to_fs_path,
+     build_file_from_blob,
+     commit_tree,
++    ensure_no_symlinked_parents,
+     get_path_element_validator,
+     index_entry_from_stat,
+     iter_fresh_objects,
+@@ -228,6 +229,9 @@
+                 raise InvalidPathError(tree_entry2.path)
+ 
+             full_path = _tree_to_fs_path(repo_path, tree_entry2.path)
++            # A symlink left at a parent component of the stash path must not
++            # redirect the write outside the working tree.
++            ensure_no_symlinked_parents(repo_path, full_path)
+ 
+             # Create parent directories if needed
+             parent_dir = os.path.dirname(full_path)

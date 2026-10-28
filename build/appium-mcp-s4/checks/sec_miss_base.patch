@@ -1,0 +1,110 @@
+diff --git a/src/ui/mcp-ui-utils.ts b/src/ui/mcp-ui-utils.ts
+index 88afb34..6e4fb98 100644
+--- a/src/ui/mcp-ui-utils.ts
++++ b/src/ui/mcp-ui-utils.ts
+@@ -914,6 +914,8 @@ export function createPageSourceInspectorUI(pageSource: string): string {
+     .replace(/>/g, '&gt;')
+     .replace(/"/g, '&quot;')
+     .replace(/'/g, '&#039;');
++  // The viewer script keeps the page source in a plain string and renders it as text.
++  const sourceLiteral = JSON.stringify(pageSource).replace(/</g, '\\u003c');
+ 
+   return `
+ <!DOCTYPE html>
+@@ -1058,19 +1060,34 @@ export function createPageSourceInspectorUI(pageSource: string): string {
+       }, '*');
+     }
+ 
++    const sourceText = ${sourceLiteral};
++
+     // Search functionality
+     document.getElementById('searchBox').addEventListener('input', (e) => {
+-      const searchTerm = e.target.value.toLowerCase();
++      const searchTerm = e.target.value;
+       const content = document.getElementById('xmlContent');
+       if (!searchTerm) {
+-        content.innerHTML = \`${escapedSource}\`;
++        content.textContent = sourceText;
+         return;
+       }
+-      const highlighted = content.textContent.replace(
+-        new RegExp(\`(\${searchTerm})\`, 'gi'),
+-        '<mark style="background: #ffd700; color: #000;">$1</mark>'
+-      );
+-      content.innerHTML = highlighted;
++      const haystack = sourceText.toLowerCase();
++      const needle = searchTerm.toLowerCase();
++      const fragment = document.createDocumentFragment();
++      let from = 0;
++      let at = haystack.indexOf(needle, from);
++      while (at !== -1) {
++        fragment.appendChild(document.createTextNode(sourceText.slice(from, at)));
++        const mark = document.createElement('mark');
++        mark.style.background = '#ffd700';
++        mark.style.color = '#000';
++        mark.textContent = sourceText.slice(at, at + searchTerm.length);
++        fragment.appendChild(mark);
++        from = at + searchTerm.length;
++        at = haystack.indexOf(needle, from);
++      }
++      fragment.appendChild(document.createTextNode(sourceText.slice(from)));
++      content.textContent = '';
++      content.appendChild(fragment);
+     });
+   </script>
+ </body>
+@@ -1703,12 +1720,12 @@ export function createElementAttributeInspectorUI(
+ </head>
+ <body>
+   <div class="container">
+-    <div class="attr-card" data-attribute="${attribute}" data-value="${stripTags(displayValue)}">
++    <div class="attr-card" data-attribute="${escapeHtml(attribute)}" data-value="${escapeHtml(displayValue)}">
+       <div class="attr-header">
+-        <h3>${attribute}</h3>
+-        <span class="element-id">${elementId}</span>
++        <h3>${escapeHtml(attribute)}</h3>
++        <span class="element-id">${escapeHtml(elementId)}</span>
+       </div>
+-      <pre class="attr-value">${stripTags(displayValue)}</pre>
++      <pre class="attr-value">${escapeHtml(displayValue)}</pre>
+       <button class="copy-btn" onclick="copyValue()">Copy value</button>
+     </div>
+   </div>
+@@ -1800,7 +1817,7 @@ export function createLocatorDataUI(
+     <p>Structured data for ${locators.length} element${locators.length !== 1 ? 's' : ''}.</p>
+     <button class="btn" onclick="copyLocatorData()">Copy JSON</button>
+   </div>
+-  <script id="locator-data" type="application/json">${JSON.stringify(locators, null, 2)}</script>
++  <script id="locator-data" type="application/json">${JSON.stringify(locators, null, 2).replace(/</g, '\\u003c')}</script>
+   <script>
+     function copyLocatorData() {
+       const node = document.getElementById('locator-data');
+@@ -1814,15 +1831,6 @@ export function createLocatorDataUI(
+   `;
+ }
+ 
+-/**
+- * Removes angle brackets so a value is shown as plain text
+- * @param value - Value to display
+- * @returns Value without angle brackets
+- */
+-function stripTags(value: string): string {
+-  return value.replace(/[<>]/g, '');
+-}
+-
+ /**
+  * Helper function to add UI resource to response content
+  * Returns both text and UI resource for backward compatibility
+@@ -1839,3 +1847,12 @@ export function addUIResourceToResponse(
+     content: [...response.content, uiResource],
+   };
+ }
++
++function escapeHtml(value: unknown): string {
++  return String(value)
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++    .replace(/'/g, '&#039;');
++}

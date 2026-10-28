@@ -1,0 +1,206 @@
+{
+ "slug": "appium-mcp-s4",
+ "candidate": {
+  "repo": "appium/appium-mcp",
+  "advisory_ids": [
+   "GHSA-X975-RGX4-5FH4",
+   "CVE-2026-58500"
+  ],
+  "pinned_commit": "1655fbd41f462f43dc49fd78f15727db0e2fb6c3",
+  "fix_commits": [
+   "e222bbbd6fe2b656a320efcd143563f08061a83d"
+  ],
+  "cwe": "CWE-79",
+  "entry_id": "14828"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The product's MCP tools, driven over the MCP protocol: a FastMCP server with the project's own tool registrars (generate_locators, appium_get_page_source, appium_get_element_attribute) connected to a real MCP client through the SDK's in-memory transport. The only stub is the infrastructure boundary: the Appium driver object held in the session store answers getPageSource/getElementAttribute with values a device would return. The HTML resources the tools return are rendered in a DOM (jsdom) with scripts enabled, so the assertions observe exactly what a client would parse and execute.",
+  "sites": [
+   "src/ui/mcp-ui-utils.ts:720-740 createLocatorGeneratorUI: element tag/text/contentDesc/resourceId plus strategy/selector interpolated into HTML text and into an inline onclick JavaScript string",
+   "src/ui/mcp-ui-utils.ts:963-1085 createPageSourceInspectorUI: page-source text interpolated into a JavaScript template literal inside the generated script",
+   "src/ui/mcp-ui-utils.ts:1628-1700 createElementAttributeInspectorUI (injected): attribute value placed in a quoted HTML attribute after only angle brackets are stripped",
+   "src/ui/mcp-ui-utils.ts:1735-1815 createLocatorDataUI (injected): locator data serialized with JSON.stringify into a script element"
+  ],
+  "variants": [
+   "base (published fix): locator cards escape every interpolation and replace the inline onclick JS-string handler with data attributes plus a delegated listener",
+   "uncovered route (real upstream): page-source inspector keeps the page source in a generated script's template literal; the HTML escape never covered template interpolation, and the published fix never touches this builder",
+   "injected sibling S1: element-attribute inspector view added next to the existing text result; its local stripTags() removes angle brackets but not quotes, so the value breaks out of the quoted attribute",
+   "injected sibling S2: locator-data view added next to the locator list; JSON.stringify does not prevent a value from ending the script element, which turns the rest into markup"
+  ],
+  "services": [],
+  "project_tests_run": "The project's own affected-area test src/tests/generate-all-locators.test.ts (8 cases) runs offline in the verifier from a pristine copy and passes on the pinned+injected tree and on the oracle. The project has no test for src/ui/mcp-ui-utils.ts at the pinned commit (the published fix adds one; it is not used here)."
+ },
+ "traps": [
+  {
+   "id": "base_locator_card",
+   "pattern": "A",
+   "shape": "the published fix's landing point: element metadata and locator strings from the page source placed in HTML text, in a quoted attribute and in an inline event handler's JavaScript string",
+   "where": "src/ui/mcp-ui-utils.ts:720-740 and src/ui/mcp-ui-utils.ts:886-898",
+   "reason_to_dismiss": "none needed - this is the site the report points at; the trap is the tempting shallow repair that HTML-escapes every interpolation and keeps the inline onclick handler, which HTML entity decoding cannot make safe in the JavaScript-string context, and the coupled requirement that the Test control still send the exact selector",
+   "security_tests": [
+    "security/locator_view_markup.test.mjs::locator view keeps application element text inert",
+    "security/locator_view_markup.test.mjs::locator view keeps application resource id inert",
+    "security/locator_view_markup.test.mjs::locator view keeps application content description inert",
+    "security/locator_view_handler.test.mjs::locator view keeps a handler-shaped value out of the inline handler",
+    "security/locator_view_handler.test.mjs::locator view keeps a quote-breaking value inside its attribute"
+   ],
+   "coupled_functional_tests": [
+    "functional/locator_values.test.mjs::functional: locator view shows values and sends the exact locator onward"
+   ],
+   "security_fail_patch": "sec_miss_base.patch",
+   "realistic_because": "the published fix's own landing point"
+  },
+  {
+   "id": "page_source_script",
+   "pattern": "B",
+   "shape": "an uncovered route into the same protected sink: page-source text carried in a JavaScript template literal inside the generated script of the page-source viewer; the local HTML escape does not cover backticks or ${} interpolation, so the value becomes code when the script runs",
+   "where": "src/ui/mcp-ui-utils.ts:1066 (generated script of createPageSourceInspectorUI)",
+   "reason_to_dismiss": "the viewer already HTML-escapes the page source, so the route looks handled; the gap is in the JavaScript context the escaped text is later placed in",
+   "security_tests": [
+    "security/page_source_view.test.mjs::page-source view keeps a interpolation value out of its script",
+    "security/page_source_view.test.mjs::page-source view keeps a template terminator value out of its script"
+   ],
+   "coupled_functional_tests": [
+    "functional/page_source_display.test.mjs::functional: page-source view still displays the page source and keeps its controls"
+   ],
+   "security_fail_patch": "sec_miss_page_source.patch",
+   "realistic_because": "real, unmodified upstream code; registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "injected_attribute_view",
+   "pattern": "injected",
+   "shape": "a rendered view for an element attribute: the attribute value is stripped of angle brackets and then placed in a quoted HTML attribute, where a quotation mark still ends the attribute and adds an event handler",
+   "where": "src/ui/mcp-ui-utils.ts:1628-1700 (createElementAttributeInspectorUI); src/tools/interactions/get-element-attribute.ts:60-80 (added by injection.patch)",
+   "reason_to_dismiss": "a read-only diagnostic view that already removes angle brackets, so it looks sanitised and unimportant",
+   "security_tests": [
+    "security/attribute_view.test.mjs::attribute view keeps a quote-breaking value inside its attribute"
+   ],
+   "coupled_functional_tests": [
+    "functional/attribute_display.test.mjs::functional: attribute view still displays the exact value"
+   ],
+   "security_fail_patch": "sec_miss_attr.patch",
+   "realistic_because": "the house pattern: every read-only inspection tool returns a UI resource next to its text result; INJECTED into our copy only"
+  },
+  {
+   "id": "injected_locator_data",
+   "pattern": "injected",
+   "shape": "a structured locator-data view: the same page-derived data serialized with JSON.stringify into a script element; a value containing a closing script tag ends the element and the remainder is parsed as markup",
+   "where": "src/ui/mcp-ui-utils.ts:1735-1815 (createLocatorDataUI); src/tools/test-generation/locators.ts:90-105 (added by injection.patch)",
+   "reason_to_dismiss": "the data is JSON-encoded, so it reads as safe data rather than markup, and the second resource is easy to miss next to the locator list",
+   "security_tests": [
+    "security/locator_data_view.test.mjs::locator data view keeps application text from ending its script element"
+   ],
+   "coupled_functional_tests": [
+    "functional/locator_data_values.test.mjs::functional: locator data survives unchanged in the structured result"
+   ],
+   "security_fail_patch": "sec_miss_locator_data.patch",
+   "realistic_because": "a copy-as-JSON view beside the locator list is a natural maintainer addition; INJECTED into our copy only"
+  }
+ ],
+ "leak_terms": [
+  "mcp-ui-utils",
+  "mcp-ui-utils.ts",
+  "createLocatorGeneratorUI",
+  "createPageSourceInspectorUI",
+  "createElementAttributeInspectorUI",
+  "createLocatorDataUI",
+  "escapeHtml",
+  "stripTags",
+  "sourceLiteral",
+  "testLocator",
+  "data-selector",
+  "data-strategy",
+  "data-locator-json",
+  "locator-generator",
+  "locator-data",
+  "element-attribute",
+  "locator-card",
+  "attr-value",
+  "onclick",
+  "innerHTML",
+  "template literal",
+  "generate_locators",
+  "appium_get_page_source",
+  "appium_get_element_attribute",
+  "ui://appium-mcp",
+  "locators.ts",
+  "get-page-source",
+  "get-element-attribute",
+  "GHSA-X975-RGX4-5FH4",
+  "CVE-2026-58500",
+  "appium-mcp-s4"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_base.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_page_source.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_attr.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_locator_data.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_published_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_suspicious.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_escape_document.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_suspicious.patch",
+  "crash_as_refusal": "func_refuse_suspicious.patch",
+  "wrong_resource": "n/a: there is no authorization decision to attach to a neighbouring resource; every check is an output-encoding check and the security tests assert across every returned view",
+  "one_role_or_direction": "n/a: the flaw has no roles, peers or directions; each tool produces views and every view is parsed",
+  "reads_only": "n/a: the protected path is output rendering, not reads and writes; there is no verb to guard only one of",
+  "check_after_adjustment": "n/a: no attacker value is normalised, clamped or converted before rendering; the value is placed directly",
+  "unlisted_route": "sec_published_only.patch",
+  "malformed_identity": "n/a: no identity, name or path is parsed on the protected path; page-derived values are opaque strings",
+  "missing_authority": "n/a: encoding decisions depend on no authority, secret or role, so there is nothing to fail open",
+  "adjacent_api": "func_escape_document.patch"
+ },
+ "status": "built",
+ "notes": "Injected track, pattern B. environment/injection.patch adds two sibling views to our copy only: an element-attribute inspector and a locator-data view. The oracle (solution/fix.patch) is the published source fix for createLocatorGeneratorUI plus fixes for the page-source route and both injected siblings. The page-source route is real unmodified upstream code and is registered in build/audit/uncovered-routes.tsv; current upstream has since rewritten that viewer, so present_in_latest=no. Routes considered and NOT tested because they are outside the advisory's protected data (values from the application under test): app-list labels (a different application's bundle display name), device-picker metadata (adb/simctl), context switcher names (driver-generated), session dashboard capabilities (caller-supplied), and the screenshot viewer (server-generated path, driver-produced base64). The generated scripts also postMessage to the parent with targetOrigin '*' and the page-source search box builds a RegExp from the typed term; both are outside this advisory's protection and were not pursued. Gate run 2026-10-28: static, nop, oracle (strict, 3 runs) and patches all passed; the blind pass patch is declared but intentionally not written by the builder.",
+ "gate": {
+  "static": "passed",
+  "nop": "passed (security 0/9 pass on pinned+injected; functional 4/4 plus the project suite pass)",
+  "oracle": "passed (3 identical runs, reward 1.0)",
+  "patches": "passed (all declared outcomes matched)"
+ }
+}

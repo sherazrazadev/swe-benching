@@ -1,0 +1,376 @@
+diff -ruN pristine/includes/class.CommonFunctions.inc.php app/includes/class.CommonFunctions.inc.php
+--- a/includes/class.CommonFunctions.inc.php	2026-10-28 16:33:01.000000000 +0000
++++ b/includes/class.CommonFunctions.inc.php	2026-10-28 16:46:30.410293270 +0000
+@@ -435,15 +435,13 @@
+      */
+     public static function clientIp()
+     {
+-        if (isset($_SERVER["HTTP_X_FORWARDED_FOR"])) {
+-            $ip = $_SERVER["HTTP_X_FORWARDED_FOR"];
+-        } elseif (isset($_SERVER["HTTP_CLIENT_IP"])) {
+-            $ip = $_SERVER["HTTP_CLIENT_IP"];
+-        } else {
+-            $ip = $_SERVER["REMOTE_ADDR"];
++        if (!function_exists('psi_client_address')) {
++            require_once dirname(__FILE__).'/ipacl.inc.php';
+         }
++        $trusted_proxies = (defined('PSI_TRUSTED_PROXIES') && is_string(PSI_TRUSTED_PROXIES))
++            ? PSI_TRUSTED_PROXIES : array();
+ 
+-        return preg_replace("/^::ffff:/", "", strtolower($ip));
++        return psi_client_address($trusted_proxies);
+     }
+ 
+     /**
+diff -ruN pristine/includes/ipacl.inc.php app/includes/ipacl.inc.php
+--- a/includes/ipacl.inc.php	1970-01-01 00:00:00.000000000 +0000
++++ b/includes/ipacl.inc.php	2026-10-28 16:46:10.801057038 +0000
+@@ -0,0 +1,205 @@
++<?php
++/**
++ * Client identity and allow-list helpers.
++ *
++ * The address used for an access decision must be one the sender cannot choose: the peer of the
++ * TCP connection, or - only when that peer is a reverse proxy the operator listed in
++ * TRUSTED_PROXIES - the client address that proxy reports for the connection it accepted.
++ *
++ * Kept free of class dependencies so it can be loaded by the shared bootstrap as well as by the
++ * standalone diagnostics scripts, which never load the full application.
++ */
++
++if (!function_exists('psi_normalize_ipv4')) {
++    /**
++     * Return an IPv4 address in its canonical dotted form, or null when the value is not one.
++     *
++     * An IPv4-mapped IPv6 address (::ffff:a.b.c.d) denotes the same host as its IPv4 form.
++     *
++     * @param mixed $value address as received from the request or the configuration
++     *
++     * @return string|null
++     */
++    function psi_normalize_ipv4($value)
++    {
++        if (!is_string($value)) {
++            return null;
++        }
++        $value = trim($value);
++        if ($value === '') {
++            return null;
++        }
++        if (strncasecmp($value, '::ffff:', 7) === 0) {
++            $value = substr($value, 7);
++        }
++        if (filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
++            return null;
++        }
++
++        return strtolower($value);
++    }
++
++    /**
++     * Split a configured list ("a, b, c") into its entries. Booleans, empty values and the
++     * string "false" mean "no entries".
++     *
++     * @param mixed $value configuration value or an already split array
++     *
++     * @return array
++     */
++    function psi_parse_address_list($value)
++    {
++        if (is_array($value)) {
++            $parts = $value;
++        } elseif (is_string($value)) {
++            $value = trim($value);
++            if (($value === '') || (strcasecmp($value, 'false') === 0)) {
++                return array();
++            }
++            $parts = preg_split('/\s*,\s*/', $value, -1, PREG_SPLIT_NO_EMPTY);
++        } else {
++            return array();
++        }
++
++        $list = array();
++        foreach ($parts as $part) {
++            if (is_string($part) && (trim($part) !== '')) {
++                $list[] = trim($part);
++            }
++        }
++
++        return $list;
++    }
++
++    /**
++     * 32-bit netmask with the given number of leading bits set.
++     *
++     * @param int $bits 0..32
++     *
++     * @return int
++     */
++    function psi_ipv4_netmask($bits)
++    {
++        if ($bits <= 0) {
++            return 0;
++        }
++        if ($bits >= 32) {
++            return 0xFFFFFFFF;
++        }
++
++        return (0xFFFFFFFF << (32 - $bits)) & 0xFFFFFFFF;
++    }
++
++    /**
++     * Whether an IPv4 address belongs to any single address or CIDR range in a list.
++     *
++     * @param string $ip      canonical IPv4 address
++     * @param array  $entries list of addresses and ranges ("10.0.0.0/8")
++     *
++     * @return boolean
++     */
++    function psi_ip_matches_list($ip, $entries)
++    {
++        $ip = psi_normalize_ipv4($ip);
++        if ($ip === null) {
++            return false;
++        }
++        $ip_long = ip2long($ip);
++        if ($ip_long === false) {
++            return false;
++        }
++
++        foreach ($entries as $entry) {
++            if (!is_string($entry)) {
++                continue;
++            }
++            $entry = trim(strtolower($entry));
++            if ($entry === '') {
++                continue;
++            }
++
++            $slash = strpos($entry, '/');
++            if ($slash === false) {
++                if (psi_normalize_ipv4($entry) === $ip) {
++                    return true;
++                }
++                continue;
++            }
++
++            $network = substr($entry, 0, $slash);
++            $bits = substr($entry, $slash + 1);
++            if ((trim($bits) === '') || !ctype_digit(trim($bits))) {
++                continue;
++            }
++            $bits = (int) trim($bits);
++            if (($bits < 0) || ($bits > 32)) {
++                continue;
++            }
++            $network = psi_normalize_ipv4($network);
++            if ($network === null) {
++                continue;
++            }
++            $network_long = ip2long($network);
++            if ($network_long === false) {
++                continue;
++            }
++
++            $netmask = psi_ipv4_netmask($bits);
++            if (($ip_long & $netmask) === ($network_long & $netmask)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    /**
++     * The client address the trusted proxy in front of this connection reports: the right-most
++     * hop of X-Forwarded-For (the one the proxy appended), else the Client-IP header.
++     *
++     * @return string|null canonical IPv4 address, or null when no usable value was reported
++     */
++    function psi_reported_client_address()
++    {
++        foreach (array('HTTP_X_FORWARDED_FOR', 'HTTP_CLIENT_IP') as $key) {
++            if (!isset($_SERVER[$key]) || !is_string($_SERVER[$key]) || (trim($_SERVER[$key]) === '')) {
++                continue;
++            }
++            // Anything to the left of the last hop came in with the request and is not
++            // vouched for by the proxy; only the hop the proxy appended may be used.
++            $hops = explode(',', $_SERVER[$key]);
++            $last = trim(end($hops));
++
++            return psi_normalize_ipv4($last);
++        }
++
++        return null;
++    }
++
++    /**
++     * Address of the client that sent the current request.
++     *
++     * @param mixed $trusted_proxies configured TRUSTED_PROXIES value (string or array)
++     *
++     * @return string
++     */
++    function psi_client_address($trusted_proxies = array())
++    {
++        $peer_raw = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
++        $peer = psi_normalize_ipv4($peer_raw);
++
++        if ($peer === null) {
++            // Not an address we can reason about; let the caller reject it.
++            return is_string($peer_raw) ? trim($peer_raw) : '';
++        }
++
++        if (psi_ip_matches_list($peer, psi_parse_address_list($trusted_proxies))) {
++            $reported = psi_reported_client_address();
++            if ($reported !== null) {
++                return $reported;
++            }
++        }
++
++        return $peer;
++    }
++}
+diff -ruN pristine/phpsysinfo.ini.new app/phpsysinfo.ini.new
+--- a/phpsysinfo.ini.new	2026-10-28 16:32:59.000000000 +0000
++++ b/phpsysinfo.ini.new	2026-10-28 16:46:35.052327049 +0000
+@@ -47,6 +47,14 @@
+ ;
+ ALLOWED=false
+ 
++; Addresses of reverse proxies that are allowed to report the client address.
++; Only a connection whose peer is listed here may use X-Forwarded-For / Client-IP;
++; for every other connection the connection peer is the client.
++; Example : TRUSTED_PROXIES="127.0.0.1,10.0.0.0/8"
++;           TRUSTED_PROXIES=false //no trusted proxy
++;
++TRUSTED_PROXIES=false
++
+ ; Enable JSONP data mode (e.g. /phpsysinfo/xml.php?plugin=complete&jsonp&callback=getData)
+ ; Disabled by default for security reasons.
+ ; - false : JSONP data mode disabled
+diff -ruN pristine/read_config.php app/read_config.php
+--- a/read_config.php	2026-10-28 16:32:59.000000000 +0000
++++ b/read_config.php	2026-10-28 16:46:15.788116816 +0000
+@@ -1,5 +1,7 @@
+ <?php
+ if (!defined('PSI_CONFIG_FILE')) {
++    require_once dirname(__FILE__).'/includes/ipacl.inc.php';
++
+     /**
+      * phpSysInfo version
+      */
+@@ -39,16 +41,11 @@
+     if (defined('PSI_ALLOWED') && is_string(PSI_ALLOWED)) {
+         $allowed = preg_split('/\s*,\s*/', strtolower(PSI_ALLOWED), -1, PREG_SPLIT_NO_EMPTY);
+ 
+-        if (isset($_SERVER["HTTP_X_FORWARDED_FOR"])) {
+-            $ip = $_SERVER["HTTP_X_FORWARDED_FOR"];
+-        } else {
+-            if (isset($_SERVER["HTTP_CLIENT_IP"])) {
+-                $ip = $_SERVER["HTTP_CLIENT_IP"];
+-            } else {
+-                $ip = $_SERVER["REMOTE_ADDR"];
+-            }
+-        }
+-        $ip = preg_replace("/^::ffff:/", "", strtolower($ip));
++        // The decision is made on the connection's peer. Forwarding headers are considered only
++        // when that peer is a proxy the operator listed in TRUSTED_PROXIES.
++        $trusted_proxies = (defined('PSI_TRUSTED_PROXIES') && is_string(PSI_TRUSTED_PROXIES))
++            ? PSI_TRUSTED_PROXIES : array();
++        $ip = psi_client_address($trusted_proxies);
+ 
+         $ip_decimal = ip2long($ip);
+         if ($ip_decimal === false) {
+@@ -56,24 +53,7 @@
+             die();
+         }
+ 
+-        // code based on https://gist.github.com/tott/7684443
+-        $was = false;
+-        foreach ($allowed as $allow) {
+-            if (strpos($allow, '/') === false) {
+-                    $was = ($allow === $ip);
+-            } else {
+-                  list($allow, $netmask) = explode('/', $allow, 2);
+-                  $allow_decimal = ip2long($allow);
+-                  $wildcard_decimal = pow(2, (32 - $netmask)) - 1;
+-                  $netmask_decimal = ~$wildcard_decimal;
+-                $was = (($ip_decimal & $netmask_decimal) === ($allow_decimal & $netmask_decimal));
+-            }
+-            if ($was) {
+-               break;
+-            }
+-        }
+-
+-        if (!$was) {
++        if (!psi_ip_matches_list($ip, $allowed)) {
+             echo "Client IP address (".$ip.") not allowed.";
+             die();
+         }
+diff -ruN pristine/tools/cputest.php app/tools/cputest.php
+--- a/tools/cputest.php	2026-10-28 16:32:59.000000000 +0000
++++ b/tools/cputest.php	2026-10-28 16:46:17.593138402 +0000
+@@ -1,4 +1,6 @@
+ <?php
++define('PSI_APP_ROOT', dirname(__FILE__).'/..');
++require_once PSI_APP_ROOT.'/read_config.php';
+ header('Content-Type: text/plain');
+ $filename = '/proc/cpuinfo';
+ $contents=file_get_contents($filename);
+diff -ruN pristine/tools/distrotest.php app/tools/distrotest.php
+--- a/tools/distrotest.php	2026-10-28 16:32:59.000000000 +0000
++++ b/tools/distrotest.php	2026-10-28 16:46:17.955142731 +0000
+@@ -1,4 +1,6 @@
+ <?php
++define('PSI_APP_ROOT', dirname(__FILE__).'/..');
++require_once PSI_APP_ROOT.'/read_config.php';
+ header('Content-Type: text/plain');
+ $filemaskarray=array("/etc/*-release",
+                      "/etc/*_release",
+diff -ruN pristine/tools/phptest.php app/tools/phptest.php
+--- a/tools/phptest.php	2026-10-28 16:33:01.000000000 +0000
++++ b/tools/phptest.php	2026-10-28 16:46:28.413268989 +0000
+@@ -1,39 +1,12 @@
+ <?php
+ /**
+- * phpSysInfo test script - it has to work even when the rest of the configuration cannot be
+- * loaded, so the client address is checked here instead of through the common bootstrap.
++ * phpSysInfo test script.
+  */
+ define('PSI_APP_ROOT', dirname(__FILE__).'/..');
+ require_once PSI_APP_ROOT.'/includes/autoloader.inc.php';
++// Make the access decision through the same bootstrap every other entry point uses.
++require_once PSI_APP_ROOT.'/read_config.php';
+ 
+-if (is_readable(PSI_APP_ROOT.'/phpsysinfo.ini') && ($config = @parse_ini_file(PSI_APP_ROOT.'/phpsysinfo.ini', true))
+-   && isset($config['main']['ALLOWED']) && is_string($config['main']['ALLOWED']) && (trim($config['main']['ALLOWED']) !== '')) {
+-    $allowed = preg_split('/\s*,\s*/', strtolower(trim($config['main']['ALLOWED'])), -1, PREG_SPLIT_NO_EMPTY);
+-    if (count($allowed) > 0) {
+-        $ip = CommonFunctions::clientIp();
+-        $ip_decimal = ip2long($ip);
+-        $was = false;
+-        foreach ($allowed as $allow) {
+-            if (strpos($allow, '/') === false) {
+-                $was = ($allow === $ip);
+-            } else {
+-                list($allow, $netmask) = explode('/', $allow, 2);
+-                $allow_decimal = ip2long($allow);
+-                $wildcard_decimal = pow(2, (32 - $netmask)) - 1;
+-                $netmask_decimal = ~$wildcard_decimal;
+-                $was = (($ip_decimal & $netmask_decimal) === ($allow_decimal & $netmask_decimal));
+-            }
+-            if ($was) {
+-                break;
+-            }
+-        }
+-        if (!$was) {
+-            header('Content-Type: text/plain');
+-            echo "Client IP address (".$ip.") not allowed.";
+-            exit;
+-        }
+-    }
+-}
+ function echoinfo($extension) {
+     echo "                                    ".$extension;
+     switch(strtolower($extension)) {

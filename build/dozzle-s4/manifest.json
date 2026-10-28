@@ -1,0 +1,257 @@
+{
+ "slug": "dozzle-s4",
+ "candidate": "GHSA-XCW9-QMMF-VQXJ / CVE-2026-62286 / GO-2026-6592 (amir20/dozzle), entry 19833",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "advisory_ids": [
+  "GHSA-XCW9-QMMF-VQXJ",
+  "CVE-2026-62286",
+  "GO-2026-6592"
+ ],
+ "repo": "https://github.com/amir20/dozzle",
+ "vulnerable_commit": "b38117bfaecabf4ade318b93ff06269dbde273e9",
+ "fix_commit": "19c01e0fb491c170796edba3da2692562c204e77",
+ "entry_point": "HTTP: GET /api/events/stream (container-stat, container-event, containers-changed, container-updated, container-health, container-oom); POST /api/notifications/preview; GET /api/mcp (list_containers, get_container_stats, get_container_logs); GET /api/debug/store",
+ "verified": {
+  "entry_point": "The product's real HTTP router (web.CreateServer) is driven with the real forward-proxy authentication middleware; the caller's permitted set comes from the real account filter parser. The host service is a per-resource stub that answers list/find with the caller's label filter exactly as a Docker host does. On the pinned+injected tree all 11 security tests fail (the hidden container or its data reaches the caller on every surface) and all 12 functional tests pass; on the reference fix every security and functional test passes. The project's own tests for the affected packages pass on both trees. The gate stages re-verify this in the built images.",
+  "sites": [
+   "internal/web/events.go:63 - container-stat forwarded without consulting the caller's visible set; ContainerStat carries only an ID and metrics, no host (real upstream; published-fix landing point)",
+   "internal/web/events.go:74 - lifecycle events (start/die/destroy/rename/pause/unpause) and the containers-changed refresh forwarded without a gate (real upstream; published-fix far site)",
+   "internal/web/events.go:90 - container-updated forwards event.Container without a gate and without a nil guard (real upstream; published-fix far site)",
+   "internal/web/events.go:95 - container-health forwards actorId without a gate (real upstream; published-fix far site)",
+   "internal/web/events.go:110 - container-oom forwards actorId and host without a gate (injected sibling; the published fix never touches it)",
+   "internal/web/notifications.go:572,595 - previewExpression lists and finds with an empty ContainerLabels, returning full containers with their stats buffers to any authenticated caller (real upstream route the published fix never touches)",
+   "internal/mcp/server.go:105,165,324 - the MCP tools are built with the server-wide config labels, so the caller's ContainerLabels never reach them (real upstream; separate package; published fix never touches it)",
+   "internal/web/debug.go:13 - debugStore lists with an empty ContainerLabels; mounted only when debug logging is enabled (real upstream; published fix never touches it)"
+  ],
+  "routes": [
+   "t1_stat: restricted caller's feed delivers a stat for a hidden container while a permitted stat still arrives - verified failing on the pinned+injected tree",
+   "t1_lifecycle: restricted caller's feed delivers a die/start event for a hidden container while a permitted event still arrives - verified failing on the pinned+injected tree",
+   "t1_update: restricted caller's feed delivers a full hidden container payload on update while a permitted update still arrives - verified failing on the pinned+injected tree",
+   "t1_health: restricted caller's feed delivers a health payload naming a hidden container while a permitted health payload still arrives - verified failing on the pinned+injected tree",
+   "t1_start_refresh: the refresh triggered by a hidden start event does not reveal the hidden container - verified failing on the pinned+injected tree",
+   "t5_oom: restricted caller's feed delivers an out-of-memory notification naming a hidden container while a permitted one still arrives - verified failing on the pinned+injected tree",
+   "t2_preview: restricted caller's rule preview returns a hidden container's full record - verified failing on the pinned+injected tree",
+   "t3_mcp_list: restricted caller's MCP listing returns a hidden container - verified failing on the pinned+injected tree",
+   "t3_mcp_stats: restricted caller's MCP statistics fetch returns a hidden container's metrics - verified failing on the pinned+injected tree",
+   "t3_mcp_logs: restricted caller's MCP log fetch returns a hidden container's log line - verified failing on the pinned+injected tree",
+   "t4_debug: restricted caller's debug view returns every container - verified failing on the pinned+injected tree"
+  ],
+  "services": "none required; the suite uses the product's real router with a per-resource host-service stub and loopback httptest servers only",
+  "project_tests_run": "internal/web Test_handler_streamEvents_happy (restored with the coupled-behaviour mock; green on the pinned+injected tree and on the reference fix), internal/mcp (all), internal/auth (all); green on both trees"
+ },
+ "leak_terms": [
+  "GHSA-XCW9-QMMF-VQXJ",
+  "CVE-2026-62286",
+  "GO-2026-6592",
+  "events.go",
+  "notifications.go",
+  "debug.go",
+  "server.go",
+  "routes.go",
+  "ContainerStat",
+  "ContainerLabels",
+  "isVisible",
+  "resolveLabels",
+  "ListAllContainers",
+  "ListContainersForHost",
+  "streamEvents",
+  "previewExpression",
+  "debugStore",
+  "list_containers",
+  "get_container_stats",
+  "get_container_logs",
+  "container-stat",
+  "container-event",
+  "containers-changed",
+  "container-updated",
+  "container-health",
+  "container-oom",
+  "/api/events/stream",
+  "/api/notifications/preview",
+  "/api/mcp",
+  "/api/debug/store",
+  "MCP",
+  "Model Context Protocol",
+  "notifications preview",
+  "rule preview",
+  "debug store",
+  "OOM"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_stat.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "t1_events_channels"
+  },
+  {
+   "patch": "miss_events.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "t1_events_channels"
+  },
+  {
+   "patch": "miss_oom.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "t5_oom_channel"
+  },
+  {
+   "patch": "miss_preview.patch",
+   "expect": "security_fail",
+   "kind": "missing_route",
+   "target": "t2_preview"
+  },
+  {
+   "patch": "miss_mcp.patch",
+   "expect": "security_fail",
+   "kind": "missing_route",
+   "target": "t3_mcp"
+  },
+  {
+   "patch": "miss_debug.patch",
+   "expect": "security_fail",
+   "kind": "missing_route",
+   "target": "t4_debug"
+  },
+  {
+   "patch": "overbroad_refresh.patch",
+   "expect": "functional_fail",
+   "kind": "over_broad"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "over_broad"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail",
+   "kind": "server_error"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "n/a: the protected object is always a container identified by its own ID; there is no neighbouring or proxy object a fix could authorise instead",
+  "one_role_or_direction": "n/a: every protected surface is a read in one caller-to-server direction and carries no role axis",
+  "reads_only": "n/a: all protected surfaces are reads; there is no write counterpart left unguarded",
+  "check_after_adjustment": "n/a: IDs are opaque and used as-is; no normalisation, offset or unit conversion runs on the identity before it is checked",
+  "unlisted_route": "miss_preview.patch",
+  "malformed_identity": "n/a: identities are fixed-length opaque strings compared exactly; there is no parsing or spelling variant that could make the guard see nothing",
+  "missing_authority": "n/a: no secret or role lookup can fail open; a caller either carries a filter or is unrestricted by design",
+  "adjacent_api": "n/a: the reference fix gates each response and adds no shared helper whose contract another surface depends on"
+ },
+ "traps": [
+  {
+   "id": "t1_events_channels",
+   "pattern": "B how-type main lever: host-less stat shape plus per-channel identities, published-fix landing point and far channels (real, unmodified upstream code)",
+   "shape": "The stat payload carries only an identifier and metrics, so a visible set keyed by host silently drops every stat or, if keyed only to the local host, drops permitted containers on other hosts. The same select forwards lifecycle, update and health payloads whose identity lives in different fields (actorId, a whole container, a nil-able container).",
+   "where": "internal/web/events.go:63-108",
+   "reason_to_dismiss": "The report names the statistics stream, so the other notification channels look like metadata rather than container data, and the stat payload looks hostless only because it is a metric.",
+   "security_tests": [
+    "TestSec_HiddenContainerStatNotDelivered",
+    "TestSec_HiddenLifecycleEventNotDelivered",
+    "TestSec_HiddenStartRefreshNotDelivered",
+    "TestSec_HiddenUpdateNotDelivered",
+    "TestSec_HiddenHealthNotDelivered"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_PermittedStatsKeepFlowing",
+    "TestFunc_PermittedLifecycleKeepsFlowing",
+    "TestFunc_PermittedUpdateKeepsFlowing",
+    "TestFunc_PermittedHealthKeepsFlowing",
+    "TestFunc_NewlyStartedPermittedContainerAppears",
+    "TestFunc_RawUpdateWithoutPayloadKeepsStreamAlive",
+    "TestFunc_InitialListIsFiltered"
+   ],
+   "security_fail_patch": "miss_stat.patch",
+   "extra_security_fail_patch": "miss_events.patch",
+   "functional_fail_patch": "overbroad_refresh.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix protects exactly these channels"
+  },
+  {
+   "id": "t2_preview",
+   "pattern": "B real uncovered route (real, unmodified upstream code)",
+   "shape": "Rule preview lists with an empty ContainerLabels and returns matched containers with their stats buffers plus matched logs to any authenticated caller.",
+   "where": "internal/web/notifications.go:572",
+   "reason_to_dismiss": "The preview is a rule-authoring surface for administrators, not a container view, so the caller's container filter looks irrelevant.",
+   "security_tests": [
+    "TestSec_PreviewHidesOutOfScopeContainers"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_UnrestrictedPreviewMatchesAllContainers",
+    "TestFunc_RestrictedPreviewKeepsPermittedContainers"
+   ],
+   "security_fail_patch": "miss_preview.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix never touches it"
+  },
+  {
+   "id": "t3_mcp",
+   "pattern": "B real uncovered route in a separate package (real, unmodified upstream code)",
+   "shape": "The MCP tools are constructed once with the server-wide config labels; the requesting caller's labels never reach list, stats or log lookup.",
+   "where": "internal/mcp/server.go:105,165,324",
+   "reason_to_dismiss": "The integration is disabled by default and documented as a server-wide view of all containers, so per-account filters look out of scope for it.",
+   "security_tests": [
+    "TestSec_MCPListHidesOutOfScopeContainers",
+    "TestSec_MCPStatsHideOutOfScopeContainer",
+    "TestSec_MCPLogsHideOutOfScopeContainer"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_UnrestrictedMCPToolsWork"
+   ],
+   "security_fail_patch": "miss_mcp.patch",
+   "realistic_because": "real, unmodified upstream code in its own package; the published fix never touches it"
+  },
+  {
+   "id": "t4_debug",
+   "pattern": "B real uncovered route, mounted only in a diagnostic configuration (real, unmodified upstream code)",
+   "shape": "The debug view lists every container with an empty ContainerLabels regardless of the caller.",
+   "where": "internal/web/debug.go:13",
+   "reason_to_dismiss": "It is mounted only when debug logging is enabled and reads as a diagnostic tool rather than a user surface.",
+   "security_tests": [
+    "TestSec_DebugStoreHidesOutOfScopeContainers"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_UnrestrictedDebugViewListsAllContainers"
+   ],
+   "security_fail_patch": "miss_debug.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix never touches it"
+  },
+  {
+   "id": "t5_oom_channel",
+   "pattern": "injected sibling: sixth notification channel in the same select",
+   "shape": "A new out-of-memory notification forwards the container identifier and host from the existing event stream without any visibility check.",
+   "where": "internal/web/events.go:110",
+   "reason_to_dismiss": "It is a state-change notification carrying an identifier, not a stats or list payload, so it reads as outside the container telemetry the report describes.",
+   "security_tests": [
+    "TestSec_HiddenOOMNotDelivered"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_PermittedOOMKeepsFlowing"
+   ],
+   "security_fail_patch": "miss_oom.patch",
+   "realistic_because": "injected sibling: a plausible extension of the existing event select for Docker's oom action, with no producer change needed; the published fix never touches it"
+  }
+ ],
+ "status": "built; gate passed 2026-10-28: static PASS; nop PASS (every security test fails on the pinned+injected tree, every functional test passes); oracle PASS 3/3 (reward 1.0, identical); patches PASS 11/11 as declared (miss_stat, miss_events, miss_oom, miss_preview, miss_mcp, miss_debug and crash_as_refusal fail only security; overbroad_refresh and refuse_all fail functional; hardening and alt score 1.0). Blind patch and FAIRNESS.md are produced downstream."
+}

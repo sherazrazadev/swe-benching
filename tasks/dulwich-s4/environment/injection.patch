@@ -1,0 +1,83 @@
+diff --git a/dulwich/porcelain/__init__.py b/dulwich/porcelain/__init__.py
+index 7afaaea..70e40a6 100644
+--- a/dulwich/porcelain/__init__.py
++++ b/dulwich/porcelain/__init__.py
+@@ -125,6 +125,7 @@ __all__ = [
+     "check_ignore",
+     "check_mailmap",
+     "checkout",
++    "checkout_index",
+     "cherry",
+     "cherry_pick",
+     "clean",
+@@ -6032,6 +6033,70 @@ def reset_file(
+     build_file_from_blob(blob, mode, full_path, symlink_fn=symlink_fn)
+ 
+ 
++def checkout_index(
++    repo: str | os.PathLike[str] | Repo = ".",
++    prefix: str | bytes = "",
++    paths: Sequence[str | bytes] | None = None,
++    force: bool = False,
++) -> None:
++    """Copy index entries into a directory.
++
++    This is similar to 'git checkout-index': the content recorded in the
++    index is written below ``prefix``, recreating the directory layout
++    relative to the repository root. The index itself is left unchanged.
++
++    Args:
++      repo: Repository path or object
++      prefix: Directory to write the files into (default: the work tree)
++      paths: Optional list of specific paths to write (default: all)
++      force: Overwrite files that already exist at the target paths
++
++    Raises:
++      Error: If a target path already exists and force is False
++    """
++    from ..index import get_path_element_validator, validate_path
++
++    with open_repo_closing(repo) as r:
++        config = r.get_config_stack()
++        validator = get_path_element_validator(config)
++        index = r.open_index(config=config)
++        prefix_path = os.fsencode(prefix) if isinstance(prefix, str) else prefix
++        selected = None
++        if paths is not None:
++            selected = set()
++            for path in paths:
++                if isinstance(path, str):
++                    selected.add(path.encode(DEFAULT_ENCODING))
++                else:
++                    selected.add(path)
++
++        for tree_path, entry in index.items():
++            if not isinstance(entry, IndexEntry):
++                continue
++            if selected is not None and tree_path not in selected:
++                continue
++            if not validate_path(tree_path, validator):
++                raise Error(f"refusing to write unsafe path: {tree_path!r}")
++            full_path = os.path.join(prefix_path, tree_path)
++            parent_dir = os.path.dirname(full_path)
++            if parent_dir and not os.path.isdir(parent_dir):
++                os.makedirs(parent_dir)
++            if os.path.lexists(full_path):
++                if not force:
++                    raise Error(
++                        f"path {tree_path.decode('utf-8', 'replace')!r} already exists "
++                        "in the target directory (use force=True to overwrite)"
++                    )
++                os.unlink(full_path)
++            blob = r.object_store[entry.sha]
++            assert isinstance(blob, Blob)
++            if stat.S_ISLNK(entry.mode):
++                os.symlink(blob.data, full_path)
++            else:
++                with open(full_path, "wb") as f:
++                    f.write(blob.data)
++
++
+ def sparse_checkout(
+     repo: str | os.PathLike[str] | Repo,
+     patterns: list[str] | None = None,

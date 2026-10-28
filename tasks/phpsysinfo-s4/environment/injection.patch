@@ -1,0 +1,69 @@
+--- a/includes/class.CommonFunctions.inc.php
++++ b/includes/class.CommonFunctions.inc.php
+@@ -429,6 +429,24 @@
+     }
+ 
+     /**
++     * address of the client that sent the current request
++     *
++     * @return string
++     */
++    public static function clientIp()
++    {
++        if (isset($_SERVER["HTTP_X_FORWARDED_FOR"])) {
++            $ip = $_SERVER["HTTP_X_FORWARDED_FOR"];
++        } elseif (isset($_SERVER["HTTP_CLIENT_IP"])) {
++            $ip = $_SERVER["HTTP_CLIENT_IP"];
++        } else {
++            $ip = $_SERVER["REMOTE_ADDR"];
++        }
++
++        return preg_replace("/^::ffff:/", "", strtolower($ip));
++    }
++
++    /**
+      * read a file and return the content as a string
+      *
+      * @param string  $strFileName name of the file which should be read
+--- a/tools/phptest.php
++++ b/tools/phptest.php
+@@ -1,4 +1,39 @@
+ <?php
++/**
++ * phpSysInfo test script - it has to work even when the rest of the configuration cannot be
++ * loaded, so the client address is checked here instead of through the common bootstrap.
++ */
++define('PSI_APP_ROOT', dirname(__FILE__).'/..');
++require_once PSI_APP_ROOT.'/includes/autoloader.inc.php';
++
++if (is_readable(PSI_APP_ROOT.'/phpsysinfo.ini') && ($config = @parse_ini_file(PSI_APP_ROOT.'/phpsysinfo.ini', true))
++   && isset($config['main']['ALLOWED']) && is_string($config['main']['ALLOWED']) && (trim($config['main']['ALLOWED']) !== '')) {
++    $allowed = preg_split('/\s*,\s*/', strtolower(trim($config['main']['ALLOWED'])), -1, PREG_SPLIT_NO_EMPTY);
++    if (count($allowed) > 0) {
++        $ip = CommonFunctions::clientIp();
++        $ip_decimal = ip2long($ip);
++        $was = false;
++        foreach ($allowed as $allow) {
++            if (strpos($allow, '/') === false) {
++                $was = ($allow === $ip);
++            } else {
++                list($allow, $netmask) = explode('/', $allow, 2);
++                $allow_decimal = ip2long($allow);
++                $wildcard_decimal = pow(2, (32 - $netmask)) - 1;
++                $netmask_decimal = ~$wildcard_decimal;
++                $was = (($ip_decimal & $netmask_decimal) === ($allow_decimal & $netmask_decimal));
++            }
++            if ($was) {
++                break;
++            }
++        }
++        if (!$was) {
++            header('Content-Type: text/plain');
++            echo "Client IP address (".$ip.") not allowed.";
++            exit;
++        }
++    }
++}
+ function echoinfo($extension) {
+     echo "                                    ".$extension;
+     switch(strtolower($extension)) {

@@ -1,0 +1,216 @@
+{
+ "slug": "dulwich-s4",
+ "candidate": "1131",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-5FQC-MRG8-W798"
+ ],
+ "repo": "https://github.com/jelmer/dulwich",
+ "vulnerable_commit": "4b6ac339f169ef75994dd3a45b4b386757f9a669",
+ "fix_commit": "9571ac60b851fce228dae7ededb380c6ce9b3fb8",
+ "entry_point": "CLI/lib: dulwich filter-branch --index-filter and the public working-tree update APIs that place repository content into a directory",
+ "track": "injected",
+ "verified": {
+  "entry_point": "At the pinned commit (and on the injected tree) every attack below was reproduced from a real public entry point: porcelain.filter_branch with an index filter, porcelain.checkout(paths=), porcelain.restore (source and index forms), porcelain.reset_file, WorkTree.reset_index, porcelain.cone_mode_disable, porcelain.sparse_checkout, and the injected porcelain.checkout_index. Each created a file inside a directory outside the target.",
+  "sites": [
+   "dulwich/filter_branch.py:212 (_apply_index_filter materialises the tree into the process directory) - published-fix site the report leads to",
+   "dulwich/porcelain/__init__.py:5659 (checkout paths= parent component) - real far site",
+   "dulwich/porcelain/__init__.py:5820,5858 (restore index/source branches) - real far site",
+   "dulwich/porcelain/__init__.py:6028 (reset_file) - real far site",
+   "dulwich/sparse_patterns.py:250 (apply_included_paths raw write) - real second implementation",
+   "dulwich/worktree.py:841 (reset_index full-tree materialisation) - real far site",
+   "dulwich/porcelain/__init__.py:6234 (cone_mode_disable full-tree materialisation) - real far site",
+   "dulwich/porcelain/__init__.py checkout_index (injected export command) - injected sibling"
+  ],
+  "routes": [
+   "porcelain.filter_branch(index_filter=...) / dulwich filter-branch --index-filter: writes each tree into the process CWD; an ancestor symlink entry is the parent of a descendant's file",
+   "porcelain.checkout(paths=[...]): lexical containment check plus final-component symlink replacement, but a persisted parent symlink is followed",
+   "porcelain.restore(paths=[...], source=...) and porcelain.restore(paths=[...]) from the index: same parent-component gap",
+   "porcelain.reset_file(...): same parent-component gap",
+   "WorkTree.reset_index(tree): materialises a whole tree into a work tree that still holds a symlink from an earlier checkout",
+   "porcelain.cone_mode_disable(repo): materialises the HEAD tree into the same work tree",
+   "porcelain.sparse_checkout(patterns=...): sparse_patterns.apply_included_paths materialises index entries with a raw open, following any parent symlink",
+   "porcelain.checkout_index (injected): repeated exports into the same directory follow the symlink written by the first export"
+  ],
+  "injected_siblings": [
+   "dulwich/porcelain/__init__.py checkout_index (public export command): os.makedirs + raw open/os.symlink, no parent-component guard; reachable through porcelain.checkout_index"
+  ],
+  "services": "none; offline after build",
+  "project_tests_run": "tests/test_filter_branch.py, tests/test_index.py, tests/test_sparse_patterns.py and tests/test_worktree.py (248 passed, 3 skipped) pass on the pinned tree, on the injected tree and on the oracle tree; pristine copies ship under tests/functional/project/ and are restored by test.sh"
+ },
+ "leak_terms": [
+  "filter_branch.py",
+  "index.py",
+  "sparse_patterns.py",
+  "worktree.py",
+  "porcelain",
+  "filter_branch",
+  "CommitFilter",
+  "_apply_index_filter",
+  "build_index_from_tree",
+  "build_file_from_blob",
+  "index_entry_from_tree_entry",
+  "ensure_no_symlink_parents",
+  "remove_symlink_directories",
+  "_ensure_parent_dir_exists",
+  "_checked_worktree_path",
+  "_transition_to_file",
+  "reset_index",
+  "cone_mode_disable",
+  "sparse_checkout",
+  "apply_included_paths",
+  "checkout_index",
+  "reset_file",
+  "WorkTree",
+  "IndexEntry",
+  "S_IFLNK",
+  "GIT_INDEX_FILE",
+  "GHSA-5FQC-MRG8-W798",
+  "4b6ac339",
+  "9571ac60"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-filter-branch.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-path-restricted.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-sparse.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-full-tree.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-export.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "n/a: the refusal contract accepts any error, and every functional test exercises a legitimate operation; a crash on legitimate use fails the functional group.",
+  "wrong_resource": "n/a: containment is over filesystem paths, not an object that could be swapped for a neighbouring resource.",
+  "one_role_or_direction": "n/a: there are no roles, peers or directions; each sink is a write of recorded content into a directory.",
+  "reads_only": "n/a: every protected sink is a write; there is no read-side guard to leave out.",
+  "check_after_adjustment": "n/a: there is no normalising or adjusting step between the check and the write; the failure is a missing parent-component check, covered by sf-miss-path-restricted.patch.",
+  "unlisted_route": "sf-miss-sparse.patch",
+  "malformed_identity": "n/a: paths and patterns are not parsed identities whose malformed spelling could make a guard see nothing.",
+  "missing_authority": "n/a: there is no external authority that could return no value and make a guard fail open.",
+  "adjacent_api": "n/a: the reference fix is additive (new helper plus guards) and does not change any sibling API's stated behaviour."
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "lever": "base flaw / published-fix site (pattern A, report target)",
+   "shape": "history rewriting materialises each commit's tree into the process directory; a symbolic-link entry from an ancestor commit becomes the parent directory for a descendant's file",
+   "where": "dulwich/filter_branch.py:212",
+   "reason_to_dismiss": "none - this is the site the report leads to; the shape is how-type because the shared blob writer already refuses a symlink at the final component, so the escape through a parent component is easy to miss when re-running the example",
+   "security_tests": [
+    "security/test_filter_branch.py::IndexFilterWorkingDirectoryTests::test_index_filter_does_not_write_outside_working_directory"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_filter_branch_contract.py::IndexFilterContractTests::test_index_filter_receives_writable_index_and_result_is_kept"
+   ],
+   "security_fail_patch": "sf-miss-filter-branch.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2",
+   "lever": "far site, selected-path writes on a live work tree (pattern A, real upstream code)",
+   "shape": "a selected path is checked lexically and a symlink is replaced only at the final component; a symbolic link left at a parent component is followed",
+   "where": "dulwich/porcelain/__init__.py:5673,5825,5863,6029",
+   "reason_to_dismiss": "this exact family was hardened for the previous advisory and the comments call it defense in depth, so the write looks protected",
+   "security_tests": [
+    "security/test_path_restricted.py::PathRestrictedWriteTests::test_checkout_selected_paths_does_not_write_through_symlink",
+    "security/test_path_restricted.py::PathRestrictedWriteTests::test_restore_from_source_does_not_write_through_symlink",
+    "security/test_path_restricted.py::PathRestrictedWriteTests::test_restore_from_index_does_not_write_through_symlink",
+    "security/test_path_restricted.py::PathRestrictedWriteTests::test_reset_file_does_not_write_through_symlink"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_normal_operations.py::NormalOperationTests::test_checkout_selected_path_writes_inside_work_tree",
+    "functional/test_normal_operations.py::NormalOperationTests::test_restore_nested_path_writes_inside_work_tree",
+    "functional/test_normal_operations.py::NormalOperationTests::test_reset_file_writes_inside_work_tree",
+    "functional/test_symlinks.py::SymlinkBehaviourTests::test_regular_file_placed_over_symlink_replaces_it"
+   ],
+   "security_fail_patch": "sf-miss-path-restricted.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T3",
+   "lever": "far site, second implementation in another module (pattern B, real upstream code)",
+   "shape": "sparse-checkout materialisation writes index entries with a raw open and creates parent directories with a helper that follows symlinks; no component is guarded",
+   "where": "dulwich/sparse_patterns.py:245-252",
+   "reason_to_dismiss": "sparse checkout is a neighbouring feature that only re-materialises paths already recorded in the index, and its write shares no code with the reported path",
+   "security_tests": [
+    "security/test_sparse_checkout.py::SparseCheckoutWriteTests::test_sparse_checkout_does_not_write_through_symlink"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_sparse_and_cone.py::SparseBehaviourTests::test_sparse_checkout_excludes_and_restores_files"
+   ],
+   "security_fail_patch": "sf-miss-sparse.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4",
+   "lever": "far site, other whole-tree materialisation callers (pattern B, real upstream code)",
+   "shape": "a whole tree is materialised into a work tree that still holds a symbolic link from an earlier checkout; the write below it happens inside the shared primitive",
+   "where": "dulwich/worktree.py:841; dulwich/porcelain/__init__.py:6299",
+   "reason_to_dismiss": "the generic materialisation primitive already refuses a symbolic link at the target path, and these are reset-style operations rather than the reported history rewrite",
+   "security_tests": [
+    "security/test_full_tree.py::FullTreeMaterialisationTests::test_reset_index_does_not_write_through_symlink",
+    "security/test_full_tree.py::FullTreeMaterialisationTests::test_cone_mode_disable_does_not_write_through_symlink"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_normal_operations.py::NormalOperationTests::test_reset_index_materialises_tree_inside_work_tree",
+    "functional/test_sparse_and_cone.py::SparseBehaviourTests::test_cone_mode_disable_restores_the_tree",
+    "functional/test_symlinks.py::SymlinkBehaviourTests::test_tree_symlink_entry_is_materialised_as_symlink"
+   ],
+   "security_fail_patch": "sf-miss-full-tree.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T5",
+   "lever": "injected sibling (new export command)",
+   "shape": "an export command copies index entries into a caller-named directory with os.makedirs plus a raw open or symlink; repeated exports into the same directory treat the link written by the first export as a directory",
+   "where": "dulwich/porcelain/__init__.py:6036",
+   "reason_to_dismiss": "an export helper writes only paths recorded in the index into a directory the caller names, and it is unrelated to the reported operation",
+   "security_tests": [
+    "security/test_index_export.py::IndexExportTests::test_repeated_export_does_not_write_through_leftover_symlink"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_export.py::IndexExportBehaviourTests::test_export_writes_files_and_symlinks",
+    "functional/test_export.py::IndexExportBehaviourTests::test_export_can_select_paths"
+   ],
+   "security_fail_patch": "sf-miss-export.patch",
+   "realistic_because": "checkout-index is a standard git command this implementation lacks; the function follows the style of the neighbouring checkout/restore writers and is exported like every other porcelain command"
+  }
+ ],
+ "status": "built; gate static/nop/oracle(3x)/patches ALL PASS (2026-10-28)"
+}

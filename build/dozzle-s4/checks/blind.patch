@@ -1,0 +1,244 @@
+diff -ruN a/internal/mcp/server.go b/internal/mcp/server.go
+--- a/internal/mcp/server.go	2026-10-28 16:36:22.000000000 +0000
++++ b/internal/mcp/server.go	2026-10-28 17:10:09.136790584 +0000
+@@ -8,6 +8,7 @@
+ 	"strings"
+ 	"time"
+ 
++	"github.com/amir20/dozzle/internal/auth"
+ 	"github.com/amir20/dozzle/internal/container"
+ 	container_support "github.com/amir20/dozzle/internal/support/container"
+ 	"github.com/modelcontextprotocol/go-sdk/mcp"
+@@ -26,13 +27,22 @@
+ 	mcpServer   *mcp.Server
+ 	hostService HostService
+ 	labels      container.ContainerLabels
++	version     string
+ }
+ 
+ // NewServer creates a new MCP server with Dozzle tools registered.
+ func NewServer(hostService HostService, labels container.ContainerLabels, version string) *Server {
++	return buildServer(hostService, labels, version)
++}
++
++// buildServer registers the container tools against one label filter. The tools
++// take their labels from the server they are registered on, so a caller with
++// its own filter needs a server built for that filter.
++func buildServer(hostService HostService, labels container.ContainerLabels, version string) *Server {
+ 	s := &Server{
+ 		hostService: hostService,
+ 		labels:      labels,
++		version:     version,
+ 	}
+ 
+ 	mcpServer := mcp.NewServer(&mcp.Implementation{
+@@ -51,6 +61,15 @@
+ // Handler returns an http.Handler for the MCP streamable HTTP transport.
+ func (s *Server) Handler() http.Handler {
+ 	return mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
++		labels := s.labels
++		if user := auth.UserFromContext(r.Context()); user != nil && user.ContainerLabels.Exists() {
++			labels = user.ContainerLabels
++		}
++		if labels.Exists() {
++			// Bind a server to this caller's permitted set. The handler asks for
++			// a server when a session starts, so the filter is fixed per session.
++			return buildServer(s.hostService, labels, s.version).mcpServer
++		}
+ 		return s.mcpServer
+ 	}, nil)
+ }
+diff -ruN a/internal/web/debug.go b/internal/web/debug.go
+--- a/internal/web/debug.go	2026-10-28 16:36:22.000000000 +0000
++++ b/internal/web/debug.go	2026-10-28 17:09:59.782788332 +0000
+@@ -3,14 +3,12 @@
+ import (
+ 	"encoding/json"
+ 	"net/http"
+-
+-	"github.com/amir20/dozzle/internal/container"
+ )
+ 
+ func (h *handler) debugStore(w http.ResponseWriter, r *http.Request) {
+ 	respone := make(map[string]interface{})
+ 	respone["hosts"] = h.hostService.Hosts()
+-	containers, errors := h.hostService.ListAllContainers(container.ContainerLabels{})
++	containers, errors := h.hostService.ListAllContainers(h.resolveLabels(r))
+ 	respone["containers"] = containers
+ 	respone["errors"] = errors
+ 
+diff -ruN a/internal/web/events.go b/internal/web/events.go
+--- a/internal/web/events.go	2026-10-28 16:36:29.000000000 +0000
++++ b/internal/web/events.go	2026-10-28 17:09:57.797787877 +0000
+@@ -38,6 +38,15 @@
+ 
+ 	allContainers, errors := h.hostService.ListAllContainers(userLabels)
+ 
++	// Everything the feed forwards after the initial list must be held to the
++	// same permitted set the list itself was built from. An unrestricted caller
++	// may observe every container, so only a caller with a filter is gated.
++	visible := newVisibleContainers(allContainers)
++	restricted := userLabels.Exists()
++	permitted := func(host, id string) bool {
++		return !restricted || visible.permits(host, id)
++	}
++
+ 	for _, err := range errors {
+ 		log.Warn().Err(err).Msg("error listing containers")
+ 		if hostNotAvailableError, ok := err.(*docker_support.HostUnavailableError); ok {
+@@ -61,6 +70,9 @@
+ 				return
+ 			}
+ 		case stat := <-stats:
++			if !permitted("", stat.ID) {
++				continue
++			}
+ 			if err := sseWriter.Event("container-stat", stat); err != nil {
+ 				log.Error().Err(err).Msg("error writing event to event stream")
+ 				return
+@@ -72,13 +84,26 @@
+ 			log.Trace().Str("event", event.Name).Str("id", event.ActorID).Msg("container event from store")
+ 			switch event.Name {
+ 			case "start", "die", "destroy", "rename", "pause", "unpause":
++				// A start or rename can change the permitted set, so refresh it
++				// before the event itself is gated. The refresh is label-filtered
++				// and only sent for an event about a permitted container.
++				var refreshed []container.Container
+ 				if event.Name == "start" || event.Name == "rename" {
+ 					if containers, err := h.hostService.ListContainersForHost(event.Host, userLabels); err == nil {
+ 						log.Debug().Str("host", event.Host).Int("count", len(containers)).Msg("updating containers for host")
+-						if err := sseWriter.Event("containers-changed", containers); err != nil {
+-							log.Error().Err(err).Msg("error writing containers to event stream")
+-							return
+-						}
++						visible.replaceHost(event.Host, containers)
++						refreshed = containers
++					}
++				}
++
++				if !permitted(event.Host, event.ActorID) {
++					continue
++				}
++
++				if refreshed != nil {
++					if err := sseWriter.Event("containers-changed", refreshed); err != nil {
++						log.Error().Err(err).Msg("error writing containers to event stream")
++						return
+ 					}
+ 				}
+ 
+@@ -88,11 +113,19 @@
+ 				}
+ 
+ 			case "update":
++				// Docker can send an update action with no container payload;
++				// there is nothing to forward then, and the stream must survive.
++				if event.Container == nil || !permitted(event.Host, event.Container.ID) {
++					continue
++				}
+ 				if err := sseWriter.Event("container-updated", event.Container); err != nil {
+ 					log.Error().Err(err).Msg("error writing event to event stream")
+ 					return
+ 				}
+ 			case "health_status: healthy", "health_status: unhealthy":
++				if !permitted(event.Host, event.ActorID) {
++					continue
++				}
+ 				healthy := "unhealthy"
+ 				if event.Name == "health_status: healthy" {
+ 					healthy = "healthy"
+@@ -107,6 +140,9 @@
+ 					return
+ 				}
+ 			case "oom":
++				if !permitted(event.Host, event.ActorID) {
++					continue
++				}
+ 				payload := map[string]string{
+ 					"actorId": event.ActorID,
+ 					"host":    event.Host,
+diff -ruN a/internal/web/notifications.go b/internal/web/notifications.go
+--- a/internal/web/notifications.go	2026-10-28 16:36:22.000000000 +0000
++++ b/internal/web/notifications.go	2026-10-28 17:10:03.413789164 +0000
+@@ -567,9 +567,9 @@
+ 		}
+ 	}
+ 
+-	// Find matching running containers
++	// Find matching running containers, restricted to what this caller may see.
+ 	if sub.ContainerProgram != nil {
+-		containers, _ := h.hostService.ListAllContainers(container.ContainerLabels{})
++		containers, _ := h.hostService.ListAllContainers(h.resolveLabels(r))
+ 		for _, c := range containers {
+ 			if c.State != "running" {
+ 				continue
+@@ -592,7 +592,7 @@
+ 		keySet := make(map[string]struct{})
+ 
+ 		for _, c := range result.MatchedContainers {
+-			containerService, err := h.hostService.FindContainer(c.Host, c.ID, container.ContainerLabels{})
++			containerService, err := h.hostService.FindContainer(c.Host, c.ID, h.resolveLabels(r))
+ 			if err != nil {
+ 				continue
+ 			}
+diff -ruN a/internal/web/visible_containers.go b/internal/web/visible_containers.go
+--- a/internal/web/visible_containers.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/web/visible_containers.go	2026-10-28 17:09:44.277785176 +0000
+@@ -0,0 +1,57 @@
++package web
++
++import "github.com/amir20/dozzle/internal/container"
++
++// visibleContainers tracks which containers the current caller may observe.
++//
++// Entries are grouped by host because a container ID only identifies a
++// container on the host that reported it: the initial list and every per-host
++// refresh come from the host service already filtered by the caller's label
++// filter, so the resulting sets are exactly that caller's permitted set.
++//
++// Statistics are the one payload that does not name a host, so they are matched
++// against every host the caller has containers on.
++type visibleContainers map[string]map[string]struct{}
++
++func newVisibleContainers(initial []container.Container) visibleContainers {
++	v := make(visibleContainers)
++	for _, c := range initial {
++		v.add(c)
++	}
++	return v
++}
++
++func (v visibleContainers) add(c container.Container) {
++	ids, ok := v[c.Host]
++	if !ok {
++		ids = make(map[string]struct{})
++		v[c.Host] = ids
++	}
++	ids[c.ID] = struct{}{}
++}
++
++// replaceHost swaps the complete permitted set for one host. It is used after a
++// start or rename refresh so a container that just became visible is admitted.
++func (v visibleContainers) replaceHost(host string, containers []container.Container) {
++	ids := make(map[string]struct{}, len(containers))
++	for _, c := range containers {
++		ids[c.ID] = struct{}{}
++	}
++	v[host] = ids
++}
++
++// permits reports whether the caller may observe id on host. An empty host
++// means the payload omitted one (statistics), so the id is accepted when any
++// joined host reports it as permitted.
++func (v visibleContainers) permits(host, id string) bool {
++	if host != "" {
++		_, ok := v[host][id]
++		return ok
++	}
++	for _, ids := range v {
++		if _, ok := ids[id]; ok {
++			return true
++		}
++	}
++	return false
++}

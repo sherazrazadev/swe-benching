@@ -1,0 +1,292 @@
+diff --git a/dulwich/filter_branch.py b/dulwich/filter_branch.py
+index 2f8fadb..331273b 100644
+--- a/dulwich/filter_branch.py
++++ b/dulwich/filter_branch.py
+@@ -33,9 +33,9 @@ import warnings
+ from collections.abc import Callable, Sequence
+ from typing import TypedDict
+ 
+-from .index import Index, build_index_from_tree, validate_path_element_ntfs
+-from .object_store import BaseObjectStore
+-from .objects import Commit, ObjectID, Tag, Tree
++from .index import Index, index_entry_from_tree_entry
++from .object_store import BaseObjectStore, iter_tree_contents
++from .objects import S_ISGITLINK, Commit, ObjectID, Tag, Tree
+ from .refs import Ref, RefsContainer, local_tag_name
+ 
+ 
+@@ -203,24 +203,28 @@ class CommitFilter:
+             self._tree_cache[tree_sha] = tree_sha
+             return tree_sha
+ 
+-        # Create temporary index file
+         with tempfile.NamedTemporaryFile(delete=False) as tmp_index:
+             tmp_index_path = tmp_index.name
+ 
+         try:
+-            # Build index from tree
+-            build_index_from_tree(
+-                ".",
+-                tmp_index_path,
+-                self.object_store,
+-                tree_sha,
+-                validate_path_element=validate_path_element_ntfs,
+-            )
++            index = Index(tmp_index_path, read=False)
++            for entry in iter_tree_contents(self.object_store, tree_sha):
++                assert (
++                    entry.path is not None
++                    and entry.mode is not None
++                    and entry.sha is not None
++                )
++                if S_ISGITLINK(entry.mode):
++                    size = 0
++                else:
++                    size = self.object_store[entry.sha].raw_length()
++                index[entry.path] = index_entry_from_tree_entry(
++                    entry.mode, entry.sha, size
++                )
++            index.write()
+ 
+-            # Run index filter
+             new_tree_sha = self.index_filter(tree_sha, tmp_index_path)
+             if new_tree_sha is None:
+-                # Read back the modified index and create new tree
+                 index = Index(tmp_index_path)
+                 new_tree_sha = index.commit(self.object_store)
+ 
+diff --git a/dulwich/index.py b/dulwich/index.py
+index 0bafe45..d754650 100644
+--- a/dulwich/index.py
++++ b/dulwich/index.py
+@@ -64,6 +64,7 @@ __all__ = [
+     "get_path_element_validator",
+     "get_unstaged_changes",
+     "index_entry_from_stat",
++    "index_entry_from_tree_entry",
+     "make_path_normalizer",
+     "pathjoin",
+     "pathsplit",
+@@ -1774,6 +1775,40 @@ def index_entry_from_stat(
+     )
+ 
+ 
++def index_entry_from_tree_entry(
++    mode: int,
++    hex_sha: bytes,
++    size: int = 0,
++) -> IndexEntry:
++    """Create an index entry from a tree entry, with zeroed stat fields.
++
++    Use this when populating an index directly from a tree without touching
++    the filesystem, matching ``git read-tree``. The stat-derived fields
++    (ctime/mtime/dev/ino/uid/gid) are zeroed; git treats such entries as
++    stat-unmerged and refreshes them on the next stat.
++
++    Args:
++      mode: File mode from the tree entry
++      hex_sha: Hex sha of the object
++      size: Size of the object (0 for gitlinks or when unknown)
++    """
++    from dulwich.objects import ObjectID
++
++    return IndexEntry(
++        ctime=0,
++        mtime=0,
++        dev=0,
++        ino=0,
++        mode=mode,
++        uid=0,
++        gid=0,
++        size=size,
++        sha=ObjectID(hex_sha),
++        flags=0,
++        extended_flags=0,
++    )
++
++
+ if sys.platform == "win32":
+     # On Windows, creating symlinks either requires administrator privileges
+     # or developer mode. Raise a more helpful error when we're unable to
+@@ -2365,6 +2400,81 @@ def _ensure_parent_dir_exists(full_path: bytes) -> None:
+         os.makedirs(parent_dir)
+ 
+ 
++def ensure_no_symlink_parents(
++    root_path: str | bytes, full_path: str | bytes
++) -> None:
++    """Refuse to write at a path that has a symbolic link in a parent component.
++
++    A symlink left in the target directory by an earlier operation must not
++    be followed by a later write below it; doing so would let tree content
++    redirect the write outside the directory being populated. The final
++    component is not checked here: replacing a symlink at the target path
++    itself is handled by :func:`build_file_from_blob`.
++
++    Args:
++      root_path: Directory the write is confined to
++      full_path: Path that is about to be written
++
++    Raises:
++      OSError: If a parent component below ``root_path`` is a symlink
++    """
++    root = os.path.abspath(os.fsdecode(root_path))
++    target = os.path.abspath(os.fsdecode(full_path))
++    rel = os.path.relpath(os.path.dirname(target), root)
++    if rel == os.curdir:
++        return
++    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
++        raise OSError(f"refusing to write outside {root!r}: {target!r}")
++    current = root
++    for part in rel.split(os.sep):
++        current = os.path.join(current, part)
++        try:
++            st = os.lstat(current)
++        except FileNotFoundError:
++            return
++        if stat.S_ISLNK(st.st_mode):
++            raise OSError(
++                f"refusing to write through symlinked directory {current!r}"
++            )
++
++
++def remove_symlink_directories(
++    root_path: str | bytes,
++    object_store: ObjectContainer,
++    tree_id: ObjectID,
++    tree_encoding: str = "utf-8",
++) -> None:
++    """Remove work-tree symlinks at paths the tree needs to be directories.
++
++    A tree cannot contain a symlink and a directory at the same path, so a
++    symlink found below ``root_path`` where the tree has a directory was left
++    by an earlier operation. Removing it before materialising the tree keeps
++    a later write from being redirected through it.
++
++    Args:
++      root_path: Target dir for materialized files
++      object_store: Object store holding the tree
++      tree_id: Tree that is about to be materialized
++      tree_encoding: Encoding used for tree paths
++    """
++    if not isinstance(root_path, bytes):
++        root_path = os.fsencode(root_path)
++    dir_paths: set[bytes] = set()
++    for entry in iter_tree_contents(object_store, tree_id):
++        assert entry.path is not None
++        parts = entry.path.split(b"/")
++        for i in range(1, len(parts)):
++            dir_paths.add(b"/".join(parts[:i]))
++    for dir_path in dir_paths:
++        full_path = _tree_to_fs_path(root_path, dir_path, tree_encoding)
++        try:
++            st = os.lstat(full_path)
++        except FileNotFoundError:
++            continue
++        if stat.S_ISLNK(st.st_mode):
++            os.unlink(full_path)
++
++
+ def _remove_file_with_readonly_handling(path: bytes) -> None:
+     """Remove a file, handling read-only files on Windows.
+ 
+diff --git a/dulwich/porcelain/__init__.py b/dulwich/porcelain/__init__.py
+index 70e40a6..871609e 100644
+--- a/dulwich/porcelain/__init__.py
++++ b/dulwich/porcelain/__init__.py
+@@ -368,6 +368,7 @@ from ..index import (
+     _fs_to_tree_path,
+     blob_from_path_and_stat,
+     build_file_from_blob,
++    ensure_no_symlink_parents,
+     get_unstaged_changes,
+     symlink,
+     update_working_tree,
+@@ -5658,6 +5659,9 @@ def checkout(
+                     # Defense in depth: refuse a path that would escape the
+                     # work tree before creating directories or writing.
+                     file_path = _checked_worktree_path(r, path)
++                    # A symlink left in the work tree at a parent component
++                    # must not redirect the write.
++                    ensure_no_symlink_parents(r.path, file_path)
+ 
+                     # Create directories if needed
+                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
+@@ -5819,6 +5823,7 @@ def restore(
+                         # Defense in depth: refuse a path that would escape
+                         # the work tree.
+                         full_path = _checked_worktree_path(r, tree_path)
++                        ensure_no_symlink_parents(r.path, full_path)
+                         mode = index_entry.mode
+ 
+                         # Use build_file_from_blob to write the file
+@@ -5857,6 +5862,7 @@ def restore(
+ 
+             # Defense in depth: refuse a path that would escape the work tree.
+             full_path = _checked_worktree_path(r, tree_path)
++            ensure_no_symlink_parents(r.path, full_path)
+ 
+             if worktree:
+                 # Use build_file_from_blob to restore to working tree
+@@ -6027,6 +6033,7 @@ def reset_file(
+     file_entry = tree.lookup_path(repo.object_store.__getitem__, tree_path)
+     # Defense in depth: refuse a path that would escape the work tree.
+     full_path = _checked_worktree_path(repo, tree_path)
++    ensure_no_symlink_parents(repo.path, full_path)
+     blob = repo.object_store[file_entry[1]]
+     assert isinstance(blob, Blob)
+     mode = file_entry[0]
+@@ -6078,6 +6085,7 @@ def checkout_index(
+             if not validate_path(tree_path, validator):
+                 raise Error(f"refusing to write unsafe path: {tree_path!r}")
+             full_path = os.path.join(prefix_path, tree_path)
++            ensure_no_symlink_parents(prefix_path, full_path)
+             parent_dir = os.path.dirname(full_path)
+             if parent_dir and not os.path.isdir(parent_dir):
+                 os.makedirs(parent_dir)
+@@ -6294,7 +6302,11 @@ def cone_mode_disable(repo: str | os.PathLike[str] | Repo, force: bool = False)
+         commit = repo_obj[repo_obj.head()]
+         assert isinstance(commit, Commit)
+ 
+-        from ..index import build_index_from_tree, get_path_element_validator
++        from ..index import (
++            build_index_from_tree,
++            get_path_element_validator,
++            remove_symlink_directories,
++        )
+ 
+         build_index_from_tree(
+             repo_obj.path,
+diff --git a/dulwich/sparse_patterns.py b/dulwich/sparse_patterns.py
+index 818fa99..1c39088 100644
+--- a/dulwich/sparse_patterns.py
++++ b/dulwich/sparse_patterns.py
+@@ -38,7 +38,7 @@ from fnmatch import fnmatch
+ from typing import TYPE_CHECKING
+ 
+ from .file import ensure_dir_exists
+-from .index import Index, IndexEntry
++from .index import Index, IndexEntry, ensure_no_symlink_parents
+ from .objects import Blob
+ from .repo import Repo
+ 
+@@ -242,6 +242,7 @@ def apply_included_paths(
+                     raise BlobNotFoundError(
+                         f"Blob {entry.sha.hex()} not found for {path_bytes.decode('utf-8')}."
+                     )
++                ensure_no_symlink_parents(repo.path, full_path)
+                 ensure_dir_exists(os.path.dirname(full_path))
+                 # Apply checkout normalization if normalizer is available
+                 if normalizer and isinstance(blob, Blob):
+diff --git a/dulwich/worktree.py b/dulwich/worktree.py
+index dccbde2..41030b1 100644
+--- a/dulwich/worktree.py
++++ b/dulwich/worktree.py
+@@ -807,6 +807,7 @@ class WorkTree:
+         from .index import (
+             build_index_from_tree,
+             get_path_element_validator,
++            remove_symlink_directories,
+             symlink,
+         )
+ 

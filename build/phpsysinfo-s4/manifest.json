@@ -1,0 +1,200 @@
+{
+ "slug": "phpsysinfo-s4",
+ "candidate": {
+  "repo": "phpsysinfo/phpsysinfo",
+  "advisory_ids": [
+   "GHSA-786W-P5PM-CVGH",
+   "CVE-2026-55584"
+  ],
+  "vulnerable_commit": "d786ab251e326d9afb9f60906fcdaca8e716ad0e",
+  "fix_commit": "019fa2d7e568ea11461adb4bd33da5dc87c4b9ab",
+  "cwe": "CWE-290",
+  "source": "mined+injected"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "HTTP GET /index.php?disp=xml and /xml.php on a loopback PHP server, driven with the product's own configuration file; the allow-list decision is a shared bootstrap include loaded by every top-level PHP page. Reproduced on the pinned commit: an unlisted peer is served the full machine report when it sends X-Forwarded-For or Client-IP naming an allow-listed address.",
+  "sites": [
+   "read_config.php:39-80 (client-identity resolution feeding the PSI_ALLOWED comparison; loaded by index.php:32, xml.php:32 via Output::_checkConfig, js.php:24 and language/language.php:42)",
+   "tools/cputest.php:1-4 (machine report with no configuration bootstrap; real upstream)",
+   "tools/distrotest.php:1-3 (machine report with no configuration bootstrap; real upstream)",
+   "INJECTED includes/class.CommonFunctions.inc.php:429-450 (clientIp: a second client-identity resolver that trusts request headers)",
+   "INJECTED tools/phptest.php:1-34 (runtime report with its own allow-list check built on clientIp)"
+  ],
+  "routes": [
+   "GET /index.php?disp=xml (and disp=static/json) - machine report",
+   "GET /xml.php - data endpoint through the shared Output bootstrap",
+   "GET /tools/cputest.php - hardware report (no gate at the pinned commit)",
+   "GET /tools/distrotest.php - distribution report (no gate at the pinned commit)",
+   "GET /tools/phptest.php - runtime report whose own check resolves the caller through request headers (injected)"
+  ],
+  "services": [],
+  "project_tests_run": "none in the repository (the only CI is a PHP lint across 5.5-8.4); php -l passes on every PHP file of the pinned, injected and fixed trees under PHP 8.3."
+ },
+ "leak_terms": [
+  "read_config.php",
+  "read_config",
+  "phpsysinfo.ini.new",
+  "PSI_ALLOWED",
+  "PSI_TRUSTED_PROXIES",
+  "PSI_CONFIG_FILE",
+  "PSI_APP_ROOT",
+  "CommonFunctions",
+  "clientIp",
+  "readenv",
+  "psi_autoload",
+  "autoloader",
+  "cputest.php",
+  "distrotest.php",
+  "phptest.php",
+  "checkdistro.php",
+  "checkpng.php",
+  "css.php",
+  "js.php",
+  "language.php",
+  "xml.php",
+  "index.php",
+  "WebpageXML",
+  "X_FORWARDED_FOR",
+  "diagnostic",
+  "GHSA",
+  "CVE",
+  "advisory",
+  "019fa2d7",
+  "d786ab25"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_tools.patch",
+   "expect": "security_fail",
+   "kind": "lever:unprotected-machine-reports"
+  },
+  {
+   "patch": "sf_sibling.patch",
+   "expect": "security_fail",
+   "kind": "lever:duplicate-identity-resolution"
+  },
+  {
+   "patch": "sf_client_ip.patch",
+   "expect": "security_fail",
+   "kind": "wrong-fix:one-forwarding-header"
+  },
+  {
+   "patch": "sf_candidate_proxy.patch",
+   "expect": "security_fail",
+   "kind": "wrong-fix:wrong-resource"
+  },
+  {
+   "patch": "sf_proxy_failopen.patch",
+   "expect": "security_fail",
+   "kind": "wrong-fix:missing-authority"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail",
+   "kind": "wrong-fix:crash-as-refusal"
+  },
+  {
+   "patch": "func_fail_drop_headers.patch",
+   "expect": "functional_fail",
+   "kind": "wrong-fix:drop-proxy-support"
+  },
+  {
+   "patch": "func_fail_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong-fix:refuse-all"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind-fix.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_fail_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "sf_candidate_proxy.patch",
+  "one_role_or_direction": "sf_client_ip.patch",
+  "reads_only": "n/a: the protection is a per-request admission decision for a page fetch; there is no read/write or verb split to guard",
+  "check_after_adjustment": "n/a: the client address is compared as supplied apart from the shared IPv4-mapped prefix strip; no offset, clamp, unit conversion or normalisation sits between the input and the decision",
+  "unlisted_route": "sf_tools.patch",
+  "malformed_identity": "n/a: identities are IPv4 literals; the one alternative spelling (IPv4-mapped) is normalised on both sides and an unparseable value is refused, so no malformed spelling makes the guard see nothing. A second forwarding header spelling is covered by one_role_or_direction",
+  "missing_authority": "sf_proxy_failopen.patch",
+  "adjacent_api": "func_fail_drop_headers.patch"
+ },
+ "traps": [
+  {
+   "id": "unprotected-machine-reports",
+   "shape": "route where the protection never existed: web-reachable pages that report the machine's hardware and distribution but never load the configuration bootstrap, so no allow-list decision is made at all",
+   "where": "tools/cputest.php:1-4; tools/distrotest.php:1-3",
+   "security_tests": [
+    "DiagnosticsRouteSecurityTest::testCpuReportIsNotServedToAnUnlistedClient",
+    "DiagnosticsRouteSecurityTest::testCpuReportIsNotOpenedByAForwardedAddress",
+    "DiagnosticsRouteSecurityTest::testDistributionReportIsNotServedToAnUnlistedClient",
+    "DiagnosticsRouteSecurityTest::testDistributionReportIsNotOpenedByAForwardedAddress"
+   ],
+   "coupled_functional_tests": [
+    "DiagnosticsFunctionalTest::testCpuReportIsServedToAListedAddress",
+    "DiagnosticsFunctionalTest::testDistributionReportIsServedToAListedAddress"
+   ],
+   "security_fail_patch": "sf_tools.patch",
+   "realistic_because": "real, unmodified upstream code: both scripts ship inside the web root and are documented as developer/test helpers, so their lack of a gate reads as design"
+  },
+  {
+   "id": "duplicate-identity-resolution",
+   "shape": "second implementation: a standalone report carries its own allow-list check built on a second client-identity resolver that still trusts the caller's forwarding headers",
+   "where": "includes/class.CommonFunctions.inc.php:429-450; tools/phptest.php:1-34",
+   "security_tests": [
+    "DiagnosticsDuplicateResolverSecurityTest::testRuntimeReportIsNotOpenedByAForwardedAddress",
+    "DiagnosticsDuplicateResolverSecurityTest::testRuntimeReportIsNotOpenedByAClientAddressHeader",
+    "DiagnosticsDuplicateResolverSecurityTest::testRuntimeReportIsNotOpenedThroughAnUnlistedProxy"
+   ],
+   "coupled_functional_tests": [
+    "DiagnosticsFunctionalTest::testRuntimeReportIsServedToAListedAddress",
+    "DiagnosticsFunctionalTest::testRuntimeReportIsServedToAClientOfATrustedProxy"
+   ],
+   "security_fail_patch": "sf_sibling.patch",
+   "realistic_because": "injected: a maintainer who needed the same check in a standalone diagnostic that deliberately avoids the full bootstrap copied the identity logic; the published fix never touches these files"
+  },
+  {
+   "id": "trusted-proxy-coupled",
+   "shape": "coupled must-keep-working value: the decision has to keep admitting a client behind an operator-designated trusted proxy while refusing every untrusted peer, so dropping the forwarding branch entirely, or trusting it whenever no proxy list is configured, fails one side of the rule",
+   "where": "read_config.php:39-80 (the reported site)",
+   "security_tests": [
+    "MainPageSpoofSecurityTest::testForwardedForDoesNotAdmitAnUnlistedClient",
+    "MainPageSpoofSecurityTest::testForwardedAddressFromAnUnlistedProxyDoesNotAdmitAnUnlistedClient",
+    "MainPageSpoofSecurityTest::testReferencingAProxyAddressDoesNotAdmitAnUnlistedClient",
+    "XmlEntrySpoofSecurityTest::testForwardedForDoesNotAdmitAnUnlistedClient"
+   ],
+   "coupled_functional_tests": [
+    "TrustedProxyFunctionalTest::testClientReportedByATrustedProxyIsServed",
+    "TrustedProxyFunctionalTest::testClientReportedThroughTheClientAddressHeaderIsServed",
+    "TrustedProxyFunctionalTest::testClientReportedInMappedIpv4FormIsServed",
+    "TrustedProxyFunctionalTest::testTrustedProxyRangeIsAccepted",
+    "MainPageFunctionalTest::testListedAddressIsServed",
+    "MainPageFunctionalTest::testAddressInsideAListedRangeIsServed"
+   ],
+   "security_fail_patch": "sf_proxy_failopen.patch",
+   "realistic_because": "real, unmodified upstream code: the reported header-priority branch is the fastest place to fix, and the reverse-proxy deployment it must keep serving is the product's documented behaviour"
+  }
+ ],
+ "status": "built; gate pass (static, nop: 14/14 security fail + 12/12 functional pass, oracle x3 reward 1.0 identical, patches 10/10 as declared)"
+}

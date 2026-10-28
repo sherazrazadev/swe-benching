@@ -1,0 +1,224 @@
+diff -ruN a/src/ui/mcp-ui-utils.ts b/src/ui/mcp-ui-utils.ts
+--- a/src/ui/mcp-ui-utils.ts	2026-10-28 16:35:49.000000000 +0000
++++ b/src/ui/mcp-ui-utils.ts	2026-10-28 16:52:25.922633935 +0000
+@@ -35,6 +35,45 @@
+ }
+ 
+ /**
++ * Character-level encoding for HTML text and quoted attribute values. Decoding
++ * happens in the HTML parser, so a value keeps its exact characters when read
++ * back through textContent, an attribute, or a dataset entry.
++ */
++const HTML_ENTITY_ENCODINGS: Record<string, string> = {
++  '&': '&amp;',
++  '<': '&lt;',
++  '>': '&gt;',
++  '"': '&quot;',
++  "'": '&#39;',
++};
++
++/**
++ * Escapes a value so it can only ever be data where HTML is parsed: element
++ * text, quoted attribute values and the like. The value itself is unchanged
++ * after the parser decodes the entities.
++ * @param value - Value supplied by the application under test
++ * @returns Encoded value that is inert in HTML contexts
++ */
++function escapeHtml(value: unknown): string {
++  return String(value).replace(/[&<>"']/g, (char) => HTML_ENTITY_ENCODINGS[char]);
++}
++
++/**
++ * Encodes a value as a JavaScript literal for insertion into a generated
++ * <script>. JSON quoting fixes the JavaScript syntax, escaping "<" stops the
++ * HTML parser from recognising a tag terminator inside the script element, and
++ * the two JavaScript line separators are escaped for older parsers.
++ * @param value - Value to embed in the generated script
++ * @returns A literal that is inert both to the HTML parser and to JavaScript
++ */
++function scriptLiteral(value: unknown): string {
++  return JSON.stringify(value)
++    .replace(/</g, '\\u003c')
++    .replace(/\u2028/g, '\\u2028')
++    .replace(/\u2029/g, '\\u2029');
++}
++
++/**
+  * Creates a device picker UI component
+  * @param devices - Array of device objects with name, udid, state, etc.
+  * @param platform - 'android' or 'ios'
+@@ -715,32 +754,38 @@
+     displayed: boolean;
+   }>
+ ): string {
++  // The control's payload is kept out of the markup entirely: each button only
++  // carries a numeric handle, and the values themselves travel in the script as
++  // a JSON literal that the HTML parser cannot terminate.
++  const locatorEntries: Array<{ strategy: string; selector: string }> = [];
++
+   const locatorCards = locators
+     .map(
+       (element, index) => `
+     <div class="locator-card" data-index="${index}">
+       <div class="locator-header">
+-        <h3>${element.tagName}</h3>
++        <h3>${escapeHtml(element.tagName)}</h3>
+         <div class="badges">
+           ${element.clickable ? '<span class="badge badge-clickable">Clickable</span>' : ''}
+           ${element.enabled ? '<span class="badge badge-enabled">Enabled</span>' : ''}
+           ${element.displayed ? '<span class="badge badge-displayed">Displayed</span>' : ''}
+         </div>
+       </div>
+-      ${element.text ? `<p class="element-text"><strong>Text:</strong> ${element.text}</p>` : ''}
+-      ${element.contentDesc ? `<p class="element-text"><strong>Content Desc:</strong> ${element.contentDesc}</p>` : ''}
+-      ${element.resourceId ? `<p class="element-text"><strong>Resource ID:</strong> <code>${element.resourceId}</code></p>` : ''}
++      ${element.text ? `<p class="element-text"><strong>Text:</strong> ${escapeHtml(element.text)}</p>` : ''}
++      ${element.contentDesc ? `<p class="element-text"><strong>Content Desc:</strong> ${escapeHtml(element.contentDesc)}</p>` : ''}
++      ${element.resourceId ? `<p class="element-text"><strong>Resource ID:</strong> <code>${escapeHtml(element.resourceId)}</code></p>` : ''}
+       <div class="locators-list">
+         ${Object.entries(element.locators)
+-          .map(
+-            ([strategy, selector]) => `
++          .map(([strategy, selector]) => {
++            const locatorIndex = locatorEntries.push({ strategy, selector }) - 1;
++            return `
+           <div class="locator-item">
+-            <span class="strategy">${strategy}</span>
+-            <code class="selector">${selector}</code>
+-            <button class="test-btn" onclick="testLocator('${strategy}', \`${selector.replace(/`/g, '\\`')}\`)">Test</button>
++            <span class="strategy">${escapeHtml(strategy)}</span>
++            <code class="selector">${escapeHtml(selector)}</code>
++            <button class="test-btn" data-locator-index="${locatorIndex}">Test</button>
+           </div>
+-        `
+-          )
++        `;
++          })
+           .join('')}
+       </div>
+     </div>
+@@ -883,6 +928,8 @@
+     </div>
+   </div>
+   <script>
++    const LOCATOR_ENTRIES = ${scriptLiteral(locatorEntries)};
++
+     function testLocator(strategy, selector) {
+       window.parent.postMessage({
+         type: 'tool',
+@@ -895,6 +942,15 @@
+         }
+       }, '*');
+     }
++
++    document.querySelectorAll('.test-btn').forEach((button) => {
++      button.addEventListener('click', () => {
++        const entry = LOCATOR_ENTRIES[Number(button.dataset.locatorIndex)];
++        if (entry) {
++          testLocator(entry.strategy, entry.selector);
++        }
++      });
++    });
+   </script>
+ </body>
+ </html>
+@@ -914,6 +970,9 @@
+     .replace(/>/g, '&gt;')
+     .replace(/"/g, '&quot;')
+     .replace(/'/g, '&#039;');
++  // The viewer script needs the raw source; carry it as a literal the script
++  // parser reads as a string, never as source text spliced into a template.
++  const sourceLiteral = scriptLiteral(pageSource);
+ 
+   return `
+ <!DOCTYPE html>
+@@ -1058,19 +1117,37 @@
+       }, '*');
+     }
+ 
+-    // Search functionality
+-    document.getElementById('searchBox').addEventListener('input', (e) => {
+-      const searchTerm = e.target.value.toLowerCase();
+-      const content = document.getElementById('xmlContent');
+-      if (!searchTerm) {
+-        content.innerHTML = \`${escapedSource}\`;
++    const SOURCE_TEXT = ${sourceLiteral};
++
++    function highlightTerm(content, term) {
++      if (!term) {
++        content.textContent = SOURCE_TEXT;
+         return;
+       }
+-      const highlighted = content.textContent.replace(
+-        new RegExp(\`(\${searchTerm})\`, 'gi'),
+-        '<mark style="background: #ffd700; color: #000;">$1</mark>'
++      // Escape the term before it becomes a pattern, then split on the
++      // captured match so alternating parts are plain text and marks.
++      const pattern = new RegExp(
++        '(' + term.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&') + ')',
++        'gi'
++      );
++      const parts = SOURCE_TEXT.split(pattern);
++      content.replaceChildren(
++        ...parts.map((part, index) => {
++          if (index % 2 === 0) {
++            return document.createTextNode(part);
++          }
++          const mark = document.createElement('mark');
++          mark.style.background = '#ffd700';
++          mark.style.color = '#000';
++          mark.textContent = part;
++          return mark;
++        })
+       );
+-      content.innerHTML = highlighted;
++    }
++
++    // Search functionality
++    document.getElementById('searchBox').addEventListener('input', (e) => {
++      highlightTerm(document.getElementById('xmlContent'), e.target.value);
+     });
+   </script>
+ </body>
+@@ -1703,12 +1780,12 @@
+ </head>
+ <body>
+   <div class="container">
+-    <div class="attr-card" data-attribute="${attribute}" data-value="${stripTags(displayValue)}">
++    <div class="attr-card" data-attribute="${escapeHtml(attribute)}" data-value="${escapeHtml(displayValue)}">
+       <div class="attr-header">
+-        <h3>${attribute}</h3>
+-        <span class="element-id">${elementId}</span>
++        <h3>${escapeHtml(attribute)}</h3>
++        <span class="element-id">${escapeHtml(elementId)}</span>
+       </div>
+-      <pre class="attr-value">${stripTags(displayValue)}</pre>
++      <pre class="attr-value">${escapeHtml(displayValue)}</pre>
+       <button class="copy-btn" onclick="copyValue()">Copy value</button>
+     </div>
+   </div>
+@@ -1800,7 +1877,7 @@
+     <p>Structured data for ${locators.length} element${locators.length !== 1 ? 's' : ''}.</p>
+     <button class="btn" onclick="copyLocatorData()">Copy JSON</button>
+   </div>
+-  <script id="locator-data" type="application/json">${JSON.stringify(locators, null, 2)}</script>
++  <script id="locator-data" type="application/json">${scriptLiteral(locators)}</script>
+   <script>
+     function copyLocatorData() {
+       const node = document.getElementById('locator-data');
+@@ -1815,15 +1892,6 @@
+ }
+ 
+ /**
+- * Removes angle brackets so a value is shown as plain text
+- * @param value - Value to display
+- * @returns Value without angle brackets
+- */
+-function stripTags(value: string): string {
+-  return value.replace(/[<>]/g, '');
+-}
+-
+-/**
+  * Helper function to add UI resource to response content
+  * Returns both text and UI resource for backward compatibility
+  */

@@ -1,0 +1,282 @@
+diff --git a/src/tools/interactions/get-element-attribute.ts b/src/tools/interactions/get-element-attribute.ts
+index 8591c9f..8dfcfcc 100644
+--- a/src/tools/interactions/get-element-attribute.ts
++++ b/src/tools/interactions/get-element-attribute.ts
+@@ -2,6 +2,11 @@ import type { ContentResult, FastMCP } from 'fastmcp';
+ import { z } from 'zod';
+ import { elementUUIDScheme } from '../../schema.js';
+ import { getElementAttribute } from '../../command.js';
++import {
++  createUIResource,
++  createElementAttributeInspectorUI,
++  addUIResourceToResponse,
++} from '../../ui/mcp-ui-utils.js';
+ import {
+   resolveDriver,
+   textResultWithPrimaryElementId,
+@@ -58,7 +63,18 @@ export default function getElementAttributeTool(server: FastMCP): void {
+           value !== null
+             ? `Attribute "${args.attribute}" of element ${args.elementUUID}: ${value}`
+             : `Attribute "${args.attribute}" is not set on element ${args.elementUUID}`;
+-        return textResultWithPrimaryElementId(args.elementUUID, detail);
++        const uiResource = createUIResource(
++          `ui://appium-mcp/element-attribute/${Date.now()}`,
++          createElementAttributeInspectorUI(
++            args.elementUUID,
++            args.attribute,
++            value
++          )
++        );
++        return addUIResourceToResponse(
++          textResultWithPrimaryElementId(args.elementUUID, detail),
++          uiResource
++        );
+       } catch (err: unknown) {
+         return errorResult(
+           `Failed to get attribute "${args.attribute}" from element ${args.elementUUID}. err: ${toolErrorMessage(err)}`
+diff --git a/src/tools/test-generation/locators.ts b/src/tools/test-generation/locators.ts
+index 1f307bf..2fb19c3 100644
+--- a/src/tools/test-generation/locators.ts
++++ b/src/tools/test-generation/locators.ts
+@@ -18,6 +18,7 @@ import { generateAllElementLocators } from '../../locators/generate-all-locators
+ import {
+   createUIResource,
+   createLocatorGeneratorUI,
++  createLocatorDataUI,
+   addUIResourceToResponse,
+ } from '../../ui/mcp-ui-utils.js';
+ import { getPageSource } from '../../command.js';
+@@ -90,7 +91,15 @@ export default function generateLocators(server: any): void {
+           createLocatorGeneratorUI(interactableElements)
+         );
+ 
+-        return addUIResourceToResponse(textResponse, uiResource);
++        const locatorDataResource = createUIResource(
++          `ui://appium-mcp/locator-data/${Date.now()}`,
++          createLocatorDataUI(interactableElements)
++        );
++
++        return addUIResourceToResponse(
++          addUIResourceToResponse(textResponse, uiResource),
++          locatorDataResource
++        );
+       } catch (err: unknown) {
+         log.error('Error getting page source:', err);
+         return errorResult(
+diff --git a/src/ui/mcp-ui-utils.ts b/src/ui/mcp-ui-utils.ts
+index d591588..88afb34 100644
+--- a/src/ui/mcp-ui-utils.ts
++++ b/src/ui/mcp-ui-utils.ts
+@@ -1617,6 +1617,212 @@ export function createTestCodeViewerUI(
+   `;
+ }
+ 
++
++/**
++ * Creates an element attribute inspector UI component
++ * @param elementId - WebDriver element id the attribute was read from
++ * @param attribute - Name of the attribute
++ * @param value - Attribute value, or null when it is not set
++ * @returns HTML string for the attribute inspector
++ */
++export function createElementAttributeInspectorUI(
++  elementId: string,
++  attribute: string,
++  value: string | null
++): string {
++  const displayValue = value === null ? '' : String(value);
++
++  return `
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>Element Attribute</title>
++  <style>
++    * {
++      margin: 0;
++      padding: 0;
++      box-sizing: border-box;
++    }
++    body {
++      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
++      background: #f5f5f5;
++      padding: 20px;
++    }
++    .container {
++      max-width: 800px;
++      margin: 0 auto;
++    }
++    .attr-card {
++      background: white;
++      border: 1px solid #e0e0e0;
++      border-radius: 8px;
++      padding: 16px;
++      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
++    }
++    .attr-header {
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      margin-bottom: 12px;
++    }
++    .attr-header h3 {
++      font-size: 16px;
++      font-weight: 600;
++      color: #1a1a1a;
++    }
++    .element-id {
++      font-size: 12px;
++      color: #666;
++      font-family: 'Monaco', 'Menlo', monospace;
++    }
++    .attr-value {
++      background: #f8f9fa;
++      border-radius: 4px;
++      padding: 12px;
++      font-size: 13px;
++      font-family: 'Monaco', 'Menlo', monospace;
++      white-space: pre-wrap;
++      word-break: break-all;
++    }
++    .copy-btn {
++      margin-top: 12px;
++      padding: 6px 12px;
++      background: #007AFF;
++      color: white;
++      border: none;
++      border-radius: 4px;
++      font-size: 13px;
++      cursor: pointer;
++    }
++    .copy-btn:hover {
++      background: #0056b3;
++    }
++  </style>
++</head>
++<body>
++  <div class="container">
++    <div class="attr-card" data-attribute="${attribute}" data-value="${stripTags(displayValue)}">
++      <div class="attr-header">
++        <h3>${attribute}</h3>
++        <span class="element-id">${elementId}</span>
++      </div>
++      <pre class="attr-value">${stripTags(displayValue)}</pre>
++      <button class="copy-btn" onclick="copyValue()">Copy value</button>
++    </div>
++  </div>
++  <script>
++    function copyValue() {
++      const card = document.querySelector('.attr-card');
++      const value = card ? card.dataset.value : '';
++      if (navigator.clipboard) {
++        navigator.clipboard.writeText(value);
++      }
++    }
++  </script>
++</body>
++</html>
++  `;
++}
++
++/**
++ * Creates a locator data UI component that carries the generated locator data
++ * so the client can copy it as JSON
++ * @param locators - Array of elements with locators
++ * @returns HTML string for the locator data view
++ */
++export function createLocatorDataUI(
++  locators: Array<{
++    tagName: string;
++    locators: Record<string, string>;
++    text: string;
++    contentDesc: string;
++    resourceId: string;
++    clickable: boolean;
++    enabled: boolean;
++    displayed: boolean;
++  }>
++): string {
++  return `
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>Locator Data</title>
++  <style>
++    * {
++      margin: 0;
++      padding: 0;
++      box-sizing: border-box;
++    }
++    body {
++      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
++      background: #f5f5f5;
++      padding: 20px;
++    }
++    .container {
++      max-width: 800px;
++      margin: 0 auto;
++      background: white;
++      border: 1px solid #e0e0e0;
++      border-radius: 8px;
++      padding: 16px;
++      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
++    }
++    .container h1 {
++      font-size: 20px;
++      margin-bottom: 8px;
++    }
++    .container p {
++      color: #666;
++      font-size: 13px;
++      margin-bottom: 12px;
++    }
++    .btn {
++      padding: 6px 12px;
++      background: #007AFF;
++      color: white;
++      border: none;
++      border-radius: 4px;
++      font-size: 13px;
++      cursor: pointer;
++    }
++    .btn:hover {
++      background: #0056b3;
++    }
++  </style>
++</head>
++<body>
++  <div class="container">
++    <h1>Locator Data</h1>
++    <p>Structured data for ${locators.length} element${locators.length !== 1 ? 's' : ''}.</p>
++    <button class="btn" onclick="copyLocatorData()">Copy JSON</button>
++  </div>
++  <script id="locator-data" type="application/json">${JSON.stringify(locators, null, 2)}</script>
++  <script>
++    function copyLocatorData() {
++      const node = document.getElementById('locator-data');
++      if (node && navigator.clipboard) {
++        navigator.clipboard.writeText(node.textContent);
++      }
++    }
++  </script>
++</body>
++</html>
++  `;
++}
++
++/**
++ * Removes angle brackets so a value is shown as plain text
++ * @param value - Value to display
++ * @returns Value without angle brackets
++ */
++function stripTags(value: string): string {
++  return value.replace(/[<>]/g, '');
++}
++
+ /**
+  * Helper function to add UI resource to response content
+  * Returns both text and UI resource for backward compatibility

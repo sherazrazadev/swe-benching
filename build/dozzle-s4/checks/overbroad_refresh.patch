@@ -1,0 +1,188 @@
+diff --git a/internal/mcp/server.go b/internal/mcp/server.go
+index 186e2a68..53b89809 100644
+--- a/internal/mcp/server.go
++++ b/internal/mcp/server.go
+@@ -8,6 +8,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/amir20/dozzle/internal/auth"
+ 	"github.com/amir20/dozzle/internal/container"
+ 	container_support "github.com/amir20/dozzle/internal/support/container"
+ 	"github.com/modelcontextprotocol/go-sdk/mcp"
+@@ -26,13 +27,20 @@ type Server struct {
+ 	mcpServer   *mcp.Server
+ 	hostService HostService
+ 	labels      container.ContainerLabels
++	version     string
+ }
+ 
+ // NewServer creates a new MCP server with Dozzle tools registered.
+ func NewServer(hostService HostService, labels container.ContainerLabels, version string) *Server {
++	s := newServerForLabels(hostService, labels, version)
++	return s
++}
++
++func newServerForLabels(hostService HostService, labels container.ContainerLabels, version string) *Server {
+ 	s := &Server{
+ 		hostService: hostService,
+ 		labels:      labels,
++		version:     version,
+ 	}
+ 
+ 	mcpServer := mcp.NewServer(&mcp.Implementation{
+@@ -51,6 +59,13 @@ func NewServer(hostService HostService, labels container.ContainerLabels, versio
+ // Handler returns an http.Handler for the MCP streamable HTTP transport.
+ func (s *Server) Handler() http.Handler {
+ 	return mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
++		labels := s.labels
++		if user := auth.UserFromContext(r.Context()); user != nil && user.ContainerLabels.Exists() {
++			labels = user.ContainerLabels
++		}
++		if labels.Exists() {
++			return newServerForLabels(s.hostService, labels, s.version).mcpServer
++		}
+ 		return s.mcpServer
+ 	}, nil)
+ }
+diff --git a/internal/web/debug.go b/internal/web/debug.go
+index 1b29e404..f9465e67 100644
+--- a/internal/web/debug.go
++++ b/internal/web/debug.go
+@@ -3,14 +3,12 @@ package web
+ import (
+ 	"encoding/json"
+ 	"net/http"
+-
+-	"github.com/amir20/dozzle/internal/container"
+ )
+ 
+ func (h *handler) debugStore(w http.ResponseWriter, r *http.Request) {
+ 	respone := make(map[string]interface{})
+ 	respone["hosts"] = h.hostService.Hosts()
+-	containers, errors := h.hostService.ListAllContainers(container.ContainerLabels{})
++	containers, errors := h.hostService.ListAllContainers(h.resolveLabels(r))
+ 	respone["containers"] = containers
+ 	respone["errors"] = errors
+ 
+diff --git a/internal/web/events.go b/internal/web/events.go
+index 7ea01204..0571d8ff 100644
+--- a/internal/web/events.go
++++ b/internal/web/events.go
+@@ -38,6 +38,42 @@ func (h *handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+ 
+ 	allContainers, errors := h.hostService.ListAllContainers(userLabels)
+ 
++	// per-host set of container IDs the caller may see, so stat/event channels stay filtered like the list
++	visibleByHost := make(map[string]map[string]struct{})
++	setVisible := func(host string, containers []container.Container) {
++		ids := make(map[string]struct{}, len(containers))
++		for _, c := range containers {
++			ids[c.ID] = struct{}{}
++		}
++		visibleByHost[host] = ids
++	}
++	isVisible := func(host, id string) bool {
++		if host != "" {
++			ids, ok := visibleByHost[host]
++			if !ok {
++				return false
++			}
++			_, ok = ids[id]
++			return ok
++		}
++		// container-stat payloads carry no host, so fall back to scanning all hosts
++		for _, ids := range visibleByHost {
++			if _, ok := ids[id]; ok {
++				return true
++			}
++		}
++		return false
++	}
++
++	for _, c := range allContainers {
++		ids, ok := visibleByHost[c.Host]
++		if !ok {
++			ids = make(map[string]struct{})
++			visibleByHost[c.Host] = ids
++		}
++		ids[c.ID] = struct{}{}
++	}
++
+ 	for _, err := range errors {
+ 		log.Warn().Err(err).Msg("error listing containers")
+ 		if hostNotAvailableError, ok := err.(*docker_support.HostUnavailableError); ok {
+@@ -61,6 +97,9 @@ func (h *handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+ 				return
+ 			}
+ 		case stat := <-stats:
++			if !isVisible("", stat.ID) {
++				continue
++			}
+ 			if err := sseWriter.Event("container-stat", stat); err != nil {
+ 				log.Error().Err(err).Msg("error writing event to event stream")
+ 				return
+@@ -72,9 +111,13 @@ func (h *handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+ 			log.Trace().Str("event", event.Name).Str("id", event.ActorID).Msg("container event from store")
+ 			switch event.Name {
+ 			case "start", "die", "destroy", "rename", "pause", "unpause":
++				if !isVisible(event.Host, event.ActorID) {
++					continue
++				}
+ 				if event.Name == "start" || event.Name == "rename" {
+ 					if containers, err := h.hostService.ListContainersForHost(event.Host, userLabels); err == nil {
+ 						log.Debug().Str("host", event.Host).Int("count", len(containers)).Msg("updating containers for host")
++						setVisible(event.Host, containers)
+ 						if err := sseWriter.Event("containers-changed", containers); err != nil {
+ 							log.Error().Err(err).Msg("error writing containers to event stream")
+ 							return
+@@ -88,11 +131,17 @@ func (h *handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+ 				}
+ 
+ 			case "update":
++				if event.Container == nil || !isVisible(event.Host, event.Container.ID) {
++					continue
++				}
+ 				if err := sseWriter.Event("container-updated", event.Container); err != nil {
+ 					log.Error().Err(err).Msg("error writing event to event stream")
+ 					return
+ 				}
+ 			case "health_status: healthy", "health_status: unhealthy":
++				if !isVisible(event.Host, event.ActorID) {
++					continue
++				}
+ 				healthy := "unhealthy"
+ 				if event.Name == "health_status: healthy" {
+ 					healthy = "healthy"
+@@ -107,6 +156,9 @@ func (h *handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+ 					return
+ 				}
+ 			case "oom":
++				if !isVisible(event.Host, event.ActorID) {
++					continue
++				}
+ 				payload := map[string]string{
+ 					"actorId": event.ActorID,
+ 					"host":    event.Host,
+diff --git a/internal/web/notifications.go b/internal/web/notifications.go
+index e118a75e..55fb3884 100644
+--- a/internal/web/notifications.go
++++ b/internal/web/notifications.go
+@@ -569,7 +569,7 @@ func (h *handler) previewExpression(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// Find matching running containers
+ 	if sub.ContainerProgram != nil {
+-		containers, _ := h.hostService.ListAllContainers(container.ContainerLabels{})
++		containers, _ := h.hostService.ListAllContainers(h.resolveLabels(r))
+ 		for _, c := range containers {
+ 			if c.State != "running" {
+ 				continue
+@@ -592,7 +592,7 @@ func (h *handler) previewExpression(w http.ResponseWriter, r *http.Request) {
+ 		keySet := make(map[string]struct{})
+ 
+ 		for _, c := range result.MatchedContainers {
+-			containerService, err := h.hostService.FindContainer(c.Host, c.ID, container.ContainerLabels{})
++			containerService, err := h.hostService.FindContainer(c.Host, c.ID, h.resolveLabels(r))
+ 			if err != nil {
+ 				continue
+ 			}

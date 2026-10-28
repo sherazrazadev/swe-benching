@@ -1,0 +1,150 @@
+diff --git a/src/ui/mcp-ui-utils.ts b/src/ui/mcp-ui-utils.ts
+index 88afb34..cc527c4 100644
+--- a/src/ui/mcp-ui-utils.ts
++++ b/src/ui/mcp-ui-utils.ts
+@@ -720,24 +720,24 @@ export function createLocatorGeneratorUI(
+       (element, index) => `
+     <div class="locator-card" data-index="${index}">
+       <div class="locator-header">
+-        <h3>${element.tagName}</h3>
++        <h3>${escapeHtml(element.tagName)}</h3>
+         <div class="badges">
+           ${element.clickable ? '<span class="badge badge-clickable">Clickable</span>' : ''}
+           ${element.enabled ? '<span class="badge badge-enabled">Enabled</span>' : ''}
+           ${element.displayed ? '<span class="badge badge-displayed">Displayed</span>' : ''}
+         </div>
+       </div>
+-      ${element.text ? `<p class="element-text"><strong>Text:</strong> ${element.text}</p>` : ''}
+-      ${element.contentDesc ? `<p class="element-text"><strong>Content Desc:</strong> ${element.contentDesc}</p>` : ''}
+-      ${element.resourceId ? `<p class="element-text"><strong>Resource ID:</strong> <code>${element.resourceId}</code></p>` : ''}
++      ${element.text ? `<p class="element-text"><strong>Text:</strong> ${escapeHtml(element.text)}</p>` : ''}
++      ${element.contentDesc ? `<p class="element-text"><strong>Content Desc:</strong> ${escapeHtml(element.contentDesc)}</p>` : ''}
++      ${element.resourceId ? `<p class="element-text"><strong>Resource ID:</strong> <code>${escapeHtml(element.resourceId)}</code></p>` : ''}
+       <div class="locators-list">
+         ${Object.entries(element.locators)
+           .map(
+             ([strategy, selector]) => `
+           <div class="locator-item">
+-            <span class="strategy">${strategy}</span>
+-            <code class="selector">${selector}</code>
+-            <button class="test-btn" onclick="testLocator('${strategy}', \`${selector.replace(/`/g, '\\`')}\`)">Test</button>
++            <span class="strategy">${escapeHtml(strategy)}</span>
++            <code class="selector">${escapeHtml(selector)}</code>
++            <button class="test-btn" data-strategy="${escapeHtml(strategy)}" data-selector="${escapeHtml(selector)}">Test</button>
+           </div>
+         `
+           )
+@@ -895,6 +895,16 @@ export function createLocatorGeneratorUI(
+         }
+       }, '*');
+     }
++
++    document.addEventListener('click', (event) => {
++      const target = event.target;
++      const button = target instanceof Element ? target.closest('.test-btn') : null;
++      if (!button) {
++        return;
++      }
++
++      testLocator(button.dataset.strategy || '', button.dataset.selector || '');
++    });
+   </script>
+ </body>
+ </html>
+@@ -914,6 +924,8 @@ export function createPageSourceInspectorUI(pageSource: string): string {
+     .replace(/>/g, '&gt;')
+     .replace(/"/g, '&quot;')
+     .replace(/'/g, '&#039;');
++  // The viewer script keeps the page source in a plain string and renders it as text.
++  const sourceLiteral = JSON.stringify(pageSource).replace(/</g, '\\u003c');
+ 
+   return `
+ <!DOCTYPE html>
+@@ -1058,19 +1070,34 @@ export function createPageSourceInspectorUI(pageSource: string): string {
+       }, '*');
+     }
+ 
++    const sourceText = ${sourceLiteral};
++
+     // Search functionality
+     document.getElementById('searchBox').addEventListener('input', (e) => {
+-      const searchTerm = e.target.value.toLowerCase();
++      const searchTerm = e.target.value;
+       const content = document.getElementById('xmlContent');
+       if (!searchTerm) {
+-        content.innerHTML = \`${escapedSource}\`;
++        content.textContent = sourceText;
+         return;
+       }
+-      const highlighted = content.textContent.replace(
+-        new RegExp(\`(\${searchTerm})\`, 'gi'),
+-        '<mark style="background: #ffd700; color: #000;">$1</mark>'
+-      );
+-      content.innerHTML = highlighted;
++      const haystack = sourceText.toLowerCase();
++      const needle = searchTerm.toLowerCase();
++      const fragment = document.createDocumentFragment();
++      let from = 0;
++      let at = haystack.indexOf(needle, from);
++      while (at !== -1) {
++        fragment.appendChild(document.createTextNode(sourceText.slice(from, at)));
++        const mark = document.createElement('mark');
++        mark.style.background = '#ffd700';
++        mark.style.color = '#000';
++        mark.textContent = sourceText.slice(at, at + searchTerm.length);
++        fragment.appendChild(mark);
++        from = at + searchTerm.length;
++        at = haystack.indexOf(needle, from);
++      }
++      fragment.appendChild(document.createTextNode(sourceText.slice(from)));
++      content.textContent = '';
++      content.appendChild(fragment);
+     });
+   </script>
+ </body>
+@@ -1703,12 +1730,12 @@ export function createElementAttributeInspectorUI(
+ </head>
+ <body>
+   <div class="container">
+-    <div class="attr-card" data-attribute="${attribute}" data-value="${stripTags(displayValue)}">
++    <div class="attr-card" data-attribute="${escapeHtml(attribute)}" data-value="${escapeHtml(displayValue)}">
+       <div class="attr-header">
+-        <h3>${attribute}</h3>
+-        <span class="element-id">${elementId}</span>
++        <h3>${escapeHtml(attribute)}</h3>
++        <span class="element-id">${escapeHtml(elementId)}</span>
+       </div>
+-      <pre class="attr-value">${stripTags(displayValue)}</pre>
++      <pre class="attr-value">${escapeHtml(displayValue)}</pre>
+       <button class="copy-btn" onclick="copyValue()">Copy value</button>
+     </div>
+   </div>
+@@ -1814,15 +1841,6 @@ export function createLocatorDataUI(
+   `;
+ }
+ 
+-/**
+- * Removes angle brackets so a value is shown as plain text
+- * @param value - Value to display
+- * @returns Value without angle brackets
+- */
+-function stripTags(value: string): string {
+-  return value.replace(/[<>]/g, '');
+-}
+-
+ /**
+  * Helper function to add UI resource to response content
+  * Returns both text and UI resource for backward compatibility
+@@ -1839,3 +1857,12 @@ export function addUIResourceToResponse(
+     content: [...response.content, uiResource],
+   };
+ }
++
++function escapeHtml(value: unknown): string {
++  return String(value)
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++    .replace(/'/g, '&#039;');
++}
