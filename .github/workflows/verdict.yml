@@ -107,8 +107,12 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           [ -s /tmp/dirs.txt ] || exit 0
-          # a Claude subscription token (claude setup-token, sk-ant-oat...) saved as ANTHROPIC_API_KEY gets 401 as an API key
-          if [[ "$ANTHROPIC_API_KEY" == sk-ant-oat* ]]; then export CLAUDE_CODE_OAUTH_TOKEN="$ANTHROPIC_API_KEY"; unset ANTHROPIC_API_KEY; echo "using the secret as a subscription token"; fi
+          # the ANTHROPIC_API_KEY secret may hold a Claude OAuth token (claude setup-token): sent as an API key it gets 401.
+          # Strip pasted spaces/newlines/quotes; anything that is not an API key (sk-ant-api...) is used as the OAuth token.
+          k=$(printf %s "$ANTHROPIC_API_KEY" | tr -d "[:space:]\"'")
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -n "$k" ] && [[ "$k" != sk-ant-api* ]]; then
+            export CLAUDE_CODE_OAUTH_TOKEN="$k"; unset ANTHROPIC_API_KEY; echo "auth: OAuth token from ANTHROPIC_API_KEY (starts sk-ant-oat: $([[ $k == sk-ant-oat* ]] && echo yes || echo no))"
+          elif [ -n "$k" ]; then export ANTHROPIC_API_KEY="$k"; echo "auth: API key"; fi
           curl -fsSL https://claude.ai/install.sh | bash -s 2.1.302 >/dev/null
           while read -r d; do
             timeout 2400 "$HOME/.local/bin/claude" -p "You are the independent auditor. Read $d/AUDITOR_BRIEF.md and follow it exactly, working only from $d (read-only). Write $d/verdict.json." \
