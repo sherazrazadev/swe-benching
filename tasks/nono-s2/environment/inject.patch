@@ -1,0 +1,290 @@
+diff --git a/crates/nono-cli/src/package.rs b/crates/nono-cli/src/package.rs
+index bcd1c502..634cfc88 100644
+--- a/crates/nono-cli/src/package.rs
++++ b/crates/nono-cli/src/package.rs
+@@ -328,6 +328,18 @@ pub fn package_install_dir(namespace: &str, name: &str) -> Result<PathBuf> {
+     Ok(package_store_dir()?.join(namespace).join(name))
+ }
+ 
++/// Pack store used before it moved under the XDG config directory.
++///
++/// Packs installed by older releases still live under `$HOME/.nono/packages`
++/// and are kept readable so an upgrade does not orphan them.
++pub fn legacy_package_store_dir() -> Result<PathBuf> {
++    Ok(profile::home_dir()?.join(".nono").join("packages"))
++}
++
++pub fn legacy_package_install_dir(namespace: &str, name: &str) -> Result<PathBuf> {
++    Ok(legacy_package_store_dir()?.join(namespace).join(name))
++}
++
+ pub fn package_groups_path(namespace: &str, name: &str) -> Result<PathBuf> {
+     Ok(package_install_dir(namespace, name)?.join("groups.json"))
+ }
+diff --git a/crates/nono-cli/src/policy.rs b/crates/nono-cli/src/policy.rs
+index ebff9585..597924ed 100644
+--- a/crates/nono-cli/src/policy.rs
++++ b/crates/nono-cli/src/policy.rs
+@@ -7,6 +7,7 @@ use crate::package;
+ use crate::profile;
+ use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+ use serde::Deserialize;
++use sha2::{Digest, Sha256};
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+ use tracing::{debug, info, warn};
+@@ -1421,6 +1422,48 @@ pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+             continue;
+         }
+ 
++        // Group files are pack content. When the pack carries a trust bundle,
++        // confirm the group file is the one the bundle was signed for before
++        // it can extend the policy.
++        if let Some(locked_pkg) = lockfile.packages.get(package_key) {
++            let bundle_path =
++                package::package_install_dir(namespace, name)?.join(".nono-trust.bundle");
++            if locked_pkg.provenance.is_some() && bundle_path.exists() {
++                let expected = std::fs::read_to_string(&bundle_path)
++                    .ok()
++                    .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
++                    .and_then(|entries| {
++                        entries.iter().find_map(|entry| {
++                            if entry.get("installed_path").and_then(|v| v.as_str())
++                                != Some("groups.json")
++                            {
++                                return None;
++                            }
++                            entry
++                                .get("digest")
++                                .and_then(|v| v.as_str())
++                                .map(str::to_string)
++                        })
++                    });
++                if let Some(expected) = expected {
++                    let bytes = std::fs::read(&groups_path).map_err(|e| {
++                        NonoError::ConfigRead {
++                            path: groups_path.clone(),
++                            source: e,
++                        }
++                    })?;
++                    let digest = Sha256::digest(&bytes);
++                    let hash = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
++                    if hash != expected {
++                        return Err(NonoError::PackageInstall(format!(
++                            "package group file '{}' does not match its signed digest",
++                            groups_path.display()
++                        )));
++                    }
++                }
++            }
++        }
++
+         let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+             path: groups_path.clone(),
+             source: e,
+diff --git a/crates/nono-cli/src/profile/mod.rs b/crates/nono-cli/src/profile/mod.rs
+index 642aa307..dfad11a5 100644
+--- a/crates/nono-cli/src/profile/mod.rs
++++ b/crates/nono-cli/src/profile/mod.rs
+@@ -2004,9 +2004,18 @@ fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &s
+ /// provides a profile artifact matching `name` (by `install_as` or alias).
+ /// Returns `None` if no pack provides a matching profile.
+ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+-    let store = crate::package::package_store_dir().ok()?;
+-    if !store.exists() {
+-        return None;
++    let mut stores: Vec<PathBuf> = Vec::new();
++    if let Ok(store) = crate::package::package_store_dir()
++        && store.exists()
++    {
++        stores.push(store);
++    }
++    // Packs installed by an older release live under `$HOME/.nono/packages`.
++    // They remain discoverable so upgrading does not orphan them.
++    if let Ok(legacy) = crate::package::legacy_package_store_dir()
++        && legacy.exists()
++    {
++        stores.push(legacy);
+     }
+ 
+     // Fast path: if name is in `org/pack-name[@version]` format, look up the
+@@ -2014,16 +2023,16 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+     // parse_package_ref strips the optional @version so we always look under
+     // the installed `packages/org/pack` directory, not `packages/org/pack@ver`.
+     if is_registry_ref(name) {
+-        return (|| {
+-            let pkg = crate::package::parse_package_ref(name).ok()?;
++        let pkg = crate::package::parse_package_ref(name).ok()?;
++        for store in &stores {
+             let pack_path = store.join(&pkg.namespace).join(&pkg.name);
+             if !pack_path.is_dir() {
+-                return None;
++                continue;
+             }
+             let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+             let manifest: crate::package::PackageManifest =
+                 serde_json::from_str(&manifest_str).ok()?;
+-            manifest
++            let hit = manifest
+                 .artifacts
+                 .iter()
+                 .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
+@@ -2033,68 +2042,79 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+                         .join("profiles")
+                         .join(format!("{install_as}.json"));
+                     profile_file.exists().then(|| (profile_file, pkg.key()))
+-                })
+-        })();
++                });
++            if hit.is_some() {
++                return hit;
++            }
++        }
++        return None;
+     }
+ 
+-    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+-    let ns_entries = std::fs::read_dir(&store).ok()?;
+-    for ns_entry in ns_entries.flatten() {
+-        let ns_path = ns_entry.path();
+-        if !ns_path.is_dir() {
++    for store in &stores {
++        let mut matches: Vec<(String, PathBuf)> = Vec::new();
++        let Ok(ns_entries) = std::fs::read_dir(store) else {
+             continue;
+-        }
+-        let pack_entries = match std::fs::read_dir(&ns_path) {
+-            Ok(e) => e,
+-            Err(_) => continue,
+         };
+-        for pack_entry in pack_entries.flatten() {
+-            let pack_path = pack_entry.path();
+-            if !pack_path.is_dir() {
++        for ns_entry in ns_entries.flatten() {
++            let ns_path = ns_entry.path();
++            if !ns_path.is_dir() {
+                 continue;
+             }
+-            let manifest_path = pack_path.join("package.json");
+-            if !manifest_path.exists() {
+-                continue;
+-            }
+-            let manifest_str = match std::fs::read_to_string(&manifest_path) {
+-                Ok(s) => s,
++            let pack_entries = match std::fs::read_dir(&ns_path) {
++                Ok(e) => e,
+                 Err(_) => continue,
+             };
+-            let manifest: crate::package::PackageManifest =
+-                match serde_json::from_str(&manifest_str) {
+-                    Ok(m) => m,
+-                    Err(_) => continue,
+-                };
+-            for artifact in &manifest.artifacts {
+-                if artifact.artifact_type != crate::package::ArtifactType::Profile {
++            for pack_entry in pack_entries.flatten() {
++                let pack_path = pack_entry.path();
++                if !pack_path.is_dir() {
+                     continue;
+                 }
+-                let install_as = match artifact.install_as.as_deref() {
+-                    Some(n) => n,
+-                    None => continue,
+-                };
+-                let matches_canonical = install_as == name;
+-                let matches_alias = artifact.aliases.iter().any(|a| a == name);
+-                if !matches_canonical && !matches_alias {
++                let manifest_path = pack_path.join("package.json");
++                if !manifest_path.exists() {
+                     continue;
+                 }
+-                let profile_file = pack_path
+-                    .join("profiles")
+-                    .join(format!("{install_as}.json"));
+-                if profile_file.exists() {
+-                    let key = format!(
+-                        "{}/{}",
+-                        ns_entry.file_name().to_string_lossy(),
+-                        pack_entry.file_name().to_string_lossy()
+-                    );
+-                    matches.push((key, profile_file));
++                let manifest_str = match std::fs::read_to_string(&manifest_path) {
++                    Ok(s) => s,
++                    Err(_) => continue,
++                };
++                let manifest: crate::package::PackageManifest =
++                    match serde_json::from_str(&manifest_str) {
++                        Ok(m) => m,
++                        Err(_) => continue,
++                    };
++                for artifact in &manifest.artifacts {
++                    if artifact.artifact_type != crate::package::ArtifactType::Profile {
++                        continue;
++                    }
++                    let install_as = match artifact.install_as.as_deref() {
++                        Some(n) => n,
++                        None => continue,
++                    };
++                    let matches_canonical = install_as == name;
++                    let matches_alias = artifact.aliases.iter().any(|a| a == name);
++                    if !matches_canonical && !matches_alias {
++                        continue;
++                    }
++                    let profile_file = pack_path
++                        .join("profiles")
++                        .join(format!("{install_as}.json"));
++                    if profile_file.exists() {
++                        let key = format!(
++                            "{}/{}",
++                            ns_entry.file_name().to_string_lossy(),
++                            pack_entry.file_name().to_string_lossy()
++                        );
++                        matches.push((key, profile_file));
++                    }
+                 }
+             }
+         }
++        matches.sort_by(|a, b| a.0.cmp(&b.0));
++        if let Some((key, path)) = matches.into_iter().next() {
++            return Some((path, key));
++        }
+     }
+-    matches.sort_by(|a, b| a.0.cmp(&b.0));
+-    matches.into_iter().next().map(|(key, path)| (path, key))
++    None
+ }
+ 
+ /// Returns true if the string looks like a registry package reference
+@@ -2122,9 +2142,22 @@ pub(crate) fn is_file_path_ref(s: &str) -> bool {
+ /// pull it first (Docker-style auto-pull with Sigstore verification).
+ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+     let package_ref = crate::package::parse_package_ref(name_or_path)?;
+-    let install_dir =
++    let mut install_dir =
+         crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+ 
++    // A pack installed by an older release lives under `$HOME/.nono/packages`
++    // rather than the XDG store. Fall back to it when the current store has
++    // no copy, so upgrading does not force a re-pull of every pack.
++    if !install_dir.join("package.json").exists() {
++        let legacy = crate::package::legacy_package_install_dir(
++            &package_ref.namespace,
++            &package_ref.name,
++        )?;
++        if legacy.join("package.json").exists() {
++            install_dir = legacy;
++        }
++    }
++
+     // Check if pack is already installed
+     if !install_dir.join("package.json").exists() {
+         eprintln!("Profile '{}' not found locally.", package_ref.key());
+@@ -2843,7 +2876,7 @@ pub(crate) fn resolve_user_config_dir() -> Result<PathBuf> {
+ }
+ 
+ /// Get home directory path using xdg-home
+-fn home_dir() -> Result<PathBuf> {
++pub(crate) fn home_dir() -> Result<PathBuf> {
+     xdg_home::home_dir().ok_or(NonoError::HomeNotFound)
+ }
+ 

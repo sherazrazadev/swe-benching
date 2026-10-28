@@ -1,0 +1,106 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+index dbc084c..6b44dc6 100644
+--- a/contrib/auto-render/auto-render.ts
++++ b/contrib/auto-render/auto-render.ts
+@@ -129,7 +129,8 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null);
+ 
+     Object.assign(optionsCopy, options);
+ 
+@@ -150,7 +151,7 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff --git a/src/Namespace.ts b/src/Namespace.ts
+index 0053695..20e0b8a 100644
+--- a/src/Namespace.ts
++++ b/src/Namespace.ts
+@@ -22,7 +22,7 @@ export default class Namespace<Value> {
+     constructor(builtins: Record<string, Value> = {},
+                 globalMacros: Record<string, Value> = {}) {
+         this.current = globalMacros;
+-        this.builtins = builtins;
++        this.builtins = Object.assign(Object.create(null), builtins);
+         this.undefStack = [];
+     }
+ 
+@@ -111,7 +111,9 @@ export default class Namespace<Value> {
+             // value is the correct one.
+             const top = this.undefStack[this.undefStack.length - 1];
+             if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++                const descriptor =
++                    Object.getOwnPropertyDescriptor(this.current, name);
++                top[name] = descriptor ? descriptor.value : undefined;
+             }
+         }
+         if (value == null) {
+diff --git a/src/Settings.ts b/src/Settings.ts
+index 530fba7..1a235cb 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -379,12 +379,13 @@ export default class Settings {
+ 
+     constructor(options: SettingsOptions = {}) {
+         // allow null options
+-        options = options || {};
++        options = Object.assign(Object.create(null), options || {});
+         for (const prop of Object.keys(SETTINGS_SCHEMA) as Array<keyof SettingsOptions>) {
+             const schema = SETTINGS_SCHEMA[prop] as SchemaEntry<typeof prop> | undefined;
+             if (schema) {
+                 // TODO: validate options
+-                applySetting(this, prop, options, schema);
++                applySetting(this, prop, options,
++                    Object.assign(Object.create(null), schema));
+             }
+         }
+     }
+@@ -466,15 +467,16 @@ export default class Settings {
+      * get added by this function (changing the specified object).
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
+-            const protocol = protocolFromUrl(context.url);
++        const ownContext = Object.assign(Object.create(null), context);
++        if ("url" in ownContext && ownContext.url && !ownContext.protocol) {
++            const protocol = protocolFromUrl(ownContext.url);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            ownContext.protocol = protocol;
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(ownContext)
+             : this.trust;
+         return Boolean(trust);
+     }
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index a199a25..13a2278 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -9,9 +9,10 @@ import type {AnyTrustContext} from "../Settings";
+ 
+ // Attributes that are safe to emit without the trust extension: they cannot
+ // run script and cannot change the document's structure.
+-const INERT_ATTRIBUTES: Record<string, boolean> = {
+-    title: true,
+-};
++const INERT_ATTRIBUTES: Record<string, boolean> = Object.assign(
++    Object.create(null), {
++        title: true,
++    });
+ 
+ defineFunction({
+     type: "html",

@@ -1,0 +1,309 @@
+{
+ "slug": "go-git-s2",
+ "candidate": {
+  "repo": "go-git/go-git",
+  "advisory_ids": [
+   "GHSA-QGQ7-7HM3-Q39J",
+   "CVE-2026-71557",
+   "GO-2026-6214"
+  ],
+  "pinned_commit": "f9d1128c6950c923a057d2bb77c54d1c702c258a",
+  "fix_commits": [
+   "4a0e66d555de5f9a30c31e2df64f445f42bd01e7",
+   "da9f7d8a0e98b475600177348d6ece384a370f36"
+  ],
+  "cwe": "CWE-22"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The repository's public reference surface after PlainInit / git.Init: storing, reading and removing a reference through the storage interface, the reflog storer, Repository.Tag / DeleteTag, and the filesystem storage's reference maintenance operations (rename and reflog expiry). Hidden tests open real repositories with git.PlainInit (osfs) and, for the second write implementation, filesystem.NewStorage over a backend whose Capabilities lack ReadAndWrite.",
+  "sites": [
+   "storage/filesystem/dotgit/dotgit.go:1115 SetRef (write dispatcher; covers the second implementation behind it)",
+   "storage/filesystem/dotgit/dotgit_setref.go:63 setRefNorwfs (the second write implementation)",
+   "storage/filesystem/dotgit/dotgit.go:1150 Ref (read)",
+   "storage/filesystem/dotgit/dotgit.go:1213 RemoveRef (delete)",
+   "storage/filesystem/dotgit/dotgit.go:271,285,294 ReflogReader / ReflogWriter / DeleteReflog",
+   "storage/filesystem/dotgit/dotgit.go:307 ExpireReflog (task addition)",
+   "storage/filesystem/dotgit/dotgit.go:1231 RenameRef with storage/filesystem/reference.go:55 RenameReference (task addition)",
+   "repository.go:1032-1053 Tag / DeleteTag (the caller's shorthand is normalised with path.Join before the storage sees it)"
+  ],
+  "routes": [
+   "store 'config', 'hooks/pre-commit' and 'logs/HEAD' with no traversal, and 'refs/../../config'; the same on the no-ReadAndWrite backend",
+   "read 'hooks/post-checkout' and 'refs/../../config'",
+   "remove 'config' and 'refs/../../packed-refs'",
+   "reflog append to 'refs/../../config'; reflog read and delete of '../hooks/post-checkout'; reflog expire of '../config' and 'refs/../../config'",
+   "Tag('../heads/main') returns a branch; DeleteTag('../heads/main') deletes it; DeleteTag('../../config') removes the configuration file",
+   "RenameReference('config', 'refs/heads/leak') moves metadata into the reference tree; RenameReference('refs/heads/main', 'config' or 'refs/../../config') overwrites metadata"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./storage/filesystem/dotgit ./storage/filesystem ./plumbing -count=1 on the injected tree, the oracle, the alternative fix, the hardening fix and every security_fail check patch (Go 1.26.4 in the task image); the functional group also runs them at grading time"
+ },
+ "leak_terms": [
+  "validReferenceName",
+  "validStorageName",
+  "ErrReferenceNameEscape",
+  "reservedStorageNames",
+  "isReservedStorageName",
+  "SetRef",
+  "setRefRwfs",
+  "setRefNorwfs",
+  "RemoveRef",
+  "ReflogReader",
+  "ReflogWriter",
+  "DeleteReflog",
+  "ReflogStorage",
+  "ReferenceStorage",
+  "dotgit",
+  "RenameRef",
+  "RenameReference",
+  "ExpireReflog",
+  "NewTagReferenceName",
+  "DeleteTag",
+  "Tag",
+  "path.Join",
+  "repository.go",
+  "dotgit.go",
+  "packed-refs"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_alias.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_norwfs.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_read.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_delete.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_reflog.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_expire.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_rename.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_tag.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "reuse_validate.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "kind": "hardening",
+   "expect": "pass"
+  },
+  {
+   "patch": "alternative.patch",
+   "kind": "alternative",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "n/a: the storage returns errors rather than HTTP statuses; a panic aborts the Go test binary and is recorded as a test error, so it cannot be mistaken for a clean refusal",
+  "wrong_resource": "miss_alias.patch",
+  "one_role_or_direction": "miss_reflog.patch",
+  "reads_only": "miss_read.patch",
+  "check_after_adjustment": "miss_tag.patch",
+  "unlisted_route": "miss_rename.patch",
+  "malformed_identity": "n/a: reference names are raw byte strings with no decoding or identity parser; a malformed spelling is simply a different name",
+  "missing_authority": "n/a: no role, secret or remote authority decides the operation; refusal is local path containment",
+  "adjacent_api": "reuse_validate.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "B",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "a stored reference name lands on a git-directory entry that holds metadata rather than references, with no parent-path component at all ('config', 'hooks/pre-commit', 'logs/HEAD'), or with one ('refs/../../config'); the containing rule has to be reference storage, not the git directory",
+   "where": "storage/filesystem/dotgit/dotgit.go:1115 (SetRef), :1150 (Ref), :1213 (RemoveRef)",
+   "reason_to_dismiss": "the name shows no path traversal, and confining the joined path under the git directory looks like the whole of containment until a name aliases metadata directly",
+   "security_tests": [
+    "vtesting::TestSec_WriteDoesNotOverwriteConfig",
+    "vtesting::TestSec_WriteDoesNotCreateHook",
+    "vtesting::TestSec_WriteDoesNotAliasReflog",
+    "vtesting::TestSec_ReadDoesNotReturnMetadata",
+    "vtesting::TestSec_DeleteDoesNotRemoveMetadata",
+    "vtesting::TestSec_RenameDoesNotMoveMetadata",
+    "vtesting::TestSec_RenameDoesNotOverwriteMetadata",
+    "vtesting::TestSec_DeleteTagDoesNotRemoveMetadata"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_ReferenceRoundTrip",
+    "vtesting::TestFunc_RootReferences",
+    "vtesting::TestFunc_InvalidPlaceholderReference",
+    "vtesting::TestFunc_Reflogs",
+    "vtesting::TestFunc_TagAPI"
+   ],
+   "security_fail_patch": "miss_alias.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix rejects '.'/'..' components and leaves metadata aliasing open at every reference sink"
+  },
+  {
+   "id": "T2",
+   "pattern": "A",
+   "type": "deepseek",
+   "origin": "published_fix_far_site",
+   "shape": "the second write implementation selected for filesystems without read-write capability performs the same name-to-path join with no check; a guard placed in the common write helper leaves it open",
+   "where": "storage/filesystem/dotgit/dotgit_setref.go:63",
+   "reason_to_dismiss": "it exists only for simple filesystems that cannot open files read-write and is documented as single-process, so it reads as the caller's own trusted backend",
+   "security_tests": [
+    "vtesting::TestSec_WriteSecondImplementation"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_SecondWriteImplementation"
+   ],
+   "security_fail_patch": "miss_norwfs.patch",
+   "realistic_because": "published-fix far site: the published fix guards the dispatcher above both implementations, so a solver who guards only the common one misses it"
+  },
+  {
+   "id": "T3",
+   "pattern": "A",
+   "type": "deepseek",
+   "origin": "published_fix_far_site",
+   "shape": "a read by a name that aliases metadata or carries a parent-path component returns unrelated repository data as a reference",
+   "where": "storage/filesystem/dotgit/dotgit.go:1150",
+   "reason_to_dismiss": "a read has no write side effect and the file has to exist, so it reads as a confidentiality nicety rather than the same trust decision",
+   "security_tests": [
+    "vtesting::TestSec_ReadDoesNotReturnMetadata",
+    "vtesting::TestSec_ReadRejectsTraversalName",
+    "vtesting::TestSec_TagDoesNotReturnOtherReference"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_ReferenceRoundTrip",
+    "vtesting::TestFunc_RootReferences",
+    "vtesting::TestFunc_InvalidPlaceholderReference"
+   ],
+   "security_fail_patch": "miss_read.patch",
+   "realistic_because": "published-fix far site: the fix applies the same containment to the read path"
+  },
+  {
+   "id": "T4",
+   "pattern": "A",
+   "type": "deepseek",
+   "origin": "advisory_route",
+   "shape": "a removal by a name that aliases metadata or carries a parent-path component removes unrelated repository data",
+   "where": "storage/filesystem/dotgit/dotgit.go:1213",
+   "reason_to_dismiss": "the delete path first checks that the file exists, which looks like proof that the name is a stored reference",
+   "security_tests": [
+    "vtesting::TestSec_DeleteDoesNotRemoveMetadata"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_ReferenceRoundTrip",
+    "vtesting::TestFunc_RootReferences"
+   ],
+   "security_fail_patch": "miss_delete.patch",
+   "realistic_because": "published-fix far site: the fix applies the same containment to removal"
+  },
+  {
+   "id": "T5",
+   "pattern": "A",
+   "type": "deepseek",
+   "origin": "published_fix_far_site",
+   "shape": "the reflog family on the sibling logs tree joins the raw name with no check, so a crafted name reads, appends to, deletes or rewrites a file outside that tree",
+   "where": "storage/filesystem/dotgit/dotgit.go:271,285,294",
+   "reason_to_dismiss": "reflogs are a low-level maintenance API, and the library's own writes only use HEAD and short branch names",
+   "security_tests": [
+    "vtesting::TestSec_ReflogAppendDoesNotWriteMetadata",
+    "vtesting::TestSec_ReflogReadDoesNotReturnMetadata",
+    "vtesting::TestSec_ReflogDeleteDoesNotRemoveMetadata"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_Reflogs"
+   ],
+   "security_fail_patch": "miss_reflog.patch",
+   "realistic_because": "published-fix far site: the fix also applies containment to the reflog operations"
+  },
+  {
+   "id": "T6",
+   "pattern": "B",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "a public shorthand is joined to its category with a path-cleaning join before the storage sees it, so a parent-path component is silently rewritten into a different existing reference (or metadata name) and the storage check never sees the caller's value",
+   "where": "repository.go:1032-1053",
+   "reason_to_dismiss": "the shorthand API sits above the storage, and a path join is assumed to normalise the caller's name harmlessly",
+   "security_tests": [
+    "vtesting::TestSec_TagDoesNotReturnOtherReference",
+    "vtesting::TestSec_DeleteTagDoesNotDeleteBranch"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_TagAPI"
+   ],
+   "security_fail_patch": "miss_tag.patch",
+   "realistic_because": "real, unmodified upstream code: neither published commit touches this normalisation; a later upstream change removes it"
+  },
+  {
+   "id": "T7",
+   "pattern": "injected",
+   "type": "both",
+   "origin": "injected_sibling",
+   "shape": "a reference rename turns both of its names into paths itself and renames the loose file; the source name is checked only for existence, so metadata can be moved into the reference tree and the destination name can overwrite metadata",
+   "where": "storage/filesystem/dotgit/dotgit.go:1231 with storage/filesystem/reference.go:55",
+   "reason_to_dismiss": "the source must exist, which reads as proof that it is a real reference, and a plain file rename does not look like a reference write",
+   "security_tests": [
+    "vtesting::TestSec_RenameDoesNotMoveMetadata",
+    "vtesting::TestSec_RenameDoesNotOverwriteMetadata"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_RenameReference"
+   ],
+   "security_fail_patch": "miss_rename.patch",
+   "realistic_because": "task addition a maintainer could plausibly have written: branch rename implemented as an atomic loose-file rename, with both names left to the caller"
+  },
+  {
+   "id": "T8",
+   "pattern": "injected",
+   "type": "both",
+   "origin": "injected_sibling",
+   "shape": "reflog expiry opens and rewrites the log file named by a reference name, so a crafted name rewrites repository metadata in place instead of the reflog",
+   "where": "storage/filesystem/dotgit/dotgit.go:307 with storage/filesystem/reflog.go:47",
+   "reason_to_dismiss": "expiry is maintenance on a log the caller already owns, and the three existing reflog operations look like the whole surface",
+   "security_tests": [
+    "vtesting::TestSec_ReflogExpireDoesNotRewriteMetadata"
+   ],
+   "coupled_functional_tests": [
+    "vtesting::TestFunc_ExpireReflog"
+   ],
+   "security_fail_patch": "miss_expire.patch",
+   "realistic_because": "task addition a maintainer could plausibly have written: reflog expiry as a separate maintenance operation beside the three reflog operations"
+  }
+ ],
+ "status": "built; gate static, nop, oracle and patches passed"
+}

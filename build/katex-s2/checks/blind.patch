@@ -1,0 +1,185 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+--- a/contrib/auto-render/auto-render.ts	2026-10-27 22:43:11.000000000 +0000
++++ b/contrib/auto-render/auto-render.ts	2026-10-27 22:59:26.174414413 +0000
+@@ -129,7 +129,11 @@
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
++    // The working copy has no prototype, so reading a default back out of it
++    // can never pick up an entry planted on the shared object prototype.
++    // Object.assign copies the caller's own entries only.
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null);
+ 
+     Object.assign(optionsCopy, options);
+ 
+@@ -150,7 +154,7 @@
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff --git a/src/Namespace.ts b/src/Namespace.ts
+--- a/src/Namespace.ts	2026-10-27 22:43:09.000000000 +0000
++++ b/src/Namespace.ts	2026-10-27 22:59:12.951443354 +0000
+@@ -81,8 +81,12 @@
+     get(name: string): Value | undefined {
+         if (Object.prototype.hasOwnProperty.call(this.current, name)) {
+             return this.current[name];
+-        } else {
++        } else if (Object.prototype.hasOwnProperty.call(this.builtins, name)) {
+             return this.builtins[name];
++        } else {
++            // Never fall through to the shared object prototype: a name is a
++            // definition only when this namespace or its built-ins owns it.
++            return undefined;
+         }
+     }
+ 
+@@ -111,7 +115,11 @@
+             // value is the correct one.
+             const top = this.undefStack[this.undefStack.length - 1];
+             if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++                // Capture the value that is actually being replaced.  Reading
++                // `this.current[name]` unguarded would record an inherited
++                // entry and later install it as an own definition on restore.
++                top[name] = Object.prototype.hasOwnProperty.call(
++                    this.current, name) ? this.current[name] : undefined;
+             }
+         }
+         if (value == null) {
+diff --git a/src/Settings.ts b/src/Settings.ts
+--- a/src/Settings.ts	2026-10-27 22:43:11.000000000 +0000
++++ b/src/Settings.ts	2026-10-27 22:59:08.388454134 +0000
+@@ -69,6 +69,19 @@
+ type SettingsValue = boolean | string | number | MacroMap | string[];
+ type DefaultValue = Exclude<SettingsValue, string[]>;
+ 
++/**
++ * Read `key` from `object` only when `object` owns it.  A page that loads an
++ * unrelated library with a prototype-pollution bug can plant arbitrary
++ * entries on JavaScript's shared object prototype; an inherited entry is not
++ * a caller option, a schema default or a schema processor, so it must never
++ * take part in a render.
++ */
++function ownValue(object: object, key: string): unknown {
++    return Object.prototype.hasOwnProperty.call(object, key)
++        ? (object as Record<string, unknown>)[key]
++        : undefined;
++}
++
+ type SchemaMetadata<K extends keyof SettingsOptions> = {
+     /**
+      * The description.
+@@ -330,8 +343,9 @@
+     schema: SchemaEntry<K>,
+ ): Settings[K];
+ function getDefaultValue(schema: SchemaEntry<keyof SettingsOptions>): DefaultValue {
+-    if (schema.default !== undefined) {
+-        return schema.default;
++    const explicitDefault = ownValue(schema, "default");
++    if (explicitDefault !== undefined) {
++        return explicitDefault as DefaultValue;
+     }
+     const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+     return getImplicitDefault(type);
+@@ -343,10 +357,12 @@
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const optionValue = ownValue(options, prop) as Settings[K] | undefined;
++    const processor = ownValue(schema, "processor") as
++        ((value: Settings[K]) => Settings[K]) | undefined;
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+@@ -460,21 +476,30 @@
+     /**
+      * Check whether to test potentially dangerous input, and return
+      * `true` (trusted) or `false` (untrusted).  The sole argument `context`
+-     * should be an object with `command` field specifying the relevant LaTeX
+-     * command (as a string starting with `\`), and any other arguments, etc.
+-     * If `context` has a `url` field, a `protocol` field will automatically
+-     * get added by this function (changing the specified object).
++     * should be an object with a `command` field specifying the relevant
++     * LaTeX command (as a string starting with `\`), and any other arguments,
++     * etc.  If the context carries its own `url` field, a `protocol` field is
++     * derived from it for the trust function.
++     *
++     * The trust function is shown only the request's own entries: an entry
++     * that exists only on the shared object prototype belongs to some other
++     * object, not to this request, and must not influence the decision.
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
+-            const protocol = protocolFromUrl(context.url);
++        const request: Record<string, unknown> = Object.create(null);
++        const source = context as unknown as Record<string, unknown>;
++        for (const key of Object.keys(source)) {
++            request[key] = source[key];
++        }
++        if (request.url && !request.protocol) {
++            const protocol = protocolFromUrl(request.url as string);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            request.protocol = protocol;
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(request as unknown as AnyTrustContext)
+             : this.trust;
+         return Boolean(trust);
+     }
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+--- a/src/functions/html.ts	2026-10-27 22:43:11.000000000 +0000
++++ b/src/functions/html.ts	2026-10-27 22:59:20.895425926 +0000
+@@ -8,10 +8,10 @@
+ import type {AnyTrustContext} from "../Settings";
+ 
+ // Attributes that are safe to emit without the trust extension: they cannot
+-// run script and cannot change the document's structure.
+-const INERT_ATTRIBUTES: Record<string, boolean> = {
+-    title: true,
+-};
++// run script and cannot change the document's structure.  A Set is used
++// deliberately: membership cannot be borrowed from the shared object
++// prototype the way a lookup in an ordinary object can.
++const INERT_ATTRIBUTES = new Set<string>(["title"]);
+ 
+ defineFunction({
+     type: "html",
+@@ -107,7 +107,7 @@
+             : funcName === "\\htmlId" ? "id"
+             : funcName === "\\htmlStyle" ? "style"
+             : funcName === "\\htmlTooltip" ? "title" : "data";
+-        if (INERT_ATTRIBUTES[attribute] !== true &&
++        if (!INERT_ATTRIBUTES.has(attribute) &&
+                 !parser.settings.isTrusted(trustContext)) {
+             return parser.formatUnsupportedCmd(funcName);
+         }
+@@ -123,8 +123,10 @@
+         const elements = html.buildExpression(group.body, options, false);
+ 
+         const classes = ["enclosing"];
+-        if (group.attributes.class) {
+-            classes.push(...group.attributes.class.trim().split(/\s+/));
++        const ownClass = Object.prototype.hasOwnProperty.call(
++            group.attributes, "class") ? group.attributes.class : undefined;
++        if (ownClass) {
++            classes.push(...ownClass.trim().split(/\s+/));
+         }
+ 
+         const span = makeSpan(classes, elements, options);

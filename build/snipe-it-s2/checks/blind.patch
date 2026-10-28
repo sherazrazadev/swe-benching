@@ -1,0 +1,187 @@
+diff -ruN a/app/Http/Controllers/Api/UsersController.php b/app/Http/Controllers/Api/UsersController.php
+--- a/app/Http/Controllers/Api/UsersController.php	2026-10-27 22:43:14.000000000 +0000
++++ b/app/Http/Controllers/Api/UsersController.php	2026-10-27 23:12:59.034070468 +0000
+@@ -539,7 +539,7 @@
+         }
+ 
+         // Pull out sensitive fields that require extra permission
+-        $user->fill($request->except(['password', 'username', 'email', 'activated', 'permissions', 'activation_code', 'remember_token', 'two_factor_secret', 'two_factor_enrolled', 'two_factor_optin']));
++        $user->fill($request->except(['password', 'username', 'email', 'activated', 'ldap_import', 'permissions', 'activation_code', 'remember_token', 'two_factor_secret', 'two_factor_enrolled', 'two_factor_optin']));
+ 
+         if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
+ 
+@@ -563,6 +563,12 @@
+                 $user->activated = $request->input('activated');
+             }
+ 
++            // has() rather than filled(): clearing this flag back to "managed locally"
++            // is a legitimate change for a caller with authority over the account.
++            if ($request->has('ldap_import')) {
++                $user->ldap_import = $request->input('ldap_import');
++            }
++
+             if ($request->has('permissions')) {
+                 // This is going to update the whole thing, not just what was passed.
+                 $user->permissions = json_encode(PreserveUnauthorizedPrivilegedPermissionsAction::run(
+diff -ruN a/app/Http/Controllers/Users/BulkUsersController.php b/app/Http/Controllers/Users/BulkUsersController.php
+--- a/app/Http/Controllers/Users/BulkUsersController.php	2026-10-27 22:43:20.000000000 +0000
++++ b/app/Http/Controllers/Users/BulkUsersController.php	2026-10-27 23:12:54.379104660 +0000
+@@ -99,6 +99,13 @@
+                 $ldap_import = $request->input('ldap_import');
+ 
+                 foreach ($users as $user) {
++                    // The route permission only allows general edits. Applying a sign-in or
++                    // password-management change additionally requires authority over those
++                    // settings on this particular account.
++                    if (! $user->authSettingsEditableBy(auth()->user())) {
++                        continue;
++                    }
++
+                     $user->activated = $activated;
+                     if (! is_null($ldap_import)) {
+                         $user->ldap_import = $ldap_import;
+@@ -188,14 +195,22 @@
+             ->conditionallyAddItem('company_id')
+             ->conditionallyAddItem('locale')
+             ->conditionallyAddItem('remote')
+-            ->conditionallyAddItem('ldap_import')
+-            ->conditionallyAddItem('activated')
+             ->conditionallyAddItem('display_name')
+             ->conditionallyAddItem('start_date')
+             ->conditionallyAddItem('end_date')
+             ->conditionallyAddItem('city')
+             ->conditionallyAddItem('autoassign_licenses');
+ 
++        // Sign-in and external-password settings are decided per account, so they are
++        // not part of the shared mass update above. Collect them here and apply them
++        // further down only to the accounts the caller may administer.
++        $auth_setting_values = [];
++        foreach (['activated', 'ldap_import'] as $auth_setting) {
++            if ($request->filled($auth_setting)) {
++                $auth_setting_values[$auth_setting] = $request->input($auth_setting);
++            }
++        }
++
+         // If the manager_id is one of the users being updated, generate a warning.
+         if (array_search($request->input('manager_id'), $user_raw_array)) {
+             $manager_conflict = true;
+@@ -252,11 +267,20 @@
+                 ->update(['location_id' => $this->update_array['location_id']]);
+         }
+ 
+-        // Only sync groups if groups were selected
+-        if ($request->filled('groups')) {
+-
++        // Apply authentication settings and group membership per account. Accounts the caller
++        // may not administer still receive the ordinary profile edits above, but their sign-in
++        // and password-management settings are left exactly as they were.
++        if ((! empty($auth_setting_values)) || $request->filled('groups')) {
+             foreach ($users as $user) {
+-                if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++                if (! $user->authSettingsEditableBy(auth()->user())) {
++                    continue;
++                }
++
++                if (! empty($auth_setting_values)) {
++                    $user->update($auth_setting_values);
++                }
++
++                if ($request->filled('groups')) {
+                     $user->groups()->sync($request->input('groups'));
+                 }
+             }
+@@ -415,7 +439,9 @@
+      */
+     public function merge(Request $request)
+     {
+-        $this->authorize('update', User::class);
++        // Consolidating accounts destroys the source accounts, so the caller needs the
++        // authority to delete users, not merely the authority to edit them.
++        $this->authorize('delete', User::class);
+ 
+         if (config('app.lock_passwords')) {
+             return redirect()->route('users.index')->with('error', trans('general.feature_disabled'));
+@@ -433,6 +459,19 @@
+         $users_to_merge = User::whereIn('id', $user_ids_to_merge)->with('assets', 'manager', 'userlog', 'licenses', 'consumables', 'accessories', 'managedLocations', 'uploads', 'acceptances')->get();
+         $admin = User::find(auth()->id());
+ 
++        if (! $merge_into_user) {
++            return redirect()->back()->with('error', trans('general.no_users_selected'));
++        }
++
++        // A merge removes every source account, so check the caller's authority over the
++        // authentication settings of each one before moving anything. Refusing up front
++        // means a partially merged selection can never be left behind.
++        foreach ($users_to_merge as $user_to_merge) {
++            if (! $user_to_merge->authSettingsEditableBy($admin)) {
++                return redirect()->route('users.index')->with('error', trans('general.insufficient_permissions'));
++            }
++        }
++
+         // Walk users
+         foreach ($users_to_merge as $user_to_merge) {
+ 
+diff -ruN a/app/Http/Controllers/Users/UsersController.php b/app/Http/Controllers/Users/UsersController.php
+--- a/app/Http/Controllers/Users/UsersController.php	2026-10-27 22:43:20.000000000 +0000
++++ b/app/Http/Controllers/Users/UsersController.php	2026-10-27 23:12:31.324280867 +0000
+@@ -291,8 +291,9 @@
+         $user->end_date = $request->input('end_date', null);
+         $user->autoassign_licenses = $request->input('autoassign_licenses', 0);
+ 
+-        // Set this here so that we can overwrite it later if the user is an admin or superadmin
+-        $user->activated = $request->input('activated', auth()->user()->is($user) ? 1 : $user->activated);
++        // Sign-in and external-password settings are deliberately not assigned here.
++        // They belong to the authority block below, which decides per account; assigning
++        // them up front would let the value survive when that block is skipped.
+ 
+         // Update the location of any assets checked out to this user
+         Asset::where('assigned_type', User::class)
+@@ -300,7 +301,7 @@
+             ->update(['location_id' => $request->input('location_id', null)]);
+ 
+         // check for permissions related fields and only set them if the user has permission to edit them
+-        if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++        if ($user->authSettingsEditableBy($authenticatedUser)) {
+ 
+             $user->username = trim($request->input('username'));
+             $user->email = trim($request->input('email'));
+@@ -355,7 +356,7 @@
+     {
+         $this->authorize('update', $user);
+ 
+-        if (auth()->user()->can('canEditAuthFields', auth()->user()) && auth()->user()->can('editableOnDemo')) {
++        if ($user->authSettingsEditableBy(auth()->user())) {
+             $user->activated = $request->input('activated', $user->activated ? 0 : 1);
+             if ($request->has('ldap_import')) {
+                 $user->ldap_import = $request->input('ldap_import');
+diff -ruN a/app/Models/User.php b/app/Models/User.php
+--- a/app/Models/User.php	2026-10-27 22:43:14.000000000 +0000
++++ b/app/Models/User.php	2026-10-27 23:12:21.287351150 +0000
+@@ -549,6 +549,27 @@
+     }
+ 
+     /**
++     * Whether the given actor may change this account's authentication settings.
++     *
++     * Authentication settings are whether the account may sign in and whether its
++     * password is managed outside the application. The decision is always taken
++     * against the account being changed, never against the actor or a class, so
++     * that bulk operations can apply the fields per target.
++     *
++     * @author [A. Gianotto] [<snipe@snipe.net>]
++     *
++     * @since  [v8.1.18]
++     */
++    public function authSettingsEditableBy(?User $actor): bool
++    {
++        if (! $actor instanceof self) {
++            return false;
++        }
++
++        return $actor->can('canEditAuthFields', $this) && $actor->can('editableOnDemo');
++    }
++
++    /**
+      * Checks if the user can edit their own profile
+      *
+      * @author A. Gianotto <snipe@snipe.net>

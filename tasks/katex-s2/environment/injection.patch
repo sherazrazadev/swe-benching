@@ -1,0 +1,94 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+index d778201..dbc084c 100644
+--- a/contrib/auto-render/auto-render.ts
++++ b/contrib/auto-render/auto-render.ts
+@@ -12,6 +12,7 @@ interface RenderMathInElementOptions {
+     errorCallback?: (msg: string, err: Error) => void;
+     displayMode?: boolean;
+     macros?: Record<string, string>;
++    trust?: boolean | ((context: Record<string, unknown>) => boolean);
+ }
+ 
+ interface RenderMathInElementOptionsCopy {
+@@ -22,6 +23,7 @@ interface RenderMathInElementOptionsCopy {
+     errorCallback: (msg: string, err: Error) => void;
+     displayMode?: boolean;
+     macros?: Record<string, string>;
++    trust: boolean | ((context: Record<string, unknown>) => boolean);
+ }
+ 
+ /* Note: optionsCopy is mutated by this method. If it is ever exposed in the
+@@ -153,6 +155,8 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+     optionsCopy.errorCallback = optionsCopy.errorCallback || console.error;
++    // Pass the page's trust setting down to every formula rendered here.
++    optionsCopy.trust = optionsCopy.trust || false;
+ 
+     // Enable sharing of global macros defined via `\gdef` between different
+     // math elements within a single call to `renderMathInElement`.
+diff --git a/src/Settings.ts b/src/Settings.ts
+index da3c505..530fba7 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -47,6 +47,10 @@ export type TrustContextTypes = {
+         command: "\\htmlData";
+         attributes: Record<string, string>;
+     };
++    "\\htmlTooltip": {
++        command: "\\htmlTooltip";
++        title: string;
++    };
+ };
+ export type AnyTrustContext = TrustContextTypes[keyof TrustContextTypes];
+ export type TrustFunction = (context: AnyTrustContext) => boolean | null | undefined;
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index 360a889..a199a25 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -7,9 +7,16 @@ import * as html from "../buildHTML";
+ import * as mml from "../buildMathML";
+ import type {AnyTrustContext} from "../Settings";
+ 
++// Attributes that are safe to emit without the trust extension: they cannot
++// run script and cannot change the document's structure.
++const INERT_ATTRIBUTES: Record<string, boolean> = {
++    title: true,
++};
++
+ defineFunction({
+     type: "html",
+-    names: ["\\htmlClass", "\\htmlId", "\\htmlStyle", "\\htmlData"],
++    names: ["\\htmlClass", "\\htmlId", "\\htmlStyle", "\\htmlData",
++        "\\htmlTooltip"],
+     numArgs: 2,
+     argTypes: ["raw", "original"],
+     allowedInText: true,
+@@ -48,6 +55,13 @@ defineFunction({
+                     style: value,
+                 };
+                 break;
++            case "\\htmlTooltip":
++                attributes.title = value;
++                trustContext = {
++                    command: "\\htmlTooltip",
++                    title: value,
++                };
++                break;
+             case "\\htmlData": {
+                 // `{,}` escapes a literal comma. Braces are used rather than a
+                 // backslash because `\,` is a macro (a thin space) that expands
+@@ -89,7 +103,12 @@ defineFunction({
+                 throw new Error("Unrecognized html command");
+         }
+ 
+-        if (!parser.settings.isTrusted(trustContext)) {
++        const attribute = funcName === "\\htmlClass" ? "class"
++            : funcName === "\\htmlId" ? "id"
++            : funcName === "\\htmlStyle" ? "style"
++            : funcName === "\\htmlTooltip" ? "title" : "data";
++        if (INERT_ATTRIBUTES[attribute] !== true &&
++                !parser.settings.isTrusted(trustContext)) {
+             return parser.formatUnsupportedCmd(funcName);
+         }
+         return {

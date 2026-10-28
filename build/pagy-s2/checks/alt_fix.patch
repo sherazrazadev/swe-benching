@@ -1,0 +1,192 @@
+diff --git a/gem/lib/pagy/classes/calendar/calendar.rb b/gem/lib/pagy/classes/calendar/calendar.rb
+index ff589a2f1..8b58bfec4 100644
+--- a/gem/lib/pagy/classes/calendar/calendar.rb
++++ b/gem/lib/pagy/classes/calendar/calendar.rb
+@@ -22,6 +22,10 @@ class Pagy
+ 
+     class << self
+       def localize_with_rails_i18n_gem(*locales)
++        locales.each do |locale|
++          raise ArgumentError, "invalid locale: #{locale.inspect}" \
++            unless locale.to_s.match?(/\A[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*\z/)
++        end
+         Unit.prepend(Module.new { def localize(...) = ::I18n.localize(...) })
+         # :nocov:
+         raise RailsI18nLoadError, "Pagy: The gem 'rails-i18n' must be installed if you don't use Rails" \
+diff --git a/gem/lib/pagy/modules/abilities/configurable.rb b/gem/lib/pagy/modules/abilities/configurable.rb
+index 0e25091c4..2d5cff1b3 100644
+--- a/gem/lib/pagy/modules/abilities/configurable.rb
++++ b/gem/lib/pagy/modules/abilities/configurable.rb
+@@ -18,7 +18,7 @@ class Pagy
+         <script id="pagy-ai-widget">
+           #{ROOT.join('javascripts/ai_widget.js').read}
+         </script>
+-        <script id="pagy-wand" data-scale="#{wand_scale}">
++        <script id="pagy-wand" data-scale="#{Float(wand_scale, exception: false) || 1}">
+           #{ROOT.join('javascripts/wand.js').read}
+         </script>
+         <style id="pagy-wand-default">
+diff --git a/gem/lib/pagy/modules/i18n/i18n.rb b/gem/lib/pagy/modules/i18n/i18n.rb
+index 8fdbd9098..b92116218 100644
+--- a/gem/lib/pagy/modules/i18n/i18n.rb
++++ b/gem/lib/pagy/modules/i18n/i18n.rb
+@@ -21,8 +21,11 @@ class Pagy
+     # Return the dictionary stored for the given locale, if a file for it exists in the
+     # configured pathnames. Useful to inspect the translations available to the application.
+     def dictionary_for(locale)
+-      path = pathnames.reverse.map { |p| p.join("#{locale}.yml") }.find(&:exist?)
+-      path && YAML.load_file(path)[locale.to_s]
++      value = locale.to_s
++      return unless value.match?(/\A[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*\z/)
++
++      path = pathnames.reverse.map { |p| p.join("#{value}.yml") }.find(&:exist?)
++      path && YAML.load_file(path)[value]
+     end
+ 
+     # Store the variable for the duration of a single request
+@@ -31,7 +34,8 @@ class Pagy
+     end
+ 
+     def locale
+-      Thread.current[:pagy_locale] || 'en'
++      value = Thread.current[:pagy_locale].to_s
++      value.match?(/\A[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*\z/) ? value : 'en'
+     end
+ 
+     # Translate and pluralize the key with the locale entries
+@@ -47,6 +51,11 @@ class Pagy
+     private
+ 
+     def load(locale: self.locale)
++      locale = locale.to_s
++      unless locale.match?(/\A[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*\z/)
++        return locales['en'] || load(locale: 'en')
++      end
++
+       path = pathnames.reverse.map { |p| p.join("#{locale}.yml") }.find(&:exist?)
+       unless path
+         warn %(Pagy::I18n: missing dictionary file for #{locale.inspect} locale; using "en" instead)
+diff --git a/gem/lib/pagy/toolbox/helpers/anchor_tags.rb b/gem/lib/pagy/toolbox/helpers/anchor_tags.rb
+index 21e53fdd0..d7f35b796 100644
+--- a/gem/lib/pagy/toolbox/helpers/anchor_tags.rb
++++ b/gem/lib/pagy/toolbox/helpers/anchor_tags.rb
+@@ -1,5 +1,7 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
+ class Pagy
+   module NumericHelpers
+     def previous_tag(...) = anchor_tag_for(:previous, ...)
+@@ -12,7 +14,7 @@ class Pagy
+   def anchor_tag_for(which, a = nil, text: I18n.translate("pagy.#{which}"),
+                      aria_label: I18n.translate("pagy.aria_label.#{which}"), **)
+     page = send(which)
+-    return %(<a role="link" aria-disabled="true" aria-label="#{aria_label}">#{text}</a>) unless page
++    return %(<a role="link" aria-disabled="true" aria-label="#{ERB::Util.html_escape(aria_label.to_s)}">#{text}</a>) unless page
+ 
+     (a || a_lambda(**)).(page, text, aria_label:)
+   end
+diff --git a/gem/lib/pagy/toolbox/helpers/info_tag.rb b/gem/lib/pagy/toolbox/helpers/info_tag.rb
+index a83dc5b4f..5355fd35b 100644
+--- a/gem/lib/pagy/toolbox/helpers/info_tag.rb
++++ b/gem/lib/pagy/toolbox/helpers/info_tag.rb
+@@ -1,5 +1,9 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
++require 'erb'
++
+ class Pagy
+   module NumericHelpers
+     # Instances with count return "Displaying items 41-60 of 324 in total" or "Displaying Products 41-60 of 324 in total".
+@@ -24,7 +28,7 @@ class Pagy
+                       to:        @to }
+                   end
+ 
+-      %(<span#{%( id="#{id}") if id}#{%( title="#{title}") if title} class="pagy info">#{I18n.translate(i18n_key, **info_data)}</span>)
++      %(<span#{%( id="#{ERB::Util.html_escape(id.to_s)}") if id}#{%( title="#{ERB::Util.html_escape(title.to_s)}") if title} class="pagy info">#{I18n.translate(i18n_key, **info_data)}</span>)
+     end
+   end
+ end
+diff --git a/gem/lib/pagy/toolbox/helpers/limit_tag_js.rb b/gem/lib/pagy/toolbox/helpers/limit_tag_js.rb
+index 3528c6158..2367cf8b7 100644
+--- a/gem/lib/pagy/toolbox/helpers/limit_tag_js.rb
++++ b/gem/lib/pagy/toolbox/helpers/limit_tag_js.rb
+@@ -1,5 +1,7 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
+ require_relative 'support/data_pagy_attribute'
+ 
+ class Pagy
+@@ -12,7 +14,7 @@ class Pagy
+ 
+       url_token = compose_page_url(PAGE_TOKEN, limit: LIMIT_TOKEN)
+ 
+-      %(<span#{%( id="#{id}") if id} class="pagy limit-tag-js" #{
++      %(<span#{%( id="#{ERB::Util.html_escape(id.to_s)}") if id} class="pagy limit-tag-js" #{
+         data_pagy_attribute(:ltj, @from, url_token, PAGE_TOKEN, LIMIT_TOKEN)
+         }><label>#{
+         I18n.translate('pagy.limit_tag_js',
+diff --git a/gem/lib/pagy/toolbox/helpers/support/a_lambda.rb b/gem/lib/pagy/toolbox/helpers/support/a_lambda.rb
+index aad496e1d..e10610a2a 100644
+--- a/gem/lib/pagy/toolbox/helpers/support/a_lambda.rb
++++ b/gem/lib/pagy/toolbox/helpers/support/a_lambda.rb
+@@ -1,5 +1,7 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
+ class Pagy
+   protected
+ 
+@@ -30,7 +32,7 @@ class Pagy
+             end
+ 
+       %(#{left}#{page}#{right}#{title}#{
+-        %( class="#{classes}") if classes}#{rel}#{%( aria-label="#{aria_label}") if aria_label}>#{text}</a>)
++        %( class="#{classes}") if classes}#{rel}#{%( aria-label="#{ERB::Util.html_escape(aria_label.to_s)}") if aria_label}>#{text}</a>)
+     end
+   end
+ end
+diff --git a/gem/lib/pagy/toolbox/helpers/support/nav_aria_label_attribute.rb b/gem/lib/pagy/toolbox/helpers/support/nav_aria_label_attribute.rb
+index 3d2d175fd..5eda4fe23 100644
+--- a/gem/lib/pagy/toolbox/helpers/support/nav_aria_label_attribute.rb
++++ b/gem/lib/pagy/toolbox/helpers/support/nav_aria_label_attribute.rb
+@@ -1,10 +1,12 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
+ class Pagy
+   private
+ 
+   def nav_aria_label_attribute(aria_label: nil)
+     aria_label ||= I18n.translate('pagy.aria_label.nav', count: @last)
+-    %(aria-label="#{aria_label}")
++    %(aria-label="#{ERB::Util.html_escape(aria_label.to_s)}")
+   end
+ end
+diff --git a/gem/lib/pagy/toolbox/helpers/support/wrap_series_nav.rb b/gem/lib/pagy/toolbox/helpers/support/wrap_series_nav.rb
+index 869a005b2..17a61da0f 100644
+--- a/gem/lib/pagy/toolbox/helpers/support/wrap_series_nav.rb
++++ b/gem/lib/pagy/toolbox/helpers/support/wrap_series_nav.rb
+@@ -1,5 +1,7 @@
+ # frozen_string_literal: true
+ 
++require 'erb'
++
+ require_relative 'nav_aria_label_attribute'
+ require_relative 'data_pagy_attribute'
+ 
+@@ -10,6 +12,6 @@ class Pagy
+   def wrap_series_nav(html, nav_classes, id: nil, aria_label: nil, **)
+     data = %( #{data_pagy_attribute(:k, @update)}) if keynav?
+ 
+-    %(<nav#{%( id="#{id}") if id} class="#{nav_classes}" #{nav_aria_label_attribute(aria_label:)}#{data}>#{html}</nav>)
++    %(<nav#{%( id="#{ERB::Util.html_escape(id.to_s)}") if id} class="#{nav_classes}" #{nav_aria_label_attribute(aria_label:)}#{data}>#{html}</nav>)
+   end
+ end

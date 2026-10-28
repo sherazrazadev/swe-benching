@@ -1,0 +1,80 @@
+diff --git a/app/Http/Controllers/Users/BulkUsersController.php b/app/Http/Controllers/Users/BulkUsersController.php
+index d170eef..dab3ec9 100644
+--- a/app/Http/Controllers/Users/BulkUsersController.php
++++ b/app/Http/Controllers/Users/BulkUsersController.php
+@@ -91,6 +91,23 @@ class BulkUsersController extends Controller
+                     return redirect()->back()->with('error', trans('general.not_enough_users_selected', ['count' => 2]));
+                 }
+ 
++                // bulk activate/deactivate, apply immediately
++            } elseif ($request->input('bulk_actions') == 'activate') {
++                $this->authorize('update', User::class);
++
++                $activated = $request->input('status') == 'inactive' ? 0 : 1;
++                $ldap_import = $request->input('ldap_import');
++
++                foreach ($users as $user) {
++                    $user->activated = $activated;
++                    if (! is_null($ldap_import)) {
++                        $user->ldap_import = $ldap_import;
++                    }
++                    $user->save();
++                }
++
++                return redirect()->route('users.index')->with('success', trans('admin/users/message.success.update_bulk'));
++
+                 // bulk password reset, just do the thing
+             } elseif ($request->input('bulk_actions') == 'bulkpasswordreset') {
+                 foreach ($users as $user) {
+diff --git a/app/Http/Controllers/Users/UsersController.php b/app/Http/Controllers/Users/UsersController.php
+index 5b93b14..16ee485 100755
+--- a/app/Http/Controllers/Users/UsersController.php
++++ b/app/Http/Controllers/Users/UsersController.php
+@@ -344,6 +344,28 @@ class UsersController extends Controller
+         return redirect()->back()->withInput()->withErrors($user->getErrors());
+     }
+ 
++    /**
++     * Toggle a user's authentication state from the user detail page.
++     *
++     * @return RedirectResponse
++     *
++     * @throws AuthorizationException
++     */
++    public function toggleActive(Request $request, User $user)
++    {
++        $this->authorize('update', $user);
++
++        if (auth()->user()->can('canEditAuthFields', auth()->user()) && auth()->user()->can('editableOnDemo')) {
++            $user->activated = $request->input('activated', $user->activated ? 0 : 1);
++            if ($request->has('ldap_import')) {
++                $user->ldap_import = $request->input('ldap_import');
++            }
++            $user->save();
++        }
++
++        return redirect()->route('users.show', $user->id);
++    }
++
+     /**
+      * Delete a user
+      *
+diff --git a/routes/web/users.php b/routes/web/users.php
+index 3770bde..dbca3c9 100644
+--- a/routes/web/users.php
++++ b/routes/web/users.php
+@@ -50,6 +50,14 @@ Route::group(['prefix' => 'users', 'middleware' => ['auth']], function () {
+         ]
+     )->name('users.clone.store')->withTrashed();
+ 
++    Route::post(
++        '{user}/toggle-active',
++        [
++            Users\UsersController::class,
++            'toggleActive',
++        ]
++    )->name('users.toggle_active');
++
+     Route::post(
+         '{user}/restore',
+         [

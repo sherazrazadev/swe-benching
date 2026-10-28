@@ -1,0 +1,134 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+index dbc084c..3be421d 100644
+--- a/contrib/auto-render/auto-render.ts
++++ b/contrib/auto-render/auto-render.ts
+@@ -133,8 +133,17 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+ 
+     Object.assign(optionsCopy, options);
+ 
++    // Defaults and caller entries are read only from the caller's own
++    // properties; a value inherited from the shared prototype is not an option.
++    const ownOption = function<K extends keyof RenderMathInElementOptions>(
++        name: K,
++    ): RenderMathInElementOptions[K] {
++        return options && Object.prototype.hasOwnProperty.call(options, name)
++            ? options[name] : undefined;
++    };
++
+     // default options
+-    optionsCopy.delimiters = optionsCopy.delimiters || [
++    optionsCopy.delimiters = ownOption("delimiters") || [
+         {left: "$$", right: "$$", display: true},
+         {left: "\\(", right: "\\)", display: false},
+         // LaTeX uses $…$, but it ruins the display of normal `$` in text:
+@@ -150,17 +159,17 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(ownOption("ignoredTags") || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+-    optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+-    optionsCopy.errorCallback = optionsCopy.errorCallback || console.error;
++    optionsCopy.ignoredClasses = ownOption("ignoredClasses") || [];
++    optionsCopy.errorCallback = ownOption("errorCallback") || console.error;
+     // Pass the page's trust setting down to every formula rendered here.
+-    optionsCopy.trust = optionsCopy.trust || false;
++    optionsCopy.trust = ownOption("trust") || false;
+ 
+     // Enable sharing of global macros defined via `\gdef` between different
+     // math elements within a single call to `renderMathInElement`.
+-    optionsCopy.macros = optionsCopy.macros || {};
++    optionsCopy.macros = ownOption("macros") || {};
+ 
+     renderElem(elem, optionsCopy as RenderMathInElementOptionsCopy);
+ };
+diff --git a/src/Namespace.ts b/src/Namespace.ts
+index 0053695..6305db4 100644
+--- a/src/Namespace.ts
++++ b/src/Namespace.ts
+@@ -81,8 +81,10 @@ export default class Namespace<Value> {
+     get(name: string): Value | undefined {
+         if (Object.prototype.hasOwnProperty.call(this.current, name)) {
+             return this.current[name];
+-        } else {
++        } else if (Object.prototype.hasOwnProperty.call(this.builtins, name)) {
+             return this.builtins[name];
++        } else {
++            return undefined;
+         }
+     }
+ 
+@@ -111,7 +113,8 @@ export default class Namespace<Value> {
+             // value is the correct one.
+             const top = this.undefStack[this.undefStack.length - 1];
+             if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++                top[name] = Object.prototype.hasOwnProperty.call(
++                    this.current, name) ? this.current[name] : undefined;
+             }
+         }
+         if (value == null) {
+diff --git a/src/Settings.ts b/src/Settings.ts
+index 530fba7..6772873 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -343,10 +343,12 @@ function applySetting<K extends keyof SettingsOptions>(
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const optionValue = Object.prototype.hasOwnProperty.call(options, prop)
++        ? options[prop] : undefined;
++    const processor = schema.processor;
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+@@ -466,15 +468,21 @@ export default class Settings {
+      * get added by this function (changing the specified object).
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
+-            const protocol = protocolFromUrl(context.url);
++        // The trust decision gets only this request's own entries: anything
++        // that exists only on the shared prototype is not part of the request.
++        const ownContext: Record<string, unknown> = Object.create(null);
++        for (const key of Object.keys(context)) {
++            ownContext[key] = (context as Record<string, unknown>)[key];
++        }
++        if (ownContext.url && !ownContext.protocol) {
++            const protocol = protocolFromUrl(ownContext.url as string);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            ownContext.protocol = protocol;
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(ownContext as unknown as AnyTrustContext)
+             : this.trust;
+         return Boolean(trust);
+     }
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index a199a25..40e4471 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -107,8 +107,9 @@ defineFunction({
+             : funcName === "\\htmlId" ? "id"
+             : funcName === "\\htmlStyle" ? "style"
+             : funcName === "\\htmlTooltip" ? "title" : "data";
+-        if (INERT_ATTRIBUTES[attribute] !== true &&
+-                !parser.settings.isTrusted(trustContext)) {
++        const inert = Object.prototype.hasOwnProperty.call(
++            INERT_ATTRIBUTES, attribute) && INERT_ATTRIBUTES[attribute] === true;
++        if (!inert && !parser.settings.isTrusted(trustContext)) {
+             return parser.formatUnsupportedCmd(funcName);
+         }
+         return {

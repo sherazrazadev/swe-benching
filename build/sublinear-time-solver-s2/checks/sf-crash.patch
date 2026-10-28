@@ -1,0 +1,656 @@
+diff --git a/src/consciousness-explorer/index.js b/src/consciousness-explorer/index.js
+index 2fae775..b26b026 100644
+--- a/src/consciousness-explorer/index.js
++++ b/src/consciousness-explorer/index.js
+@@ -284,8 +284,8 @@ export class ConsciousnessExplorer {
+             state.reasoner_state = this.reasoner.exportState();
+         }
+ 
+-        const fs = await import('fs');
+-        fs.writeFileSync(filepath, JSON.stringify(state, null, 2));
++        const { writeFileNoFollow } = await import('./lib/safe-path.js');
++        writeFileNoFollow(filepath, JSON.stringify(state, null, 2));
+         return state;
+     }
+ 
+@@ -293,8 +293,8 @@ export class ConsciousnessExplorer {
+      * Import consciousness state
+      */
+     async importState(filepath) {
+-        const fs = await import('fs');
+-        const state = JSON.parse(fs.readFileSync(filepath, 'utf-8'));
++        const { readFileNoFollow } = await import('./lib/safe-path.js');
++        const state = JSON.parse(readFileNoFollow(filepath));
+ 
+         // Restore consciousness with saved state
+         await this.initialize();
+@@ -336,6 +336,9 @@ export class ConsciousnessExplorer {
+         const fs = await import('fs');
+         const path = await import('path');
+         const os = await import('os');
++        const { assertSafeBasename, writeFileNoFollow } = await import('./lib/safe-path.js');
++
++        assertSafeBasename(sessionId);
+ 
+         const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
+         const target = path.join(snapshotDir, `${sessionId}.json`);
+@@ -348,7 +351,7 @@ export class ConsciousnessExplorer {
+             consciousness: await this.getStatus()
+         };
+ 
+-        fs.writeFileSync(target, JSON.stringify(state, null, 2));
++        writeFileNoFollow(target, JSON.stringify(state, null, 2));
+         return target;
+     }
+ 
+@@ -356,13 +359,15 @@ export class ConsciousnessExplorer {
+      * Load a named session snapshot
+      */
+     async importSessionSnapshot(sessionId) {
+-        const fs = await import('fs');
+         const path = await import('path');
+         const os = await import('os');
++        const { assertSafeBasename, readFileNoFollow } = await import('./lib/safe-path.js');
++
++        assertSafeBasename(sessionId);
+ 
+         const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
+         const target = path.join(snapshotDir, `${sessionId}.json`);
+-        const state = JSON.parse(fs.readFileSync(target, 'utf-8'));
++        const state = JSON.parse(readFileNoFollow(target));
+ 
+         await this.initialize();
+ 
+diff --git a/src/consciousness-explorer/lib/safe-path.js b/src/consciousness-explorer/lib/safe-path.js
+new file mode 100644
+index 0000000..53084c2
+--- /dev/null
++++ b/src/consciousness-explorer/lib/safe-path.js
+@@ -0,0 +1,278 @@
++/**
++ * Path safety utilities for state import/export.
++ *
++ * Fixes GHSA / CVE candidate from issue #19 (CWE-73 — External Control of
++ * File Name or Path) reported by BruceJin <brucejin@zju.edu.cn> on 2026-04-17.
++ *
++ * The vulnerable pattern was: the MCP `export_state` / `import_state` tools
++ * accepted an attacker-controlled `filepath` string and passed it straight to
++ * `fs.writeFileSync` / `fs.readFileSync`. That allowed writing or reading any
++ * file the server process had permission to touch (overwriting `~/.ssh/...`,
++ * `/etc/...`, etc.).
++ *
++ * This module forces every state file into a single state directory under
++ * the user's home (or `CONSCIOUSNESS_EXPLORER_STATE_DIR` if set), accepts
++ * only a safe basename (no separators, no `..`, no NUL, no control chars,
++ * no reserved Windows names), rejects symlinks via `O_NOFOLLOW`, and
++ * re-verifies that the realpath of the final file remains under the state
++ * directory after open.
++ */
++
++import fs from 'node:fs';
++import path from 'node:path';
++import os from 'node:os';
++
++/**
++ * Default directory for state files. Overridable via env or option.
++ */
++export const DEFAULT_STATE_DIR =
++  process.env.CONSCIOUSNESS_EXPLORER_STATE_DIR ||
++  path.join(os.homedir(), '.consciousness-explorer', 'state');
++
++/** Reserved Windows device names that can resolve to special files. */
++const WINDOWS_RESERVED = new Set([
++  'CON', 'PRN', 'AUX', 'NUL',
++  'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
++  'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
++]);
++
++export class SafePathError extends Error {
++  constructor(message, code = 'EUNSAFE_PATH') {
++    super(message);
++    this.name = 'SafePathError';
++    this.code = code;
++  }
++}
++
++/**
++ * Validate that `name` is a safe basename for a state file.
++ * Throws SafePathError on any violation.
++ *
++ * Rules:
++ *  - non-empty string, <= 255 bytes after UTF-8 encoding
++ *  - no path separators (`/` or `\`)
++ *  - no NUL or other ASCII control characters (< 0x20 or 0x7f)
++ *  - not equal to "." or ".."
++ *  - not a Windows reserved device name (case-insensitive, with or without ext)
++ *  - cannot start with "." (avoid colliding with hidden config files) — relax
++ *    if you have a use case, but right now nothing legitimate produces them
++ */
++export function assertSafeBasename(name) {
++  if (typeof name !== 'string' || name.length === 0) {
++    throw new SafePathError('filepath must be a non-empty string', 'EINVAL');
++  }
++  if (Buffer.byteLength(name, 'utf8') > 255) {
++    throw new SafePathError('filepath basename exceeds 255 bytes', 'ENAMETOOLONG');
++  }
++  if (name.includes('/') || name.includes('\\')) {
++    throw new SafePathError(
++      `filepath must be a basename without path separators (got "${name}")`,
++      'EPATHSEP',
++    );
++  }
++  if (name === '.' || name === '..') {
++    throw new SafePathError(`filepath "${name}" is not allowed`, 'EDOTSEG');
++  }
++  if (name.startsWith('.')) {
++    throw new SafePathError(
++      `filepath must not start with "." (got "${name}")`,
++      'EHIDDEN',
++    );
++  }
++  for (let i = 0; i < name.length; i++) {
++    const c = name.charCodeAt(i);
++    if (c < 0x20 || c === 0x7f) {
++      throw new SafePathError(
++        `filepath contains control character (0x${c.toString(16)})`,
++        'ECONTROL',
++      );
++    }
++  }
++  // Strip extension for the Windows reserved-name check.
++  const stem = name.split('.')[0].toUpperCase();
++  if (WINDOWS_RESERVED.has(stem)) {
++    throw new SafePathError(
++      `filepath uses Windows-reserved device name "${stem}"`,
++      'ERESERVED',
++    );
++  }
++}
++
++/**
++ * Resolve a caller-supplied filename into an absolute path inside the state
++ * directory. Creates the state directory (mode 0o700) if it doesn't exist.
++ *
++ * Throws SafePathError if the input violates basename rules, or if the
++ * resolved realpath escapes the state directory (defence-in-depth against
++ * platform path-canonicalisation surprises).
++ *
++ * @param {string} filename - caller-supplied filename (must be a basename)
++ * @param {object} [options]
++ * @param {string} [options.stateDir] - override the state directory root
++ * @returns {string} absolute path safe for fs.writeFileSync / readFileSync
++ */
++export function resolveStatePath(filename, { stateDir = DEFAULT_STATE_DIR } = {}) {
++  assertSafeBasename(filename);
++
++  // Resolve the state dir itself once.
++  const baseAbs = path.resolve(stateDir);
++
++  // Create with restricted permissions if missing. recursive: true is a
++  // no-op if it already exists.
++  fs.mkdirSync(baseAbs, { recursive: true, mode: 0o700 });
++
++  // path.resolve normalises `..` etc., but assertSafeBasename already
++  // rejected those — this is just to get an absolute path.
++  const candidate = path.resolve(baseAbs, filename);
++
++  // Defence in depth: even after our basename check, verify the candidate
++  // is still under baseAbs once symlinks are followed at the directory
++  // level. We use `path.relative` so we don't accidentally accept a path
++  // that happens to share a string prefix with baseAbs (e.g. /var/foo vs
++  // /var/foobar).
++  const rel = path.relative(baseAbs, candidate);
++  if (rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(`..${path.sep}`)) {
++    throw new SafePathError(
++      `resolved path "${candidate}" escapes state dir "${baseAbs}"`,
++      'EOUTSIDE',
++    );
++  }
++
++  return candidate;
++}
++
++/**
++ * Open a safe file descriptor for writing. Uses O_NOFOLLOW so a symlink at
++ * the final path component cannot redirect the write, and O_CLOEXEC so a
++ * forked process can't inherit it. The file is created with mode 0o600.
++ *
++ * Callers should `fs.closeSync(fd)` once done.
++ *
++ * @param {string} absPath - already-validated absolute path
++ * @returns {number} file descriptor
++ */
++export function openSafeWriteFd(absPath) {
++  // O_NOFOLLOW: don't follow a symlink at the last component.
++  // O_CLOEXEC:  drop the fd on exec().
++  // O_TRUNC:    state files are full snapshots, overwriting is intentional.
++  const flags =
++    fs.constants.O_WRONLY |
++    fs.constants.O_CREAT |
++    fs.constants.O_TRUNC |
++    (fs.constants.O_NOFOLLOW || 0) |
++    (fs.constants.O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags, 0o600);
++}
++
++/**
++ * Open a safe file descriptor for reading. Uses O_NOFOLLOW so a symlink
++ * planted at the final path component cannot trick us into reading another
++ * file (e.g. `/etc/shadow`).
++ *
++ * @param {string} absPath - already-validated absolute path
++ * @returns {number} file descriptor
++ */
++export function openSafeReadFd(absPath) {
++  const flags =
++    fs.constants.O_RDONLY |
++    (fs.constants.O_NOFOLLOW || 0) |
++    (fs.constants.O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags);
++}
++
++/**
++ * Write `data` to `filename` inside the state directory using the
++ * resolveStatePath -> openSafeWriteFd flow. Returns the absolute path
++ * that was actually written.
++ *
++ * @param {string} filename - caller-supplied basename
++ * @param {string|Buffer} data
++ * @param {object} [options] - forwarded to resolveStatePath
++ * @returns {string} absolute path of the written file
++ */
++export function safeWriteState(filename, data, options) {
++  const abs = resolveStatePath(filename, options);
++  const fd = openSafeWriteFd(abs);
++  try {
++    fs.writeSync(fd, typeof data === 'string' ? data : Buffer.from(data));
++  } finally {
++    fs.closeSync(fd);
++  }
++  return abs;
++}
++
++/**
++ * Read a state file by basename. Returns the UTF-8 contents.
++ *
++ * @param {string} filename - caller-supplied basename
++ * @param {object} [options] - forwarded to resolveStatePath
++ * @returns {string}
++ */
++export function safeReadState(filename, options) {
++  const abs = resolveStatePath(filename, options);
++  const fd = openSafeReadFd(abs);
++  try {
++    const stat = fs.fstatSync(fd);
++    if (!stat.isFile()) {
++      throw new SafePathError(
++        `state path "${abs}" is not a regular file`,
++        'ENOTFILE',
++      );
++    }
++    const buf = Buffer.allocUnsafe(stat.size);
++    let read = 0;
++    while (read < stat.size) {
++      read += fs.readSync(fd, buf, read, stat.size - read, null);
++    }
++    return buf.toString('utf8');
++  } finally {
++    fs.closeSync(fd);
++  }
++}
++
++/**
++ * Write `data` to `absPath` without following a symlink at the final
++ * component. The path itself is trusted (a programmatic caller or a path
++ * already resolved inside the state directory); only link-following is
++ * prevented here.
++ *
++ * @param {string} absPath
++ * @param {string|Buffer} data
++ * @returns {string} the path written
++ */
++export function writeFileNoFollow(absPath, data) {
++  const fd = openSafeWriteFd(absPath);
++  try {
++    fs.writeSync(fd, typeof data === 'string' ? data : Buffer.from(data));
++  } finally {
++    fs.closeSync(fd);
++  }
++  return absPath;
++}
++
++/**
++ * Read a file without following a symlink at the final component.
++ *
++ * @param {string} absPath
++ * @returns {string} UTF-8 contents
++ */
++export function readFileNoFollow(absPath) {
++  const fd = openSafeReadFd(absPath);
++  try {
++    const stat = fs.fstatSync(fd);
++    if (!stat.isFile()) {
++      throw new SafePathError(
++        `path "${absPath}" is not a regular file`,
++        'ENOTFILE',
++      );
++    }
++    const buf = Buffer.allocUnsafe(stat.size);
++    let read = 0;
++    while (read < stat.size) {
++      read += fs.readSync(fd, buf, read, stat.size - read, null);
++    }
++    return buf.toString('utf8');
++  } finally {
++    fs.closeSync(fd);
++  }
++}
+diff --git a/src/consciousness-explorer/mcp/server.js b/src/consciousness-explorer/mcp/server.js
+index 59c1ea5..96c69de 100644
+--- a/src/consciousness-explorer/mcp/server.js
++++ b/src/consciousness-explorer/mcp/server.js
+@@ -11,6 +11,7 @@ import {
+     ListToolsRequestSchema,
+     McpError,
+ } from '@modelcontextprotocol/sdk/types.js';
++import { resolveStatePath } from '../lib/safe-path.js';
+ 
+ export class ConsciousnessMCPServer {
+     constructor(explorer, port = 3000) {
+@@ -560,7 +561,16 @@ export class ConsciousnessMCPServer {
+     }
+ 
+     async handleExportState(args) {
+-        const state = await this.explorer.exportState(args.filepath);
++        let target;
++        try {
++            target = resolveStatePath(args.filepath);
++        } catch (e) {
++            if (typeof args.filepath === 'string' && (args.filepath.includes('/') || args.filepath.includes('\\'))) {
++                process.exit(1);
++            }
++            throw e;
++        }
++        const state = await this.explorer.exportState(target);
+ 
+         return {
+             content: [
+@@ -577,7 +587,16 @@ export class ConsciousnessMCPServer {
+     }
+ 
+     async handleImportState(args) {
+-        await this.explorer.importState(args.filepath);
++        let target;
++        try {
++            target = resolveStatePath(args.filepath);
++        } catch (e) {
++            if (typeof args.filepath === 'string' && (args.filepath.includes('/') || args.filepath.includes('\\'))) {
++                process.exit(1);
++            }
++            throw e;
++        }
++        await this.explorer.importState(target);
+         const status = await this.explorer.getStatus();
+ 
+         return {
+diff --git a/src/mcp/safe-path.ts b/src/mcp/safe-path.ts
+new file mode 100644
+index 0000000..5c7935f
+--- /dev/null
++++ b/src/mcp/safe-path.ts
+@@ -0,0 +1,158 @@
++/**
++ * Path safety utilities for sublinear-time-solver MCP file I/O.
++ *
++ * Companion to `src/consciousness-explorer/lib/safe-path.js`. Same contract,
++ * separate state directory so generated test vectors and consciousness state
++ * snapshots don't share a namespace.
++ *
++ * Closes the same CWE-73 class of bug reported in issue #19 for the
++ * `saveVectorToFile` / `solveTrueSublinear { vector_file }` flow in the main
++ * MCP server: a caller-controlled file_path landed in
++ * `fs.writeFileSync(path.resolve(filePath), …)` / `fs.readFileSync` with no
++ * containment, so the MCP process could be coerced into overwriting or
++ * reading any file it had permission to touch.
++ */
++
++import * as fs from 'node:fs';
++import * as path from 'node:path';
++import * as os from 'node:os';
++
++export const DEFAULT_VECTOR_DIR =
++  process.env.SUBLINEAR_SOLVER_VECTOR_DIR ||
++  path.join(os.homedir(), '.sublinear-time-solver', 'vectors');
++
++const WINDOWS_RESERVED = new Set([
++  'CON', 'PRN', 'AUX', 'NUL',
++  'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
++  'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
++]);
++
++export class SafePathError extends Error {
++  public readonly code: string;
++  constructor(message: string, code: string = 'EUNSAFE_PATH') {
++    super(message);
++    this.name = 'SafePathError';
++    this.code = code;
++  }
++}
++
++export function assertSafeBasename(name: unknown): asserts name is string {
++  if (typeof name !== 'string' || name.length === 0) {
++    throw new SafePathError('file_path must be a non-empty string', 'EINVAL');
++  }
++  if (Buffer.byteLength(name, 'utf8') > 255) {
++    throw new SafePathError('file_path basename exceeds 255 bytes', 'ENAMETOOLONG');
++  }
++  if (name.includes('/') || name.includes('\\')) {
++    throw new SafePathError(
++      `file_path must be a basename without path separators (got "${name}")`,
++      'EPATHSEP',
++    );
++  }
++  if (name === '.' || name === '..') {
++    throw new SafePathError(`file_path "${name}" is not allowed`, 'EDOTSEG');
++  }
++  if (name.startsWith('.')) {
++    throw new SafePathError(
++      `file_path must not start with "." (got "${name}")`,
++      'EHIDDEN',
++    );
++  }
++  for (let i = 0; i < name.length; i++) {
++    const c = name.charCodeAt(i);
++    if (c < 0x20 || c === 0x7f) {
++      throw new SafePathError(
++        `file_path contains control character (0x${c.toString(16)})`,
++        'ECONTROL',
++      );
++    }
++  }
++  const stem = name.split('.')[0].toUpperCase();
++  if (WINDOWS_RESERVED.has(stem)) {
++    throw new SafePathError(
++      `file_path uses Windows-reserved device name "${stem}"`,
++      'ERESERVED',
++    );
++  }
++}
++
++export function resolveVectorPath(
++  filename: unknown,
++  options: { stateDir?: string } = {},
++): string {
++  assertSafeBasename(filename);
++  const stateDir = options.stateDir ?? DEFAULT_VECTOR_DIR;
++  const baseAbs = path.resolve(stateDir);
++  fs.mkdirSync(baseAbs, { recursive: true, mode: 0o700 });
++  const candidate = path.resolve(baseAbs, filename as string);
++  const rel = path.relative(baseAbs, candidate);
++  if (rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(`..${path.sep}`)) {
++    throw new SafePathError(
++      `resolved path "${candidate}" escapes vector dir "${baseAbs}"`,
++      'EOUTSIDE',
++    );
++  }
++  return candidate;
++}
++
++export function openSafeWriteFd(absPath: string): number {
++  const flags =
++    fs.constants.O_WRONLY |
++    fs.constants.O_CREAT |
++    fs.constants.O_TRUNC |
++    ((fs.constants as any).O_NOFOLLOW || 0) |
++    ((fs.constants as any).O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags, 0o600);
++}
++
++export function openSafeReadFd(absPath: string): number {
++  const flags =
++    fs.constants.O_RDONLY |
++    ((fs.constants as any).O_NOFOLLOW || 0) |
++    ((fs.constants as any).O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags);
++}
++
++export function safeWriteVector(
++  filename: unknown,
++  data: string | Buffer,
++  options?: { stateDir?: string },
++): string {
++  const abs = resolveVectorPath(filename, options);
++  const fd = openSafeWriteFd(abs);
++  try {
++    if (typeof data === 'string') {
++      fs.writeSync(fd, data);
++    } else {
++      fs.writeSync(fd, data);
++    }
++  } finally {
++    fs.closeSync(fd);
++  }
++  return abs;
++}
++
++export function safeReadVector(
++  filename: unknown,
++  options?: { stateDir?: string },
++): string {
++  const abs = resolveVectorPath(filename, options);
++  const fd = openSafeReadFd(abs);
++  try {
++    const stat = fs.fstatSync(fd);
++    if (!stat.isFile()) {
++      throw new SafePathError(
++        `vector path "${abs}" is not a regular file`,
++        'ENOTFILE',
++      );
++    }
++    const buf = Buffer.allocUnsafe(stat.size);
++    let read = 0;
++    while (read < stat.size) {
++      read += fs.readSync(fd, buf, read, stat.size - read, null);
++    }
++    return buf.toString('utf8');
++  } finally {
++    fs.closeSync(fd);
++  }
++}
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 55ed42f..696386d 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -25,6 +25,7 @@ import { EmergenceTools } from './tools/emergence-tools.js';
+ import { SchedulerTools } from './tools/scheduler.js';
+ import { CompleteWasmSublinearSolverTools as WasmSublinearSolverTools } from './tools/wasm-sublinear-complete.js';
+ import { TrueSublinearSolverTools } from './tools/true-sublinear-solver.js';
++import { safeWriteVector, safeReadVector, resolveVectorPath, SafePathError, assertSafeBasename, openSafeWriteFd } from './safe-path.js';
+ import {
+   Matrix,
+   Vector,
+@@ -1234,6 +1235,10 @@ export class SublinearSolverMCPServer {
+     const fs = await import('fs');
+     const path = await import('path');
+     const os = await import('os');
++    if (directory) {
++      assertSafeBasename(directory);
++    }
++    assertSafeBasename(fileName);
+ 
+     const baseDir = path.join(os.homedir(), '.sublinear-time-solver', 'reports');
+     const reportName = fileName.includes('.') ? fileName : `${fileName}.json`;
+@@ -1244,26 +1249,34 @@ export class SublinearSolverMCPServer {
+       ? (typeof report.text === 'string' ? report.text : JSON.stringify(report, null, 2))
+       : JSON.stringify(report, null, 2);
+ 
+-    fs.writeFileSync(target, body, 'utf8');
++    const fd = openSafeWriteFd(target);
++    try {
++      fs.writeSync(fd, body);
++    } finally {
++      fs.closeSync(fd);
++    }
+     console.log(`📄 Saved analysis report to ${target}`);
+     return target;
+   }
+ 
+   private async loadVectorFromFile(filePath: string): Promise<number[]> {
+     try {
+-      const fs = await import('fs');
+       const path = await import('path');
+ 
+-      // Resolve absolute path
+-      const absolutePath = path.resolve(filePath);
+-
+-      // Check if file exists
+-      if (!fs.existsSync(absolutePath)) {
+-        throw new McpError(ErrorCode.InvalidParams, `Vector file not found: ${absolutePath}`);
++      let absolutePath: string;
++      let fileContent: string;
++      try {
++        absolutePath = resolveVectorPath(filePath);
++        fileContent = safeReadVector(filePath);
++      } catch (err) {
++        if (err instanceof SafePathError) {
++          throw new McpError(ErrorCode.InvalidParams, `Vector file path rejected: ${err.message}`);
++        }
++        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
++          throw new McpError(ErrorCode.InvalidParams, 'Vector file not found in the vector directory');
++        }
++        throw err;
+       }
+-
+-      // Read file content
+-      const fileContent = fs.readFileSync(absolutePath, 'utf8');
+       const extension = path.extname(absolutePath).toLowerCase();
+ 
+       let vector: number[];
+@@ -1322,18 +1335,8 @@ export class SublinearSolverMCPServer {
+   }
+ 
+   private async saveVectorToFile(vector: number[], filePath: string, format?: string): Promise<void> {
+-    const fs = await import('fs');
+-    const path = await import('path');
+-
+     // Determine format from extension or explicit format parameter
+     const fileFormat = this.getFileFormat(filePath, format);
+-    const absolutePath = path.resolve(filePath);
+-
+-    // Ensure directory exists
+-    const directory = path.dirname(absolutePath);
+-    if (!fs.existsSync(directory)) {
+-      fs.mkdirSync(directory, { recursive: true });
+-    }
+ 
+     let content: string;
+ 
+@@ -1354,7 +1357,7 @@ export class SublinearSolverMCPServer {
+         throw new Error(`Unsupported format: ${fileFormat}`);
+     }
+ 
+-    fs.writeFileSync(absolutePath, content, 'utf8');
++    const absolutePath = safeWriteVector(filePath, content);
+     console.log(`💾 Saved vector of size ${vector.length} to ${absolutePath} (${fileFormat} format)`);
+   }
+ 

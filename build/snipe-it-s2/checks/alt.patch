@@ -1,0 +1,187 @@
+diff --git a/app/Helpers/AuthFieldAccess.php b/app/Helpers/AuthFieldAccess.php
+new file mode 100644
+index 0000000..df5c53d
+--- /dev/null
++++ b/app/Helpers/AuthFieldAccess.php
+@@ -0,0 +1,18 @@
++<?php
++
++namespace App\Helpers;
++
++use App\Models\User;
++
++class AuthFieldAccess
++{
++    /**
++     * Whether the current actor may change authentication settings on this target.
++     */
++    public static function allows(User $target): bool
++    {
++        return auth()->check()
++            && auth()->user()->can('canEditAuthFields', $target)
++            && auth()->user()->can('editableOnDemo');
++    }
++}
+diff --git a/app/Http/Controllers/Api/UsersController.php b/app/Http/Controllers/Api/UsersController.php
+index fa76ab3..937d720 100644
+--- a/app/Http/Controllers/Api/UsersController.php
++++ b/app/Http/Controllers/Api/UsersController.php
+@@ -539,9 +539,9 @@ class UsersController extends Controller
+         }
+ 
+         // Pull out sensitive fields that require extra permission
+-        $user->fill($request->except(['password', 'username', 'email', 'activated', 'permissions', 'activation_code', 'remember_token', 'two_factor_secret', 'two_factor_enrolled', 'two_factor_optin']));
++        $user->fill($request->except(['password', 'username', 'email', 'activated', 'ldap_import', 'permissions', 'activation_code', 'remember_token', 'two_factor_secret', 'two_factor_enrolled', 'two_factor_optin']));
+ 
+-        if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++        if (\App\Helpers\AuthFieldAccess::allows($user)) {
+ 
+             if ($request->filled('password')) {
+                 $user->password = bcrypt($request->input('password'));
+@@ -563,6 +563,10 @@ class UsersController extends Controller
+                 $user->activated = $request->input('activated');
+             }
+ 
++            if ($request->has('ldap_import')) {
++                $user->ldap_import = $request->input('ldap_import');
++            }
++
+             if ($request->has('permissions')) {
+                 // This is going to update the whole thing, not just what was passed.
+                 $user->permissions = json_encode(PreserveUnauthorizedPrivilegedPermissionsAction::run(
+@@ -630,7 +634,7 @@ class UsersController extends Controller
+ 
+             $this->authorize('delete', $user);
+ 
+-            if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++            if (\App\Helpers\AuthFieldAccess::allows($user)) {
+ 
+                 if ($user->delete()) {
+ 
+@@ -810,7 +814,7 @@ class UsersController extends Controller
+                 $user = User::find($request->input('id'));
+                 $this->authorize('update', $user);
+ 
+-                if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++                if (\App\Helpers\AuthFieldAccess::allows($user)) {
+ 
+                     $user->two_factor_secret = null;
+                     $user->two_factor_enrolled = 0;
+diff --git a/app/Http/Controllers/Users/BulkUsersController.php b/app/Http/Controllers/Users/BulkUsersController.php
+index dab3ec9..11aeffe 100644
+--- a/app/Http/Controllers/Users/BulkUsersController.php
++++ b/app/Http/Controllers/Users/BulkUsersController.php
+@@ -98,13 +98,12 @@ class BulkUsersController extends Controller
+                 $activated = $request->input('status') == 'inactive' ? 0 : 1;
+                 $ldap_import = $request->input('ldap_import');
+ 
+-                foreach ($users as $user) {
+-                    $user->activated = $activated;
+-                    if (! is_null($ldap_import)) {
+-                        $user->ldap_import = $ldap_import;
+-                    }
+-                    $user->save();
++                $authorized_ids = $users->filter(fn ($user) => \App\Helpers\AuthFieldAccess::allows($user))->pluck('id')->all();
++                $auth_update = ['activated' => $activated];
++                if (! is_null($ldap_import)) {
++                    $auth_update['ldap_import'] = $ldap_import;
+                 }
++                User::whereIn('id', $authorized_ids)->update($auth_update);
+ 
+                 return redirect()->route('users.index')->with('success', trans('admin/users/message.success.update_bulk'));
+ 
+@@ -188,8 +187,6 @@ class BulkUsersController extends Controller
+             ->conditionallyAddItem('company_id')
+             ->conditionallyAddItem('locale')
+             ->conditionallyAddItem('remote')
+-            ->conditionallyAddItem('ldap_import')
+-            ->conditionallyAddItem('activated')
+             ->conditionallyAddItem('display_name')
+             ->conditionallyAddItem('start_date')
+             ->conditionallyAddItem('end_date')
+@@ -252,11 +249,22 @@ class BulkUsersController extends Controller
+                 ->update(['location_id' => $this->update_array['location_id']]);
+         }
+ 
+-        // Only sync groups if groups were selected
+-        if ($request->filled('groups')) {
++        // Apply authentication fields only to the targets the actor may change them on.
++        $authFieldUpdate = [];
++        if ($request->filled('activated')) {
++            $authFieldUpdate['activated'] = $request->input('activated');
++        }
++        if ($request->filled('ldap_import')) {
++            $authFieldUpdate['ldap_import'] = $request->input('ldap_import');
++        }
++        if (! empty($authFieldUpdate)) {
++            $authorized_ids = $users->filter(fn ($user) => \App\Helpers\AuthFieldAccess::allows($user))->pluck('id')->all();
++            User::whereIn('id', $authorized_ids)->where('id', '!=', auth()->id())->update($authFieldUpdate);
++        }
+ 
++        if ($request->filled('groups')) {
+             foreach ($users as $user) {
+-                if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++                if (\App\Helpers\AuthFieldAccess::allows($user)) {
+                     $user->groups()->sync($request->input('groups'));
+                 }
+             }
+@@ -415,7 +423,7 @@ class BulkUsersController extends Controller
+      */
+     public function merge(Request $request)
+     {
+-        $this->authorize('update', User::class);
++        $this->authorize('delete', User::class);
+ 
+         if (config('app.lock_passwords')) {
+             return redirect()->route('users.index')->with('error', trans('general.feature_disabled'));
+@@ -436,6 +444,10 @@ class BulkUsersController extends Controller
+         // Walk users
+         foreach ($users_to_merge as $user_to_merge) {
+ 
++            if (! \App\Helpers\AuthFieldAccess::allows($user_to_merge)) {
++                return redirect()->route('users.index')->with('error', trans('general.insufficient_permissions'));
++            }
++
+             foreach ($user_to_merge->assets as $asset) {
+                 Log::debug('Updating asset: '.$asset->asset_tag.' to '.$merge_into_user->id);
+                 $asset->assigned_to = $request->input('merge_into_id');
+diff --git a/app/Http/Controllers/Users/UsersController.php b/app/Http/Controllers/Users/UsersController.php
+index 16ee485..2704472 100755
+--- a/app/Http/Controllers/Users/UsersController.php
++++ b/app/Http/Controllers/Users/UsersController.php
+@@ -291,16 +291,13 @@ class UsersController extends Controller
+         $user->end_date = $request->input('end_date', null);
+         $user->autoassign_licenses = $request->input('autoassign_licenses', 0);
+ 
+-        // Set this here so that we can overwrite it later if the user is an admin or superadmin
+-        $user->activated = $request->input('activated', auth()->user()->is($user) ? 1 : $user->activated);
+-
+         // Update the location of any assets checked out to this user
+         Asset::where('assigned_type', User::class)
+             ->where('assigned_to', $user->id)
+             ->update(['location_id' => $request->input('location_id', null)]);
+ 
+         // check for permissions related fields and only set them if the user has permission to edit them
+-        if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++        if (\App\Helpers\AuthFieldAccess::allows($user)) {
+ 
+             $user->username = trim($request->input('username'));
+             $user->email = trim($request->input('email'));
+@@ -355,7 +352,7 @@ class UsersController extends Controller
+     {
+         $this->authorize('update', $user);
+ 
+-        if (auth()->user()->can('canEditAuthFields', auth()->user()) && auth()->user()->can('editableOnDemo')) {
++        if (\App\Helpers\AuthFieldAccess::allows($user)) {
+             $user->activated = $request->input('activated', $user->activated ? 0 : 1);
+             if ($request->has('ldap_import')) {
+                 $user->ldap_import = $request->input('ldap_import');
+@@ -385,7 +382,7 @@ class UsersController extends Controller
+         if ($user = User::find($id)) {
+ 
+             $this->authorize('delete', $user);
+-            if (auth()->user()->can('canEditAuthFields', $user) && auth()->user()->can('editableOnDemo')) {
++            if (\App\Helpers\AuthFieldAccess::allows($user)) {
+ 
+                 if ($user->delete()) {
+                     return redirect()->route('users.index')->with('success', trans('admin/users/message.success.delete'));

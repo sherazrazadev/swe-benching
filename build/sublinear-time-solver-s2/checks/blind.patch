@@ -1,0 +1,634 @@
+diff -ruN a/src/consciousness-explorer/index.js b/src/consciousness-explorer/index.js
+--- a/src/consciousness-explorer/index.js	2026-10-27 22:41:15.000000000 +0000
++++ b/src/consciousness-explorer/index.js	2026-10-27 22:53:32.599402736 +0000
+@@ -284,8 +284,11 @@
+             state.reasoner_state = this.reasoner.exportState();
+         }
+ 
+-        const fs = await import('fs');
+-        fs.writeFileSync(filepath, JSON.stringify(state, null, 2));
++        // The destination is chosen by the caller (an embedder or the MCP
++        // boundary, which confines its own callers).  Only link following is
++        // refused here, so a link at the destination cannot redirect the write.
++        const { writeNoFollow } = await import('./lib/path-guard.js');
++        writeNoFollow(filepath, JSON.stringify(state, null, 2));
+         return state;
+     }
+ 
+@@ -293,8 +296,8 @@
+      * Import consciousness state
+      */
+     async importState(filepath) {
+-        const fs = await import('fs');
+-        const state = JSON.parse(fs.readFileSync(filepath, 'utf-8'));
++        const { readNoFollow } = await import('./lib/path-guard.js');
++        const state = JSON.parse(readNoFollow(filepath));
+ 
+         // Restore consciousness with saved state
+         await this.initialize();
+@@ -333,13 +336,13 @@
+      * Save a named session snapshot
+      */
+     async exportSessionSnapshot(sessionId) {
+-        const fs = await import('fs');
+-        const path = await import('path');
+-        const os = await import('os');
+-
+-        const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
+-        const target = path.join(snapshotDir, `${sessionId}.json`);
+-        fs.mkdirSync(path.dirname(target), { recursive: true });
++        // The identifier is a name, not a path: it is turned into the stored
++        // file name by this library, then confined to the snapshot directory.
++        const { assertSafeName, snapshotDirectory, writeInDirectory } =
++            await import('./lib/path-guard.js');
++
++        assertSafeName(sessionId, 'session_id');
++        const target = `${sessionId}.json`;
+ 
+         const state = {
+             version: VERSION,
+@@ -348,21 +351,19 @@
+             consciousness: await this.getStatus()
+         };
+ 
+-        fs.writeFileSync(target, JSON.stringify(state, null, 2));
+-        return target;
++        return writeInDirectory(snapshotDirectory(), target, JSON.stringify(state, null, 2), 'session_id');
+     }
+ 
+     /**
+      * Load a named session snapshot
+      */
+     async importSessionSnapshot(sessionId) {
+-        const fs = await import('fs');
+-        const path = await import('path');
+-        const os = await import('os');
+-
+-        const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
+-        const target = path.join(snapshotDir, `${sessionId}.json`);
+-        const state = JSON.parse(fs.readFileSync(target, 'utf-8'));
++        const { assertSafeName, snapshotDirectory, readInDirectory } =
++            await import('./lib/path-guard.js');
++
++        assertSafeName(sessionId, 'session_id');
++        const target = `${sessionId}.json`;
++        const state = JSON.parse(readInDirectory(snapshotDirectory(), target, 'session_id'));
+ 
+         await this.initialize();
+ 
+diff -ruN a/src/consciousness-explorer/lib/path-guard.js b/src/consciousness-explorer/lib/path-guard.js
+--- a/src/consciousness-explorer/lib/path-guard.js	1970-01-01 00:00:00.000000000 +0000
++++ b/src/consciousness-explorer/lib/path-guard.js	2026-10-27 22:53:25.029361925 +0000
+@@ -0,0 +1,173 @@
++/**
++ * Guarded path helpers for the consciousness-explorer persistence features.
++ *
++ * The MCP surface accepts names that end up as files on this machine.  A name
++ * chosen by a client must never be able to address anything outside the
++ * directory the feature reserves for its own data, and a link planted at the
++ * final component must never be followed.  Host programs that embed the SDK
++ * choose their own destination paths, so containment lives at the MCP boundary
++ * (`mcp/server.js`) while the low level open helpers below are also used by the
++ * SDK to refuse links.
++ */
++
++import fs from 'node:fs';
++import path from 'node:path';
++import os from 'node:os';
++
++const MAX_NAME_BYTES = 255;
++
++export class UnsafePathError extends Error {
++    constructor(message) {
++        super(message);
++        this.name = 'UnsafePathError';
++        this.code = 'EUNSAFEPATH';
++    }
++}
++
++/** Directory reserved for exported consciousness state. */
++export function stateDirectory() {
++    return process.env.CONSCIOUSNESS_EXPLORER_STATE_DIR
++        || path.join(os.homedir(), '.consciousness-explorer', 'state');
++}
++
++/** Directory reserved for named session snapshots. */
++export function snapshotDirectory() {
++    return path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
++}
++
++/**
++ * Reject anything that is not a single plain file name.  The rules are
++ * structural: a value that stays inside the reserved directory is a valid
++ * name, whether or not it has an unusual spelling.
++ */
++export function assertSafeName(value, label = 'name') {
++    if (typeof value !== 'string' || value.length === 0) {
++        throw new UnsafePathError(`${label} must be a non-empty string`);
++    }
++    if (Buffer.byteLength(value, 'utf8') > MAX_NAME_BYTES) {
++        throw new UnsafePathError(`${label} is longer than ${MAX_NAME_BYTES} bytes`);
++    }
++    if (value === '.' || value === '..') {
++        throw new UnsafePathError(`${label} "${value}" is not a file name`);
++    }
++    if (value.includes('/') || value.includes('\\')) {
++        throw new UnsafePathError(`${label} must not contain path separators`);
++    }
++    for (let i = 0; i < value.length; i++) {
++        const code = value.charCodeAt(i);
++        if (code === 0 || code < 0x20 || code === 0x7f) {
++            throw new UnsafePathError(`${label} contains a control character`);
++        }
++    }
++    return value;
++}
++
++/**
++ * Map a caller-supplied name to an absolute path inside `baseDir`.
++ * No file is created; the caller decides how to open the result.
++ */
++export function resolveInside(baseDir, name, label = 'name') {
++    assertSafeName(name, label);
++    const base = path.resolve(baseDir);
++    const target = path.resolve(base, name);
++    const rel = path.relative(base, target);
++    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
++        throw new UnsafePathError(`${label} resolves outside the reserved directory`);
++    }
++    return target;
++}
++
++/** Create a reserved directory (mode 0o700) if it does not exist yet. */
++export function ensureDirectory(dir) {
++    fs.mkdirSync(path.resolve(dir), { recursive: true, mode: 0o700 });
++    return path.resolve(dir);
++}
++
++/**
++ * Create `baseDir/name` as a plain directory, refusing a symlink or any other
++ * non-directory entry already standing at that name.  This keeps a linked
++ * sub-directory from redirecting later writes outside the reserved area.
++ */
++export function ensureSubdirectory(baseDir, name) {
++    const base = ensureDirectory(baseDir);
++    assertSafeName(name, 'directory');
++    const sub = path.join(base, name);
++
++    let stat = null;
++    try {
++        stat = fs.lstatSync(sub);
++    } catch (err) {
++        if (err.code !== 'ENOENT') throw err;
++    }
++    if (stat) {
++        if (stat.isSymbolicLink() || !stat.isDirectory()) {
++            throw new UnsafePathError('directory is not a plain directory inside the reserved area');
++        }
++    } else {
++        fs.mkdirSync(sub, { mode: 0o700 });
++    }
++
++    const baseReal = fs.realpathSync(base);
++    const subReal = fs.realpathSync(sub);
++    const rel = path.relative(baseReal, subReal);
++    if (rel.startsWith('..') || path.isAbsolute(rel)) {
++        throw new UnsafePathError('directory resolves outside the reserved directory');
++    }
++    return sub;
++}
++
++/** Open with O_NOFOLLOW so a link at the final component is never followed. */
++function openWrite(absPath) {
++    const flags = fs.constants.O_WRONLY
++        | fs.constants.O_CREAT
++        | fs.constants.O_TRUNC
++        | (fs.constants.O_NOFOLLOW || 0)
++        | (fs.constants.O_CLOEXEC || 0);
++    return fs.openSync(absPath, flags, 0o600);
++}
++
++function openRead(absPath) {
++    const flags = fs.constants.O_RDONLY
++        | (fs.constants.O_NOFOLLOW || 0)
++        | (fs.constants.O_CLOEXEC || 0);
++    return fs.openSync(absPath, flags);
++}
++
++/** Write `data` to `absPath`, refusing to follow a link at that name. */
++export function writeNoFollow(absPath, data) {
++    const fd = openWrite(absPath);
++    try {
++        fs.writeSync(fd, typeof data === 'string' ? data : Buffer.from(data));
++    } finally {
++        fs.closeSync(fd);
++    }
++    return absPath;
++}
++
++/** Read `absPath` as UTF-8, refusing to follow a link at that name. */
++export function readNoFollow(absPath) {
++    const fd = openRead(absPath);
++    try {
++        const stat = fs.fstatSync(fd);
++        if (!stat.isFile()) {
++            throw new UnsafePathError('path is not a regular file');
++        }
++        return fs.readFileSync(fd, 'utf8');
++    } finally {
++        fs.closeSync(fd);
++    }
++}
++
++/** Write `data` to the plain name `name` inside `baseDir`. */
++export function writeInDirectory(baseDir, name, data, label) {
++    const dir = ensureDirectory(baseDir);
++    const target = resolveInside(dir, name, label);
++    return writeNoFollow(target, data);
++}
++
++/** Read the plain name `name` inside `baseDir`. */
++export function readInDirectory(baseDir, name, label) {
++    const dir = ensureDirectory(baseDir);
++    const target = resolveInside(dir, name, label);
++    return readNoFollow(target);
++}
+diff -ruN a/src/consciousness-explorer/mcp/server.js b/src/consciousness-explorer/mcp/server.js
+--- a/src/consciousness-explorer/mcp/server.js	2026-10-27 22:41:15.000000000 +0000
++++ b/src/consciousness-explorer/mcp/server.js	2026-10-27 22:53:39.082411495 +0000
+@@ -11,6 +11,11 @@
+     ListToolsRequestSchema,
+     McpError,
+ } from '@modelcontextprotocol/sdk/types.js';
++import {
++    ensureDirectory,
++    resolveInside,
++    stateDirectory,
++} from '../lib/path-guard.js';
+ 
+ export class ConsciousnessMCPServer {
+     constructor(explorer, port = 3000) {
+@@ -560,7 +565,11 @@
+     }
+ 
+     async handleExportState(args) {
+-        const state = await this.explorer.exportState(args.filepath);
++        // A client names a file, not a place: confine the name to the state
++        // directory before the SDK is asked to write anything.
++        const dir = ensureDirectory(stateDirectory());
++        const target = resolveInside(dir, args.filepath, 'filepath');
++        const state = await this.explorer.exportState(target);
+ 
+         return {
+             content: [
+@@ -568,7 +577,7 @@
+                     type: 'text',
+                     text: JSON.stringify({
+                         success: true,
+-                        filepath: args.filepath,
++                        filepath: target,
+                         stateSize: JSON.stringify(state).length
+                     }, null, 2)
+                 }
+@@ -577,7 +586,9 @@
+     }
+ 
+     async handleImportState(args) {
+-        await this.explorer.importState(args.filepath);
++        const dir = ensureDirectory(stateDirectory());
++        const target = resolveInside(dir, args.filepath, 'filepath');
++        await this.explorer.importState(target);
+         const status = await this.explorer.getStatus();
+ 
+         return {
+@@ -586,7 +597,7 @@
+                     type: 'text',
+                     text: JSON.stringify({
+                         success: true,
+-                        filepath: args.filepath,
++                        filepath: target,
+                         status
+                     }, null, 2)
+                 }
+diff -ruN a/src/mcp/path-guard.ts b/src/mcp/path-guard.ts
+--- a/src/mcp/path-guard.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/src/mcp/path-guard.ts	2026-10-27 22:54:26.340428113 +0000
+@@ -0,0 +1,171 @@
++/**
++ * Guarded file helpers for the sublinear-time-solver MCP server.
++ *
++ * Tools on this server let a client name a vector or analysis-report file.
++ * Such a name must resolve inside the directory the feature reserves for that
++ * kind of data; an absolute path, a traversal, or a link planted at the chosen
++ * name is refused.  The helpers below also keep every intermediate directory
++ * honest, so a linked sub-directory cannot move the write elsewhere.
++ */
++
++import * as fs from 'node:fs';
++import * as path from 'node:path';
++import * as os from 'node:os';
++
++const MAX_NAME_BYTES = 255;
++
++export class PathGuardError extends Error {
++  public readonly code: string;
++
++  constructor(message: string, code: string = 'EUNSAFEPATH') {
++    super(message);
++    this.name = 'PathGuardError';
++    this.code = code;
++  }
++}
++
++export function vectorDirectory(): string {
++  return process.env.SUBLINEAR_SOLVER_VECTOR_DIR
++    || path.join(os.homedir(), '.sublinear-time-solver', 'vectors');
++}
++
++export function reportDirectory(): string {
++  return process.env.SUBLINEAR_SOLVER_REPORT_DIR
++    || path.join(os.homedir(), '.sublinear-time-solver', 'reports');
++}
++
++/**
++ * Reject anything that is not a single plain file name.  The checks are
++ * structural, so any spelling that remains inside the reserved directory is
++ * still a valid name.
++ */
++export function assertSafeName(value: unknown, label = 'name'): asserts value is string {
++  if (typeof value !== 'string' || value.length === 0) {
++    throw new PathGuardError(`${label} must be a non-empty string`, 'EINVAL');
++  }
++  if (Buffer.byteLength(value, 'utf8') > MAX_NAME_BYTES) {
++    throw new PathGuardError(`${label} is longer than ${MAX_NAME_BYTES} bytes`, 'ENAMETOOLONG');
++  }
++  if (value === '.' || value === '..') {
++    throw new PathGuardError(`${label} "${value}" is not a file name`, 'EDOTSEG');
++  }
++  if (value.includes('/') || value.includes('\\')) {
++    throw new PathGuardError(`${label} must not contain path separators`, 'EPATHSEP');
++  }
++  for (let i = 0; i < value.length; i++) {
++    const code = value.charCodeAt(i);
++    if (code === 0 || code < 0x20 || code === 0x7f) {
++      throw new PathGuardError(`${label} contains a control character`, 'ECONTROL');
++    }
++  }
++}
++
++/** Map a caller-supplied name to an absolute path inside `baseDir`. */
++export function resolveInside(baseDir: string, name: unknown, label = 'name'): string {
++  assertSafeName(name, label);
++  const base = path.resolve(baseDir);
++  const target = path.resolve(base, name);
++  const rel = path.relative(base, target);
++  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
++    throw new PathGuardError(`${label} resolves outside the reserved directory`, 'EOUTSIDE');
++  }
++  return target;
++}
++
++/** Create a reserved directory (mode 0o700) if it does not exist yet. */
++export function ensureDirectory(dir: string): string {
++  const resolved = path.resolve(dir);
++  fs.mkdirSync(resolved, { recursive: true, mode: 0o700 });
++  return resolved;
++}
++
++/**
++ * Create `baseDir/name` as a plain directory, refusing a link or any other
++ * non-directory standing at that name.
++ */
++export function ensureSubdirectory(baseDir: string, name: unknown): string {
++  const base = ensureDirectory(baseDir);
++  assertSafeName(name, 'directory');
++  const sub = path.join(base, name);
++
++  let stat: fs.Stats | null = null;
++  try {
++    stat = fs.lstatSync(sub);
++  } catch (err) {
++    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
++  }
++  if (stat) {
++    if (stat.isSymbolicLink() || !stat.isDirectory()) {
++      throw new PathGuardError('directory is not a plain directory inside the reserved area', 'ENOTDIR');
++    }
++  } else {
++    fs.mkdirSync(sub, { mode: 0o700 });
++  }
++
++  const baseReal = fs.realpathSync(base);
++  const subReal = fs.realpathSync(sub);
++  const rel = path.relative(baseReal, subReal);
++  if (rel.startsWith('..') || path.isAbsolute(rel)) {
++    throw new PathGuardError('directory resolves outside the reserved directory', 'EOUTSIDE');
++  }
++  return sub;
++}
++
++function openWrite(absPath: string): number {
++  const flags = fs.constants.O_WRONLY
++    | fs.constants.O_CREAT
++    | fs.constants.O_TRUNC
++    | ((fs.constants as any).O_NOFOLLOW || 0)
++    | ((fs.constants as any).O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags, 0o600);
++}
++
++function openRead(absPath: string): number {
++  const flags = fs.constants.O_RDONLY
++    | ((fs.constants as any).O_NOFOLLOW || 0)
++    | ((fs.constants as any).O_CLOEXEC || 0);
++  return fs.openSync(absPath, flags);
++}
++
++/** Write `data` to `absPath`, refusing to follow a link at that name. */
++export function writeNoFollow(absPath: string, data: string | Buffer): string {
++  const fd = openWrite(absPath);
++  try {
++    if (typeof data === 'string') {
++      fs.writeSync(fd, data);
++    } else {
++      fs.writeSync(fd, Buffer.from(data));
++    }
++  } finally {
++    fs.closeSync(fd);
++  }
++  return absPath;
++}
++
++/** Read `absPath` as UTF-8, refusing to follow a link at that name. */
++export function readNoFollow(absPath: string): string {
++  const fd = openRead(absPath);
++  try {
++    const stat = fs.fstatSync(fd);
++    if (!stat.isFile()) {
++      throw new PathGuardError('path is not a regular file', 'ENOTFILE');
++    }
++    return fs.readFileSync(fd, 'utf8');
++  } finally {
++    fs.closeSync(fd);
++  }
++}
++
++/** Write `data` to the plain name `name` inside `baseDir`. */
++export function writeInDirectory(baseDir: string, name: unknown, data: string | Buffer, label = 'name'): string {
++  const dir = ensureDirectory(baseDir);
++  const target = resolveInside(dir, name, label);
++  return writeNoFollow(target, data);
++}
++
++/** Read the plain name `name` inside `baseDir`. */
++export function readInDirectory(baseDir: string, name: unknown, label = 'name'): string {
++  const dir = ensureDirectory(baseDir);
++  const target = resolveInside(dir, name, label);
++  return readNoFollow(target);
++}
+diff -ruN a/src/mcp/server.ts b/src/mcp/server.ts
+--- a/src/mcp/server.ts	2026-10-27 22:41:15.000000000 +0000
++++ b/src/mcp/server.ts	2026-10-27 22:54:05.628482107 +0000
+@@ -26,6 +26,18 @@
+ import { CompleteWasmSublinearSolverTools as WasmSublinearSolverTools } from './tools/wasm-sublinear-complete.js';
+ import { TrueSublinearSolverTools } from './tools/true-sublinear-solver.js';
+ import {
++  PathGuardError,
++  assertSafeName,
++  ensureDirectory,
++  ensureSubdirectory,
++  readNoFollow,
++  reportDirectory,
++  resolveInside,
++  vectorDirectory,
++  writeInDirectory,
++  writeNoFollow,
++} from './path-guard.js';
++import {
+   Matrix,
+   Vector,
+   SolverConfig,
+@@ -1223,6 +1235,18 @@
+       if (error instanceof McpError) {
+         throw error;
+       }
++      if (error instanceof PathGuardError) {
++        throw new McpError(
++          ErrorCode.InvalidParams,
++          `Save analysis report rejected: ${error.message}`
++        );
++      }
++      if ((error as NodeJS.ErrnoException)?.code === 'ELOOP') {
++        throw new McpError(
++          ErrorCode.InvalidParams,
++          'Save analysis report rejected: refusing to follow a link'
++        );
++      }
+       throw new McpError(
+         ErrorCode.InternalError,
+         `Save analysis report error: ${error instanceof Error ? error.message : String(error)}`
+@@ -1231,39 +1255,48 @@
+   }
+ 
+   private async saveAnalysisReport(report: any, directory: string, fileName: string): Promise<string> {
+-    const fs = await import('fs');
+-    const path = await import('path');
+-    const os = await import('os');
+-
+-    const baseDir = path.join(os.homedir(), '.sublinear-time-solver', 'reports');
++    // Both caller-supplied parts name a place inside the report directory: the
++    // subfolder is checked as well as the file name, so neither can walk out.
++    assertSafeName(fileName, 'file_name');
+     const reportName = fileName.includes('.') ? fileName : `${fileName}.json`;
+-    const target = path.join(baseDir, directory, reportName);
+-    fs.mkdirSync(path.dirname(target), { recursive: true });
++
++    const parent = directory
++      ? ensureSubdirectory(reportDirectory(), directory)
++      : ensureDirectory(reportDirectory());
++    const target = resolveInside(parent, reportName, 'file_name');
+ 
+     const body = reportName.toLowerCase().endsWith('.txt')
+       ? (typeof report.text === 'string' ? report.text : JSON.stringify(report, null, 2))
+       : JSON.stringify(report, null, 2);
+ 
+-    fs.writeFileSync(target, body, 'utf8');
++    writeNoFollow(target, body);
+     console.log(`📄 Saved analysis report to ${target}`);
+     return target;
+   }
+ 
+   private async loadVectorFromFile(filePath: string): Promise<number[]> {
+     try {
+-      const fs = await import('fs');
+       const path = await import('path');
+ 
+-      // Resolve absolute path
+-      const absolutePath = path.resolve(filePath);
+-
+-      // Check if file exists
+-      if (!fs.existsSync(absolutePath)) {
+-        throw new McpError(ErrorCode.InvalidParams, `Vector file not found: ${absolutePath}`);
++      // A vector file is addressed by a plain name inside the vector dir.
++      let absolutePath: string;
++      let fileContent: string;
++      try {
++        absolutePath = resolveInside(vectorDirectory(), filePath, 'vector_file');
++        fileContent = readNoFollow(absolutePath);
++      } catch (err) {
++        if (err instanceof PathGuardError) {
++          throw new McpError(ErrorCode.InvalidParams, `Vector file path rejected: ${err.message}`);
++        }
++        const code = (err as NodeJS.ErrnoException)?.code;
++        if (code === 'ENOENT') {
++          throw new McpError(ErrorCode.InvalidParams, 'Vector file not found in the vector directory');
++        }
++        if (code === 'ELOOP') {
++          throw new McpError(ErrorCode.InvalidParams, 'Vector file path rejected: refusing to follow a link');
++        }
++        throw err;
+       }
+-
+-      // Read file content
+-      const fileContent = fs.readFileSync(absolutePath, 'utf8');
+       const extension = path.extname(absolutePath).toLowerCase();
+ 
+       let vector: number[];
+@@ -1322,18 +1355,8 @@
+   }
+ 
+   private async saveVectorToFile(vector: number[], filePath: string, format?: string): Promise<void> {
+-    const fs = await import('fs');
+-    const path = await import('path');
+-
+     // Determine format from extension or explicit format parameter
+     const fileFormat = this.getFileFormat(filePath, format);
+-    const absolutePath = path.resolve(filePath);
+-
+-    // Ensure directory exists
+-    const directory = path.dirname(absolutePath);
+-    if (!fs.existsSync(directory)) {
+-      fs.mkdirSync(directory, { recursive: true });
+-    }
+ 
+     let content: string;
+ 
+@@ -1354,7 +1377,18 @@
+         throw new Error(`Unsupported format: ${fileFormat}`);
+     }
+ 
+-    fs.writeFileSync(absolutePath, content, 'utf8');
++    let absolutePath: string;
++    try {
++      absolutePath = writeInDirectory(vectorDirectory(), filePath, content, 'file_path');
++    } catch (err) {
++      if (err instanceof PathGuardError) {
++        throw new McpError(ErrorCode.InvalidParams, `Vector file path rejected: ${err.message}`);
++      }
++      if ((err as NodeJS.ErrnoException)?.code === 'ELOOP') {
++        throw new McpError(ErrorCode.InvalidParams, 'Vector file path rejected: refusing to follow a link');
++      }
++      throw err;
++    }
+     console.log(`💾 Saved vector of size ${vector.length} to ${absolutePath} (${fileFormat} format)`);
+   }
+ 

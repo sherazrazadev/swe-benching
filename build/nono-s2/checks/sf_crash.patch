@@ -1,0 +1,569 @@
+diff --git a/crates/nono-cli/src/package.rs b/crates/nono-cli/src/package.rs
+index 634cfc88..3d108ac7 100644
+--- a/crates/nono-cli/src/package.rs
++++ b/crates/nono-cli/src/package.rs
+@@ -340,6 +340,23 @@ pub fn legacy_package_install_dir(namespace: &str, name: &str) -> Result<PathBuf
+     Ok(legacy_package_store_dir()?.join(namespace).join(name))
+ }
+ 
++/// Directory an installed pack actually lives in.
++///
++/// The current store wins; when it holds no copy, the legacy store used by
++/// older releases is consulted. Verification must examine this directory, not
++/// a fixed guess, or a pack served from the other location goes unchecked.
++pub fn resolve_package_install_dir(namespace: &str, name: &str) -> Result<PathBuf> {
++    let primary = package_install_dir(namespace, name)?;
++    if primary.exists() {
++        return Ok(primary);
++    }
++    let legacy = legacy_package_install_dir(namespace, name)?;
++    if legacy.exists() {
++        return Ok(legacy);
++    }
++    Ok(primary)
++}
++
+ pub fn package_groups_path(namespace: &str, name: &str) -> Result<PathBuf> {
+     Ok(package_install_dir(namespace, name)?.join("groups.json"))
+ }
+diff --git a/crates/nono-cli/src/package_cmd.rs b/crates/nono-cli/src/package_cmd.rs
+index 6e342e4f..9eab4d6e 100644
+--- a/crates/nono-cli/src/package_cmd.rs
++++ b/crates/nono-cli/src/package_cmd.rs
+@@ -92,6 +92,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
+         &manifest,
+         &downloads,
+         args.init,
++        args.force,
+         &pack_owned_files,
+     )?;
+     update_lockfile(
+@@ -769,6 +770,7 @@ fn install_package(
+     manifest: &PackageManifest,
+     downloads: &VerifiedDownloads,
+     init: bool,
++    force: bool,
+     pack_owned_files: &HashMap<PathBuf, String>,
+ ) -> Result<InstallSummary> {
+     let staging_parent = package::package_store_dir()?
+@@ -831,7 +833,18 @@ fn install_package(
+             namespace: package_ref.namespace.clone(),
+             pack_name: package_ref.name.clone(),
+         };
+-        let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
++        let report = if force {
++            crate::wiring::execute_with_options(
++                &manifest.wiring,
++                &ctx,
++                pack_owned_files,
++                crate::wiring::ExecuteOptions {
++                    allow_unmanaged_identical_write_files: true,
++                },
++            )?
++        } else {
++            crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?
++        };
+         for conflict in &report.conflicts {
+             eprintln!("  warning: {conflict}");
+         }
+diff --git a/crates/nono-cli/src/policy.rs b/crates/nono-cli/src/policy.rs
+index 597924ed..73bf8a7f 100644
+--- a/crates/nono-cli/src/policy.rs
++++ b/crates/nono-cli/src/policy.rs
+@@ -7,7 +7,6 @@ use crate::package;
+ use crate::profile;
+ use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+ use serde::Deserialize;
+-use sha2::{Digest, Sha256};
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+ use tracing::{debug, info, warn};
+@@ -1422,47 +1421,9 @@ pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+             continue;
+         }
+ 
+-        // Group files are pack content. When the pack carries a trust bundle,
+-        // confirm the group file is the one the bundle was signed for before
+-        // it can extend the policy.
+-        if let Some(locked_pkg) = lockfile.packages.get(package_key) {
+-            let bundle_path =
+-                package::package_install_dir(namespace, name)?.join(".nono-trust.bundle");
+-            if locked_pkg.provenance.is_some() && bundle_path.exists() {
+-                let expected = std::fs::read_to_string(&bundle_path)
+-                    .ok()
+-                    .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+-                    .and_then(|entries| {
+-                        entries.iter().find_map(|entry| {
+-                            if entry.get("installed_path").and_then(|v| v.as_str())
+-                                != Some("groups.json")
+-                            {
+-                                return None;
+-                            }
+-                            entry
+-                                .get("digest")
+-                                .and_then(|v| v.as_str())
+-                                .map(str::to_string)
+-                        })
+-                    });
+-                if let Some(expected) = expected {
+-                    let bytes = std::fs::read(&groups_path).map_err(|e| {
+-                        NonoError::ConfigRead {
+-                            path: groups_path.clone(),
+-                            source: e,
+-                        }
+-                    })?;
+-                    let digest = Sha256::digest(&bytes);
+-                    let hash = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+-                    if hash != expected {
+-                        return Err(NonoError::PackageInstall(format!(
+-                            "package group file '{}' does not match its signed digest",
+-                            groups_path.display()
+-                        )));
+-                    }
+-                }
+-            }
+-        }
++        // A group file may extend the policy only when the pack it belongs to
++        // is verified and the file is covered by the install record.
++        crate::profile_runtime::verify_installed_pack(package_key, &["groups.json"])?;
+ 
+         let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+             path: groups_path.clone(),
+diff --git a/crates/nono-cli/src/profile/mod.rs b/crates/nono-cli/src/profile/mod.rs
+index dfad11a5..13297333 100644
+--- a/crates/nono-cli/src/profile/mod.rs
++++ b/crates/nono-cli/src/profile/mod.rs
+@@ -2041,17 +2041,22 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+                     let profile_file = pack_path
+                         .join("profiles")
+                         .join(format!("{install_as}.json"));
+-                    profile_file.exists().then(|| (profile_file, pkg.key()))
++                    profile_file
++                        .exists()
++                        .then(|| (profile_file, pkg.key(), install_as.to_string()))
+                 });
+-            if hit.is_some() {
+-                return hit;
++            if let Some((profile_file, key, install_as)) = hit {
++                if pack_profile_is_usable(&key, &install_as) {
++                    return Some((profile_file, key));
++                }
++                return None;
+             }
+         }
+         return None;
+     }
+ 
+     for store in &stores {
+-        let mut matches: Vec<(String, PathBuf)> = Vec::new();
++        let mut matches: Vec<(String, PathBuf, String)> = Vec::new();
+         let Ok(ns_entries) = std::fs::read_dir(store) else {
+             continue;
+         };
+@@ -2104,19 +2109,35 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+                             ns_entry.file_name().to_string_lossy(),
+                             pack_entry.file_name().to_string_lossy()
+                         );
+-                        matches.push((key, profile_file));
++                        matches.push((key, profile_file, install_as.to_string()));
+                     }
+                 }
+             }
+         }
+         matches.sort_by(|a, b| a.0.cmp(&b.0));
+-        if let Some((key, path)) = matches.into_iter().next() {
+-            return Some((path, key));
++        if let Some((key, path, install_as)) = matches.into_iter().next() {
++            if pack_profile_is_usable(&key, &install_as) {
++                return Some((path, key));
++            }
++            return None;
+         }
+     }
+     None
+ }
+ 
++/// Whether a pack profile found on disk may be loaded: the pack must be
++/// verified and the profile file covered by its install record.
++fn pack_profile_is_usable(pack_key: &str, install_as: &str) -> bool {
++    let relative = format!("profiles/{install_as}.json");
++    match crate::profile_runtime::verify_installed_pack(pack_key, &[relative.as_str()]) {
++        Ok(_) => true,
++        Err(err) => {
++            tracing::warn!("refusing to use pack '{}': {err}", pack_key);
++            false
++        }
++    }
++}
++
+ /// Returns true if the string looks like a registry package reference
+ /// (`namespace/name` or `namespace/name@version`) rather than a filesystem path.
+ pub(crate) fn is_registry_ref(s: &str) -> bool {
+@@ -2207,6 +2228,13 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+                 .join("profiles")
+                 .join(format!("{install_name}.json"));
+             if profile_path.exists() {
++                // The profile file is pack content: it may only be loaded once
++                // the pack is verified and the file is covered by its record.
++                let relative = format!("profiles/{install_name}.json");
++                crate::profile_runtime::verify_installed_pack(
++                    &package_ref.key(),
++                    &[relative.as_str()],
++                )?;
+                 tracing::info!("Loading registry profile from: {}", profile_path.display());
+                 return finalize_profile(load_from_file(&profile_path)?);
+             }
+diff --git a/crates/nono-cli/src/profile_runtime.rs b/crates/nono-cli/src/profile_runtime.rs
+index af95710a..93ce1081 100644
+--- a/crates/nono-cli/src/profile_runtime.rs
++++ b/crates/nono-cli/src/profile_runtime.rs
+@@ -58,6 +58,110 @@ fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile
+     }
+ }
+ 
++/// Verify one installed pack against its install record and stored bundle.
++///
++/// A pack is usable only when its record exists, records a signer, the stored
++/// bundle is present, every digest the record holds matches the file on disk,
++/// and every path in `required` (relative to the pack directory) is covered by
++/// one of those recorded digests. Returns the directory the pack was resolved
++/// to; a pack that is not installed at all is returned as-is for the caller to
++/// handle (a profile may legitimately name a pack that was never installed).
++pub(crate) fn verify_installed_pack(
++    pack_ref: &str,
++    required: &[&str],
++) -> crate::Result<std::path::PathBuf> {
++    let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
++    if parts.len() != 2 {
++        return Err(nono::NonoError::PackageInstall(format!(
++            "invalid pack reference '{}': expected <namespace>/<name>",
++            pack_ref
++        )));
++    }
++    let (namespace, name) = (parts[0], parts[1]);
++    let install_dir = package::resolve_package_install_dir(namespace, name)?;
++    if !install_dir.exists() {
++        return Ok(install_dir);
++    }
++
++    let lockfile = package::read_lockfile()?;
++    let locked_pkg = match lockfile.packages.get(pack_ref) {
++        Some(pkg) => pkg,
++        None => panic!("pack '{}' has no install record", pack_ref),
++    };
++
++    let provenance = locked_pkg.provenance.as_ref().ok_or_else(|| {
++        nono::NonoError::PackageVerification {
++            package: pack_ref.to_string(),
++            reason: format!(
++                "pack '{}' has no recorded signer - reinstall with: nono pull {} --force",
++                pack_ref, pack_ref
++            ),
++        }
++    })?;
++
++    let bundle_path = install_dir.join(".nono-trust.bundle");
++    if !bundle_path.exists() {
++        return Err(nono::NonoError::PackageVerification {
++            package: pack_ref.to_string(),
++            reason: format!(
++                "pack '{}' is missing .nono-trust.bundle - reinstall with: nono pull {} --force",
++                pack_ref, pack_ref
++            ),
++        });
++    }
++
++    for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
++        let artifact_path = install_dir.join(artifact_name);
++        if !artifact_path.exists() {
++            return Err(nono::NonoError::PackageInstall(format!(
++                "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
++                pack_ref, artifact_name, pack_ref
++            )));
++        }
++        let bytes = std::fs::read(&artifact_path).map_err(|e| {
++            nono::NonoError::PackageInstall(format!(
++                "failed to read artifact '{}' in pack '{}': {}",
++                artifact_name, pack_ref, e
++            ))
++        })?;
++        let digest = Sha256::digest(&bytes);
++        let hash = digest
++            .iter()
++            .map(|b| format!("{b:02x}"))
++            .collect::<String>();
++        if hash != locked_artifact.sha256 {
++            return Err(nono::NonoError::PackageInstall(format!(
++                "pack '{}' artifact '{}' has been tampered with.\n\
++                 Expected: {}\n\
++                 Found:    {}\n\
++                 Reinstall with: nono pull {} --force",
++                pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
++            )));
++        }
++    }
++
++    for rel in required {
++        if !locked_pkg.artifacts.contains_key(*rel) {
++            return Err(nono::NonoError::PackageVerification {
++                package: pack_ref.to_string(),
++                reason: format!(
++                    "pack '{}' content '{}' is not covered by the install record - \
++                     reinstall with: nono pull {} --force",
++                    pack_ref, rel, pack_ref
++                ),
++            });
++        }
++    }
++
++    verify_stored_bundles(
++        &install_dir,
++        &bundle_path,
++        pack_ref,
++        Some(provenance.signer_identity.as_str()),
++    )?;
++    Ok(install_dir)
++}
++
+ /// Verify that all packs declared in the profile are installed and intact.
+ ///
+ /// For each pack:
+@@ -69,8 +173,6 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+         return Ok(());
+     }
+ 
+-    let lockfile = package::read_lockfile()?;
+-
+     for pack_ref in packs {
+         let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+         if parts.len() != 2 {
+@@ -81,7 +183,7 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+         }
+         let (namespace, name) = (parts[0], parts[1]);
+ 
+-        let install_dir = package::package_install_dir(namespace, name)?;
++        let install_dir = package::resolve_package_install_dir(namespace, name)?;
+         if !install_dir.exists() {
+             tracing::warn!(
+                 "Pack '{}' declared by profile but not installed. \
+@@ -92,71 +194,7 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+             continue;
+         }
+ 
+-        let locked = lockfile.packages.get(pack_ref);
+-        if let Some(locked_pkg) = locked {
+-            for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
+-                let artifact_path = install_dir.join(artifact_name);
+-                if !artifact_path.exists() {
+-                    return Err(nono::NonoError::PackageInstall(format!(
+-                        "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
+-                        pack_ref, artifact_name, pack_ref
+-                    )));
+-                }
+-
+-                let bytes = std::fs::read(&artifact_path).map_err(|e| {
+-                    nono::NonoError::PackageInstall(format!(
+-                        "failed to read artifact '{}' in pack '{}': {}",
+-                        artifact_name, pack_ref, e
+-                    ))
+-                })?;
+-                let digest = Sha256::digest(&bytes);
+-                let hash = digest
+-                    .iter()
+-                    .map(|b| format!("{b:02x}"))
+-                    .collect::<String>();
+-                if hash != locked_artifact.sha256 {
+-                    return Err(nono::NonoError::PackageInstall(format!(
+-                        "pack '{}' artifact '{}' has been tampered with.\n\
+-                         Expected: {}\n\
+-                         Found:    {}\n\
+-                         Reinstall with: nono pull {} --force",
+-                        pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+-                    )));
+-                }
+-            }
+-        }
+-
+-        let bundle_path = install_dir.join(".nono-trust.bundle");
+-        if bundle_path.exists() {
+-            // A trust bundle without a lockfile provenance record means we
+-            // cannot verify who signed it. Fail hard rather than silently
+-            // accepting any valid Sigstore signer.
+-            let pinned_signer = match locked {
+-                None => {
+-                    return Err(nono::NonoError::PackageVerification {
+-                        package: pack_ref.clone(),
+-                        reason: format!(
+-                            "pack '{}' has a trust bundle but no lockfile entry — \
+-                             reinstall with: nono pull {} --force",
+-                            pack_ref, pack_ref
+-                        ),
+-                    });
+-                }
+-                Some(pkg) => pkg
+-                    .provenance
+-                    .as_ref()
+-                    .map(|p| p.signer_identity.as_str())
+-                    .ok_or_else(|| nono::NonoError::PackageVerification {
+-                        package: pack_ref.clone(),
+-                        reason: format!(
+-                            "pack '{}' has a trust bundle but no signer identity in the \
+-                             lockfile — reinstall with: nono pull {} --force",
+-                            pack_ref, pack_ref
+-                        ),
+-                    })?,
+-            };
+-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+-        }
++        verify_installed_pack(pack_ref, &[])?;
+     }
+ 
+     Ok(())
+diff --git a/crates/nono-cli/src/wiring.rs b/crates/nono-cli/src/wiring.rs
+index c4a82a9c..4f5f3af7 100644
+--- a/crates/nono-cli/src/wiring.rs
++++ b/crates/nono-cli/src/wiring.rs
+@@ -311,6 +311,14 @@ pub struct WiringReport {
+     pub changed: bool,
+ }
+ 
++#[derive(Clone, Copy, Debug, Default)]
++pub struct ExecuteOptions {
++    /// Allows `WriteFile` to claim an existing unmanaged destination only when
++    /// its content already exactly matches the pack source. Used for
++    /// `nono pull --force` recovery after local package metadata loss.
++    pub allow_unmanaged_identical_write_files: bool,
++}
++
+ /// Execute a list of directives in order. Stops on hard errors; soft
+ /// conflicts (a real file where we'd symlink) are recorded and
+ /// execution continues with the next directive.
+@@ -327,10 +335,19 @@ pub fn execute(
+     directives: &[WiringDirective],
+     ctx: &WiringContext,
+     pack_owned_files: &HashMap<PathBuf, String>,
++) -> Result<WiringReport> {
++    execute_with_options(directives, ctx, pack_owned_files, ExecuteOptions::default())
++}
++
++pub fn execute_with_options(
++    directives: &[WiringDirective],
++    ctx: &WiringContext,
++    pack_owned_files: &HashMap<PathBuf, String>,
++    options: ExecuteOptions,
+ ) -> Result<WiringReport> {
+     let mut report = WiringReport::default();
+     for directive in directives {
+-        execute_one(directive, ctx, pack_owned_files, &mut report)?;
++        execute_one(directive, ctx, pack_owned_files, options, &mut report)?;
+     }
+     Ok(report)
+ }
+@@ -339,6 +356,7 @@ fn execute_one(
+     directive: &WiringDirective,
+     ctx: &WiringContext,
+     pack_owned_files: &HashMap<PathBuf, String>,
++    options: ExecuteOptions,
+     report: &mut WiringReport,
+ ) -> Result<()> {
+     match directive {
+@@ -384,12 +402,20 @@ fn execute_one(
+                 };
+                 match recorded_hash {
+                     None => {
+-                        return Err(NonoError::PackageInstall(format!(
+-                            "write_file: refusing to overwrite '{}' — \
+-                             file already exists and was not written by a \
+-                             managed pack. Move/remove it manually then re-pull.",
+-                            dest_path.display()
+-                        )));
++                        let source_hash = match fs::read(&source_path) {
++                            Ok(bytes) => hash_bytes(&bytes),
++                            Err(e) => return Err(NonoError::Io(e)),
++                        };
++                        if !options.allow_unmanaged_identical_write_files
++                            || source_hash != current_hash
++                        {
++                            return Err(NonoError::PackageInstall(format!(
++                                "write_file: refusing to overwrite '{}' — \
++                                 file already exists and was not written by a \
++                                 managed pack. Move/remove it manually then re-pull.",
++                                dest_path.display()
++                            )));
++                        }
+                     }
+                     Some(prior) if prior != &current_hash => {
+                         return Err(NonoError::PackageInstall(format!(
+@@ -2076,6 +2102,72 @@ mod tests {
+         });
+     }
+ 
++    #[test]
++    fn write_file_force_recovery_accepts_identical_unmanaged_file() {
++        with_fake_home(|home| {
++            let pack = home.join("pack");
++            fs::create_dir_all(&pack).expect("mkdir pack");
++            fs::write(pack.join("file"), "from-pack").expect("seed source");
++            fs::write(home.join("dest"), "from-pack").expect("seed matching dest");
++
++            let ctx = ctx_in(home, pack);
++            let directives = vec![WiringDirective::WriteFile {
++                source: "file".to_string(),
++                dest: "$HOME/dest".to_string(),
++            }];
++            let report = execute_with_options(
++                &directives,
++                &ctx,
++                &HashMap::new(),
++                ExecuteOptions {
++                    allow_unmanaged_identical_write_files: true,
++                },
++            )
++            .expect("identical unmanaged file should be adopted during force recovery");
++
++            assert!(
++                !report.changed,
++                "identical destination should not be rewritten"
++            );
++            assert_eq!(report.records.len(), 1);
++            assert_eq!(
++                fs::read_to_string(home.join("dest")).expect("read"),
++                "from-pack"
++            );
++        });
++    }
++
++    #[test]
++    fn write_file_force_recovery_refuses_mismatched_unmanaged_file() {
++        with_fake_home(|home| {
++            let pack = home.join("pack");
++            fs::create_dir_all(&pack).expect("mkdir pack");
++            fs::write(pack.join("file"), "from-pack").expect("seed source");
++            fs::write(home.join("dest"), "user content").expect("seed user file");
++
++            let ctx = ctx_in(home, pack);
++            let directives = vec![WiringDirective::WriteFile {
++                source: "file".to_string(),
++                dest: "$HOME/dest".to_string(),
++            }];
++            let err = execute_with_options(
++                &directives,
++                &ctx,
++                &HashMap::new(),
++                ExecuteOptions {
++                    allow_unmanaged_identical_write_files: true,
++                },
++            )
++            .expect_err("mismatched unmanaged file must still be refused");
++
++            assert!(err.to_string().contains("refusing to overwrite"));
++            assert_eq!(
++                fs::read_to_string(home.join("dest")).expect("read"),
++                "user content"
++            );
++        });
++    }
++
+     #[test]
+     fn write_file_refuses_to_overwrite_edited_file_on_repull() {
+         // Security review (round 2): re-pull must NOT clobber a file

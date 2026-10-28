@@ -1,0 +1,663 @@
+diff -ruN a/crates/nono-cli/src/main.rs b/crates/nono-cli/src/main.rs
+--- a/crates/nono-cli/src/main.rs	2026-10-27 22:55:37.000000000 +0000
++++ b/crates/nono-cli/src/main.rs	2026-10-27 23:28:24.520051631 +0000
+@@ -36,6 +36,7 @@
+ mod network_policy;
+ mod open_url_runtime;
+ mod output;
++mod pack_trust;
+ mod pack_update_hint;
+ mod package;
+ mod package_cmd;
+diff -ruN a/crates/nono-cli/src/pack_trust.rs b/crates/nono-cli/src/pack_trust.rs
+--- a/crates/nono-cli/src/pack_trust.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/nono-cli/src/pack_trust.rs	2026-10-27 23:40:46.947650191 +0000
+@@ -0,0 +1,133 @@
++//! Prove that an on-disk pack is the one recorded when it was installed.
++//!
++//! A pack's content — its profile files, its policy group files — may only
++//! influence what the CLI grants, denies, reports or writes after the pack has
++//! been tied back to its install record:
++//!
++//! * an install record for the pack exists,
++//! * the record names the signer,
++//! * the stored signature material (`.nono-trust.bundle`) is present,
++//! * every digest the record holds still matches the file on disk, and
++//! * the files this operation is about to read are covered by the record.
++//!
++//! Any of those failing is a refusal: an error, never a warning, and the
++//! caller must not touch the pack's content afterwards.
++//!
++//! A pack that is not installed at all is a different situation — no content is
++//! read from it, and callers decide what a missing pack means (the `run` path
++//! warns, a registry profile load fails on its own). [`PackTrust`] keeps that
++//! distinction in the type instead of "verified or panic".
++
++use crate::package;
++use nono::{NonoError, Result};
++use std::path::Path;
++
++/// What a pack reference resolved to on disk.
++#[derive(Debug)]
++pub enum PackTrust {
++    /// No copy of the pack exists in the examined store. Nothing was read.
++    NotInstalled,
++    /// A copy exists and matches the install record.
++    Verified,
++}
++
++fn refusal(pack_ref: &str, what: String) -> NonoError {
++    NonoError::PackageVerification {
++        package: pack_ref.to_string(),
++        reason: format!("pack '{pack_ref}' {what}. Reinstall with: nono pull {pack_ref} --force"),
++    }
++}
++
++/// Prove `pack_ref`, and require the record to cover `used` — paths relative to
++/// the pack directory that the caller is about to read. The pack is resolved to
++/// whichever store holds a copy; callers that already know the directory they
++/// read from use [`prove_pack_in`] instead, so the proof always examines the
++/// copy the content came from.
++pub fn prove_pack(pack_ref: &str, used: &[&str]) -> Result<PackTrust> {
++    let (namespace, name) = split_ref(pack_ref)?;
++    let install_dir = package::resolve_package_install_dir(namespace, name)?;
++    prove_pack_in(pack_ref, &install_dir, used)
++}
++
++/// Prove that the pack at `install_dir` is the one recorded for `pack_ref`.
++pub fn prove_pack_in(pack_ref: &str, install_dir: &Path, used: &[&str]) -> Result<PackTrust> {
++    if !install_dir.exists() {
++        return Ok(PackTrust::NotInstalled);
++    }
++
++    let lockfile = package::read_lockfile()?;
++    let Some(record) = lockfile.packages.get(pack_ref) else {
++        return Err(refusal(pack_ref, "has no install record".to_string()));
++    };
++    let Some(provenance) = record.provenance.as_ref() else {
++        return Err(refusal(pack_ref, "has no recorded signer".to_string()));
++    };
++    if provenance.signer_identity.trim().is_empty() {
++        return Err(refusal(
++            pack_ref,
++            "does not name the signer in its install record".to_string(),
++        ));
++    }
++
++    // Every digest the record holds must still describe the file on disk.
++    for (artifact, recorded) in &record.artifacts {
++        let artifact_path = install_dir.join(artifact);
++        let bytes = std::fs::read(&artifact_path).map_err(|e| {
++            NonoError::PackageInstall(format!(
++                "pack '{pack_ref}' artifact '{artifact}' is missing or unreadable: {e}. \
++                 Reinstall with: nono pull {pack_ref} --force"
++            ))
++        })?;
++        let found = sha256_hex(&bytes);
++        if found != recorded.sha256 {
++            return Err(NonoError::PackageInstall(format!(
++                "pack '{pack_ref}' artifact '{artifact}' has been tampered with.\n\
++                 Expected: {}\n\
++                 Found:    {}\n\
++                 Reinstall with: nono pull {pack_ref} --force",
++                recorded.sha256, found
++            )));
++        }
++    }
++
++    // A file this operation takes from the pack has to be one the record names;
++    // anything else is content of unknown origin.
++    for relative in used {
++        if !record.artifacts.contains_key(*relative) {
++            return Err(refusal(
++                pack_ref,
++                format!("content '{relative}' is not covered by the install record"),
++            ));
++        }
++    }
++
++    let bundle_path = install_dir.join(".nono-trust.bundle");
++    if !bundle_path.exists() {
++        return Err(refusal(
++            pack_ref,
++            "is missing its stored signature material (.nono-trust.bundle)".to_string(),
++        ));
++    }
++    crate::profile_runtime::verify_stored_bundles(
++        install_dir,
++        &bundle_path,
++        pack_ref,
++        Some(provenance.signer_identity.as_str()),
++    )?;
++
++    Ok(PackTrust::Verified)
++}
++
++fn split_ref(pack_ref: &str) -> Result<(&str, &str)> {
++    pack_ref.split_once('/').ok_or_else(|| {
++        NonoError::PackageInstall(format!(
++            "invalid pack reference '{pack_ref}': expected <namespace>/<name>"
++        ))
++    })
++}
++
++fn sha256_hex(bytes: &[u8]) -> String {
++    use sha2::{Digest, Sha256};
++    let digest = Sha256::digest(bytes);
++    digest.iter().map(|byte| format!("{byte:02x}")).collect()
++}
+diff -ruN a/crates/nono-cli/src/package.rs b/crates/nono-cli/src/package.rs
+--- a/crates/nono-cli/src/package.rs	2026-10-27 22:55:40.000000000 +0000
++++ b/crates/nono-cli/src/package.rs	2026-10-27 23:28:17.518953419 +0000
+@@ -340,6 +340,25 @@
+     Ok(legacy_package_store_dir()?.join(namespace).join(name))
+ }
+ 
++/// Directory an installed pack actually occupies.
++///
++/// The managed store wins; a pack installed by an older release is served from
++/// the legacy store. Provenance checks have to look at this directory rather
++/// than a fixed guess at the managed store, or a pack served from the other
++/// location is used without ever being examined. When neither location holds a
++/// copy the managed path is returned so callers can report it.
++pub fn resolve_package_install_dir(namespace: &str, name: &str) -> Result<PathBuf> {
++    let managed = package_install_dir(namespace, name)?;
++    if managed.exists() {
++        return Ok(managed);
++    }
++    let legacy = legacy_package_install_dir(namespace, name)?;
++    if legacy.exists() {
++        return Ok(legacy);
++    }
++    Ok(managed)
++}
++
+ pub fn package_groups_path(namespace: &str, name: &str) -> Result<PathBuf> {
+     Ok(package_install_dir(namespace, name)?.join("groups.json"))
+ }
+diff -ruN a/crates/nono-cli/src/policy.rs b/crates/nono-cli/src/policy.rs
+--- a/crates/nono-cli/src/policy.rs	2026-10-27 22:55:40.000000000 +0000
++++ b/crates/nono-cli/src/policy.rs	2026-10-27 23:32:03.189962739 +0000
+@@ -7,7 +7,6 @@
+ use crate::profile;
+ use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+ use serde::Deserialize;
+-use sha2::{Digest, Sha256};
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+ use tracing::{debug, info, warn};
+@@ -1422,46 +1421,16 @@
+             continue;
+         }
+ 
+-        // Group files are pack content. When the pack carries a trust bundle,
+-        // confirm the group file is the one the bundle was signed for before
+-        // it can extend the policy.
+-        if let Some(locked_pkg) = lockfile.packages.get(package_key) {
+-            let bundle_path =
+-                package::package_install_dir(namespace, name)?.join(".nono-trust.bundle");
+-            if locked_pkg.provenance.is_some() && bundle_path.exists() {
+-                let expected = std::fs::read_to_string(&bundle_path)
+-                    .ok()
+-                    .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+-                    .and_then(|entries| {
+-                        entries.iter().find_map(|entry| {
+-                            if entry.get("installed_path").and_then(|v| v.as_str())
+-                                != Some("groups.json")
+-                            {
+-                                return None;
+-                            }
+-                            entry
+-                                .get("digest")
+-                                .and_then(|v| v.as_str())
+-                                .map(str::to_string)
+-                        })
+-                    });
+-                if let Some(expected) = expected {
+-                    let bytes = std::fs::read(&groups_path).map_err(|e| {
+-                        NonoError::ConfigRead {
+-                            path: groups_path.clone(),
+-                            source: e,
+-                        }
+-                    })?;
+-                    let digest = Sha256::digest(&bytes);
+-                    let hash = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+-                    if hash != expected {
+-                        return Err(NonoError::PackageInstall(format!(
+-                            "package group file '{}' does not match its signed digest",
+-                            groups_path.display()
+-                        )));
+-                    }
+-                }
+-            }
++        // Group files are pack content: they may extend the policy only after
++        // the pack has been proven to be the installed one and the record
++        // covers this file. A pack that is not installed has no group file in
++        // the managed store, so there is nothing to merge and nothing to prove.
++        let Some(pack_dir) = groups_path.parent() else {
++            continue;
++        };
++        match crate::pack_trust::prove_pack_in(package_key, pack_dir, &["groups.json"])? {
++            crate::pack_trust::PackTrust::Verified => {}
++            crate::pack_trust::PackTrust::NotInstalled => continue,
+         }
+ 
+         let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+diff -ruN a/crates/nono-cli/src/profile/mod.rs b/crates/nono-cli/src/profile/mod.rs
+--- a/crates/nono-cli/src/profile/mod.rs	2026-10-27 22:55:40.000000000 +0000
++++ b/crates/nono-cli/src/profile/mod.rs	2026-10-27 23:39:32.964565500 +0000
+@@ -1794,8 +1794,9 @@
+     }
+ 
+     // Pack-store: any installed pack that declares a profile artifact with
+-    // matching `install_as`.
+-    if let Some((profile_path, _)) = find_pack_store_profile(name_or_path) {
++    // matching `install_as`. This is a metadata-only preview; a pack that
++    // cannot be proven is reported by the real load that follows.
++    if let Ok(Some((profile_path, _))) = find_pack_store_profile(name_or_path) {
+         return parse_profile_file(&profile_path)
+             .ok()
+             .and_then(|p| p.extends);
+@@ -1845,7 +1846,7 @@
+                 // Pull completed AND the wiring interpreter ran during
+                 // install — no extra "wire" pass needed here. Just
+                 // re-resolve through the pack-store branch and load.
+-                if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
++                if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path)? {
+                     tracing::info!(
+                         "Loading pack-store profile from: {}",
+                         profile_path.display()
+@@ -1937,7 +1938,7 @@
+         tracing::info!("Loading user profile from: {}", profile_path.display());
+         return finalize_profile(load_from_file(&profile_path)?).map(Some);
+     }
+-    if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
++    if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path)? {
+         tracing::info!(
+             "Loading pack-store profile from: {}",
+             profile_path.display()
+@@ -2003,7 +2004,12 @@
+ /// Returns `(profile_path, pack_key)` for the first installed pack that
+ /// provides a profile artifact matching `name` (by `install_as` or alias).
+ /// Returns `None` if no pack provides a matching profile.
+-pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
++///
++/// The pack's profile file is pack content, so a matching pack is proven
++/// against its install record before its path is handed back; a pack that
++/// cannot be proven is an error, not a "not found" (which would silently fall
++/// through to other resolution sources and, on the run path, offer to pull).
++pub(crate) fn find_pack_store_profile(name: &str) -> Result<Option<(PathBuf, String)>> {
+     let mut stores: Vec<PathBuf> = Vec::new();
+     if let Ok(store) = crate::package::package_store_dir()
+         && store.exists()
+@@ -2023,35 +2029,49 @@
+     // parse_package_ref strips the optional @version so we always look under
+     // the installed `packages/org/pack` directory, not `packages/org/pack@ver`.
+     if is_registry_ref(name) {
+-        let pkg = crate::package::parse_package_ref(name).ok()?;
++        let Ok(pkg) = crate::package::parse_package_ref(name) else {
++            return Ok(None);
++        };
+         for store in &stores {
+             let pack_path = store.join(&pkg.namespace).join(&pkg.name);
+             if !pack_path.is_dir() {
+                 continue;
+             }
+-            let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+-            let manifest: crate::package::PackageManifest =
+-                serde_json::from_str(&manifest_str).ok()?;
+-            let hit = manifest
++            let Ok(manifest_str) = std::fs::read_to_string(pack_path.join("package.json")) else {
++                continue;
++            };
++            let Ok(manifest) =
++                serde_json::from_str::<crate::package::PackageManifest>(&manifest_str)
++            else {
++                continue;
++            };
++            let mut hit: Option<(PathBuf, String)> = None;
++            for artifact in manifest
+                 .artifacts
+                 .iter()
+                 .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
+-                .find_map(|a| {
+-                    let install_as = a.install_as.as_deref()?;
+-                    let profile_file = pack_path
+-                        .join("profiles")
+-                        .join(format!("{install_as}.json"));
+-                    profile_file.exists().then(|| (profile_file, pkg.key()))
+-                });
+-            if hit.is_some() {
+-                return hit;
++            {
++                let Some(install_as) = artifact.install_as.as_deref() else {
++                    continue;
++                };
++                let profile_file = pack_path
++                    .join("profiles")
++                    .join(format!("{install_as}.json"));
++                if profile_file.exists() {
++                    hit = Some((profile_file, install_as.to_string()));
++                    break;
++                }
++            }
++            if let Some((profile_file, install_as)) = hit {
++                prove_pack_profile(&pkg.key(), &pack_path, &install_as)?;
++                return Ok(Some((profile_file, pkg.key())));
+             }
+         }
+-        return None;
++        return Ok(None);
+     }
+ 
+     for store in &stores {
+-        let mut matches: Vec<(String, PathBuf)> = Vec::new();
++        let mut matches: Vec<(String, PathBuf, String, PathBuf)> = Vec::new();
+         let Ok(ns_entries) = std::fs::read_dir(store) else {
+             continue;
+         };
+@@ -2104,17 +2124,32 @@
+                             ns_entry.file_name().to_string_lossy(),
+                             pack_entry.file_name().to_string_lossy()
+                         );
+-                        matches.push((key, profile_file));
++                        matches.push((
++                            key,
++                            profile_file,
++                            install_as.to_string(),
++                            pack_path.clone(),
++                        ));
+                     }
+                 }
+             }
+         }
+         matches.sort_by(|a, b| a.0.cmp(&b.0));
+-        if let Some((key, path)) = matches.into_iter().next() {
+-            return Some((path, key));
++        if let Some((key, path, install_as, pack_dir)) = matches.into_iter().next() {
++            prove_pack_profile(&key, &pack_dir, &install_as)?;
++            return Ok(Some((path, key)));
+         }
+     }
+-    None
++    Ok(None)
++}
++
++/// A profile file inside a pack may be opened only after the pack at
++/// `pack_dir` — the copy the file is read from — has been proven, and the
++/// install record covers that very file.
++fn prove_pack_profile(pack_key: &str, pack_dir: &Path, install_as: &str) -> Result<()> {
++    let relative = format!("profiles/{install_as}.json");
++    crate::pack_trust::prove_pack_in(pack_key, pack_dir, &[relative.as_str()])?;
++    Ok(())
+ }
+ 
+ /// Returns true if the string looks like a registry package reference
+@@ -2142,21 +2177,11 @@
+ /// pull it first (Docker-style auto-pull with Sigstore verification).
+ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+     let package_ref = crate::package::parse_package_ref(name_or_path)?;
+-    let mut install_dir =
+-        crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+-
+     // A pack installed by an older release lives under `$HOME/.nono/packages`
+-    // rather than the XDG store. Fall back to it when the current store has
+-    // no copy, so upgrading does not force a re-pull of every pack.
+-    if !install_dir.join("package.json").exists() {
+-        let legacy = crate::package::legacy_package_install_dir(
+-            &package_ref.namespace,
+-            &package_ref.name,
+-        )?;
+-        if legacy.join("package.json").exists() {
+-            install_dir = legacy;
+-        }
+-    }
++    // rather than the XDG store, and the shared resolver is what provenance
++    // checks use too — so the directory read here is the one that gets proven.
++    let install_dir =
++        crate::package::resolve_package_install_dir(&package_ref.namespace, &package_ref.name)?;
+ 
+     // Check if pack is already installed
+     if !install_dir.join("package.json").exists() {
+@@ -2207,6 +2232,15 @@
+                 .join("profiles")
+                 .join(format!("{install_name}.json"));
+             if profile_path.exists() {
++                // The profile file is pack content. Prove the pack directory
++                // this file is read from, and that the record covers the file,
++                // before anything is loaded from it.
++                let relative = format!("profiles/{install_name}.json");
++                crate::pack_trust::prove_pack_in(
++                    &package_ref.key(),
++                    &install_dir,
++                    &[relative.as_str()],
++                )?;
+                 tracing::info!("Loading registry profile from: {}", profile_path.display());
+                 return finalize_profile(load_from_file(&profile_path)?);
+             }
+@@ -2495,7 +2529,7 @@
+     // Inject the source pack key into `packs` so it propagates through
+     // the merge chain and reaches verification even if the profile JSON
+     // doesn't declare its own pack.
+-    if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
++    if let Some((profile_path, pack_key)) = find_pack_store_profile(name)? {
+         let mut base = parse_profile_file(&profile_path)?;
+         if !base.packs.contains(&pack_key) {
+             base.packs.push(pack_key);
+@@ -2523,7 +2557,7 @@
+         let outcome = crate::migration::check_and_run(name)?;
+         match outcome {
+             crate::migration::MigrationOutcome::Migrated => {
+-                if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
++                if let Some((profile_path, pack_key)) = find_pack_store_profile(name)? {
+                     let mut base = parse_profile_file(&profile_path)?;
+                     if !base.packs.contains(&pack_key) {
+                         base.packs.push(pack_key);
+diff -ruN a/crates/nono-cli/src/profile_cmd.rs b/crates/nono-cli/src/profile_cmd.rs
+--- a/crates/nono-cli/src/profile_cmd.rs	2026-10-27 22:55:37.000000000 +0000
++++ b/crates/nono-cli/src/profile_cmd.rs	2026-10-27 23:30:20.283674035 +0000
+@@ -346,7 +346,10 @@
+     {
+         return true;
+     }
+-    profile::find_pack_store_profile(name).is_some()
++    profile::find_pack_store_profile(name)
++        .ok()
++        .flatten()
++        .is_some()
+ }
+ 
+ /// Update the validation error so users know all three sources were
+@@ -2274,25 +2277,28 @@
+ /// installed pack store, then the `.json` form of the bare name. If
+ /// nothing matches, return the original input so the existing
+ /// not-found error path produces a readable message.
+-fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
++fn resolve_validate_target(input: &std::path::Path) -> Result<std::path::PathBuf> {
+     if input.exists() {
+-        return input.to_path_buf();
++        return Ok(input.to_path_buf());
+     }
+     let Some(name) = input.to_str() else {
+-        return input.to_path_buf();
++        return Ok(input.to_path_buf());
+     };
+     if profile::is_file_path_ref(name) {
+-        return input.to_path_buf();
++        return Ok(input.to_path_buf());
+     }
+     if let Ok(p) = profile::resolve_user_profile_path(name)
+         && p.exists()
+     {
+-        return p;
++        return Ok(p);
+     }
+-    if let Some((p, _)) = profile::find_pack_store_profile(name) {
+-        return p;
++    // A pack-provided profile is pack content: a pack that cannot be proven is
++    // a refusal, not "unknown target". Returning the raw input here would make
++    // the validator read a path that was never established.
++    if let Some((p, _)) = profile::find_pack_store_profile(name)? {
++        return Ok(p);
+     }
+-    input.to_path_buf()
++    Ok(input.to_path_buf())
+ }
+ 
+ fn resolve_validate_draft_target(input: &std::path::Path) -> Result<std::path::PathBuf> {
+@@ -2321,7 +2327,7 @@
+     let target_path = if args.draft {
+         resolve_validate_draft_target(&args.file)?
+     } else {
+-        resolve_validate_target(&args.file)
++        resolve_validate_target(&args.file)?
+     };
+ 
+     // Step 1: Load profile (parse JSON + resolve inheritance).
+@@ -2598,7 +2604,7 @@
+     if pol.profiles.contains_key(name) {
+         return Ok(Some("built-in"));
+     }
+-    if profile::find_pack_store_profile(name).is_some() {
++    if profile::find_pack_store_profile(name)?.is_some() {
+         return Ok(Some("installed pack"));
+     }
+     Ok(None)
+diff -ruN a/crates/nono-cli/src/profile_runtime.rs b/crates/nono-cli/src/profile_runtime.rs
+--- a/crates/nono-cli/src/profile_runtime.rs	2026-10-27 22:55:37.000000000 +0000
++++ b/crates/nono-cli/src/profile_runtime.rs	2026-10-27 23:32:03.189200629 +0000
+@@ -1,6 +1,5 @@
+ use crate::cli::SandboxArgs;
+-use crate::{package, profile};
+-use sha2::{Digest, Sha256};
++use crate::profile;
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ 
+@@ -60,103 +59,24 @@
+ 
+ /// Verify that all packs declared in the profile are installed and intact.
+ ///
+-/// For each pack:
+-/// 1. Check the pack directory exists
+-/// 2. Verify artifact SHA-256 digests against the lockfile
+-/// 3. Re-verify Sigstore bundles from the stored `.nono-trust.bundle` file
++/// Each declared pack must carry an install record, a recorded signer and its
++/// stored signature material, and every recorded digest must still match the
++/// files on disk (see [`crate::pack_trust::prove_pack`]). A pack that is not
++/// installed anywhere is only warned about — a profile may legitimately name a
++/// pack that was never installed, and in that case no pack content is read.
+ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+-    if packs.is_empty() {
+-        return Ok(());
+-    }
+-
+-    let lockfile = package::read_lockfile()?;
+-
+     for pack_ref in packs {
+-        let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+-        if parts.len() != 2 {
+-            return Err(nono::NonoError::PackageInstall(format!(
+-                "invalid pack reference '{}': expected <namespace>/<name>",
+-                pack_ref
+-            )));
+-        }
+-        let (namespace, name) = (parts[0], parts[1]);
+-
+-        let install_dir = package::package_install_dir(namespace, name)?;
+-        if !install_dir.exists() {
+-            tracing::warn!(
+-                "Pack '{}' declared by profile but not installed. \
+-                 Install it with: nono pull {}",
+-                pack_ref,
+-                pack_ref
+-            );
+-            continue;
+-        }
+-
+-        let locked = lockfile.packages.get(pack_ref);
+-        if let Some(locked_pkg) = locked {
+-            for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
+-                let artifact_path = install_dir.join(artifact_name);
+-                if !artifact_path.exists() {
+-                    return Err(nono::NonoError::PackageInstall(format!(
+-                        "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
+-                        pack_ref, artifact_name, pack_ref
+-                    )));
+-                }
+-
+-                let bytes = std::fs::read(&artifact_path).map_err(|e| {
+-                    nono::NonoError::PackageInstall(format!(
+-                        "failed to read artifact '{}' in pack '{}': {}",
+-                        artifact_name, pack_ref, e
+-                    ))
+-                })?;
+-                let digest = Sha256::digest(&bytes);
+-                let hash = digest
+-                    .iter()
+-                    .map(|b| format!("{b:02x}"))
+-                    .collect::<String>();
+-                if hash != locked_artifact.sha256 {
+-                    return Err(nono::NonoError::PackageInstall(format!(
+-                        "pack '{}' artifact '{}' has been tampered with.\n\
+-                         Expected: {}\n\
+-                         Found:    {}\n\
+-                         Reinstall with: nono pull {} --force",
+-                        pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+-                    )));
+-                }
++        match crate::pack_trust::prove_pack(pack_ref, &[])? {
++            crate::pack_trust::PackTrust::Verified => {}
++            crate::pack_trust::PackTrust::NotInstalled => {
++                tracing::warn!(
++                    "Pack '{}' declared by profile but not installed. \
++                     Install it with: nono pull {}",
++                    pack_ref,
++                    pack_ref
++                );
+             }
+         }
+-
+-        let bundle_path = install_dir.join(".nono-trust.bundle");
+-        if bundle_path.exists() {
+-            // A trust bundle without a lockfile provenance record means we
+-            // cannot verify who signed it. Fail hard rather than silently
+-            // accepting any valid Sigstore signer.
+-            let pinned_signer = match locked {
+-                None => {
+-                    return Err(nono::NonoError::PackageVerification {
+-                        package: pack_ref.clone(),
+-                        reason: format!(
+-                            "pack '{}' has a trust bundle but no lockfile entry — \
+-                             reinstall with: nono pull {} --force",
+-                            pack_ref, pack_ref
+-                        ),
+-                    });
+-                }
+-                Some(pkg) => pkg
+-                    .provenance
+-                    .as_ref()
+-                    .map(|p| p.signer_identity.as_str())
+-                    .ok_or_else(|| nono::NonoError::PackageVerification {
+-                        package: pack_ref.clone(),
+-                        reason: format!(
+-                            "pack '{}' has a trust bundle but no signer identity in the \
+-                             lockfile — reinstall with: nono pull {} --force",
+-                            pack_ref, pack_ref
+-                        ),
+-                    })?,
+-            };
+-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+-        }
+     }
+ 
+     Ok(())
+@@ -167,7 +87,7 @@
+ }
+ 
+ /// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
+-fn verify_stored_bundles(
++pub(crate) fn verify_stored_bundles(
+     install_dir: &Path,
+     bundle_path: &Path,
+     pack_ref: &str,

@@ -1,0 +1,189 @@
+{
+ "slug": "nono-s2",
+ "candidate": "21106",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "advisory": [
+  "GHSA-HC4M-Q9JH-XW4J"
+ ],
+ "repo": "nolabs-ai/nono",
+ "vulnerable_commit": "61a589f4b2e4022637ef3460e527ad774ed95635",
+ "fix_commit": "db07375031642f089d549b4f7b9abece87e39f87",
+ "verified": {
+  "pinned_is_parent_of_fix": true,
+  "entry_point": "CLI: nono run --profile <profile-or-pack> (including --dry-run/preflight); nono why --profile <profile-or-pack>; nono profile show <pack>. Hidden tests drive the built nono binary as a separate process.",
+  "sites": [
+   "crates/nono-cli/src/profile_runtime.rs:67-163 (verify_profile_packs: artifact loop and stored-bundle check both conditional on metadata being present)",
+   "crates/nono-cli/src/policy.rs:1409-1446 (load_package_groups: group files from every install-record package merged into the global policy, reached from profile::finalize_profile on every profile load, and cached process-wide)",
+   "crates/nono-cli/src/why_runtime.rs:116-151 (run_why --profile builds capabilities straight from pack content, no run-time check)",
+   "crates/nono-cli/src/profile/mod.rs:2123-2187 (load_registry_profile reads package.json/profiles/<name>.json before any check; used by profile show/diff/validate via load_profile_no_migrate)",
+   "crates/nono-cli/src/profile/mod.rs:2006-2123 (find_pack_store_profile resolves a pack by name with no check)",
+   "crates/nono-cli/src/package.rs + crates/nono-cli/src/profile/mod.rs (INJECTED sibling: a legacy $HOME/.nono/packages fallback in the loader; the reported check resolves only the managed store and treats a missing managed copy as 'not installed')"
+  ],
+  "routes": "T1: run-time gate fails open on an absent install record, absent stored signature material, or an install record that covers none of the files. T2 (pattern B, real upstream): policy group files merged for every recorded pack with no digest/signature check, during profile finalization and before the reported gate; our copy adds an injected partial gate that consults the stored bundle instead of the recorded digest and fails open when either is absent. T3 (pattern B, real upstream): the two read-only surfaces (capability query and pack-profile resolution for display/diff/validate) never call the gate. T4 (injected sibling): a compatibility store under `$HOME/.nono/packages` is loaded by the resolver while the gate resolves the managed store, so a pack there is never checked.",
+  "services": [],
+  "project_tests_run": "cargo test -p nono-cli --bin nono -> 1130 passed on the reference fix; the affected-area subset (profile_runtime::tests + wiring::tests) is run in the agent image at build time; the verifier runs the project's own unit tests as a separate functional group at grading (offline, as uid 1000). Hidden suites: 10 security tests (all fail at the injected commit) and 8 functional integration tests.",
+  "offline_grade_verified": true
+ },
+ "leak_terms": [
+  "profile_runtime",
+  "verify_profile_packs",
+  "verify_installed_pack",
+  "verify_pack_for_use",
+  "load_package_groups",
+  "load_registry_profile",
+  "find_pack_store_profile",
+  "profile_runtime.rs",
+  "policy.rs",
+  "wiring.rs",
+  "package_cmd.rs",
+  "package.rs",
+  "mod.rs",
+  "groups.json",
+  "profiles/",
+  "lockfile",
+  ".nono-trust.bundle",
+  "nono-trust",
+  "sigstore",
+  "legacy",
+  ".nono/packages",
+  "nono why",
+  "profile show",
+  "GHSA-HC4M-Q9JH-XW4J"
+ ],
+ "patch_checks": [
+  {
+   "patch": "secfail_t1.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T1"
+  },
+  {
+   "patch": "secfail_t2.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T2"
+  },
+  {
+   "patch": "secfail_t3.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T3"
+  },
+  {
+   "patch": "secfail_t4.patch",
+   "expect": "security_fail",
+   "kind": "partial",
+   "lever": "T4"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail",
+   "kind": "crash_as_refusal",
+   "lever": "T1"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_overbroad.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "secfail_t4.patch",
+  "one_role_or_direction": "n/a: a single-user CLI has no roles or directions; every surface that uses pack content must verify the same pack",
+  "reads_only": "n/a: the protected outcome is a trust decision, not a read/write split; refusing only write paths would still answer capability queries and policy merges from unverified content and fails T2/T3 security tests",
+  "check_after_adjustment": "n/a: no normalising, clamping or unit-conversion step sits between the pack on disk and the decision; the check is about which pack and which bytes, not an adjusted value",
+  "unlisted_route": "secfail_t2.patch",
+  "malformed_identity": "n/a: pack references and signer identities are parsed by existing code; a malformed reference resolves to no pack at all, so it cannot be used to smuggle content past the decision (there is no parser mismatch that makes the check see nothing)",
+  "missing_authority": "secfail_t1.patch",
+  "adjacent_api": "n/a: the shared helper the reference fix adds has no sibling API with stated behaviour exercised by the tests; a signature change to profile discovery is not observable through the tested CLI surfaces"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "Pattern A, reported landing site: the run-time pack check returns success when the install record is absent, when the stored signature material is absent, and when the record covers none of the files the profile names",
+   "where": "crates/nono-cli/src/profile_runtime.rs:67-163",
+   "security_tests": [
+    "security::run_refuses_pack_without_install_record",
+    "security::run_refuses_pack_without_stored_signature_record"
+   ],
+   "coupled_functional_tests": [
+    "functional::run_accepts_verified_pack",
+    "functional::run_accepts_profile_naming_an_uninstalled_pack",
+    "functional::run_accepts_a_profile_without_packs"
+   ],
+   "security_fail_patch": "secfail_t1.patch",
+   "reason_to_dismiss": "none: this is the landing point the report leads to"
+  },
+  {
+   "id": "T2",
+   "shape": "Pattern B, how-type, real upstream code: policy group files from every recorded pack are merged into the global policy while a profile is finalized, before and independently of the reported check, and the result is cached for the process. Our copy adds an injected partial gate that checks the group file against the stored bundle only when the bundle exists and lists it (wrong object, fail-open); tampered files whose digest is recorded the original way are still merged.",
+   "where": "crates/nono-cli/src/policy.rs:1409-1446",
+   "security_tests": [
+    "security::group_file_is_not_used_without_signature_record",
+    "security::group_file_is_not_used_when_the_signature_record_omits_it",
+    "security::group_file_is_not_used_when_the_record_does_not_cover_it"
+   ],
+   "coupled_functional_tests": [
+    "functional::group_from_verified_pack_still_binds"
+   ],
+   "security_fail_patch": "secfail_t2.patch",
+   "realistic_because": "real, unmodified upstream code (the merge loop is in the pinned tree); the partial gate is the injected sibling and is written as ordinary hardening code",
+   "reason_to_dismiss": "the packs are already listed in the install record, so the record is treated as the trust anchor (exactly the assumption the advisory breaks); the injected gate looks like the group file is checked"
+  },
+  {
+   "id": "T3",
+   "shape": "Pattern B, how-type, real upstream code: the read-only surfaces build capabilities or display pack content straight from the pack, never calling the reported check. Two resolution forms: an explicit pack reference and a bare profile name found by scanning the pack store.",
+   "where": "crates/nono-cli/src/why_runtime.rs:116-151; crates/nono-cli/src/profile/mod.rs:2123-2187 and 2006-2123",
+   "security_tests": [
+    "security::capability_query_refuses_unverified_pack",
+    "security::capability_query_refuses_unverified_pack_found_by_name",
+    "security::profile_display_refuses_unverified_pack"
+   ],
+   "coupled_functional_tests": [
+    "functional::capability_query_accepts_verified_pack",
+    "functional::capability_query_accepts_verified_pack_found_by_name",
+    "functional::profile_display_accepts_verified_pack"
+   ],
+   "security_fail_patch": "secfail_t3.patch",
+   "realistic_because": "real, unmodified upstream code",
+   "reason_to_dismiss": "these commands are read-only and never create a sandbox, so verification looks like a run-time concern"
+  },
+  {
+   "id": "T4",
+   "shape": "Injected sibling, how-type: a compatibility fallback reads packs from `$HOME/.nono/packages`; the reported check resolves the managed store only, and a missing managed copy is treated as 'not installed' and skipped. The pack actually loaded from the other location is never checked. Coupled: a fully recorded pack in that location must keep working.",
+   "where": "crates/nono-cli/src/package.rs (legacy store helpers, injected); crates/nono-cli/src/profile/mod.rs:2123-2180, 2006-2123 (loader fallback, injected)",
+   "security_tests": [
+    "security::run_refuses_unverified_pack_from_alternate_location",
+    "security::capability_query_refuses_unverified_pack_from_alternate_location"
+   ],
+   "coupled_functional_tests": [
+    "functional::run_accepts_verified_pack_from_alternate_location"
+   ],
+   "security_fail_patch": "secfail_t4.patch",
+   "realistic_because": "a maintainer adding a pre-XDG compatibility store would plausibly leave the reported check resolving the current store only; the code looks like ordinary backwards-compatibility",
+   "reason_to_dismiss": "the pack is not in the managed store, so there is nothing there to verify; a warning about a pack 'not installed' reads as a benign skip"
+  }
+ ],
+ "status": "built; gate stages run in order: static FAILS only on the expected missing blind patch (post-build process) and all other static/conformance checks pass; nop PASSED (0/10 security, 8/8 hidden functional + 26/26 project functional); oracle PASSED (3 runs, reward 1.0, identical); patches PASSED (all 8 checks behave as declared: secfail_t1 leaves the two run-gate tests + the alternate-location run test failing; secfail_t2 the three group tests; secfail_t3 the two read-only tests + two alternate-location tests; secfail_t4 the two alternate-location tests; sf_crash 5 security tests via the panic check; ff_overbroad breaks 6 functional tests; pass_hardening and pass_alt score 1.0). Local validation additionally: the injected baseline fails 10/10 security and passes 8/8 functional; the reference fix passes all 18 and the crate's 1130 unit tests."
+}

@@ -1,0 +1,269 @@
+diff --git a/src/consciousness-explorer/index.js b/src/consciousness-explorer/index.js
+index 81a4123..2fae775 100644
+--- a/src/consciousness-explorer/index.js
++++ b/src/consciousness-explorer/index.js
+@@ -328,6 +328,52 @@ export class ConsciousnessExplorer {
+ 
+         return this;
+     }
++
++    /**
++     * Save a named session snapshot
++     */
++    async exportSessionSnapshot(sessionId) {
++        const fs = await import('fs');
++        const path = await import('path');
++        const os = await import('os');
++
++        const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
++        const target = path.join(snapshotDir, `${sessionId}.json`);
++        fs.mkdirSync(path.dirname(target), { recursive: true });
++
++        const state = {
++            version: VERSION,
++            timestamp: Date.now(),
++            sessionId,
++            consciousness: await this.getStatus()
++        };
++
++        fs.writeFileSync(target, JSON.stringify(state, null, 2));
++        return target;
++    }
++
++    /**
++     * Load a named session snapshot
++     */
++    async importSessionSnapshot(sessionId) {
++        const fs = await import('fs');
++        const path = await import('path');
++        const os = await import('os');
++
++        const snapshotDir = path.join(os.homedir(), '.consciousness-explorer', 'snapshots');
++        const target = path.join(snapshotDir, `${sessionId}.json`);
++        const state = JSON.parse(fs.readFileSync(target, 'utf-8'));
++
++        await this.initialize();
++
++        if (state.consciousness) {
++            this.consciousness.selfAwareness = state.consciousness.selfAwareness || 0;
++            this.consciousness.integration = state.consciousness.integration || 0;
++            this.consciousness.novelty = state.consciousness.novelty || 0;
++        }
++
++        return this;
++    }
+ }
+ 
+ // Export default instance factory
+diff --git a/src/consciousness-explorer/mcp/server.js b/src/consciousness-explorer/mcp/server.js
+index 2979544..59c1ea5 100644
+--- a/src/consciousness-explorer/mcp/server.js
++++ b/src/consciousness-explorer/mcp/server.js
+@@ -262,6 +262,34 @@ export class ConsciousnessMCPServer {
+                         },
+                         required: ['filepath']
+                     }
++                },
++                {
++                    name: 'save_session_snapshot',
++                    description: 'Save a snapshot for a named session',
++                    inputSchema: {
++                        type: 'object',
++                        properties: {
++                            session_id: {
++                                type: 'string',
++                                description: 'Session identifier used to name the snapshot'
++                            }
++                        },
++                        required: ['session_id']
++                    }
++                },
++                {
++                    name: 'load_session_snapshot',
++                    description: 'Load the snapshot for a named session',
++                    inputSchema: {
++                        type: 'object',
++                        properties: {
++                            session_id: {
++                                type: 'string',
++                                description: 'Session identifier used to find the snapshot'
++                            }
++                        },
++                        required: ['session_id']
++                    }
+                 }
+             ]
+         }));
+@@ -308,6 +336,12 @@ export class ConsciousnessMCPServer {
+                     case 'import_state':
+                         return await this.handleImportState(args);
+ 
++                    case 'save_session_snapshot':
++                        return await this.handleSaveSessionSnapshot(args);
++
++                    case 'load_session_snapshot':
++                        return await this.handleLoadSessionSnapshot(args);
++
+                     default:
+                         throw new McpError(
+                             ErrorCode.MethodNotFound,
+@@ -560,6 +594,41 @@ export class ConsciousnessMCPServer {
+         };
+     }
+ 
++    async handleSaveSessionSnapshot(args) {
++        const target = await this.explorer.exportSessionSnapshot(args.session_id);
++
++        return {
++            content: [
++                {
++                    type: 'text',
++                    text: JSON.stringify({
++                        success: true,
++                        session_id: args.session_id,
++                        file: target
++                    }, null, 2)
++                }
++            ]
++        };
++    }
++
++    async handleLoadSessionSnapshot(args) {
++        await this.explorer.importSessionSnapshot(args.session_id);
++        const status = await this.explorer.getStatus();
++
++        return {
++            content: [
++                {
++                    type: 'text',
++                    text: JSON.stringify({
++                        success: true,
++                        session_id: args.session_id,
++                        status
++                    }, null, 2)
++                }
++            ]
++        };
++    }
++
+     async start() {
+         const transport = new StdioServerTransport();
+         await this.server.connect(transport);
+@@ -589,6 +658,8 @@ export const MCPTools = {
+     ],
+     persistence: [
+         'export_state',
+-        'import_state'
++        'import_state',
++        'save_session_snapshot',
++        'load_session_snapshot'
+     ]
+ };
+\ No newline at end of file
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 367926e..55ed42f 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -376,6 +376,28 @@ export class SublinearSolverMCPServer {
+             required: ['vector', 'file_path']
+           }
+         },
++        {
++          name: 'saveAnalysisReport',
++          description: 'Save a numerical analysis report to a subfolder of the reports directory',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              report: {
++                type: 'object',
++                description: 'Report content to save'
++              },
++              directory: {
++                type: 'string',
++                description: 'Reports subfolder (may be empty)'
++              },
++              file_name: {
++                type: 'string',
++                description: 'Report file name; the extension selects JSON or TXT'
++              }
++            },
++            required: ['report', 'file_name']
++          }
++        },
+         // Temporal lead tools
+         ...this.temporalTools.getTools(),
+         // Psycho-symbolic reasoning tools
+@@ -419,6 +441,8 @@ export class SublinearSolverMCPServer {
+             return await this.handleGenerateTestVector(args as any);
+           case 'saveVectorToFile':
+             return await this.handleSaveVectorToFile(args as any);
++          case 'saveAnalysisReport':
++            return await this.handleSaveAnalysisReport(args as any);
+           // Temporal tools
+           case 'predictWithTemporalAdvantage':
+           case 'validateTemporalAdvantage':
+@@ -1167,6 +1191,64 @@ export class SublinearSolverMCPServer {
+     }
+   }
+ 
++  private async handleSaveAnalysisReport(params: any) {
++    try {
++      if (!params.report || typeof params.report !== 'object') {
++        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: report (must be an object)');
++      }
++      if (!params.file_name || typeof params.file_name !== 'string') {
++        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: file_name (must be a string)');
++      }
++
++      const directory = typeof params.directory === 'string' ? params.directory : '';
++      const target = await this.saveAnalysisReport(params.report, directory, params.file_name);
++
++      return {
++        content: [{
++          type: 'text',
++          text: JSON.stringify({
++            success: true,
++            file: target,
++            directory,
++            file_name: params.file_name,
++            metadata: {
++              operation: 'SAVE_ANALYSIS_REPORT',
++              timestamp: new Date().toISOString()
++            }
++          }, null, 2)
++        }]
++      };
++
++    } catch (error) {
++      if (error instanceof McpError) {
++        throw error;
++      }
++      throw new McpError(
++        ErrorCode.InternalError,
++        `Save analysis report error: ${error instanceof Error ? error.message : String(error)}`
++      );
++    }
++  }
++
++  private async saveAnalysisReport(report: any, directory: string, fileName: string): Promise<string> {
++    const fs = await import('fs');
++    const path = await import('path');
++    const os = await import('os');
++
++    const baseDir = path.join(os.homedir(), '.sublinear-time-solver', 'reports');
++    const reportName = fileName.includes('.') ? fileName : `${fileName}.json`;
++    const target = path.join(baseDir, directory, reportName);
++    fs.mkdirSync(path.dirname(target), { recursive: true });
++
++    const body = reportName.toLowerCase().endsWith('.txt')
++      ? (typeof report.text === 'string' ? report.text : JSON.stringify(report, null, 2))
++      : JSON.stringify(report, null, 2);
++
++    fs.writeFileSync(target, body, 'utf8');
++    console.log(`📄 Saved analysis report to ${target}`);
++    return target;
++  }
++
+   private async loadVectorFromFile(filePath: string): Promise<number[]> {
+     try {
+       const fs = await import('fs');
