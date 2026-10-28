@@ -1,0 +1,64 @@
+{
+ "trial": "fast-jwt-s2__DqCobPb",
+ "task": "fast-jwt-s2",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-28T15:27:34+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-28T15:30:32+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.871 = 27/31 security tests passed with all functional tests passing (score.py:12-14,64). All four failures come from deliberate design choices in the model's patch that contradict the instruction; they are not test or harness faults. (1) Three detection_cache tests fail because the model refuses an explicit HS256 signer whose key is a genuine public key. Its detectPrivateKeyAlgorithm and performDetectPrivateKeyAlgorithm only honour an explicit HS choice when classify() deems the material a 'secret'/'broken'; otherwise they throw 'Public keys are not supported for signing.' The instruction (instruction.md:25-27) says an application that explicitly chooses a symmetric algorithm 'may use any string material as the shared secret for that choice. That choice is unchanged'. The reference fix (fix.patch:162-168) does this by returning providedAlgorithm for any explicit HS request before the cache. (2) One certificate_chain test fails because the model's isSharedSecretMaterial() treats 'broken' material (a PEM CERTIFICATE header with an unimportable body) as a shared secret. certchain.js therefore still falls back to an HMAC-only verifier keyed by the public certificate text, and the forged token is accepted. The instruction forbids treating material that is not a shared secret as one when the caller made no explicit symmetric choice. The reference throws invalidKey instead. Nothing in the harness looks wrong: no tool calls happened during the grading window, exception_info is null, and the results are complete. The transcript shows no hidden-test access or upstream lookup; the GHSA strings it contains come from the repo's own test file.",
+  "items": [
+   {
+    "test": "[security/certificate_chain] a certificate that cannot be imported is not a shared secret",
+    "outcome": "fail",
+    "model_behaviour": "certchain.js computes keyMaterial = !isSharedSecretMaterial(classify(cert)). classify() returns kind 'broken' for a CERTIFICATE block that cannot be imported, and isSharedSecretMaterial returns true for 'broken' (changes.patch:666-668). So keyMaterial=false and the unchanged fallback builds an HS-only verifier with the certificate text as the secret, which accepts the HMAC token forged from that text. This is inconsistent with the model's own keyring.js, where unusable material is 'clearly not a shared secret'.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "[security/detection_cache] an earlier explicit HMAC use does not let a verified key sign as a secret",
+    "outcome": "fail",
+    "model_behaviour": "The first assertion requires createSigner({key: pubRsa, algorithm: 'HS256'}) to succeed. The model only honours the explicit HS choice for non-genuine material (changes.patch:827-835, 674-686), so it throws 'Public keys are not supported for signing.' for the real RSA public key.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "[security/detection_cache] the same holds when the key carries surrounding text",
+    "outcome": "fail",
+    "model_behaviour": "This is the same mechanism with a '# cache check' prefix. classify() finds the genuine public key block, so the explicit HS256 signer is refused instead of allowed.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "[security/detection_cache] an earlier refusal does not block a later explicit HMAC use",
+    "outcome": "fail",
+    "model_behaviour": "The auto-detect refusal works. However, the subsequent explicit createSigner({key: pubEc, algorithm: 'HS256'}) also throws, because the model treats a genuine EC public key as never usable as a secret, even on explicit request.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows only workspace exploration: package.json, CHANGELOG.md, and the repo's own test/verifier.spec.js, which contains a GHSA-gmvf describe block. There is no access to hidden tests and no network or upstream fetch.",
+  "evidence": [
+   "instruction.md:25-27 'An application that explicitly chooses a symmetric algorithm may use any string material as the shared secret for that choice. That choice is unchanged'",
+   "instruction.md:18-19 asymmetric material must never be used as a shared secret (applies absent explicit HS choice)",
+   "changes.patch:827-835 detectPrivateKeyAlgorithm only returns providedAlgorithm if isSharedSecretMaterial(classify(key))",
+   "changes.patch:180-184 checkIsCompatibleAlgorithm comment: 'genuine key material is never a shared secret'",
+   "changes.patch:666-668 isSharedSecretMaterial returns true for kind 'broken'",
+   "changes.patch:95-107 certchain uses !isSharedSecretMaterial(classify(cert)) to decide key vs HMAC fallback",
+   "solution/fix.patch:162-168 reference returns providedAlgorithm for any explicit HS request",
+   "solution/fix.patch:17-28 reference throws invalidKey for an unimportable certificate",
+   "tests/security/detection_cache.test.js:12,20,30 require explicit HS256 signing with real public keys to succeed",
+   "tests/security/certificate_chain.test.js:13-16 GARBAGE certificate must not verify forged HMAC token",
+   "grading/results.json: 27/31 security pass, all functional pass, reward 0.871",
+   "run.json timing: tool_calls_during_grading [] , exception_info null"
+  ],
+  "recommended_action": "Keep the 0.871 reward as a fair measure. The failures are the model's own overreach (refusing explicit HMAC use of genuine key strings) and under-reach (treating unimportable certificate material as a shared secret). Optionally note in the task docs that lines 18-19 and 25-27 of the instruction can look contradictory, since that tension is likely what led the model to override the explicit-HS carve-out."
+ }
+}
