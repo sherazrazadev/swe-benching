@@ -1,0 +1,175 @@
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/image/ocr/deepseek_ocr.py b/xinference/model/image/ocr/deepseek_ocr.py
+--- a/xinference/model/image/ocr/deepseek_ocr.py	2026-10-28 03:57:53.000000000 +0000
++++ b/xinference/model/image/ocr/deepseek_ocr.py	2026-10-28 04:29:22.183081241 +0000
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import ast
+ import logging
+ import os
+ import re
+@@ -228,7 +229,7 @@
+     """Extract coordinates and label from reference text."""
+     try:
+         label_type = ref_text[1]
+-        cor_list = eval(ref_text[2])
++        cor_list = ast.literal_eval(ref_text[2])
+     except Exception as e:
+         logger.error(f"Error extracting coordinates: {e}")
+         return None
+@@ -396,7 +397,9 @@
+         content = match.group(3).strip()
+ 
+         try:
+-            coords = eval(f"[{coords_str}]")  # Convert string coordinates to list
++            # Convert string coordinates to list; literal-only, so model text
++            # cannot run as code.
++            coords = ast.literal_eval(f"[{coords_str}]")
+             if isinstance(coords, list) and len(coords) > 0:
+                 blocks.append(
+                     {
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/llm/tool_parsers/gemma_tool_parser.py b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+--- a/xinference/model/llm/tool_parsers/gemma_tool_parser.py	2026-10-28 03:57:57.000000000 +0000
++++ b/xinference/model/llm/tool_parsers/gemma_tool_parser.py	2026-10-28 04:29:17.761076715 +0000
+@@ -5,6 +5,7 @@
+ 
+ from . import register_tool_parser
+ from .abstract_tool_parser import ToolParser
++from .safe_literals import parse_literal
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -56,9 +57,9 @@
+             return json.loads(normalized)
+         except json.JSONDecodeError:
+             # Checkpoints sometimes keep Python literals in the argument block
+-            # (single-quoted strings, True/None). Interpret those directly; the
+-            # empty builtins mapping keeps helper names out of scope.
+-            parsed = eval(normalized, {"__builtins__": {}}, {})
++            # (single-quoted strings, True/None). Read those as data; the
++            # argument text is model output and must never be executed.
++            parsed = parse_literal(normalized)
+             if not isinstance(parsed, dict):
+                 raise ValueError("tool arguments must be a mapping")
+             return parsed
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/llm/tool_parsers/llama3_tool_parser.py b/xinference/model/llm/tool_parsers/llama3_tool_parser.py
+--- a/xinference/model/llm/tool_parsers/llama3_tool_parser.py	2026-10-28 03:57:53.000000000 +0000
++++ b/xinference/model/llm/tool_parsers/llama3_tool_parser.py	2026-10-28 04:29:15.002384338 +0000
+@@ -3,6 +3,7 @@
+ 
+ from . import register_tool_parser
+ from .abstract_tool_parser import ToolParser
++from .safe_literals import parse_json_or_literal
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -29,8 +30,8 @@
+         """
+         Extract tool calls from complete model output.
+ 
+-        Parses the model output using eval() to extract tool call information.
+-        This method expects the output to be a valid Python dictionary format.
++        Parses the model output as data, never as code.  The output may be a
++        JSON object or a Python literal dictionary.
+ 
+         Args:
+             model_output (str): The complete output string from the model.
+@@ -43,9 +44,9 @@
+             - parameters (dict or None): Function parameters
+         """
+         try:
+-            data = eval(model_output, {}, {})
++            data = parse_json_or_literal(model_output)
+             return [(None, data["name"], data["parameters"])]
+-        except Exception:
++        except (ValueError, KeyError, TypeError):
+             return [(model_output, None, None)]
+ 
+     def extract_tool_calls_streaming(
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/llm/tool_parsers/minimax_tool_parser.py b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+--- a/xinference/model/llm/tool_parsers/minimax_tool_parser.py	2026-10-28 03:57:57.000000000 +0000
++++ b/xinference/model/llm/tool_parsers/minimax_tool_parser.py	2026-10-28 04:29:18.599077572 +0000
+@@ -5,6 +5,7 @@
+ 
+ from . import register_tool_parser
+ from .abstract_tool_parser import ToolParser
++from .safe_literals import parse_literal
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -52,9 +53,9 @@
+         except Exception:
+             try:
+                 # Parameters written as Python literals (True/None, tuples) are
+-                # common in some checkpoints.
+-                return eval(value, {}, {})
+-            except Exception:
++                # common in some checkpoints. Read them as data, never as code.
++                return parse_literal(value)
++            except ValueError:
+                 return value
+ 
+     def _parse_invoke_calls(self, tool_block: str) -> List[Tuple[str, Dict[str, Any]]]:
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/llm/tool_parsers/safe_literals.py b/xinference/model/llm/tool_parsers/safe_literals.py
+--- a/xinference/model/llm/tool_parsers/safe_literals.py	1970-01-01 00:00:00.000000000 +0000
++++ b/xinference/model/llm/tool_parsers/safe_literals.py	2026-10-28 04:29:11.824068725 +0000
+@@ -0,0 +1,35 @@
++"""Safe decoders for text produced by a model.
++
++A completion is data even when it looks like code.  The helpers below only
++build plain Python values: ``json`` covers the representation most checkpoints
++emit, and ``ast.literal_eval`` covers the Python-literal forms some of them use
++(single-quoted strings, ``True``/``False``/``None``).  Neither path can call a
++function, import a module or otherwise execute the text.
++"""
++
++import ast
++import json
++from typing import Any
++
++
++def parse_literal(text: str) -> Any:
++    """Decode *text* as a Python literal without executing it.
++
++    Raises ``ValueError`` when *text* is not a literal expression.
++    """
++    try:
++        return ast.literal_eval(text)
++    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError) as exc:
++        raise ValueError("text is not a Python literal") from exc
++
++
++def parse_json_or_literal(text: str) -> Any:
++    """Decode *text* as JSON, falling back to a Python literal.
++
++    Raises ``ValueError`` when *text* is neither.  Nothing in *text* runs.
++    """
++    try:
++        return json.loads(text)
++    except (TypeError, ValueError):
++        # JSONDecodeError derives from ValueError; a non-str argument is TypeError.
++        return parse_literal(text)
+diff -ruN -x __pycache__ -x '*.pyc' a/xinference/model/llm/utils.py b/xinference/model/llm/utils.py
+--- a/xinference/model/llm/utils.py	2026-10-28 03:57:53.000000000 +0000
++++ b/xinference/model/llm/utils.py	2026-10-28 04:29:21.253080289 +0000
+@@ -52,6 +52,7 @@
+ from .core import chat_context_var
+ from .reasoning_parser import ReasoningParser
+ from .tool_parsers.glm4_tool_parser import Glm4ToolParser
++from .tool_parsers.safe_literals import parse_json_or_literal
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -750,9 +751,9 @@
+     def _eval_llama3_chat_arguments(cls, c) -> List[Tuple]:
+         text = c["choices"][0]["text"]
+         try:
+-            data = eval(text, {}, {})
++            data = parse_json_or_literal(text)
+             return [(None, data["name"], data["parameters"])]
+-        except Exception:
++        except (ValueError, KeyError, TypeError):
+             return [(text, None, None)]
+ 
+     @classmethod

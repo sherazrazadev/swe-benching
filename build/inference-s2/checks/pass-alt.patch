@@ -1,0 +1,146 @@
+diff --git a/xinference/model/image/ocr/deepseek_ocr.py b/xinference/model/image/ocr/deepseek_ocr.py
+index 648b999..04ab011 100644
+--- a/xinference/model/image/ocr/deepseek_ocr.py
++++ b/xinference/model/image/ocr/deepseek_ocr.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import ast
+ import logging
+ import os
+ import re
+@@ -228,7 +229,7 @@ def extract_coordinates_and_label(
+     """Extract coordinates and label from reference text."""
+     try:
+         label_type = ref_text[1]
+-        cor_list = eval(ref_text[2])
++        cor_list = ast.literal_eval(ref_text[2])
+     except Exception as e:
+         logger.error(f"Error extracting coordinates: {e}")
+         return None
+@@ -396,7 +397,7 @@ def extract_text_blocks(text: str) -> List[Dict[str, Any]]:
+         content = match.group(3).strip()
+ 
+         try:
+-            coords = eval(f"[{coords_str}]")  # Convert string coordinates to list
++            coords = ast.literal_eval(coords_str)  # Convert string coordinates to list
+             if isinstance(coords, list) and len(coords) > 0:
+                 blocks.append(
+                     {
+diff --git a/xinference/model/llm/tool_parsers/gemma_tool_parser.py b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+index 0dafd0f..42dc17e 100644
+--- a/xinference/model/llm/tool_parsers/gemma_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+@@ -1,3 +1,4 @@
++import ast
+ import json
+ import logging
+ import re
+@@ -53,15 +54,15 @@ class GemmaToolParser(ToolParser):
+             return {}
+         normalized = self._quote_keys(cleaned)
+         try:
+-            return json.loads(normalized)
+-        except json.JSONDecodeError:
+-            # Checkpoints sometimes keep Python literals in the argument block
+-            # (single-quoted strings, True/None). Interpret those directly; the
+-            # empty builtins mapping keeps helper names out of scope.
+-            parsed = eval(normalized, {"__builtins__": {}}, {})
+-            if not isinstance(parsed, dict):
++            parsed = ast.literal_eval(normalized)
++        except (ValueError, SyntaxError):
++            try:
++                parsed = json.loads(normalized)
++            except json.JSONDecodeError:
+                 raise ValueError("tool arguments must be a mapping")
+-            return parsed
++        if not isinstance(parsed, dict):
++            raise ValueError("tool arguments must be a mapping")
++        return parsed
+ 
+     def _parse_tool_call_block(
+         self, block: str
+diff --git a/xinference/model/llm/tool_parsers/llama3_tool_parser.py b/xinference/model/llm/tool_parsers/llama3_tool_parser.py
+index de87ad7..430b51d 100644
+--- a/xinference/model/llm/tool_parsers/llama3_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/llama3_tool_parser.py
+@@ -1,3 +1,5 @@
++import ast
++import json
+ import logging
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -43,9 +45,15 @@ class Llama3ToolParser(ToolParser):
+             - parameters (dict or None): Function parameters
+         """
+         try:
+-            data = eval(model_output, {}, {})
++            data = ast.literal_eval(model_output)
++        except (ValueError, SyntaxError):
++            try:
++                data = json.loads(model_output)
++            except (json.JSONDecodeError, TypeError):
++                return [(model_output, None, None)]
++        try:
+             return [(None, data["name"], data["parameters"])]
+-        except Exception:
++        except (KeyError, TypeError):
+             return [(model_output, None, None)]
+ 
+     def extract_tool_calls_streaming(
+diff --git a/xinference/model/llm/tool_parsers/minimax_tool_parser.py b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+index 7ba4be9..5ca5323 100644
+--- a/xinference/model/llm/tool_parsers/minimax_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+@@ -1,3 +1,4 @@
++import ast
+ import json
+ import logging
+ import re
+@@ -48,12 +49,10 @@ class MiniMaxToolParser(ToolParser):
+         if not value:
+             return ""
+         try:
+-            return json.loads(value)
+-        except Exception:
++            return ast.literal_eval(value)
++        except (ValueError, SyntaxError):
+             try:
+-                # Parameters written as Python literals (True/None, tuples) are
+-                # common in some checkpoints.
+-                return eval(value, {}, {})
++                return json.loads(value)
+             except Exception:
+                 return value
+ 
+diff --git a/xinference/model/llm/utils.py b/xinference/model/llm/utils.py
+index e0190ce..6d6dc7b 100644
+--- a/xinference/model/llm/utils.py
++++ b/xinference/model/llm/utils.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import ast
+ import base64
+ import functools
+ import json
+@@ -750,9 +751,15 @@ class ChatModelMixin:
+     def _eval_llama3_chat_arguments(cls, c) -> List[Tuple]:
+         text = c["choices"][0]["text"]
+         try:
+-            data = eval(text, {}, {})
++            data = ast.literal_eval(text)
++        except (ValueError, SyntaxError):
++            try:
++                data = json.loads(text)
++            except (json.JSONDecodeError, TypeError):
++                return [(text, None, None)]
++        try:
+             return [(None, data["name"], data["parameters"])]
+-        except Exception:
++        except (KeyError, TypeError):
+             return [(text, None, None)]
+ 
+     @classmethod

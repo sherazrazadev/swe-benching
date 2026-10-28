@@ -1,0 +1,40 @@
+diff --git a/xinference/model/llm/tool_parsers/gemma_tool_parser.py b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+index 5bf2a19..0dafd0f 100644
+--- a/xinference/model/llm/tool_parsers/gemma_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+@@ -52,7 +52,16 @@ class GemmaToolParser(ToolParser):
+         if not cleaned:
+             return {}
+         normalized = self._quote_keys(cleaned)
+-        return json.loads(normalized)
++        try:
++            return json.loads(normalized)
++        except json.JSONDecodeError:
++            # Checkpoints sometimes keep Python literals in the argument block
++            # (single-quoted strings, True/None). Interpret those directly; the
++            # empty builtins mapping keeps helper names out of scope.
++            parsed = eval(normalized, {"__builtins__": {}}, {})
++            if not isinstance(parsed, dict):
++                raise ValueError("tool arguments must be a mapping")
++            return parsed
+ 
+     def _parse_tool_call_block(
+         self, block: str
+diff --git a/xinference/model/llm/tool_parsers/minimax_tool_parser.py b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+index 06f7fa8..7ba4be9 100644
+--- a/xinference/model/llm/tool_parsers/minimax_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+@@ -50,7 +50,12 @@ class MiniMaxToolParser(ToolParser):
+         try:
+             return json.loads(value)
+         except Exception:
+-            return value
++            try:
++                # Parameters written as Python literals (True/None, tuples) are
++                # common in some checkpoints.
++                return eval(value, {}, {})
++            except Exception:
++                return value
+ 
+     def _parse_invoke_calls(self, tool_block: str) -> List[Tuple[str, Dict[str, Any]]]:
+         results = []

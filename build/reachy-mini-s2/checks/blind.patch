@@ -1,0 +1,675 @@
+diff -ruN pristine/src/reachy_mini/daemon/app/main.py app/src/reachy_mini/daemon/app/main.py
+--- a/src/reachy_mini/daemon/app/main.py	2026-10-28 03:55:48.000000000 +0000
++++ b/src/reachy_mini/daemon/app/main.py	2026-10-28 04:15:55.261859648 +0000
+@@ -24,6 +24,7 @@
+ from fastapi.templating import Jinja2Templates
+ 
+ from reachy_mini.apps.manager import AppManager
++from reachy_mini.daemon.app.request_limits import SoundUploadBodyLimit
+ from reachy_mini.daemon.app.routers import (
+     apps,
+     audio_config,
+@@ -46,6 +47,7 @@
+     check_reachymini_asoundrc,
+     write_asoundrc_to_home,
+ )
++from reachy_mini.media.audio_validation import MAX_SOUND_BYTES
+ from reachy_mini.motion.recorded_move import preload_default_datasets
+ from reachy_mini.utils.discovery import MdnsServiceRegistration
+ from reachy_mini.utils.wireless_version.startup_check import (
+@@ -268,6 +270,17 @@
+             health_check_event.set()
+             return {"status": "ok"}
+ 
++    # Bound a single sound upload's body before it is parsed, so an honest
++    # oversized Content-Length is refused outright and a streamed/understated
++    # one is aborted as it arrives.  The multipart allowance keeps a genuine
++    # file just under the per-file limit acceptable; the handler still
++    # enforces the exact file size.
++    app.add_middleware(
++        SoundUploadBodyLimit,
++        max_body_size=MAX_SOUND_BYTES + 256 * 1024,
++        paths={"/api/media/sounds/upload"},
++    )
++
+     # Restrict cross-origin access to local browser tooling; everything else is
+     # same-origin, native, or WebRTC.
+     app.add_middleware(
+diff -ruN pristine/src/reachy_mini/daemon/app/request_limits.py app/src/reachy_mini/daemon/app/request_limits.py
+--- a/src/reachy_mini/daemon/app/request_limits.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/reachy_mini/daemon/app/request_limits.py	2026-10-28 04:15:33.977657902 +0000
+@@ -0,0 +1,111 @@
++"""ASGI middleware that bounds request bodies on selected routes."""
++
++from __future__ import annotations
++
++import json
++import logging
++from collections.abc import Iterable
++
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++logger = logging.getLogger(__name__)
++
++
++class _BodyTooLarge(Exception):
++    """Internal signal used to abort a request body that grows too large."""
++
++
++def _largest_declared_length(headers: Iterable[tuple[bytes, bytes]]) -> int | None:
++    """Return the largest usable ``Content-Length`` in *headers*, if any."""
++    declared: int | None = None
++    for name, value in headers:
++        if name.lower() != b"content-length":
++            continue
++        try:
++            length = int(value)
++        except (TypeError, ValueError):
++            continue
++        if declared is None or length > declared:
++            declared = length
++    return declared
++
++
++class SoundUploadBodyLimit:
++    """Reject oversized request bodies on *paths* before they are parsed.
++
++    An honest ``Content-Length`` over the limit is refused without reading a
++    byte.  Any other body (chunked, absent or understated length) is counted
++    as it streams and aborted the moment it crosses the limit, so the daemon
++    never buffers an unbounded upload.
++
++    Args:
++        app: The wrapped ASGI application.
++        max_body_size: Largest accepted request body, in bytes.
++        paths: Exact request paths the limit applies to.
++
++    """
++
++    def __init__(
++        self, app: ASGIApp, *, max_body_size: int, paths: Iterable[str]
++    ) -> None:
++        """Wrap *app* and limit bodies on *paths* to *max_body_size*."""
++        self.app = app
++        self.max_body_size = max_body_size
++        self.paths = frozenset(paths)
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        """Enforce the body limit on matching HTTP requests."""
++        if scope["type"] != "http" or scope.get("path") not in self.paths:
++            await self.app(scope, receive, send)
++            return
++
++        declared = _largest_declared_length(scope.get("headers", []))
++        if declared is not None and declared > self.max_body_size:
++            await self._reject(send)
++            return
++
++        seen = 0
++        response_started = False
++
++        async def limited_receive() -> Message:
++            nonlocal seen
++            message = await receive()
++            if message["type"] == "http.request":
++                seen += len(message.get("body", b""))
++                if seen > self.max_body_size:
++                    raise _BodyTooLarge
++            return message
++
++        async def watching_send(message: Message) -> None:
++            nonlocal response_started
++            if message["type"] == "http.response.start":
++                response_started = True
++            await send(message)
++
++        try:
++            await self.app(scope, limited_receive, watching_send)
++        except _BodyTooLarge:
++            if response_started:
++                logger.warning(
++                    "Body on %s exceeded %d bytes after the response started",
++                    scope.get("path"),
++                    self.max_body_size,
++                )
++                return
++            await self._reject(send)
++
++    async def _reject(self, send: Send) -> None:
++        payload = json.dumps(
++            {"detail": f"Request body too large; limit is {self.max_body_size} bytes"}
++        ).encode()
++        await send(
++            {
++                "type": "http.response.start",
++                "status": 413,
++                "headers": [
++                    (b"content-type", b"application/json"),
++                    (b"content-length", str(len(payload)).encode()),
++                ],
++            }
++        )
++        await send({"type": "http.response.body", "body": payload})
+diff -ruN pristine/src/reachy_mini/daemon/app/routers/media.py app/src/reachy_mini/daemon/app/routers/media.py
+--- a/src/reachy_mini/daemon/app/routers/media.py	2026-10-28 03:55:45.000000000 +0000
++++ b/src/reachy_mini/daemon/app/routers/media.py	2026-10-28 04:15:39.317708152 +0000
+@@ -14,8 +14,10 @@
+ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+ from pydantic import BaseModel
+ 
++from ....media.audio_validation import InvalidSound
+ from ...daemon import Daemon
+ from ..dependencies import get_daemon
++from ..sound_staging import SoundStager, stage_upload
+ 
+ router = APIRouter(
+     prefix="/media",
+@@ -153,26 +155,26 @@
+     The file is saved to ``/tmp/reachy_mini_sounds/<original_filename>``.
+     If a file with the same name already exists it is overwritten.
+ 
++    The payload must be a complete, decodable audio stream no larger than
++    25 MiB, stored under a recognised audio extension; otherwise the upload
++    is refused and the sound directory is left untouched.
++
+     Returns:
+         JSON with the absolute *path* of the saved file on the daemon.
+ 
+     """
+-    if not file.filename:
+-        raise HTTPException(status_code=400, detail="Filename is required")
+-
+-    # Reject path traversal
+-    filename = Path(file.filename).name
+-    if not filename or filename in (".", ".."):
+-        raise HTTPException(status_code=400, detail="Invalid filename")
+-
+-    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
+-    dest = os.path.join(SOUNDS_TMP_DIR, filename)
+-
+-    content = await file.read()
+-    with open(dest, "wb") as f:
+-        f.write(content)
++    stager = SoundStager(SOUNDS_TMP_DIR)
++    try:
++        staged = await stage_upload(stager, file)
++        stager.commit()
++    except InvalidSound as exc:
++        stager.discard()
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    except BaseException:
++        stager.discard()
++        raise
+ 
+-    return {"status": "ok", "path": dest}
++    return {"status": "ok", "path": staged.dest_path}
+ 
+ 
+ @router.get("/sounds")
+diff -ruN pristine/src/reachy_mini/daemon/app/routers/sound_packs.py app/src/reachy_mini/daemon/app/routers/sound_packs.py
+--- a/src/reachy_mini/daemon/app/routers/sound_packs.py	2026-10-28 03:55:48.000000000 +0000
++++ b/src/reachy_mini/daemon/app/routers/sound_packs.py	2026-10-28 04:15:45.454766224 +0000
+@@ -13,6 +13,8 @@
+ 
+ from fastapi import APIRouter, File, HTTPException, UploadFile
+ 
++from ....media.audio_validation import InvalidSound
++from ..sound_staging import SoundStager, stage_upload
+ from .media import SOUNDS_TMP_DIR
+ 
+ router = APIRouter(prefix="/media/sounds")
+@@ -21,6 +23,10 @@
+ # a malformed export cannot tie up the daemon.
+ MAX_PACK_MEMBERS = 512
+ 
++# Read archive members in bounded steps so the per-file cap is enforced
++# while decompressing rather than after materialising a whole member.
++_MEMBER_READ_SIZE = 1 << 20
++
+ 
+ def _entry_name(raw: str) -> str | None:
+     """Return the name a pack entry should be stored under."""
+@@ -30,13 +36,25 @@
+     return name
+ 
+ 
++def _member_chunks(archive: zipfile.ZipFile, info: zipfile.ZipInfo):
++    """Yield one archive member's decompressed bytes in bounded steps."""
++    with archive.open(info) as member:
++        while True:
++            chunk = member.read(_MEMBER_READ_SIZE)
++            if not chunk:
++                break
++            yield chunk
++
++
+ @router.post("/packs/import")
+ async def import_sound_pack(file: UploadFile = File(...)) -> dict:
+     """Install a zip archive of sound files.
+ 
+     Every file in the archive is written to the temporary sound
+     directory under its own name.  Directories in the archive are
+-    skipped.
++    skipped.  Each member is validated as playable audio and the whole
++    pack is staged before anything is stored, so one bad member leaves
++    the sound directory untouched.
+ 
+     Returns:
+         JSON with the names of the imported files.
+@@ -58,16 +76,22 @@
+     if len(members) > MAX_PACK_MEMBERS:
+         raise HTTPException(status_code=400, detail="Sound pack has too many files")
+ 
+-    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    stager = SoundStager(SOUNDS_TMP_DIR)
+     imported: list[str] = []
+-    for info in members:
+-        name = _entry_name(info.filename)
+-        if name is None:
+-            continue
+-        dest = os.path.join(SOUNDS_TMP_DIR, name)
+-        with open(dest, "wb") as f:
+-            f.write(archive.read(info))
+-        imported.append(name)
++    try:
++        for info in members:
++            name = _entry_name(info.filename)
++            if name is None:
++                continue
++            staged = stager.stage_chunks(name, _member_chunks(archive, info))
++            imported.append(os.path.basename(staged.dest_path))
++        stager.commit()
++    except InvalidSound as exc:
++        stager.discard()
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    except BaseException:
++        stager.discard()
++        raise
+     return {"status": "ok", "files": imported}
+ 
+ 
+@@ -76,22 +100,27 @@
+     """Install several sound files uploaded together.
+ 
+     Each file is written to the temporary sound directory under its
+-    own name, replacing an existing file of the same name.
++    own name, replacing an existing file of the same name.  Every file is
++    validated as playable audio and the whole set is staged before anything
++    is stored, so one bad file leaves the sound directory untouched.
+ 
+     Returns:
+         JSON with the names of the imported files.
+ 
+     """
+-    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    stager = SoundStager(SOUNDS_TMP_DIR)
+     imported: list[str] = []
+-    for upload in files:
+-        if not upload.filename:
+-            raise HTTPException(status_code=400, detail="Filename is required")
+-        name = _entry_name(upload.filename)
+-        if name is None:
+-            raise HTTPException(status_code=400, detail="Invalid filename")
+-        dest = os.path.join(SOUNDS_TMP_DIR, name)
+-        with open(dest, "wb") as f:
+-            f.write(await upload.read())
+-        imported.append(name)
++    try:
++        for upload in files:
++            if not upload.filename:
++                raise InvalidSound("Filename is required")
++            staged = await stage_upload(stager, upload)
++            imported.append(os.path.basename(staged.dest_path))
++        stager.commit()
++    except InvalidSound as exc:
++        stager.discard()
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    except BaseException:
++        stager.discard()
++        raise
+     return {"status": "ok", "files": imported}
+diff -ruN pristine/src/reachy_mini/daemon/app/sound_staging.py app/src/reachy_mini/daemon/app/sound_staging.py
+--- a/src/reachy_mini/daemon/app/sound_staging.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/reachy_mini/daemon/app/sound_staging.py	2026-10-28 04:15:30.383624132 +0000
+@@ -0,0 +1,167 @@
++"""Staging area for validated client sound files.
++
++Callers stage one or more files under temporary names; nothing becomes
++visible at its final path until :meth:`SoundStager.commit` runs.  A refused
++upload therefore leaves the sound directory exactly as it was, and a
++multi-file import (archive or bulk) is all-or-nothing.
++
++The checks themselves live in :mod:`reachy_mini.media.audio_validation` so
++the HTTP routes and the command-channel audio sink share them.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import tempfile
++from dataclasses import dataclass
++from typing import Any, Callable, Iterable
++
++from reachy_mini.media.audio_validation import (
++    MAX_SOUND_BYTES,
++    InvalidSound,
++    is_playable_audio,
++    sound_basename,
++)
++
++_READ_SIZE = 1 << 20
++
++
++@dataclass(frozen=True)
++class StagedSound:
++    """A validated file waiting under a temporary name."""
++
++    temp_path: str
++    dest_path: str
++
++
++class SoundStager:
++    """Stage validated sounds and move them into place atomically.
++
++    Args:
++        directory: Directory the sounds are stored in.
++        max_bytes: Largest accepted size of one stored file.
++        probe: Content check used on each staged file.
++
++    """
++
++    def __init__(
++        self,
++        directory: str,
++        *,
++        max_bytes: int = MAX_SOUND_BYTES,
++        probe: Callable[[str], bool] = is_playable_audio,
++    ) -> None:
++        """Configure the staging directory, size cap and content probe."""
++        self.directory = directory
++        self.max_bytes = max_bytes
++        self._probe = probe
++        self._pending: list[StagedSound] = []
++
++    def _new_scratch(self) -> tuple[int, str]:
++        os.makedirs(self.directory, exist_ok=True)
++        return tempfile.mkstemp(dir=self.directory, suffix=".part")
++
++    def _check_size(self, total: int) -> None:
++        if total > self.max_bytes:
++            raise InvalidSound(
++                f"A stored sound may not exceed {self.max_bytes} bytes"
++            )
++
++    def stage_chunks(self, raw_name: str, chunks: Iterable[bytes]) -> StagedSound:
++        """Write *chunks* to a scratch file and validate the result.
++
++        Args:
++            raw_name: The client-supplied name for the file.
++            chunks: The file content, in order.
++
++        Returns:
++            The staged file, ready for :meth:`commit`.
++
++        Raises:
++            InvalidSound: if the name, size or content is not acceptable.
++
++        """
++        name = sound_basename(raw_name)
++        fd, temp_path = self._new_scratch()
++        try:
++            total = 0
++            with os.fdopen(fd, "wb") as handle:
++                for chunk in chunks:
++                    if not chunk:
++                        continue
++                    total += len(chunk)
++                    self._check_size(total)
++                    handle.write(chunk)
++            if not self._probe(temp_path):
++                raise InvalidSound("Content is not a decodable audio stream")
++            staged = StagedSound(temp_path, os.path.join(self.directory, name))
++            self._pending.append(staged)
++            return staged
++        except BaseException:
++            if os.path.exists(temp_path):
++                os.remove(temp_path)
++            raise
++
++    def stage_bytes(self, raw_name: str, data: bytes) -> StagedSound:
++        """Stage *data* as the sound *raw_name*."""
++        return self.stage_chunks(raw_name, (data,))
++
++    def commit(self) -> None:
++        """Move every staged file to its final path, replacing older files."""
++        while self._pending:
++            staged = self._pending[0]
++            os.replace(staged.temp_path, staged.dest_path)
++            self._pending.pop(0)
++
++    def discard(self) -> None:
++        """Delete every file still staged and forget about it."""
++        pending, self._pending = self._pending, []
++        for staged in pending:
++            try:
++                if os.path.exists(staged.temp_path):
++                    os.remove(staged.temp_path)
++            except OSError:
++                pass
++
++
++async def stage_upload(stager: SoundStager, upload: Any) -> StagedSound:
++    """Stream one uploaded file into *stager* and validate it.
++
++    Reading incrementally means the size cap is enforced while the content
++    arrives, so an absent or understated length cannot smuggle an oversized
++    file through.
++
++    Args:
++        stager: Staging area that owns the scratch directory and cap.
++        upload: An upload object exposing ``filename`` and ``read(size)``.
++
++    Returns:
++        The staged file, ready for :meth:`SoundStager.commit`.
++
++    Raises:
++        InvalidSound: if the name, size or content is not acceptable.
++
++    """
++    name = sound_basename(getattr(upload, "filename", "") or "")
++    fd, temp_path = stager._new_scratch()
++    try:
++        total = 0
++        with os.fdopen(fd, "wb") as handle:
++            while True:
++                chunk = await upload.read(_READ_SIZE)
++                if not chunk:
++                    break
++                total += len(chunk)
++                stager._check_size(total)
++                handle.write(chunk)
++        # Discovery is blocking; keep it off the event loop.
++        if not await asyncio.to_thread(stager._probe, temp_path):
++            raise InvalidSound("Content is not a decodable audio stream")
++        staged = StagedSound(temp_path, os.path.join(stager.directory, name))
++        stager._pending.append(staged)
++        return staged
++    except BaseException:
++        if os.path.exists(temp_path):
++            os.remove(temp_path)
++        raise
+diff -ruN pristine/src/reachy_mini/daemon/backend/abstract.py app/src/reachy_mini/daemon/backend/abstract.py
+--- a/src/reachy_mini/daemon/backend/abstract.py	2026-10-28 03:55:45.000000000 +0000
++++ b/src/reachy_mini/daemon/backend/abstract.py	2026-10-28 04:15:49.774807367 +0000
+@@ -83,6 +83,7 @@
+     from reachy_mini.kinematics import AnyKinematics
+ # MediaManager no longer used here — play_sound delegated to GstMediaServer
+ from reachy_mini.media.audio_doa import AudioDoA
++from reachy_mini.media.audio_validation import MAX_SOUND_BYTES, is_playable_audio
+ from reachy_mini.motion.goto import GotoMove
+ from reachy_mini.motion.move import Move
+ from reachy_mini.utils import create_head_pose
+@@ -1588,13 +1589,45 @@
+             )
+             return
+         payload = "".join(slot)
++        # Base64 is longer than the bytes it encodes, so an encoded payload
++        # this large cannot decode to an acceptable file: refuse it before
++        # the decode allocates anything.
++        if len(payload) > (MAX_SOUND_BYTES * 4) // 3 + 8:
++            self.logger.warning(
++                f"upload_audio_finish: payload for {cmd.upload_id} is oversized; "
++                "dropping slot"
++            )
++            return
+         try:
+             import base64
++
+             raw = base64.b64decode(payload, validate=False)
++            if len(raw) > MAX_SOUND_BYTES:
++                self.logger.warning(
++                    f"upload_audio_finish: audio for {cmd.upload_id} exceeds "
++                    f"{MAX_SOUND_BYTES} bytes; dropping slot"
++                )
++                return
+             os.makedirs(self._audio_temp_dir, exist_ok=True)
+             path = os.path.join(self._audio_temp_dir, f"{cmd.upload_id}.wav")
+-            with open(path, "wb") as f:
+-                f.write(raw)
++            # Validate a scratch copy so a refused upload cannot disturb any
++            # audio already stored for this id.
++            fd, tmp_path = tempfile.mkstemp(
++                dir=self._audio_temp_dir, suffix=".part"
++            )
++            try:
++                with os.fdopen(fd, "wb") as f:
++                    f.write(raw)
++                if not is_playable_audio(tmp_path):
++                    self.logger.warning(
++                        f"upload_audio_finish: payload for {cmd.upload_id} is not "
++                        "decodable audio; dropping slot"
++                    )
++                    return
++                os.replace(tmp_path, path)
++            finally:
++                if os.path.exists(tmp_path):
++                    os.remove(tmp_path)
+         except Exception as e:
+             self.logger.warning(
+                 f"upload_audio_finish: write failed for slot {cmd.upload_id}: {e}"
+diff -ruN pristine/src/reachy_mini/media/audio_validation.py app/src/reachy_mini/media/audio_validation.py
+--- a/src/reachy_mini/media/audio_validation.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/reachy_mini/media/audio_validation.py	2026-10-28 04:17:15.658613239 +0000
+@@ -0,0 +1,111 @@
++"""Validation of client-supplied audio before it is stored on disk.
++
++Both the HTTP sound routes and the command-channel audio sink write
++client-supplied bytes into a temporary sound directory.  They share the
++checks in this module so every route holds a payload to the same standard:
++
++* the storage name must carry an extension the daemon treats as audio;
++* the payload must be a complete media file with at least one audio stream,
++  as reported by the same GStreamer stack used for playback;
++* one stored file must not exceed :data:`MAX_SOUND_BYTES`.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++
++logger = logging.getLogger(__name__)
++
++#: Largest single sound file the daemon will store (25 MiB).
++MAX_SOUND_BYTES = 25 * 1024 * 1024
++
++#: Container extensions the daemon's media stack is known to play.
++AUDIO_EXTENSIONS = frozenset(
++    {".wav", ".mp3", ".ogg", ".oga", ".opus", ".flac", ".m4a", ".aac"}
++)
++
++#: GStreamer discoverer timeout for a single probe, in seconds.
++_PROBE_TIMEOUT_S = 5
++
++
++class InvalidSound(ValueError):
++    """Raised when client-supplied content must not be stored as a sound."""
++
++
++def sound_basename(raw_name: str) -> str:
++    """Reduce a client-supplied name to a validated base name.
++
++    The name is stripped of any directory prefix and its extension is checked
++    against :data:`AUDIO_EXTENSIONS` case-insensitively, so a payload cannot
++    be stored under a name the daemon does not recognise as audio.
++
++    Args:
++        raw_name: The name supplied by the client.
++
++    Returns:
++        The base name to store the sound under.
++
++    Raises:
++        InvalidSound: if the name is empty, has no usable base name, or does
++            not end in a known audio extension.
++
++    """
++    if not raw_name:
++        raise InvalidSound("Filename is required")
++    # Treat both separators as directory separators so neither a POSIX nor a
++    # Windows-style prefix can escape the sound directory.
++    name = os.path.basename(raw_name.replace("\\", "/"))
++    if not name or name in (".", "..") or "\x00" in name:
++        raise InvalidSound("Invalid filename")
++    # Refuse names the sound directory cannot hold rather than failing at the
++    # filesystem with a server error.
++    if len(os.fsencode(name)) > 255:
++        raise InvalidSound("Filename is too long")
++    extension = os.path.splitext(name)[1].lower()
++    if extension not in AUDIO_EXTENSIONS:
++        raise InvalidSound(
++            "Unsupported sound extension; expected one of: "
++            + ", ".join(sorted(AUDIO_EXTENSIONS))
++        )
++    return name
++
++
++def is_playable_audio(path: str) -> bool:
++    """Return whether *path* is a complete, decodable audio stream.
++
++    The check uses GStreamer's discoverer, i.e. the same media stack the
++    daemon plays sounds with, and requires a successful discovery result with
++    at least one audio stream.  The file extension is not consulted; only the
++    content is.
++
++    Fails closed: a missing probe, an import error, a probe error or a timeout
++    all yield ``False``.
++
++    Args:
++        path: Filesystem path of the file to probe.
++
++    Returns:
++        ``True`` if the file decodes as audio, ``False`` otherwise.
++
++    """
++    try:
++        import gi
++
++        gi.require_version("Gst", "1.0")
++        gi.require_version("GstPbutils", "1.0")
++        from gi.repository import Gst, GstPbutils
++    except Exception as exc:  # pragma: no cover - depends on the host image
++        logger.warning("GStreamer audio probe is unavailable: %s", exc)
++        return False
++
++    try:
++        Gst.init([])  # idempotent after the first call
++        discoverer = GstPbutils.Discoverer.new(_PROBE_TIMEOUT_S * Gst.SECOND)
++        info = discoverer.discover_uri(Gst.filename_to_uri(os.path.abspath(path)))
++        if info.get_result() != GstPbutils.DiscovererResult.OK:
++            return False
++        return bool(info.get_audio_streams())
++    except Exception as exc:
++        logger.warning("Could not decode %s as audio: %s", path, exc)
++        return False

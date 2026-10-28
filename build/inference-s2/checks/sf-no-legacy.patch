@@ -1,0 +1,110 @@
+diff --git a/xinference/model/llm/tool_parsers/minimax_tool_parser.py b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+index 7ba4be9..ebdfcb3 100644
+--- a/xinference/model/llm/tool_parsers/minimax_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/minimax_tool_parser.py
+@@ -1,3 +1,4 @@
++import ast
+ import json
+ import logging
+ import re
+@@ -53,7 +54,7 @@ class MiniMaxToolParser(ToolParser):
+             try:
+                 # Parameters written as Python literals (True/None, tuples) are
+                 # common in some checkpoints.
+-                return eval(value, {}, {})
++                return ast.literal_eval(value)
+             except Exception:
+                 return value
+ 
+diff --git a/xinference/model/image/ocr/deepseek_ocr.py b/xinference/model/image/ocr/deepseek_ocr.py
+index 648b999..04ab011 100644
+--- a/xinference/model/image/ocr/deepseek_ocr.py
++++ b/xinference/model/image/ocr/deepseek_ocr.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import ast
+ import logging
+ import os
+ import re
+@@ -228,7 +229,7 @@ def extract_coordinates_and_label(
+     """Extract coordinates and label from reference text."""
+     try:
+         label_type = ref_text[1]
+-        cor_list = eval(ref_text[2])
++        cor_list = ast.literal_eval(ref_text[2])
+     except Exception as e:
+         logger.error(f"Error extracting coordinates: {e}")
+         return None
+@@ -396,7 +397,7 @@ def extract_text_blocks(text: str) -> List[Dict[str, Any]]:
+         content = match.group(3).strip()
+ 
+         try:
+-            coords = eval(f"[{coords_str}]")  # Convert string coordinates to list
++            coords = ast.literal_eval(coords_str)  # Convert string coordinates to list
+             if isinstance(coords, list) and len(coords) > 0:
+                 blocks.append(
+                     {
+diff --git a/xinference/model/llm/tool_parsers/gemma_tool_parser.py b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+index 0dafd0f..05b0a76 100644
+--- a/xinference/model/llm/tool_parsers/gemma_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/gemma_tool_parser.py
+@@ -1,3 +1,4 @@
++import ast
+ import json
+ import logging
+ import re
+@@ -58,7 +59,7 @@ class GemmaToolParser(ToolParser):
+             # Checkpoints sometimes keep Python literals in the argument block
+             # (single-quoted strings, True/None). Interpret those directly; the
+             # empty builtins mapping keeps helper names out of scope.
+-            parsed = eval(normalized, {"__builtins__": {}}, {})
++            parsed = ast.literal_eval(normalized)
+             if not isinstance(parsed, dict):
+                 raise ValueError("tool arguments must be a mapping")
+             return parsed
+diff --git a/xinference/model/llm/tool_parsers/llama3_tool_parser.py b/xinference/model/llm/tool_parsers/llama3_tool_parser.py
+index de87ad7..bba9aa2 100644
+--- a/xinference/model/llm/tool_parsers/llama3_tool_parser.py
++++ b/xinference/model/llm/tool_parsers/llama3_tool_parser.py
+@@ -1,3 +1,5 @@
++import ast
++import json
+ import logging
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -29,8 +31,8 @@ class Llama3ToolParser(ToolParser):
+         """
+         Extract tool calls from complete model output.
+ 
+-        Parses the model output using eval() to extract tool call information.
+-        This method expects the output to be a valid Python dictionary format.
++        Parses the model output using safe parsing to extract tool call information.
++        This method expects the output to be a valid JSON or Python literal dictionary format.
+ 
+         Args:
+             model_output (str): The complete output string from the model.
+@@ -43,9 +45,20 @@ class Llama3ToolParser(ToolParser):
+             - parameters (dict or None): Function parameters
+         """
+         try:
+-            data = eval(model_output, {}, {})
++            # Try JSON first (most common LLM output format)
++            data = json.loads(model_output)
++        except (json.JSONDecodeError, TypeError):
++            try:
++                # Fall back to ast.literal_eval for Python literal formats
++                # (e.g., True/False/None instead of true/false/null).
++                # Unlike eval(), ast.literal_eval() only allows literal
++                # structures and cannot execute arbitrary code.
++                data = ast.literal_eval(model_output)
++            except (ValueError, SyntaxError):
++                return [(model_output, None, None)]
++        try:
+             return [(None, data["name"], data["parameters"])]
+-        except Exception:
++        except (KeyError, TypeError):
+             return [(model_output, None, None)]
+ 
+     def extract_tool_calls_streaming(

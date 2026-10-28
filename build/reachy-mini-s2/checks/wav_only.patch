@@ -1,0 +1,533 @@
+diff --git a/src/reachy_mini/daemon/app/main.py b/src/reachy_mini/daemon/app/main.py
+index a653b07..f3f5c69 100644
+--- a/src/reachy_mini/daemon/app/main.py
++++ b/src/reachy_mini/daemon/app/main.py
+@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
+ from fastapi.templating import Jinja2Templates
+ 
+ from reachy_mini.apps.manager import AppManager
++from reachy_mini.daemon.app.middleware import MaxBodySizeMiddleware
+ from reachy_mini.daemon.app.routers import (
+     apps,
+     audio_config,
+@@ -268,6 +269,15 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
+             health_check_event.set()
+             return {"status": "ok"}
+ 
++    # Cap the size of sound uploads before the body is read, so a large file
++    # cannot be streamed to disk. Added before CORS so CORS remains the
++    # outermost middleware and even a 413 carries its headers.
++    app.add_middleware(
++        MaxBodySizeMiddleware,
++        max_body_size=media.MAX_SOUND_UPLOAD_BYTES,
++        paths={"/api/media/sounds/upload"},
++    )
++
+     # Restrict cross-origin access to local browser tooling; everything else is
+     # same-origin, native, or WebRTC.
+     app.add_middleware(
+diff --git a/src/reachy_mini/daemon/app/middleware.py b/src/reachy_mini/daemon/app/middleware.py
+new file mode 100644
+index 0000000..df4d178
+--- /dev/null
++++ b/src/reachy_mini/daemon/app/middleware.py
+@@ -0,0 +1,103 @@
++"""Custom ASGI middleware for the daemon HTTP app."""
++
++import json
++import logging
++from collections.abc import Iterable
++
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++logger = logging.getLogger(__name__)
++
++
++class _BodyTooLarge(Exception):
++    """Raised internally once a request body exceeds the configured limit."""
++
++
++class MaxBodySizeMiddleware:
++    """Reject requests to *paths* whose body exceeds *max_body_size* bytes.
++
++    The limit is enforced *before* the body is parsed, so a large upload is
++    never read in full:
++
++    - an explicit ``Content-Length`` over the limit is rejected outright,
++      before a single byte of the body is read;
++    - a body that crosses the limit while streaming (chunked transfer, or an
++      understated/absent ``Content-Length``) is aborted as soon as the
++      threshold is passed.
++
++    Other paths and non-HTTP scopes are passed through untouched.
++    """
++
++    def __init__(
++        self, app: ASGIApp, *, max_body_size: int, paths: Iterable[str]
++    ) -> None:
++        """Wrap *app*, capping bodies on *paths* at *max_body_size* bytes."""
++        self.app = app
++        self.max_body_size = max_body_size
++        self.paths = frozenset(paths)
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        """Enforce the body-size limit on matching requests."""
++        if scope["type"] != "http" or scope.get("path") not in self.paths:
++            await self.app(scope, receive, send)
++            return
++
++        # Fast path: an honest, oversized Content-Length is rejected before the
++        # body is read at all (covers curl, browsers, requests, ...).
++        for name, value in scope.get("headers", []):
++            if name == b"content-length":
++                try:
++                    declared = int(value)
++                except ValueError:
++                    break
++                if declared > self.max_body_size:
++                    await self._send_too_large(send)
++                    return
++                break
++
++        received = 0
++        response_started = False
++
++        async def limited_receive() -> Message:
++            nonlocal received
++            message = await receive()
++            if message["type"] == "http.request":
++                received += len(message.get("body", b""))
++                if received > self.max_body_size:
++                    raise _BodyTooLarge
++            return message
++
++        async def tracking_send(message: Message) -> None:
++            nonlocal response_started
++            if message["type"] == "http.response.start":
++                response_started = True
++            await send(message)
++
++        try:
++            await self.app(scope, limited_receive, tracking_send)
++        except _BodyTooLarge:
++            # The body parser raises before producing a response, so the
++            # response stream is still ours to write.
++            if not response_started:
++                await self._send_too_large(send)
++            else:
++                logger.warning(
++                    "Request body exceeded %d bytes after the response started",
++                    self.max_body_size,
++                )
++
++    async def _send_too_large(self, send: Send) -> None:
++        body = json.dumps(
++            {"detail": f"Request body too large; maximum is {self.max_body_size} bytes"}
++        ).encode()
++        await send(
++            {
++                "type": "http.response.start",
++                "status": 413,
++                "headers": [
++                    (b"content-type", b"application/json"),
++                    (b"content-length", str(len(body)).encode()),
++                ],
++            }
++        )
++        await send({"type": "http.response.body", "body": body})
+diff --git a/src/reachy_mini/daemon/app/routers/media.py b/src/reachy_mini/daemon/app/routers/media.py
+index 9890824..3ec0c50 100644
+--- a/src/reachy_mini/daemon/app/routers/media.py
++++ b/src/reachy_mini/daemon/app/routers/media.py
+@@ -8,12 +8,15 @@ so that WebRTC clients can upload, play, list and delete sound files on
+ the daemon.
+ """
+ 
++import asyncio
+ import os
++import tempfile
+ from pathlib import Path
+ 
+ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+ from pydantic import BaseModel
+ 
++from ....media.gstreamer_utils import is_valid_audio_file
+ from ...daemon import Daemon
+ from ..dependencies import get_daemon
+ 
+@@ -23,6 +26,15 @@ router = APIRouter(
+ 
+ SOUNDS_TMP_DIR = "/tmp/reachy_mini_sounds"
+ 
++# Sound uploads are restricted to known audio container extensions (allow-list)
++# and validated by content (see ``is_valid_audio_file``) to prevent arbitrary
++# file upload (CWE-434, GHSA-m2pc-3q4q-w6jr).
++ALLOWED_SOUND_EXTENSIONS = frozenset({".wav"})
++
++# Cap upload size before the file is probed so a large body can neither exhaust
++# memory nor tie up the GStreamer discoverer.
++MAX_SOUND_UPLOAD_BYTES = 25 * 1024 * 1024
++
+ 
+ @router.post("/release")
+ async def release_media(daemon: Daemon = Depends(get_daemon)) -> dict[str, str]:
+@@ -144,6 +156,108 @@ async def disable_wobbling(
+     return {"status": "ok"}
+ 
+ 
++def sound_filename(raw_name: str) -> str:
++    """Return the storage name for a client-supplied sound file.
++
++    The name is reduced to its base name, then checked against the audio
++    extension allow-list, before any file is touched.
++
++    Args:
++        raw_name: The name supplied by the client.
++
++    Returns:
++        The safe base name to store the file under.
++
++    """
++    filename = Path(raw_name).name
++    if not filename or filename in (".", ".."):
++        raise HTTPException(status_code=400, detail="Invalid filename")
++    if Path(filename).suffix.lower() not in ALLOWED_SOUND_EXTENSIONS:
++        raise HTTPException(
++            status_code=400,
++            detail=(
++                "Unsupported file extension; allowed: "
++                f"{', '.join(sorted(ALLOWED_SOUND_EXTENSIONS))}"
++            ),
++        )
++    return filename
++
++
++def _probe_and_stage(tmp_path: str, filename: str) -> tuple[str, str]:
++    """Probe a written temporary file and return it with its destination."""
++    if not is_valid_audio_file(tmp_path):
++        os.remove(tmp_path)
++        raise HTTPException(status_code=400, detail="Unsupported or invalid audio file")
++    return tmp_path, os.path.join(SOUNDS_TMP_DIR, filename)
++
++
++def stage_sound_bytes(raw_name: str, data: bytes) -> tuple[str, str]:
++    """Write *data* to a temporary file and validate it as audio.
++
++    Nothing is placed at the final destination until :func:`commit_staged`
++    is called, so a refused upload leaves existing files untouched.
++
++    Args:
++        raw_name: The client-supplied name for the file.
++        data: The complete file content.
++
++    Returns:
++        A ``(temporary_path, destination_path)`` pair.
++
++    """
++    filename = sound_filename(raw_name)
++    if len(data) > MAX_SOUND_UPLOAD_BYTES:
++        raise HTTPException(status_code=400, detail="Sound file is too large")
++
++    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    tmp_fd, tmp_path = tempfile.mkstemp(dir=SOUNDS_TMP_DIR, suffix=".upload")
++    try:
++        with os.fdopen(tmp_fd, "wb") as f:
++            f.write(data)
++        return _probe_and_stage(tmp_path, filename)
++    except BaseException:
++        if os.path.exists(tmp_path):
++            os.remove(tmp_path)
++        raise
++
++
++async def stage_sound_upload(upload: UploadFile) -> tuple[str, str]:
++    """Stream one uploaded file to a temporary file and validate it as audio.
++
++    The body is read in chunks and the cap is enforced while streaming, so a
++    body with an absent or understated length is also stopped.
++
++    Args:
++        upload: The uploaded file from the request.
++
++    Returns:
++        A ``(temporary_path, destination_path)`` pair.
++
++    """
++    filename = sound_filename(upload.filename or "")
++    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    tmp_fd, tmp_path = tempfile.mkstemp(dir=SOUNDS_TMP_DIR, suffix=".upload")
++    try:
++        total = 0
++        with os.fdopen(tmp_fd, "wb") as f:
++            while chunk := await upload.read(1 << 20):
++                total += len(chunk)
++                if total > MAX_SOUND_UPLOAD_BYTES:
++                    raise HTTPException(status_code=400, detail="Sound file is too large")
++                f.write(chunk)
++        return await asyncio.to_thread(_probe_and_stage, tmp_path, filename)
++    except BaseException:
++        if os.path.exists(tmp_path):
++            os.remove(tmp_path)
++        raise
++
++
++def commit_staged(staged: list[tuple[str, str]]) -> None:
++    """Move validated temporary files to their destinations atomically."""
++    for tmp_path, dest in staged:
++        os.replace(tmp_path, dest)
++
++
+ @router.post("/sounds/upload")
+ async def upload_sound(
+     file: UploadFile = File(...),
+@@ -153,6 +267,10 @@ async def upload_sound(
+     The file is saved to ``/tmp/reachy_mini_sounds/<original_filename>``.
+     If a file with the same name already exists it is overwritten.
+ 
++    The upload is restricted to known audio extensions, capped at
++    ``MAX_SOUND_UPLOAD_BYTES``, and validated by content before being stored,
++    so non-audio payloads cannot be written to disk.
++
+     Returns:
+         JSON with the absolute *path* of the saved file on the daemon.
+ 
+@@ -160,19 +278,10 @@ async def upload_sound(
+     if not file.filename:
+         raise HTTPException(status_code=400, detail="Filename is required")
+ 
+-    # Reject path traversal
+-    filename = Path(file.filename).name
+-    if not filename or filename in (".", ".."):
+-        raise HTTPException(status_code=400, detail="Invalid filename")
+-
+-    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
+-    dest = os.path.join(SOUNDS_TMP_DIR, filename)
+-
+-    content = await file.read()
+-    with open(dest, "wb") as f:
+-        f.write(content)
++    staged = await stage_sound_upload(file)
++    commit_staged([staged])
+ 
+-    return {"status": "ok", "path": dest}
++    return {"status": "ok", "path": staged[1]}
+ 
+ 
+ @router.get("/sounds")
+diff --git a/src/reachy_mini/daemon/app/routers/sound_packs.py b/src/reachy_mini/daemon/app/routers/sound_packs.py
+index 472c45c..2cbceb3 100644
+--- a/src/reachy_mini/daemon/app/routers/sound_packs.py
++++ b/src/reachy_mini/daemon/app/routers/sound_packs.py
+@@ -13,7 +13,7 @@ from pathlib import Path
+ 
+ from fastapi import APIRouter, File, HTTPException, UploadFile
+ 
+-from .media import SOUNDS_TMP_DIR
++from .media import SOUNDS_TMP_DIR, commit_staged, stage_sound_bytes, stage_sound_upload
+ 
+ router = APIRouter(prefix="/media/sounds")
+ 
+@@ -58,17 +58,22 @@ async def import_sound_pack(file: UploadFile = File(...)) -> dict:
+     if len(members) > MAX_PACK_MEMBERS:
+         raise HTTPException(status_code=400, detail="Sound pack has too many files")
+ 
+-    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
+-    imported: list[str] = []
+-    for info in members:
+-        name = _entry_name(info.filename)
+-        if name is None:
+-            continue
+-        dest = os.path.join(SOUNDS_TMP_DIR, name)
+-        with open(dest, "wb") as f:
+-            f.write(archive.read(info))
+-        imported.append(name)
+-    return {"status": "ok", "files": imported}
++    # Stage and validate every member before placing any of them, so a pack
++    # with one bad member leaves the sound directory untouched.
++    staged: list[tuple[str, str]] = []
++    try:
++        for info in members:
++            name = _entry_name(info.filename)
++            if name is None:
++                continue
++            staged.append(stage_sound_bytes(name, archive.read(info)))
++        commit_staged(staged)
++    except BaseException:
++        for tmp_path, _ in staged:
++            if os.path.exists(tmp_path):
++                os.remove(tmp_path)
++        raise
++    return {"status": "ok", "files": [Path(dest).name for _, dest in staged]}
+ 
+ 
+ @router.post("/packs/bulk")
+@@ -83,15 +88,16 @@ async def upload_sound_pack(files: list[UploadFile] = File(...)) -> dict:
+ 
+     """
+     os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
+-    imported: list[str] = []
+-    for upload in files:
+-        if not upload.filename:
+-            raise HTTPException(status_code=400, detail="Filename is required")
+-        name = _entry_name(upload.filename)
+-        if name is None:
+-            raise HTTPException(status_code=400, detail="Invalid filename")
+-        dest = os.path.join(SOUNDS_TMP_DIR, name)
+-        with open(dest, "wb") as f:
+-            f.write(await upload.read())
+-        imported.append(name)
+-    return {"status": "ok", "files": imported}
++    staged: list[tuple[str, str]] = []
++    try:
++        for upload in files:
++            if not upload.filename:
++                raise HTTPException(status_code=400, detail="Filename is required")
++            staged.append(await stage_sound_upload(upload))
++        commit_staged(staged)
++    except BaseException:
++        for tmp_path, _ in staged:
++            if os.path.exists(tmp_path):
++                os.remove(tmp_path)
++        raise
++    return {"status": "ok", "files": [Path(dest).name for _, dest in staged]}
+diff --git a/src/reachy_mini/daemon/backend/abstract.py b/src/reachy_mini/daemon/backend/abstract.py
+index 85aac60..f49ab61 100644
+--- a/src/reachy_mini/daemon/backend/abstract.py
++++ b/src/reachy_mini/daemon/backend/abstract.py
+@@ -83,6 +83,7 @@ if typing.TYPE_CHECKING:
+     from reachy_mini.kinematics import AnyKinematics
+ # MediaManager no longer used here — play_sound delegated to GstMediaServer
+ from reachy_mini.media.audio_doa import AudioDoA
++from reachy_mini.media.gstreamer_utils import is_valid_audio_file
+ from reachy_mini.motion.goto import GotoMove
+ from reachy_mini.motion.move import Move
+ from reachy_mini.utils import create_head_pose
+@@ -94,6 +95,9 @@ from reachy_mini.utils.interpolation import (
+     time_trajectory,
+ )
+ 
++# Largest audio payload the daemon stores for a client upload.
++MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
++
+ 
+ class _PlaybackCancelToken:
+     """Per-run cancellation handle for ``Backend.play_move``.
+@@ -1588,13 +1592,46 @@ class Backend:
+             )
+             return
+         payload = "".join(slot)
++        # Refuse an oversized payload on its encoded size too, so the
++        # base64 decode is not the first place the limit is noticed.
++        if len(payload) > (MAX_AUDIO_UPLOAD_BYTES * 4 // 3) + 8:
++            self.logger.warning(
++                f"upload_audio_finish: payload for {cmd.upload_id} exceeds "
++                f"{MAX_AUDIO_UPLOAD_BYTES} bytes; dropping slot"
++            )
++            return
+         try:
+             import base64
++
+             raw = base64.b64decode(payload, validate=False)
++            if len(raw) > MAX_AUDIO_UPLOAD_BYTES:
++                self.logger.warning(
++                    f"upload_audio_finish: audio for {cmd.upload_id} exceeds "
++                    f"{MAX_AUDIO_UPLOAD_BYTES} bytes; dropping slot"
++                )
++                return
+             os.makedirs(self._audio_temp_dir, exist_ok=True)
+             path = os.path.join(self._audio_temp_dir, f"{cmd.upload_id}.wav")
+-            with open(path, "wb") as f:
+-                f.write(raw)
++            # Validate a temporary copy before it can replace any existing
++            # audio stored for this id.
++            tmp_fd, tmp_path = tempfile.mkstemp(
++                dir=self._audio_temp_dir, suffix=".upload"
++            )
++            try:
++                with os.fdopen(tmp_fd, "wb") as f:
++                    f.write(raw)
++                if not is_valid_audio_file(tmp_path):
++                    os.remove(tmp_path)
++                    self.logger.warning(
++                        f"upload_audio_finish: payload for {cmd.upload_id} "
++                        "is not decodable audio; dropping slot"
++                    )
++                    return
++                os.replace(tmp_path, path)
++            except BaseException:
++                if os.path.exists(tmp_path):
++                    os.remove(tmp_path)
++                raise
+         except Exception as e:
+             self.logger.warning(
+                 f"upload_audio_finish: write failed for slot {cmd.upload_id}: {e}"
+diff --git a/src/reachy_mini/media/gstreamer_utils.py b/src/reachy_mini/media/gstreamer_utils.py
+index 23ace29..0a30f3c 100644
+--- a/src/reachy_mini/media/gstreamer_utils.py
++++ b/src/reachy_mini/media/gstreamer_utils.py
+@@ -13,8 +13,9 @@ except ImportError as e:
+ 
+ gi.require_version("Gst", "1.0")
+ gi.require_version("GstApp", "1.0")
++gi.require_version("GstPbutils", "1.0")
+ 
+-from gi.repository import Gst, GstApp  # noqa: E402
++from gi.repository import Gst, GstApp, GstPbutils  # noqa: E402
+ 
+ 
+ def handle_default_bus_message(
+@@ -73,3 +74,54 @@ def get_sample(appsink: GstApp.AppSink, logger: logging.Logger) -> Optional[byte
+             logger.warning("Buffer is None")
+         data = buf.extract_dup(0, buf.get_size())
+     return data
++
++
++def is_valid_audio_file(path: str) -> bool:
++    """Return whether the file at *path* is a decodable audio file.
++
++    Uses GStreamer's ``pbutils`` discoverer — the same machinery used to play
++    sounds — so anything that passes here is guaranteed to be playable. The
++    probe inspects the media's structure rather than trusting the extension,
++    which rejects mislabelled or non-audio payloads.
++
++    Fails closed: returns ``False`` if the probe errors out for any reason.
++
++    Args:
++        path: Filesystem path to the file to validate.
++
++    Returns:
++        ``True`` if the file is a decodable media file with at least one audio
++        stream, ``False`` otherwise.
++
++    """
++    Gst.init([])  # idempotent
++    try:
++        discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
++        info = discoverer.discover_uri(Gst.filename_to_uri(path))
++    except Exception as e:
++        logging.warning(f"Could not validate audio file {path}: {e}")
++        return False
++
++    return (
++        info.get_result() == GstPbutils.DiscovererResult.OK
++        and len(info.get_audio_streams()) > 0
++    )
++
++
++def audio_duration_seconds(path: str) -> float:
++    """Return the media duration in seconds via GStreamer's discoverer.
++
++    Works for any container the daemon can play (WAV, OGG, MP3, FLAC, ...).
++
++    Args:
++        path: Filesystem path to the media file.
++
++    Returns:
++        The duration in seconds.
++
++    """
++    Gst.init([])  # idempotent
++    info = GstPbutils.Discoverer.new(5 * Gst.SECOND).discover_uri(
++        Gst.filename_to_uri(path)
++    )
++    return float(info.get_duration()) / 1_000_000_000

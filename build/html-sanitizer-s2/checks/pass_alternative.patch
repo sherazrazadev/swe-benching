@@ -1,0 +1,63 @@
+diff -ruN a/src/Serializer/Rules.php b/src/Serializer/Rules.php
+--- a/src/Serializer/Rules.php	2026-10-28 03:49:19.596616213 +0000
++++ b/src/Serializer/Rules.php	2026-10-28 03:53:21.238413448 +0000
+@@ -200,8 +200,46 @@
+         if ($domNode === null || !$this->behavior instanceof Behavior || !$this->isRawText($domNode)) {
+             return false;
+         }
++        // content models that differ from the parser's raw-text assumption
++        if (in_array(strtolower((string)$domNode->localName), self::NON_RAW_CONTENT_MODELS, true)) {
++            return false;
++        }
++        foreach (['noscript', 'svg', 'math', 'select'] as $contextName) {
++            if ($this->hasAncestorWithName($domNode, $contextName)) {
++                return false;
++            }
++        }
+         $tag = $this->behavior->getTag($domNode->nodeName);
+-        return $tag instanceof Behavior\Tag && $tag->shallAllowInsecureRawText();
++        if (!$tag instanceof Behavior\Tag || !$tag->shallAllowInsecureRawText()) {
++            return false;
++        }
++        // refuse to echo a sequence a browser reads as the end of this element
++        foreach ($domNode->childNodes as $child) {
++            if ($child instanceof DOMCharacterData
++                && preg_match(
++                    '~</\s*' . preg_quote((string)$domNode->localName, '~') . '([\s/>]|$)~i',
++                    $child->data
++                ) === 1
++            ) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    protected function hasAncestorWithName(?DOMNode $domNode, string $ancestorName): bool
++    {
++        if (!$domNode instanceof DOMNode) {
++            return false;
++        }
++        $ancestor = $domNode->parentNode;
++        while ($ancestor instanceof DOMNode) {
++            if ($ancestor->localName === $ancestorName) {
++                return true;
++            }
++            $ancestor = $ancestor->parentNode;
++        }
++        return false;
+     }
+ 
+     /**
+@@ -210,6 +248,11 @@
+      */
+     protected const RAW_TEXT_ELEMENTS = ['xmp'];
+ 
++    /**
++     * Elements a browser reads with a content model other than raw text.
++     */
++    protected const NON_RAW_CONTENT_MODELS = ['xmp'];
++
+     protected function isRawText(?DOMNode $domNode): bool
+     {
+         return $domNode !== null

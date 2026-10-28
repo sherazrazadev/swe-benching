@@ -1,0 +1,235 @@
+diff --git a/src/certchain.js b/src/certchain.js
+index c71a36d..a5b6af0 100644
+--- a/src/certchain.js
++++ b/src/certchain.js
+@@ -2,7 +2,6 @@
+ 
+ const { createPublicKey } = require('node:crypto')
+ 
+-const { hsAlgorithms } = require('./crypto')
+ const { TokenError } = require('./error')
+ 
+ // A certificate chain is a list of PEM-encoded X.509 certificates. The leaf
+@@ -29,13 +28,13 @@ function createCertificateChainVerifier(createVerifier, options) {
+       importable = false
+     }
+ 
+-    if (importable || rest.algorithms) {
+-      return createVerifier(base)
++    if (!importable) {
++      // A value that is not an importable certificate must never be downgraded to a
++      // shared secret: the certificate text is public, so anyone could forge with it.
++      throw new TokenError(TokenError.codes.invalidKey, 'The configured certificate could not be imported.')
+     }
+ 
+-    // A deployment that has not finished migrating may keep a shared secret in
+-    // the same configuration field, so keep honouring it for HMAC tokens.
+-    return createVerifier({ ...base, algorithms: hsAlgorithms })
++    return createVerifier(base)
+   })
+ 
+   return function verifyWithCertificateChain(token, callback) {
+diff --git a/src/crypto.js b/src/crypto.js
+index 0ab7adc..a9f185d 100644
+--- a/src/crypto.js
++++ b/src/crypto.js
+@@ -27,6 +27,14 @@ const encoderMap = { '=': '', '+': '-', '/': '_' }
+ const privateKeyPemMatcher = /^-----BEGIN(?: (RSA|EC|ENCRYPTED))? PRIVATE KEY-----/
+ const publicKeyPemMatcher = /^-----BEGIN(?: (RSA))? PUBLIC KEY-----/
+ const publicKeyX509CertMatcher = '-----BEGIN CERTIFICATE-----'
++// Matches any PEM/certificate header regardless of its position in the string.
++// Used to locate the start of a PEM block so that leading bytes (whitespace,
++// control chars, zero-width unicode, comments, wrappers, ...) cannot push the
++// header off position 0 and defeat the ^-anchored matchers above, which would
++// misclassify an asymmetric key as an HMAC secret (algorithm confusion —
++// GHSA-ww5h-9m49-7xx4, the incomplete-fix lineage of CVE-2023-48223 /
++// CVE-2026-34950).
++const pemBeginMatcher = /-----BEGIN [A-Z0-9 ]+?-----/
+ const privateKeysCache = new Cache(1000)
+ const publicKeysCache = new Cache(1000)
+ 
+@@ -71,6 +79,22 @@ function cacheSet(cache, key, value, error) {
+   return value || error
+ }
+ 
++// Single source of truth for locating a PEM/certificate block. Returns the key
++// sliced from its first `-----BEGIN ...-----` header, or flags it as a raw HMAC
++// secret when no header is present anywhere. Both detectors MUST use this and
++// classify by the leading header of the slice, so their handling can never
++// drift apart (the drift is how this CVE lineage stayed incomplete —
++// GHSA-ww5h-9m49-7xx4 / CVE-2026-34950 / CVE-2023-48223).
++function locatePem(trimmedKey) {
++  const pemStart = trimmedKey.search(pemBeginMatcher)
++
++  if (pemStart === -1) {
++    return { pem: null, isRawSecret: true }
++  }
++
++  return { pem: trimmedKey.slice(pemStart), isRawSecret: false }
++}
++
+ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+   const trimmedKey = key.trim()
+ 
+@@ -79,14 +103,22 @@ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+     return providedAlgorithm
+   }
+ 
+-  if (trimmedKey.match(publicKeyPemMatcher) || trimmedKey.includes(publicKeyX509CertMatcher)) {
++  const { pem, isRawSecret } = locatePem(trimmedKey)
++
++  if (isRawSecret) {
++    return 'HS256'
++  }
++
++  if (pem.match(publicKeyPemMatcher) || pem.startsWith(publicKeyX509CertMatcher)) {
+     throw new TokenError(TokenError.codes.invalidKey, 'Public keys are not supported for signing.')
+   }
+ 
+-  const pemData = trimmedKey.match(privateKeyPemMatcher)
++  const pemData = pem.match(privateKeyPemMatcher)
+ 
+   if (!pemData) {
+-    return 'HS256'
++    // A PEM header is present but it is neither a supported private key nor a
++    // public key/certificate: refuse rather than silently using it as a secret.
++    throw new TokenError(TokenError.codes.invalidKey, 'Unsupported PEM private key.')
+   }
+ 
+   let keyData
+@@ -97,14 +129,14 @@ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+     case 'RSA': // pkcs1 format - Can only be RSA key
+       return 'RS256'
+     case 'EC': // sec1 format - Can only be a EC key
+-      keyData = ECPrivateKey.decode(trimmedKey, 'pem', { label: 'EC PRIVATE KEY' })
++      keyData = ECPrivateKey.decode(pem, 'pem', { label: 'EC PRIVATE KEY' })
+       curveId = keyData.parameters.value.join('.')
+       break
+     case 'ENCRYPTED': // Can be either RSA or EC key - we'll used the supplied algorithm
+       return 'ENCRYPTED'
+     default:
+       // pkcs8
+-      keyData = PrivateKey.decode(trimmedKey, 'pem', { label: 'PRIVATE KEY' })
++      keyData = PrivateKey.decode(pem, 'pem', { label: 'PRIVATE KEY' })
+       oid = keyData.algorithm.algorithm.join('.')
+ 
+       switch (oid) {
+@@ -132,22 +164,32 @@ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+ 
+ function performDetectPublicKeyAlgorithms(key) {
+   const trimmedKey = key.trim()
+-  const publicKeyPemMatch = trimmedKey.match(publicKeyPemMatcher)
+ 
+-  if (trimmedKey.match(privateKeyPemMatcher)) {
++  const { pem, isRawSecret } = locatePem(trimmedKey)
++
++  if (isRawSecret) {
++    // Not a PEM, assume a plain secret
++    return hsAlgorithms
++  }
++
++  const publicKeyPemMatch = pem.match(publicKeyPemMatcher)
++
++  if (pem.match(privateKeyPemMatcher)) {
+     throw new TokenError(TokenError.codes.invalidKey, 'Private keys are not supported for verifying.')
+   } else if (publicKeyPemMatch && publicKeyPemMatch[1] === 'RSA') {
+     // pkcs1 format - Can only be RSA key
+     return rsaAlgorithms
+-  } else if (!publicKeyPemMatch && !trimmedKey.includes(publicKeyX509CertMatcher)) {
+-    // Not a PEM, assume a plain secret
+-    return hsAlgorithms
++  } else if (!publicKeyPemMatch && !pem.startsWith(publicKeyX509CertMatcher)) {
++    // The leading PEM header is neither a public key nor a certificate. Refuse
++    // rather than scanning past it (asn1 would) so this matches the private path
++    // exactly for junk-before-a-real-header input.
++    throw new TokenError(TokenError.codes.invalidKey, 'Unsupported PEM public key.')
+   }
+ 
+   // if the key is a X509 cert we need to convert it
+-  let resolvedKey = trimmedKey
+-  if (trimmedKey.includes(publicKeyX509CertMatcher)) {
+-    resolvedKey = createPublicKey(trimmedKey).export({ type: 'spki', format: 'pem' })
++  let resolvedKey = pem
++  if (pem.startsWith(publicKeyX509CertMatcher)) {
++    resolvedKey = createPublicKey(pem).export({ type: 'spki', format: 'pem' })
+   }
+ 
+   const keyData = PublicKey.decode(resolvedKey, 'pem', { label: 'PUBLIC KEY' })
+@@ -183,6 +225,17 @@ function detectPrivateKeyAlgorithm(key, providedAlgorithm) {
+     throw new TokenError(TokenError.codes.invalidKey, 'The private key must be a string or a buffer.')
+   }
+ 
++  // An explicit HS* request means the caller is asserting that the string is a raw
++  // secret. It is an option of this operation, not a property of the key, so it must
++  // neither be answered from a detection cached by a different operation nor stored
++  // for one.
++  if (hsAlgorithms.includes(providedAlgorithm)) {
++    if (key.includes('-----BEGIN')) {
++      throw new TokenError(TokenError.codes.invalidKey, 'PEM key material cannot be used as a shared secret.')
++    }
++    return providedAlgorithm
++  }
++
+   // Check cache first
+   const [cached, error] = privateKeysCache.get(key) || []
+ 
+@@ -218,6 +271,9 @@ function detectPublicKeyAlgorithms(key, providedAlgorithms) {
+   // If all provided algorithms are HS, skip detection and caching entirely
+   // since the key might look like a PEM but should be used as a raw HMAC secret
+   if (providedAlgorithms && providedAlgorithms.length && providedAlgorithms.every(a => hsAlgorithms.includes(a))) {
++    if (String(key).includes('-----BEGIN')) {
++      throw new TokenError(TokenError.codes.invalidKey, 'PEM key material cannot be used as a shared secret.')
++    }
+     return providedAlgorithms
+   }
+ 
+diff --git a/src/keyring.js b/src/keyring.js
+index a388fa1..c69783d 100644
+--- a/src/keyring.js
++++ b/src/keyring.js
+@@ -1,21 +1,10 @@
+ 'use strict'
+ 
+-const { hsAlgorithms } = require('./crypto')
+ const { TokenError } = require('./error')
+ 
+-const pemBlockMatcher = /^-----BEGIN [A-Z0-9 ]+-----/
+-
+ // A key ring holds more than one verification key so tokens signed with a key
+ // that is being rotated out are still accepted. An entry is either the PEM
+ // block of a public key or certificate, or the value of a shared secret.
+-function isPemEntry(value) {
+-  if (typeof value !== 'string') {
+-    return false
+-  }
+-
+-  return pemBlockMatcher.test(value.trim())
+-}
+-
+ function createKeyRingVerifier(createVerifier, options) {
+   const { keyRing, ...rest } = options
+ 
+@@ -27,14 +16,9 @@ function createKeyRingVerifier(createVerifier, options) {
+       )
+     }
+ 
+-    const base = { ...rest, key: entry }
+-
+-    if (isPemEntry(entry) || rest.algorithms) {
+-      return createVerifier(base)
+-    }
+-
+-    // A value that is not a PEM block is a shared secret, so only the HMAC algorithms apply.
+-    return createVerifier({ ...base, algorithms: hsAlgorithms })
++    // Whether an entry is a shared secret or an asymmetric key is decided by the
++    // key detection shared with the single-key verifier, never by the entry's spelling.
++    return createVerifier({ ...rest, key: entry })
+   })
+ 
+   return function verifyWithKeyRing(token, callback) {
+@@ -60,4 +44,4 @@ function createKeyRingVerifier(createVerifier, options) {
+   }
+ }
+ 
+-module.exports = { createKeyRingVerifier, isPemEntry }
++module.exports = { createKeyRingVerifier }

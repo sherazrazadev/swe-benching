@@ -1,0 +1,53 @@
+diff -ruN a/src/Sanitizer.php b/src/Sanitizer.php
+--- a/src/Sanitizer.php	2026-10-28 03:40:05.539787101 +0000
++++ b/src/Sanitizer.php	2026-10-28 03:49:19.596773185 +0000
+@@ -94,9 +94,26 @@
+ 
+     protected function parse(string $html): DOMDocumentFragment
+     {
++        // complete documents are parsed as documents so that their structure is kept
++        if (preg_match('#^\s*<!doctype\b#i', $html) === 1) {
++            return $this->parseDocument($html);
++        }
+         return $this->parser->parseFragment($html);
+     }
+ 
++    protected function parseDocument(string $html): DOMDocumentFragment
++    {
++        $document = $this->parser->parse($html);
++        $fragment = $document->createDocumentFragment();
++        $body = $document->getElementsByTagName('body')->item(0) ?? $document->documentElement;
++        if ($body !== null) {
++            foreach (iterator_to_array($body->childNodes) as $child) {
++                $fragment->appendChild($document->importNode($child, true));
++            }
++        }
++        return $fragment;
++    }
++
+     protected function handle(DOMNode $domNode, ?InitiatorInterface $initiator = null): DOMNode
+     {
+         $this->context = new Context($this->parser, $initiator);
+diff -ruN a/src/Serializer/Rules.php b/src/Serializer/Rules.php
+--- a/src/Serializer/Rules.php	2026-10-28 03:40:05.539787101 +0000
++++ b/src/Serializer/Rules.php	2026-10-28 03:49:19.596616213 +0000
+@@ -204,11 +204,18 @@
+         return $tag instanceof Behavior\Tag && $tag->shallAllowInsecureRawText();
+     }
+ 
++    /**
++     * Elements that are written as raw text when the behavior allows it.
++     * The upstream element table does not mark all of them as raw text.
++     */
++    protected const RAW_TEXT_ELEMENTS = ['xmp'];
++
+     protected function isRawText(?DOMNode $domNode): bool
+     {
+         return $domNode !== null
+             && !empty($domNode->tagName)
+-            && Elements::isA($domNode->localName, Elements::TEXT_RAW);
++            && (Elements::isA($domNode->localName, Elements::TEXT_RAW)
++                || in_array(strtolower((string)$domNode->localName), self::RAW_TEXT_ELEMENTS, true));
+     }
+ 
+     protected function isVoid(?DOMNode $domNode): bool

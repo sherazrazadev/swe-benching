@@ -1,0 +1,70 @@
+diff -ruN a/src/Serializer/Rules.php b/src/Serializer/Rules.php
+--- a/src/Serializer/Rules.php	2026-10-28 03:49:19.596616213 +0000
++++ b/src/Serializer/Rules.php	2026-10-28 03:49:36.714505411 +0000
+@@ -154,9 +154,8 @@
+         if (!$domNode instanceof DOMNode) {
+             return;
+         }
+-        // @todo if allowed as text raw element
+         $parentDomNode = $domNode->parentNode ?? null;
+-        if (!$this->isRawText($parentDomNode) || !$this->shallAllowInsecureRawText($parentDomNode)) {
++        if (!$this->shallAllowInsecureRawText($parentDomNode)) {
+             $this->wr($this->enc($domNode->data));
+             return;
+         }
+@@ -200,22 +199,27 @@
+         if ($domNode === null || !$this->behavior instanceof Behavior || !$this->isRawText($domNode)) {
+             return false;
+         }
++        // allowing raw-text in elements nested in `<noscript>` is denied per default
++        if ($this->hasAncestorWithName($domNode, 'noscript')) {
++            return false;
++        }
++        // browsers do not use raw-text parsing for elements in foreign content
++        // (`<svg>`, `<math>`) or in a `<select>` insertion mode
++        if ($this->hasAncestorWithName($domNode, 'svg')
++            || $this->hasAncestorWithName($domNode, 'math')
++            || $this->hasAncestorWithName($domNode, 'select')
++        ) {
++            return false;
++        }
+         $tag = $this->behavior->getTag($domNode->nodeName);
+         return $tag instanceof Behavior\Tag && $tag->shallAllowInsecureRawText();
+     }
+ 
+-    /**
+-     * Elements that are written as raw text when the behavior allows it.
+-     * The upstream element table does not mark all of them as raw text.
+-     */
+-    protected const RAW_TEXT_ELEMENTS = ['xmp'];
+-
+     protected function isRawText(?DOMNode $domNode): bool
+     {
+         return $domNode !== null
+             && !empty($domNode->tagName)
+-            && (Elements::isA($domNode->localName, Elements::TEXT_RAW)
+-                || in_array(strtolower((string)$domNode->localName), self::RAW_TEXT_ELEMENTS, true));
++            && Elements::isA($domNode->localName, Elements::TEXT_RAW);
+     }
+ 
+     protected function isVoid(?DOMNode $domNode): bool
+@@ -224,4 +228,19 @@
+             && !empty($domNode->tagName)
+             && Elements::isA($domNode->localName, Elements::VOID_TAG);
+     }
++
++    protected function hasAncestorWithName(?DOMNode $domNode, string $ancestorName): bool
++    {
++        if (!$domNode instanceof DOMNode) {
++            return false;
++        }
++        $ancestor = $domNode->parentNode;
++        while ($ancestor instanceof DOMNode) {
++            if ($ancestor->localName === $ancestorName) {
++                return true;
++            }
++            $ancestor = $ancestor->parentNode;
++        }
++        return false;
++    }
+ }

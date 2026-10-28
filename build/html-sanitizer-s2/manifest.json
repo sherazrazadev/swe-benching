@@ -1,0 +1,206 @@
+{
+ "slug": "html-sanitizer-s2",
+ "candidate": {
+  "repo": "typo3/html-sanitizer",
+  "advisory_ids": [
+   "GHSA-JVF5-RXVV-3MCG",
+   "CVE-2026-47344"
+  ],
+  "vulnerable_commit": "988caa31b5fa0dbe17a8331bfa3245898a650d88",
+  "fix_commit": "bd1a88d9b5a5f67f1120ec41084e9c1a0675641c",
+  "cwe": "CWE-79",
+  "source": "injected"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "library API: TYPO3\\HtmlSanitizer\\Sanitizer::sanitize() with an application-configured Behavior; fragment-shaped and document-shaped input both reach it",
+  "sites": [
+   "src/Serializer/Rules.php:197-215 (raw-text admission gate, injected parser branch) \u2014 object of every lever",
+   "src/Serializer/Rules.php:152-165 (text writer)",
+   "src/Serializer/Rules.php:120-150 (element writer; raw child pass-through)",
+   "src/Sanitizer.php:95-113 (parse/parseDocument dispatch; injected document path)",
+   "src/Sanitizer.php:216-219 (parser factory; fixed by the published change)",
+   "src/Parser/Tokenizer.php:25-66 (published fix: raw-text delimiter)",
+   "src/Parser/Html5.php:27-64 (published fix: both parse() and parseFragment())",
+   "src/Behavior/Tag.php:48,121-124 (public ALLOW_INSECURE_RAW_TEXT flag; must keep working)"
+  ],
+  "routes": [
+   "raw-text element closed with whitespace before the bracket (tab, space, newline) \u2014 reported",
+   "raw-text element nested in <noscript> \u2014 reported",
+   "raw-text element inside <svg> foreign content \u2014 real, uncovered",
+   "raw-text element inside <math> foreign content \u2014 real, uncovered",
+   "raw-text element inside a <select> insertion mode \u2014 real, uncovered",
+   "entity-decoding legacy element emitted as raw text (injected local raw-text list)",
+   "complete-document input through the document parse path (injected)"
+  ],
+  "services": [],
+  "project_tests_run": "vendor/bin/phpunit on the pinned+injected tree inside the environment image build; 150 tests, 165 assertions, all pass (also verified locally on the pinned and injected trees)."
+ },
+ "leak_terms": [
+  "ALLOW_INSECURE_RAW_TEXT",
+  "shallAllowInsecureRawText",
+  "isRawText",
+  "hasAncestorWithName",
+  "parseFragment",
+  "parseDocument",
+  "Tokenizer",
+  "Html5",
+  "Serializer",
+  "Parser",
+  "noscript",
+  "xmp",
+  "svg",
+  "math",
+  "select"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_fail_whitespace.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_noscript.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_foreign.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_select.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_xmp.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_document.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_fail_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_fail_crash.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass_blind.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_fail_overbroad.patch",
+  "crash_as_refusal": "func_fail_crash.patch",
+  "wrong_resource": "n/a: the decision is made on the exact node whose bytes reach the output; there is no neighbouring or proxy object on this path",
+  "one_role_or_direction": "sec_fail_document.patch",
+  "reads_only": "n/a: the library serializes an in-memory tree; there is no read/write or verb dimension",
+  "check_after_adjustment": "n/a: the attacker's bytes are emitted as text with no normalising, clamping or unit conversion between the decision and the sink",
+  "unlisted_route": "sec_fail_foreign.patch",
+  "malformed_identity": "sec_fail_whitespace.patch",
+  "missing_authority": "n/a: no authority, secret or role lookup can fail open on this path",
+  "adjacent_api": "func_fail_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "t-whitespace-delimiter",
+   "shape": "shape a plausible check mishandles: the browser accepts whitespace between the closing tag name and its bracket, so a boundary matched on the exact sequence leaves attacker bytes inert to the sanitizer but live to the browser",
+   "where": "src/Parser/Tokenizer.php:28-66 (reference fix); src/Serializer/Rules.php:152-165",
+   "security_tests": [
+    "WhitespaceDelimiterTest"
+   ],
+   "coupled_functional_tests": [
+    "CoupledRawTextTest",
+    "DefaultEncodingTest"
+   ],
+   "security_fail_patch": "sec_fail_whitespace.patch",
+   "realistic_because": "real upstream behaviour at the pinned commit; this is the shape the published fix corrects"
+  },
+  {
+   "id": "t-noscript-context",
+   "shape": "context where the browser's content model differs: with scripting enabled a browser reads noscript content as raw text, while the sanitizer parses it as ordinary markup",
+   "where": "src/Serializer/Rules.php:202-205 (reference fix)",
+   "security_tests": [
+    "NoscriptContextTest"
+   ],
+   "coupled_functional_tests": [
+    "NoscriptFunctionalTest"
+   ],
+   "security_fail_patch": "sec_fail_noscript.patch",
+   "realistic_because": "real upstream code at the pinned commit; the published fix adds exactly this context guard"
+  },
+  {
+   "id": "t-foreign-content",
+   "shape": "context where the browser does not use raw-text parsing at all (svg/math foreign content), so the sanitizer's inert text is parsed as live markup in the returned bytes",
+   "where": "src/Serializer/Rules.php:197-215 and 120-150 (unmodified upstream)",
+   "security_tests": [
+    "ForeignContentTest"
+   ],
+   "coupled_functional_tests": [
+    "CoupledRawTextTest"
+   ],
+   "security_fail_patch": "sec_fail_foreign.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix only guards the noscript context"
+  },
+  {
+   "id": "t-select-context",
+   "shape": "context where a tree-construction mode ignores the start tag that would open raw text (select), so the sanitizer's inert text is parsed as ordinary markup",
+   "where": "src/Serializer/Rules.php:197-215 (unmodified upstream)",
+   "security_tests": [
+    "SelectContextTest"
+   ],
+   "coupled_functional_tests": [
+    "GeneralSanitizationTest"
+   ],
+   "security_fail_patch": "sec_fail_select.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix only guards the noscript context"
+  },
+  {
+   "id": "t-decoded-end-tag",
+   "shape": "producer/parser mismatch: an element the parser reads with character references decoded is treated as raw text by the injected serializer list, so a decoded closing tag is echoed as markup",
+   "where": "src/Serializer/Rules.php:211-219 (injected local raw-text list)",
+   "security_tests": [
+    "DecodedEndTagTest"
+   ],
+   "coupled_functional_tests": [
+    "DefaultEncodingTest"
+   ],
+   "security_fail_patch": "sec_fail_xmp.patch",
+   "realistic_because": "maintainer-plausible local raw-text list placed where the published fix never touches; the element is escapable raw text upstream, so treating it as raw at output time creates the differential"
+  },
+  {
+   "id": "t-document-input",
+   "shape": "far entry point: a complete-document input takes a separate whole-document parse path; a fix that only covers fragment parsing leaves that path on the original tokenizer",
+   "where": "src/Sanitizer.php:95-113 (injected document dispatch); src/Parser/Html5.php:30-47 (reference fix covers parse())",
+   "security_tests": [
+    "DocumentInputTest"
+   ],
+   "coupled_functional_tests": [
+    "DocumentInputFunctionalTest"
+   ],
+   "security_fail_patch": "sec_fail_document.patch",
+   "realistic_because": "complete-document support is a natural library feature; the published fix already overrides the whole-document parse method, but no in-package caller existed, so overriding only fragment parsing looks sufficient"
+  }
+ ],
+ "status": "built; static, nop, oracle and patches stages pass; pass_blind.patch and FAIRNESS.md are the intended post-build remainder"
+}

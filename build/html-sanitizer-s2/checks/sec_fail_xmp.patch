@@ -1,0 +1,226 @@
+diff -ruN a/src/Parser/Html5.php b/src/Parser/Html5.php
+--- a/src/Parser/Html5.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/Parser/Html5.php	2026-10-28 03:49:23.808063974 +0000
+@@ -0,0 +1,65 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 project.
++ *
++ * It is free software; you can redistribute it and/or modify it under the terms
++ * of the MIT License (MIT). For the full copyright and license information,
++ * please read the LICENSE file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\HtmlSanitizer\Parser;
++
++use DOMDocument;
++use DOMDocumentFragment;
++use Masterminds\HTML5 as MastermindsHTML5;
++use Masterminds\HTML5\Parser\DOMTreeBuilder;
++use Masterminds\HTML5\Parser\Scanner;
++
++/**
++ * Extends the Masterminds HTML5 parser to substitute the local Tokenizer
++ * subclass, which fixes raw-text end-tag handling for whitespace variants.
++ */
++class Html5 extends MastermindsHTML5
++{
++    #[\Override]
++    public function parse($input, array $options = []): DOMDocument
++    {
++        $this->errors = [];
++        $options = array_merge($this->getOptions(), $options);
++        $events = new DOMTreeBuilder(false, $options);
++        $scanner = new Scanner($input, !empty($options['encoding']) ? $options['encoding'] : 'UTF-8');
++        $parser = new Tokenizer(
++            $scanner,
++            $events,
++            !empty($options['xmlNamespaces']) ? Tokenizer::CONFORMANT_XML : Tokenizer::CONFORMANT_HTML
++        );
++
++        $parser->parse();
++        $this->errors = $events->getErrors();
++
++        return $events->document();
++    }
++
++    #[\Override]
++    public function parseFragment($input, array $options = []): DOMDocumentFragment
++    {
++        $options = array_merge($this->getOptions(), $options);
++        $events = new DOMTreeBuilder(true, $options);
++        $scanner = new Scanner($input, !empty($options['encoding']) ? $options['encoding'] : 'UTF-8');
++        $parser = new Tokenizer(
++            $scanner,
++            $events,
++            !empty($options['xmlNamespaces']) ? Tokenizer::CONFORMANT_XML : Tokenizer::CONFORMANT_HTML
++        );
++
++        $parser->parse();
++        $this->errors = $events->getErrors();
++
++        return $events->fragment();
++    }
++}
+diff -ruN a/src/Parser/Tokenizer.php b/src/Parser/Tokenizer.php
+--- a/src/Parser/Tokenizer.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/Parser/Tokenizer.php	2026-10-28 03:49:23.808127743 +0000
+@@ -0,0 +1,69 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 project.
++ *
++ * It is free software; you can redistribute it and/or modify it under the terms
++ * of the MIT License (MIT). For the full copyright and license information,
++ * please read the LICENSE file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\HtmlSanitizer\Parser;
++
++use Masterminds\HTML5\Elements;
++use Masterminds\HTML5\Parser\Tokenizer as MastermindsTokenizer;
++
++/**
++ * Extends the Masterminds tokenizer to fix rawText() so that it recognises
++ * whitespace-variant closing tags (e.g. </style\t>) as valid end tags per
++ * HTML5 spec § 8.2.6.1, aligning it with the existing rcdata() behaviour.
++ */
++class Tokenizer extends MastermindsTokenizer
++{
++    #[\Override]
++    protected function rawText($tok): bool
++    {
++        if ($this->untilTag === null) {
++            return $this->text($tok);
++        }
++
++        // Search for `'</' . $untilTag` without the trailing '>' so that
++        // optional whitespace before '>' is handled correctly, matching
++        // the behaviour of rcdata() and the HTML5 spec (§ 8.2.6.1).
++        // Entity references are NOT decoded in raw text (unlike rcdata).
++        $sequence = '</' . $this->untilTag;
++        $txt = '';
++
++        $caseSensitive = !Elements::isHtml5Element($this->untilTag);
++        while ($tok !== false &&
++            ($tok !== '<' || !$this->scanner->sequenceMatches($sequence, $caseSensitive))
++        ) {
++            $txt .= $tok;
++            $tok = $this->scanner->next();
++        }
++
++        if ($tok === false) {
++            $this->parseError('Unexpected EOF during raw text read.');
++            $this->events->text($txt);
++            $this->setTextMode(0);
++            return false;
++        }
++
++        $len = strlen($sequence);
++        $this->scanner->consume($len);
++        $len += $this->scanner->whitespace();
++        if ($this->scanner->current() !== '>') {
++            $this->parseError('Unclosed raw text end tag');
++        }
++
++        $this->scanner->unconsume($len);
++        $this->events->text($txt);
++        $this->setTextMode(0);
++
++        return $this->endTag();
++    }
++}
+diff -ruN a/src/Sanitizer.php b/src/Sanitizer.php
+--- a/src/Sanitizer.php	2026-10-28 03:49:19.596773185 +0000
++++ b/src/Sanitizer.php	2026-10-28 03:49:23.808127743 +0000
+@@ -17,7 +17,7 @@
+ use DOMDocumentFragment;
+ use DOMNode;
+ use DOMNodeList;
+-use Masterminds\HTML5;
++use TYPO3\HtmlSanitizer\Parser\Html5;
+ use TYPO3\HtmlSanitizer\Serializer\Rules;
+ use TYPO3\HtmlSanitizer\Serializer\RulesInterface;
+ use TYPO3\HtmlSanitizer\Visitor\VisitorInterface;
+@@ -213,8 +213,8 @@
+         return fclose($rules->getStream());
+     }
+ 
+-    protected function createParser(): HTML5
++    protected function createParser(): Html5
+     {
+-        return new HTML5(self::mastermindsDefaultOptions);
++        return new Html5(self::mastermindsDefaultOptions);
+     }
+ }
+diff -ruN a/src/Serializer/Rules.php b/src/Serializer/Rules.php
+--- a/src/Serializer/Rules.php	2026-10-28 03:49:19.596616213 +0000
++++ b/src/Serializer/Rules.php	2026-10-28 03:53:20.717174088 +0000
+@@ -154,9 +154,8 @@
+         if (!$domNode instanceof DOMNode) {
+             return;
+         }
+-        // @todo if allowed as text raw element
+         $parentDomNode = $domNode->parentNode ?? null;
+-        if (!$this->isRawText($parentDomNode) || !$this->shallAllowInsecureRawText($parentDomNode)) {
++        if (!$this->shallAllowInsecureRawText($parentDomNode)) {
+             $this->wr($this->enc($domNode->data));
+             return;
+         }
+@@ -200,14 +199,22 @@
+         if ($domNode === null || !$this->behavior instanceof Behavior || !$this->isRawText($domNode)) {
+             return false;
+         }
++        // allowing raw-text in elements nested in `<noscript>` is denied per default
++        if ($this->hasAncestorWithName($domNode, 'noscript')) {
++            return false;
++        }
++        // browsers do not use raw-text parsing for elements in foreign content
++        // (`<svg>`, `<math>`) or in a `<select>` insertion mode
++        if ($this->hasAncestorWithName($domNode, 'svg')
++            || $this->hasAncestorWithName($domNode, 'math')
++            || $this->hasAncestorWithName($domNode, 'select')
++        ) {
++            return false;
++        }
+         $tag = $this->behavior->getTag($domNode->nodeName);
+         return $tag instanceof Behavior\Tag && $tag->shallAllowInsecureRawText();
+     }
+ 
+-    /**
+-     * Elements that are written as raw text when the behavior allows it.
+-     * The upstream element table does not mark all of them as raw text.
+-     */
+     protected const RAW_TEXT_ELEMENTS = ['xmp'];
+ 
+     protected function isRawText(?DOMNode $domNode): bool
+@@ -224,4 +231,19 @@
+             && !empty($domNode->tagName)
+             && Elements::isA($domNode->localName, Elements::VOID_TAG);
+     }
++
++    protected function hasAncestorWithName(?DOMNode $domNode, string $ancestorName): bool
++    {
++        if (!$domNode instanceof DOMNode) {
++            return false;
++        }
++        $ancestor = $domNode->parentNode;
++        while ($ancestor instanceof DOMNode) {
++            if ($ancestor->localName === $ancestorName) {
++                return true;
++            }
++            $ancestor = $ancestor->parentNode;
++        }
++        return false;
++    }
+ }

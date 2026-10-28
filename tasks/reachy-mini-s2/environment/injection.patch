@@ -1,0 +1,123 @@
+diff --git a/src/reachy_mini/daemon/app/main.py b/src/reachy_mini/daemon/app/main.py
+index c65655c..a653b07 100644
+--- a/src/reachy_mini/daemon/app/main.py
++++ b/src/reachy_mini/daemon/app/main.py
+@@ -36,6 +36,7 @@ from reachy_mini.daemon.app.routers import (
+     motors,
+     move,
+     sdk_ws,
++    sound_packs,
+     state,
+     volume,
+ )
+@@ -242,6 +243,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
+     router.include_router(hf_auth.router)
+     router.include_router(kinematics.router)
+     router.include_router(media.router)
++    router.include_router(sound_packs.router)
+     router.include_router(motors.router)
+     router.include_router(move.router)
+     router.include_router(state.router)
+diff --git a/src/reachy_mini/daemon/app/routers/sound_packs.py b/src/reachy_mini/daemon/app/routers/sound_packs.py
+new file mode 100644
+index 0000000..472c45c
+--- /dev/null
++++ b/src/reachy_mini/daemon/app/routers/sound_packs.py
+@@ -0,0 +1,97 @@
++"""Sound pack API routes.
++
++The dashboard's sound editor exports a set of sounds as one zip
++archive.  These endpoints install such a pack, or a group of files
++picked together, into the temporary sound directory used by single
++uploads, so the daemon can play every sound by name.
++"""
++
++import io
++import os
++import zipfile
++from pathlib import Path
++
++from fastapi import APIRouter, File, HTTPException, UploadFile
++
++from .media import SOUNDS_TMP_DIR
++
++router = APIRouter(prefix="/media/sounds")
++
++# A pack is a handful of sounds; refuse obviously oversized archives so
++# a malformed export cannot tie up the daemon.
++MAX_PACK_MEMBERS = 512
++
++
++def _entry_name(raw: str) -> str | None:
++    """Return the name a pack entry should be stored under."""
++    name = Path(raw).name
++    if not name or name in (".", ".."):
++        return None
++    return name
++
++
++@router.post("/packs/import")
++async def import_sound_pack(file: UploadFile = File(...)) -> dict:
++    """Install a zip archive of sound files.
++
++    Every file in the archive is written to the temporary sound
++    directory under its own name.  Directories in the archive are
++    skipped.
++
++    Returns:
++        JSON with the names of the imported files.
++
++    """
++    if not file.filename:
++        raise HTTPException(status_code=400, detail="Filename is required")
++    archive_name = Path(file.filename).name
++    if Path(archive_name).suffix.lower() != ".zip":
++        raise HTTPException(status_code=400, detail="A .zip sound pack is required")
++
++    data = await file.read()
++    try:
++        archive = zipfile.ZipFile(io.BytesIO(data))
++    except zipfile.BadZipFile as e:
++        raise HTTPException(status_code=400, detail="Invalid sound pack") from e
++
++    members = [info for info in archive.infolist() if not info.is_dir()]
++    if len(members) > MAX_PACK_MEMBERS:
++        raise HTTPException(status_code=400, detail="Sound pack has too many files")
++
++    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    imported: list[str] = []
++    for info in members:
++        name = _entry_name(info.filename)
++        if name is None:
++            continue
++        dest = os.path.join(SOUNDS_TMP_DIR, name)
++        with open(dest, "wb") as f:
++            f.write(archive.read(info))
++        imported.append(name)
++    return {"status": "ok", "files": imported}
++
++
++@router.post("/packs/bulk")
++async def upload_sound_pack(files: list[UploadFile] = File(...)) -> dict:
++    """Install several sound files uploaded together.
++
++    Each file is written to the temporary sound directory under its
++    own name, replacing an existing file of the same name.
++
++    Returns:
++        JSON with the names of the imported files.
++
++    """
++    os.makedirs(SOUNDS_TMP_DIR, exist_ok=True)
++    imported: list[str] = []
++    for upload in files:
++        if not upload.filename:
++            raise HTTPException(status_code=400, detail="Filename is required")
++        name = _entry_name(upload.filename)
++        if name is None:
++            raise HTTPException(status_code=400, detail="Invalid filename")
++        dest = os.path.join(SOUNDS_TMP_DIR, name)
++        with open(dest, "wb") as f:
++            f.write(await upload.read())
++        imported.append(name)
++    return {"status": "ok", "files": imported}

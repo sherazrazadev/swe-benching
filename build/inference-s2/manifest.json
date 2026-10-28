@@ -1,0 +1,196 @@
+{
+ "slug": "inference-s2",
+ "candidate": "6261",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-X2RJ-828P-HX9M",
+  "CVE-2026-61539",
+  "PYSEC-2026-3946"
+ ],
+ "repo": "https://github.com/xorbitsai/inference",
+ "vulnerable_commit": "4cefcaa1e63d7e29d26bcd4be96cb267da113871",
+ "fix_commit": "1b3d220f342ce68d34cec4586d9409d457dadc42",
+ "entry_point": "HTTP POST /v1/chat/completions with tools (after generation: ChatModelMixin._post_process_completion -> registered tool parser) and HTTP POST /v1/images/ocr with save_results (DeepSeekOCRModel.ocr -> coordinate parser)",
+ "track": "injected",
+ "verified": {
+  "entry_point": "Confirmed offline at the pinned+injected commit with no network, GPU or model weights. A completion text carrying an expression writes a marker through ChatModelMixin._post_process_completion (the post-generation function the chat route uses) for the llama3, gemma and minimax parsers and through the legacy ChatModelMixin._eval_tool_arguments dispatch; the image route's public DeepSeekOCRModel.ocr(image, save_results=True, save_dir=...) writes the same marker when the stubbed model reply carries it in its coordinate annotation. The REST OCR handler passes its JSON `kwargs` form field straight into that public call, so save_results/save_dir are reachable from HTTP. The tests supply the model reply; the fixation is the product's own parse of it.",
+  "sites": [
+   "xinference/model/llm/tool_parsers/llama3_tool_parser.py:46 (reported site, published-fix target)",
+   "xinference/model/llm/utils.py:753 (legacy family-dispatch second implementation, published-fix far site)",
+   "xinference/model/image/ocr/deepseek_ocr.py:231 (pattern-B uncovered route, unmodified upstream; fixed separately upstream later)",
+   "xinference/model/llm/tool_parsers/gemma_tool_parser.py:61 (injected sibling: restricted-builtins fallback)",
+   "xinference/model/llm/tool_parsers/minimax_tool_parser.py:56 (injected sibling: leaf parameter value)"
+  ],
+  "routes": [
+   "chat completion tool-call post-processing for the llama3 family (registered parser)",
+   "chat completion tool-call post-processing for the gemma family (registered parser, injected gap)",
+   "chat completion tool-call post-processing for the minimax family (registered parser, injected gap)",
+   "legacy family-dispatch API ChatModelMixin._eval_tool_arguments (published-fix second site)",
+   "image route: DeepSeekOCRModel.ocr(image, save_results=True, save_dir=...) -> extract_coordinates_and_label"
+  ],
+  "services": "none; the verifier runs offline and the project is imported from the restored /workspace through PYTHONPATH",
+  "project_tests": "xinference/model/llm/tool_parsers/tests (23 tests) and xinference/model/llm/tests/test_utils.py (7 tests) pass at the injected commit and again under the oracle: 30 passed locally, and they are run from pristine copies restored at grade time."
+ },
+ "leak_terms": [
+  "eval",
+  "literal_eval",
+  "ast.literal_eval",
+  "llama3",
+  "gemma",
+  "minimax",
+  "deepseek",
+  "ocr",
+  "tool_parser",
+  "tool_parsers",
+  "parser",
+  "coordinate",
+  "coordinates",
+  "bounding",
+  "det",
+  "visualization",
+  "visualize",
+  "utils",
+  "extract_tool_calls",
+  "_eval_llama3_chat_arguments",
+  "_eval_tool_arguments",
+  "_parse_arguments",
+  "_parse_param_value",
+  "_post_process_completion",
+  "deepseek_ocr"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-llama3-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-legacy.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-ocr.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-gemma.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-minimax.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-json-only.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-crash.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-adjacent.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "ff-crash.patch",
+  "wrong_resource": "n/a: the protected outcome is execution of model text, not a neighbouring resource or authority; there is nothing else to authorise instead.",
+  "one_role_or_direction": "n/a: the product has no role or direction dimension for this parse; every route is one-way from model text to data.",
+  "reads_only": "n/a: there is no read/write split; every route parses text rather than reading or writing a resource.",
+  "check_after_adjustment": "n/a: the attacker value is the completion text itself; no offset, clamp or unit conversion sits between it and the sink.",
+  "unlisted_route": "sf-llama3-only.patch",
+  "malformed_identity": "n/a: the input is model text, not a parsed identity whose alternative spelling could hide a target from a guard.",
+  "missing_authority": "n/a: the rule is unconditional; there is no external authority that could return nothing and make a guard fail open.",
+  "adjacent_api": "ff-adjacent.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_legacy_dispatch",
+   "lever": "published-fix second implementation; where-type",
+   "shape": "the legacy family-dispatch API evaluates the completion text (the published fix's other site), while every backend at the pinned commit uses the registered parser",
+   "where": "xinference/model/llm/utils.py:753",
+   "reason_to_dismiss": "legacy dead code at the pinned commit: no in-tree caller, so it looks unreachable and safe to leave",
+   "security_tests": [
+    "security/test_tool_call_execution.py::test_legacy_family_dispatch_does_not_execute"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_tool_call_parsing.py::test_legacy_dispatch_keeps_parsing_calls",
+    "functional/test_tool_call_parsing.py::test_python_literal_tool_call_binds"
+   ],
+   "security_fail_patch": "sf-no-legacy.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix changed this exact method"
+  },
+  {
+   "id": "T2_ocr_route",
+   "lever": "pattern-B route where the protection never existed; how-type",
+   "shape": "the image route's coordinate parser evaluates the OCR model's <|det|> text, reached through the public ocr(image, save_results=True, save_dir=...) call",
+   "where": "xinference/model/image/ocr/deepseek_ocr.py:231",
+   "reason_to_dismiss": "a different feature (bounding-box coordinates in a vision reply), not the chat tool-call path the advisory names",
+   "security_tests": [
+    "security/test_image_route_execution.py::test_ocr_annotation_text_is_not_executed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_image_route.py::test_ordinary_coordinates_render_and_save",
+    "functional/test_image_route.py::test_plain_ocr_text_without_annotations_still_returns"
+   ],
+   "security_fail_patch": "sf-no-ocr.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned commit (fixed separately upstream later, which confirms it was a real defect)"
+  },
+  {
+   "id": "T3_gemma_sandbox",
+   "lever": "injected sibling; how-type (restricted builtins are still executable)",
+   "shape": "a restricted-builtins eval fallback for non-JSON argument blocks; an object-traversal payload with no builtins available still runs through the registered gemma parser",
+   "where": "xinference/model/llm/tool_parsers/gemma_tool_parser.py:61",
+   "reason_to_dismiss": "the fallback removes __builtins__, so it looks like a sandboxed literal evaluator rather than code execution",
+   "security_tests": [
+    "security/test_sibling_parsers_execution.py::test_gemma_argument_text_is_not_executed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_tool_call_parsing.py::test_gemma_tool_call_binds",
+    "functional/test_tool_call_parsing.py::test_gemma_python_literal_arguments_bind"
+   ],
+   "security_fail_patch": "sf-no-gemma.patch",
+   "realistic_because": "injected: a plausible fallback a maintainer could add to the parser that already normalises unquoted keys; reachable through the same completion route"
+  },
+  {
+   "id": "T4_minimax_leaf_value",
+   "lever": "injected sibling; how-type (a local-looking leaf-value parse)",
+   "shape": "eval on a single leaf <parameter> value after json.loads fails; the check never inspects the value as code",
+   "where": "xinference/model/llm/tool_parsers/minimax_tool_parser.py:56",
+   "reason_to_dismiss": "it parses only one scalar parameter value and json.loads already handles real input, so it looks local and harmless",
+   "security_tests": [
+    "security/test_sibling_parsers_execution.py::test_minimax_parameter_value_is_not_executed"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_tool_call_parsing.py::test_minimax_tool_call_binds",
+    "functional/test_tool_call_parsing.py::test_minimax_python_literal_value_binds"
+   ],
+   "security_fail_patch": "sf-no-minimax.patch",
+   "realistic_because": "injected: a plausible literal fallback next to the existing per-value json.loads in the same parser; reachable through the same completion route"
+  }
+ ],
+ "status": "built; gate PASSED 2026-10-28 one stage at a time: static (clean; blind patch + FAIRNESS.md downstream), nop (8/8 security fail on the injected tree, 44/44 functional pass), oracle (3 runs, reward 1.0 each, identical), patches (all 11 declared checks behave as declared; blind produced downstream)."
+}

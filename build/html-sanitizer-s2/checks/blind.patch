@@ -1,0 +1,114 @@
+diff -ruN pristine/src/Serializer/Rules.php app/src/Serializer/Rules.php
+--- a/src/Serializer/Rules.php	2026-10-28 03:55:40.000000000 +0000
++++ b/src/Serializer/Rules.php	2026-10-28 04:05:53.094267531 +0000
+@@ -14,7 +14,6 @@
+ 
+ namespace TYPO3\HtmlSanitizer\Serializer;
+ 
+-use DOMCharacterData;
+ use DOMElement;
+ use DOMNode;
+ use Masterminds\HTML5\Elements;
+@@ -131,17 +130,9 @@
+         }
+ 
+         $this->openTag($domNode);
+-        if ($this->shallAllowInsecureRawText($domNode)) {
+-            // the potentially insecure case, not encoding node data
+-            foreach ($domNode->childNodes as $child) {
+-                if ($child instanceof DOMCharacterData) {
+-                    $this->wr($child->data);
+-                } elseif ($child instanceof DOMElement) {
+-                    $this->element($child);
+-                }
+-            }
+-        } elseif ($domNode->hasChildNodes()) {
+-            // enforce encoding for those raw text elements (different to original implementation)
++        if ($domNode->hasChildNodes()) {
++            // text() decides for every node whether its data may be written
++            // verbatim; no raw-text specific writing is done here
+             $this->traverser->children($domNode->childNodes);
+         }
+         if (!$this->isVoid($domNode)) {
+@@ -154,14 +145,15 @@
+         if (!$domNode instanceof DOMNode) {
+             return;
+         }
+-        // @todo if allowed as text raw element
+         $parentDomNode = $domNode->parentNode ?? null;
+         if (!$this->isRawText($parentDomNode) || !$this->shallAllowInsecureRawText($parentDomNode)) {
+             $this->wr($this->enc($domNode->data));
+             return;
+         }
+-        // the potentially insecure case, not encoding node data
+-        $this->wr($domNode->data);
++        // the potentially insecure case: the data is written verbatim, therefore
++        // sequences that a browser could read as the end of the enclosing
++        // element have to be neutralised first
++        $this->wr($this->secureRawTextData($parentDomNode, (string)$domNode->data));
+     }
+ 
+     protected function enc($text, $attribute = false): string
+@@ -200,11 +192,62 @@
+         if ($domNode === null || !$this->behavior instanceof Behavior || !$this->isRawText($domNode)) {
+             return false;
+         }
++        // A browser only applies raw-text tokenization to these elements when
++        // their surroundings allow it. Inside these ancestors it does not, so
++        // writing the data verbatim would expose markup that the sanitizer
++        // treated as inert text.
++        foreach (self::NON_RAW_TEXT_CONTEXTS as $ancestorName) {
++            if ($this->hasAncestorNamed($domNode, $ancestorName)) {
++                return false;
++            }
++        }
+         $tag = $this->behavior->getTag($domNode->nodeName);
+         return $tag instanceof Behavior\Tag && $tag->shallAllowInsecureRawText();
+     }
+ 
+     /**
++     * Ancestors whose content is not tokenized with the raw-text rules that
++     * were applied while parsing - `<noscript>` is raw text for a browser with
++     * scripting enabled (so the nested element never opens), while `<svg>`,
++     * `<math>` and `<select>` do not use raw text for the nested element at all.
++     */
++    protected const NON_RAW_TEXT_CONTEXTS = ['noscript', 'svg', 'math', 'select'];
++
++    protected function hasAncestorNamed(DOMNode $domNode, string $ancestorName): bool
++    {
++        $ancestor = $domNode->parentNode;
++        while ($ancestor instanceof DOMNode) {
++            if (strtolower((string)$ancestor->localName) === $ancestorName) {
++                return true;
++            }
++            $ancestor = $ancestor->parentNode;
++        }
++        return false;
++    }
++
++    /**
++     * Decide how the text of a raw-text element may be written.
++     *
++     * The parser ends a raw-text element only at the exact `</name>` byte
++     * sequence, whereas a browser also accepts whitespace, `/` or `>` after
++     * the tag name. If the data holds such a sequence, both readings disagree:
++     * bytes the sanitizer considered inert were read as a real end tag by the
++     * browser, so everything following them has to be encoded as text.
++     */
++    protected function secureRawTextData(DOMNode $domNode, string $data): string
++    {
++        $name = strtolower((string)($domNode->localName ?: $domNode->nodeName));
++        if ($name === '') {
++            return $this->enc($data);
++        }
++        $endTag = '#</' . preg_quote($name, '#') . '(?=[\t\n\f\r />]|\z)#i';
++        if (preg_match($endTag, $data) === 1) {
++            return $this->enc($data);
++        }
++        return $data;
++    }
++
++    /**
+      * Elements that are written as raw text when the behavior allows it.
+      * The upstream element table does not mark all of them as raw text.
+      */
