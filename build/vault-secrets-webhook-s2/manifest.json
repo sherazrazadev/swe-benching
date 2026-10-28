@@ -1,0 +1,220 @@
+{
+ "slug": "vault-secrets-webhook-s2",
+ "candidate": {
+  "repo": "bank-vaults/vault-secrets-webhook",
+  "advisory_ids": [
+   "GHSA-R2V3-8GWF-7GHM",
+   "CVE-2026-54725",
+   "GO-2026-6160"
+  ],
+  "pinned_commit": "71cfbb8907b2b7197e892570975428a447e615be",
+  "fix_commits": [
+   "76db45976fee0f54cafd94dffa425e6b542f65a0"
+  ],
+  "cwe": "CWE-918 (also CWE-295)",
+  "entry_id": "19004"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The webhook's real admission entry point MutatingWebhook.VaultSecretsMutator (main.go handlers /pods, /secrets, /configmaps, /objects) driven with ordinary corev1 Secret/ConfigMap/Pod and unstructured.Unstructured objects, a fake clientset holding the ServiceAccount and its token Secret, and local httptest peers (plain and self-signed TLS). Nothing below the admission entry point is stubbed.",
+  "variants": [
+   "L1 published landing site: an object annotation supplies the Vault address; the webhook records no provenance, mints a token for the object-named ServiceAccount and dials the object address (2 requests to the local peer on the pinned code).",
+   "L1 shapes: userinfo-bearing, query-string and fragment forms of the same local address are also accepted on the pinned code.",
+   "L2 published far site: an object annotation sets skip-verify and the client accepts a self-signed TLS Vault peer.",
+   "L3 Pattern B, protection never existed: an object registry-skip-verify annotation sets InsecureSkipVerify on the webhook's registry transport; the pinned webhook serves /v2/ from a self-signed local registry.",
+   "L4 injected sibling: a best-effort Vault health probe in the pod path dials the object address and honours the object skip-verify (GET /v1/sys/health reaches the local peer)."
+  ],
+  "services": [],
+  "project_tests_run": "pkg/webhook (TestNewVaultClientMetrics, Test_mutatingWebhook_mutatePod, Test_mutatingWebhook_mutateContainers, TestIsAllowedToCache) and pkg/common (TestValidateObjectAddr, TestSplitAndTrim, TestResolveObjectSkipVerify) are restored pristine at grading time and pass at the pinned+injected commit, on the oracle and on every patch. configmap_test.go is build-tagged integration and is restored but not run. The project's tests pass locally on the host (Go 1.26.3) in every state.",
+  "hidden_counts": "8 security test functions (11 testcases including the 3 address-shape subtests) all fail on pinned+injected and pass on the oracle; 5 hidden functional tests pass on both, plus the project's own affected tests.",
+  "sites": [
+   "pkg/webhook/webhook.go:196-216 newVaultClient (address, TLS config; reached from secret.go, configmap.go, object.go)",
+   "pkg/webhook/config.go:107-111 vault-addr provenance; config.go:147-151 vault-skip-verify; config.go:283-287 registry-skip-verify",
+   "pkg/webhook/registry.go:162-196 getImageConfig -> registry.go:185-188 (registry TLS transport, reached from pod.go:279)",
+   "pkg/webhook/pod.go probeVaultEndpoint (injected; called from MutatePod for agent/ct pods)"
+  ],
+  "routes": [
+   "/secrets with an object address and object-named ServiceAccount -> attacker peer",
+   "/configmaps with an object address -> attacker peer",
+   "/objects with an object address -> attacker peer",
+   "/secrets with an object skip-verify -> self-signed TLS peer",
+   "/pods with an object registry-skip-verify -> self-signed TLS registry",
+   "/pods with an agent annotation and an object address/skip-verify -> health probe to the peer"
+  ]
+ },
+ "leak_terms": [
+  "GHSA-R2V3-8GWF-7GHM",
+  "CVE-2026-54725",
+  "GO-2026-6160",
+  "71cfbb8907b2b7197e892570975428a447e615be",
+  "76db45976fee0f54cafd94dffa425e6b542f65a0",
+  "newVaultClient",
+  "vaultAddrPolicy",
+  "assertObjectAddr",
+  "probeVaultEndpoint",
+  "ValidateObjectAddr",
+  "ResolveObjectSkipVerify",
+  "AddrFromObject",
+  "VaultConfig",
+  "parseVaultConfig",
+  "SetConfigDefaults",
+  "config.go",
+  "webhook.go",
+  "pod.go",
+  "registry.go",
+  "addr.go",
+  "policy.go",
+  "pkg/webhook",
+  "pkg/common",
+  "bank-vaults",
+  "vault_addr",
+  "vault_skip_verify",
+  "vault_addr_allowlist",
+  "vault_allow_object_skip_verify",
+  "vault_allow_private_addr",
+  "registry_skip_verify",
+  "registry_allow_object_skip_verify",
+  "vault-skip-verify",
+  "registry-skip-verify",
+  "vault-agent",
+  "registry",
+  "probe",
+  "allowlist",
+  "skip-verify",
+  "injection",
+  "injected",
+  "SSRF",
+  "CWE",
+  "health check"
+ ],
+ "patch_checks": [
+  {
+   "patch": "s_fail_addr.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "s_fail_skipverify.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "s_fail_registry.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "s_fail_probe.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "s_fail_failopen.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "p_fail_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "p_pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "p_pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "p_blind.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "p_fail_refuse_all.patch",
+  "crash_as_refusal": "n/a: a panic escaping the mutator aborts the test process instead of yielding a client error, so it can never pass the security tests and needs no separate patch",
+  "wrong_resource": "n/a: the protected resource is the connection destination itself; there is no neighbouring or proxy object whose authorization could be checked instead",
+  "one_role_or_direction": "n/a: the property has one direction (the webhook dials out) and no roles or peers; the tests vary transports, not principals",
+  "reads_only": "n/a: every affected path is a read/connect path; there is no write counterpart to leave unguarded",
+  "check_after_adjustment": "n/a: no normalising or adjusting step sits between the object value and the sink; any guard placed before the client is used passes, and a guard after the dial cannot undo the connection the tests observe",
+  "unlisted_route": "s_fail_registry.patch",
+  "malformed_identity": "n/a: no identity string is parsed; the address forms are parsed by the URL parser and by the guard itself",
+  "missing_authority": "s_fail_failopen.patch",
+  "adjacent_api": "n/a: the fix adds call sites and leaves the shared guard's documented contract unchanged; the restored project helper tests keep that contract fixed"
+ },
+ "traps": [
+  {
+   "id": "object_address_provenance",
+   "pattern": "A",
+   "shape": "the published landing site: an object-supplied address is trusted by the Vault client factory, which also mints and attaches a token for the object-named ServiceAccount; the fix needs provenance so the operator's own address stays trusted and the value that is only propagated to a workload stays untouched",
+   "where": "pkg/webhook/webhook.go:196-216 (newVaultClient) and pkg/webhook/config.go:107-111 (provenance)",
+   "reason_to_dismiss": "the address annotation is a documented feature that must keep working, and a check in the shared loader or an unconditional check rejects the operator's own trusted address and the value that is only copied into the workload",
+   "security_tests": [
+    "security/zz_hidden_security_test.go::TestSec_ObjectAddressNotUsedForSecret",
+    "security/zz_hidden_security_test.go::TestSec_ObjectAddressNotUsedForConfigMap",
+    "security/zz_hidden_security_test.go::TestSec_ObjectAddressNotUsedForObject",
+    "security/zz_hidden_security_test.go::TestSec_ObjectAddressShapesNotUsed"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_hidden_functional_test.go::TestFunc_OperatorAddressTrusted",
+    "functional/zz_hidden_functional_test.go::TestFunc_PodAddressPropagated"
+   ],
+   "security_fail_patch": "s_fail_addr.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned commit; it is the published fix's landing point"
+  },
+  {
+   "id": "object_skip_verify",
+   "pattern": "A",
+   "shape": "a separate TLS-verification setting beside the address: the object-supplied skip flag is parsed straight into the client's TLS configuration",
+   "where": "pkg/webhook/config.go:147-151 feeding pkg/webhook/webhook.go:206",
+   "reason_to_dismiss": "the report is about the address; this is a separate documented TLS option and the client is constructed after the address is checked",
+   "security_tests": [
+    "security/zz_hidden_security_test.go::TestSec_ObjectSkipVerifyIgnored"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_hidden_functional_test.go::TestFunc_OperatorSkipVerifyHonoured"
+   ],
+   "security_fail_patch": "s_fail_skipverify.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned commit; the published fix also changes this branch"
+  },
+  {
+   "id": "registry_skip_verify",
+   "pattern": "B",
+   "shape": "route where the protection never existed: a second outbound transport (the image-registry fetch) applies an object-supplied skip-verify directly to its TLS configuration",
+   "where": "pkg/webhook/registry.go:185-188, reached from pkg/webhook/pod.go:279",
+   "reason_to_dismiss": "a separate documented feature for private registries with self-signed certificates: a different annotation, a different transport and a different destination from the Vault connection",
+   "security_tests": [
+    "security/zz_hidden_security_test.go::TestSec_RegistrySkipVerifyIgnored"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_hidden_functional_test.go::TestFunc_OperatorRegistrySkipVerifyHonoured"
+   ],
+   "security_fail_patch": "s_fail_registry.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned commit; the published fix never touches it and it is still ungated at current upstream"
+  },
+  {
+   "id": "pod_agent_probe",
+   "pattern": "injected",
+   "shape": "second implementation: a best-effort Vault health probe before agent injection builds its own client from the object-supplied address and skip-verify",
+   "where": "pkg/webhook/pod.go probeVaultEndpoint, added by environment/injection.patch and called from MutatePod",
+   "reason_to_dismiss": "the pod path is believed to only propagate the address to the workload; the webhook is not expected to dial it at all",
+   "security_tests": [
+    "security/zz_hidden_security_test.go::TestSec_PodAgentProbeAddressNotUsed",
+    "security/zz_hidden_security_test.go::TestSec_PodAgentProbeSkipVerifyIgnored"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_hidden_functional_test.go::TestFunc_PodAgentStillMutates",
+    "functional/zz_hidden_functional_test.go::TestFunc_PodAddressPropagated"
+   ],
+   "security_fail_patch": "s_fail_probe.patch",
+   "realistic_because": "plausible maintainer code: a best-effort reachability probe around agent injection that uses the same config the injected sidecar will use"
+  }
+ ],
+ "status": "built; gate static/nop/oracle/patches ALL PASS (2026-10-27)"
+}

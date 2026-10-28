@@ -1,0 +1,248 @@
+{
+ "slug": "aws-cli-s2",
+ "candidate": "screener-v2 entry 6085: GHSA-WFP6-F47H-HXC3 / CVE-2026-13769 / PYSEC-2026-3548 (aws/aws-cli); injected track",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "6c0f166e073dbaab812bc8cb26ad085f3e114c16 (parent of the first published fix e0799fde; 68811b5a follows it; 84f0ec6a is the release-branch sibling)",
+  "entry_points": [
+   "CLI subprocess: aws iam create-virtual-mfa-device --virtual-mfa-device-name X --outfile PATH --bootstrap-method Base32StringSeed|QRCodePNG (loopback IAM query endpoint)",
+   "CLI subprocess: aws deploy register --instance-name X --region us-east-1 (writes codedeploy.onpremises.yml in the working directory; loopback IAM + CodeDeploy endpoints)",
+   "CLI subprocess: aws codeartifact login --tool swift --domain D --repository R (rewrites an existing ~/.netrc; stub swift on PATH)",
+   "CLI subprocess: aws codeartifact login --tool twine --domain D --repository R (writes ~/.pypirc; loopback CodeArtifact REST endpoint)",
+   "CLI subprocess: aws configure set aws_secret_access_key|aws_session_token VALUE (rewrites or appends ~/.aws/credentials; no service call)",
+   "CLI subprocess: aws rds generate-db-auth-token --hostname H --port P --username U --outfile PATH (injected option; token generated locally)",
+   "in-process: awscli.clidriver for the chmod-failure contract (no network)"
+  ],
+  "sites": [
+   "awscli/customizations/iamvirtmfa.py:74 (landing, published e0799fde/68811b5a set)",
+   "awscli/customizations/codedeploy/register.py:182 (published 84f0ec6a)",
+   "awscli/customizations/codeartifact/login.py:186 (published e0799fde)",
+   "awscli/customizations/codeartifact/login.py:634 (published e0799fde)",
+   "awscli/customizations/configure/writer.py:110 and :137 (real uncovered route; not touched by the published fix)",
+   "awscli/customizations/rds.py (injected sibling gap: outfile option; not touched by the published fix)"
+  ],
+  "routes": [
+   "aws configure set aws_secret_access_key / aws_session_token on a pre-existing credentials file: rewrite ('w') branch and append ('a') branch both kept 0644 at pinned (confirmed by running the CLI)",
+   "aws rds generate-db-auth-token --outfile: plain open, 0644 at pinned (confirmed; injected code)",
+   "DROPPED aws eks update-kubeconfig pre-existing kubeconfig: real and reproduces (0644) but a kubeconfig written by this command carries an exec-credential command rather than a secret, so the general property would not cover it literally for every reading; dropped for fairness"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/functional/iam/test_create_virtual_mfa_device.py (5 pass)",
+   "tests/unit/customizations/codeartifact/test_adapter_login.py (113 pass)",
+   "tests/unit/customizations/configure/test_writer.py (24 pass)",
+   "tests/unit/customizations/configure/test_set.py (20 pass)",
+   "tests/unit/customizations/configure/test_configure.py (8 pass)",
+   "tests/unit/customizations/eks/test_kubeconfig.py (11 pass)",
+   "tests/unit/customizations/eks/test_update_kubeconfig.py (2 pass)",
+   "tests/functional/rds/test_generate_db_auth_token.py (5 pass)",
+   "188 pass total at pinned and on the oracle; tests/unit/customizations/codedeploy/test_register.py is intentionally not graded because it asserts the write goes through the module-level builtin open(), an implementation detail the published fix changes"
+  ],
+  "local_runs": "vulnerable injected tree: security 0/13, functional 19/19, project 188/188; oracle: security 13/13, functional 19/19, project 188/188; every security test fails on vulnerable and passes on the oracle"
+ },
+ "leak_terms": [
+  "iamvirtmfa.py",
+  "register.py",
+  "login.py",
+  "writer.py",
+  "configure.py",
+  "rds.py",
+  "iamvirtmfa",
+  "compat_open",
+  "access_permissions",
+  "fchmod",
+  "_save_file",
+  "_create_config",
+  "_update_netrc_entry",
+  "_create_netrc_file",
+  "ConfigFileWriter",
+  "update_config",
+  "_write_new_section",
+  "_create_file",
+  "_secure_file",
+  "secure",
+  ".netrc",
+  "netrc",
+  ".pypirc",
+  "pypirc",
+  "kubeconfig",
+  "codeartifact",
+  "codedeploy",
+  "deploy register",
+  "aws configure",
+  "configure set",
+  "update-kubeconfig",
+  "generate-db-auth-token",
+  "eks",
+  "outfile option"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-create-mode-only.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: every site passes 0o600 to open/os.open but never changes an existing file's mode; new-file security tests pass, all existing-file tests fail, functional all pass"
+  },
+  {
+   "patch": "sf-landing-only.patch",
+   "expect": "security_fail",
+   "note": "fixes only the report's example command; far sites and routes stay open"
+  },
+  {
+   "patch": "sf-no-deploy.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the CodeDeploy writer (A far site)"
+  },
+  {
+   "patch": "sf-no-codeartifact.patch",
+   "expect": "security_fail",
+   "note": "oracle minus both CodeArtifact login writers (A far sites)"
+  },
+  {
+   "patch": "sf-no-configure.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the shared credentials writer (B route)"
+  },
+  {
+   "patch": "sf-no-rds.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the injected token writer (injected sibling)"
+  },
+  {
+   "patch": "sf-wrong-resource.patch",
+   "expect": "security_fail",
+   "note": "oracle but the MFA writer changes the parent directory's mode instead of the file's"
+  },
+  {
+   "patch": "ff-refuse-loose.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: a shared outfile helper refuses to write when the destination already exists with group/other access, breaking legitimate overwrites"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus a defensive chmod inside the shared compat_open helper for every explicit-permission write"
+  },
+  {
+   "patch": "pass-alt-helper.patch",
+   "expect": "pass",
+   "note": "independent design: the shared compat_open helper applies the mode to existing files and every site routes its write through it"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-loose.patch",
+  "crash_as_refusal": "n/a: the correct behaviour is to write the file securely, not to refuse; an aborting variant is already exercised by ff-refuse-loose.patch as a functional failure",
+  "wrong_resource": "sf-wrong-resource.patch",
+  "one_role_or_direction": "sf-create-mode-only.patch",
+  "reads_only": "n/a: the property is about the mode of files the CLI writes; guarding reads cannot protect a file that is created world-readable",
+  "check_after_adjustment": "n/a: the protected operation is the final file mode and truncation does not reset a mode, so moving the permission change before or after the write does not change the outcome",
+  "unlisted_route": "sf-no-configure.patch",
+  "malformed_identity": "n/a: no parsed identity or request grammar; the only input is a path, which the product expands before writing, and the security tests use absolute paths",
+  "missing_authority": "n/a: no authority, role or secret lookup is involved",
+  "adjacent_api": "ff-refuse-loose.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A landing / shape",
+   "shape": "a destination file that already exists with loose permissions keeps them, because the mode passed to open/os.open is honoured only when the file is created",
+   "where": "awscli/customizations/iamvirtmfa.py:74 (the same shape exists at every other write site)",
+   "security_tests": [
+    "security/test_sec_mfa.py::test_existing_outfile_is_tightened",
+    "security/test_sec_mfa.py::test_existing_outfile_is_tightened_for_qr_payload",
+    "security/test_sec_mfa.py::test_new_outfile_is_owner_only"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_mfa.py::test_base32_payload_is_written_verbatim",
+    "functional/test_func_mfa.py::test_qr_payload_is_written_verbatim",
+    "functional/test_func_mfa.py::test_outfile_is_replaced_not_appended",
+    "functional/test_func_mfa.py::test_existing_owner_only_outfile_is_written"
+   ],
+   "security_fail_patch": "sf-create-mode-only.patch",
+   "realistic_because": "the published fix itself had to add an explicit fchmod after opening for exactly this reason"
+  },
+  {
+   "id": "T2",
+   "pattern": "A far site",
+   "shape": "another command writes its credential-bearing configuration with a plain open()",
+   "where": "awscli/customizations/codedeploy/register.py:182",
+   "security_tests": [
+    "security/test_sec_codedeploy.py::test_new_config_is_owner_only",
+    "security/test_sec_codedeploy.py::test_existing_config_is_tightened"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_codedeploy.py::test_register_writes_the_expected_config",
+    "functional/test_func_codedeploy.py::test_register_with_provided_user_arn_writes_no_config"
+   ],
+   "security_fail_patch": "sf-no-deploy.patch",
+   "realistic_because": "real, unmodified upstream code (a published fix site the report does not name)"
+  },
+  {
+   "id": "T3",
+   "pattern": "A far site / second implementation",
+   "shape": "two separate writers rewrite tool configuration files holding a repository token; the netrc create path is already 0o600 so the write looks protected",
+   "where": "awscli/customizations/codeartifact/login.py:186 and :634",
+   "security_tests": [
+    "security/test_sec_codeartifact.py::test_swift_existing_netrc_is_tightened",
+    "security/test_sec_codeartifact.py::test_swift_existing_netrc_with_matching_entry_is_tightened",
+    "security/test_sec_codeartifact.py::test_twine_new_pypirc_is_owner_only",
+    "security/test_sec_codeartifact.py::test_twine_existing_pypirc_is_tightened"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_codeartifact.py::test_swift_appends_entry_and_keeps_other_machines",
+    "functional/test_func_codeartifact.py::test_swift_replaces_existing_token_in_place",
+    "functional/test_func_codeartifact.py::test_twine_writes_default_configuration",
+    "functional/test_func_codeartifact.py::test_twine_merges_existing_configuration",
+    "functional/test_func_codeartifact.py::test_twine_dry_run_writes_nothing",
+    "functional/test_func_codeartifact.py::test_twine_dry_run_leaves_existing_file_untouched",
+    "functional/test_func_codeartifact.py::test_swift_dry_run_writes_nothing",
+    "functional/test_func_codeartifact.py::test_login_survives_permissions_that_cannot_be_set"
+   ],
+   "security_fail_patch": "sf-no-codeartifact.patch",
+   "realistic_because": "real, unmodified upstream code (two published fix sites the report does not name)"
+  },
+  {
+   "id": "T4",
+   "pattern": "B uncovered route",
+   "shape": "the shared configuration writer creates new files 0o600 but rewrites or appends to a pre-existing credentials file without changing its mode",
+   "where": "awscli/customizations/configure/writer.py:110 (rewrite) and :137 (append)",
+   "security_tests": [
+    "security/test_sec_configure.py::test_configure_set_updates_existing_credentials_owner_only",
+    "security/test_sec_configure.py::test_configure_set_appends_section_to_existing_credentials_owner_only"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_configure.py::test_configure_set_updates_value_and_preserves_file",
+    "functional/test_func_configure.py::test_configure_set_creates_missing_credentials_file",
+    "functional/test_func_configure.py::test_configure_set_non_secret_value_goes_to_config"
+   ],
+   "security_fail_patch": "sf-no-configure.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T5",
+   "pattern": "injected sibling",
+   "shape": "a command that returns a signed database token gains a save-to-file option that writes with a plain open()",
+   "where": "awscli/customizations/rds.py (outfile option added to GenerateDBAuthTokenCommand)",
+   "security_tests": [
+    "security/test_sec_rds.py::test_new_token_file_is_owner_only",
+    "security/test_sec_rds.py::test_existing_token_file_is_tightened"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_rds.py::test_token_is_printed_without_outfile",
+    "functional/test_func_rds.py::test_token_is_written_to_outfile"
+   ],
+   "security_fail_patch": "sf-no-rds.patch",
+   "realistic_because": "code a maintainer could plausibly have written: a convenience save-to-file option on a command that emits a credential, in a package the published fix never touches"
+  }
+ ],
+ "status": "built; gate PASS on 2026-10-27: static PASS, nop PASS (security 0/13, functional 207/207), oracle PASS (3 runs, reward 1.0, 220/220 identical), patches PASS (10/10 declared expectations; security_fail 8, functional_fail 1, pass 2 incl. hardening). blind.patch and FAIRNESS.md are written by the later passes and are not shipped by the builder."
+}

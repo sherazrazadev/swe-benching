@@ -1,0 +1,69 @@
+diff --git a/internal/sanitize/sanitize.go b/internal/sanitize/sanitize.go
+new file mode 100644
+index 0000000..85c0ff2
+--- /dev/null
++++ b/internal/sanitize/sanitize.go
+@@ -0,0 +1,20 @@
++// Package sanitize neutralises text that is about to be written to a
++// terminal by removing the code points a terminal would act on instead of
++// printing: C0 controls (including ESC, BEL, CR, LF and TAB), DEL and C1
++// controls.
++package sanitize
++
++import "strings"
++
++// Control returns s without C0 controls (0x00-0x1F), DEL (0x7F) or C1
++// controls (0x80-0x9F). Printable UTF-8 is preserved unchanged; invalid
++// bytes become U+FFFD, which is inert. strings.Map returns s itself, with no
++// allocation, when it is already clean.
++func Control(s string) string {
++	return strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
++			return -1
++		}
++		return r
++	}, s)
++}
+diff --git a/internal/ui/logtable.go b/internal/ui/logtable.go
+index a1ecb37..d18fd08 100644
+--- a/internal/ui/logtable.go
++++ b/internal/ui/logtable.go
+@@ -19,6 +19,9 @@ func fitCellLeft(s string, cells int) string {
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	// Log fields are attacker-controlled (request URI/host/method, raw
++	// lines); strip terminal control bytes before the width math.
++	s = sanitizeControl(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+@@ -34,6 +37,7 @@ func fitCellRight(s string, cells int) string {
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	s = sanitizeControl(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+diff --git a/internal/ui/sanitize.go b/internal/ui/sanitize.go
+new file mode 100644
+index 0000000..153cf0f
+--- /dev/null
++++ b/internal/ui/sanitize.go
+@@ -0,0 +1,15 @@
++package ui
++
++import "github.com/alexandre-daubois/ember/internal/sanitize"
++
++// sanitizeControl drops terminal control bytes from a value before it is
++// drawn, so attacker-supplied log fields (request URI, host, method, raw log
++// lines, in-flight requests, certificate metadata) cannot smuggle ANSI/OSC/
++// CSI escape sequences into the operator's terminal (CWE-150).
++//
++// Neutralising happens at the render boundary, not in ParseLogLine: the
++// parsed fields also feed the JSON/metrics output and the aggregation keys,
++// which must keep the raw values.
++func sanitizeControl(s string) string {
++	return sanitize.Control(s)
++}

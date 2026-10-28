@@ -1,0 +1,177 @@
+diff --git a/pkg/webhook/config.go b/pkg/webhook/config.go
+index d1e621b..ead5273 100644
+--- a/pkg/webhook/config.go
++++ b/pkg/webhook/config.go
+@@ -30,6 +30,7 @@ import (
+ // VaultConfig represents vault options
+ type VaultConfig struct {
+ 	Addr                          string
++	AddrFromObject                bool
+ 	AuthMethod                    string
+ 	Role                          string
+ 	Path                          string
+@@ -57,6 +58,7 @@ type VaultConfig struct {
+ 	RunAsGroup                    int64
+ 	ReadOnlyRootFilesystem        bool
+ 	RegistrySkipVerify            bool
++	RegistrySkipVerifyFromObject  bool
+ 	IgnoreMissingSecrets          string
+ 	VaultEnvPassThrough           string
+ 	ConfigfilePath                string
+@@ -106,6 +108,7 @@ func parseVaultConfig(obj metav1.Object, ar *model.AdmissionReview) VaultConfig
+ 
+ 	if val, ok := annotations[common.VaultAddrAnnotation]; ok {
+ 		vaultConfig.Addr = val
++		vaultConfig.AddrFromObject = true
+ 	} else {
+ 		vaultConfig.Addr = viper.GetString("vault_addr")
+ 	}
+@@ -145,7 +148,7 @@ func parseVaultConfig(obj metav1.Object, ar *model.AdmissionReview) VaultConfig
+ 	}
+ 
+ 	if val, ok := annotations[common.VaultSkipVerifyAnnotation]; ok {
+-		vaultConfig.SkipVerify, _ = strconv.ParseBool(val)
++		vaultConfig.SkipVerify = common.ResolveObjectSkipVerify(val, "vault_allow_object_skip_verify", "vault_skip_verify")
+ 	} else {
+ 		vaultConfig.SkipVerify = viper.GetBool("vault_skip_verify")
+ 	}
+@@ -282,6 +285,7 @@ func parseVaultConfig(obj metav1.Object, ar *model.AdmissionReview) VaultConfig
+ 
+ 	if val, ok := annotations[common.RegistrySkipVerifyAnnotation]; ok {
+ 		vaultConfig.RegistrySkipVerify, _ = strconv.ParseBool(val)
++		vaultConfig.RegistrySkipVerifyFromObject = true
+ 	} else {
+ 		vaultConfig.RegistrySkipVerify, _ = strconv.ParseBool(viper.GetString("registry_skip_verify"))
+ 	}
+@@ -473,6 +477,10 @@ func SetConfigDefaults() {
+ 	viper.SetDefault("vault_ct_pull_policy", string(corev1.PullIfNotPresent))
+ 	viper.SetDefault("vault_addr", "https://vault:8200")
+ 	viper.SetDefault("vault_skip_verify", "false")
++	viper.SetDefault("vault_addr_allowlist", "")
++	viper.SetDefault("vault_allow_object_skip_verify", "false")
++	viper.SetDefault("vault_allow_private_addr", "false")
++	viper.SetDefault("registry_allow_object_skip_verify", "false")
+ 	viper.SetDefault("vault_path", "kubernetes")
+ 	viper.SetDefault("vault_auth_method", "jwt")
+ 	viper.SetDefault("vault_role", "")
+diff --git a/pkg/webhook/configmap.go b/pkg/webhook/configmap.go
+index 87724ac..a7317cb 100644
+--- a/pkg/webhook/configmap.go
++++ b/pkg/webhook/configmap.go
+@@ -46,6 +46,10 @@ func (mw *MutatingWebhook) MutateConfigMap(ctx context.Context, configMap *corev
+ 		return nil
+ 	}
+ 
++	if err := assertObjectAddr(vaultConfig); err != nil {
++		return errors.Wrap(err, "refused Vault address from object annotation")
++	}
++
+ 	vaultClient, err := mw.newVaultClient(ctx, vaultConfig)
+ 	if err != nil {
+ 		return errors.Wrap(err, "failed to create vault client")
+diff --git a/pkg/webhook/object.go b/pkg/webhook/object.go
+index 285c394..5946bf4 100644
+--- a/pkg/webhook/object.go
++++ b/pkg/webhook/object.go
+@@ -124,6 +124,10 @@ func traverseObject(ctx context.Context, o interface{}, secretInjector *injector
+ func (mw *MutatingWebhook) MutateObject(ctx context.Context, object *unstructured.Unstructured, vaultConfig VaultConfig) error {
+ 	mw.logger.Debug(fmt.Sprintf("mutating object: %s.%s", object.GetNamespace(), object.GetName()))
+ 
++	if err := assertObjectAddr(vaultConfig); err != nil {
++		return errors.Wrap(err, "refused Vault address from object annotation")
++	}
++
+ 	vaultClient, err := mw.newVaultClient(ctx, vaultConfig)
+ 	if err != nil {
+ 		return errors.Wrap(err, "failed to create vault client")
+diff --git a/pkg/webhook/pod.go b/pkg/webhook/pod.go
+index 622397c..dd13b1f 100644
+--- a/pkg/webhook/pod.go
++++ b/pkg/webhook/pod.go
+@@ -25,6 +25,7 @@ import (
+ 
+ 	"emperror.dev/errors"
+ 	injector "github.com/bank-vaults/vault-sdk/injector/vault"
++	"github.com/spf13/viper"
+ 	vaultapi "github.com/hashicorp/vault/api"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -69,6 +70,10 @@ func (mw *MutatingWebhook) MutatePod(ctx context.Context, pod *corev1.Pod, vault
+ 		mw.probeVaultEndpoint(ctx, vaultConfig)
+ 	}
+ 
++	if vaultConfig.RegistrySkipVerifyFromObject && !viper.GetBool("registry_allow_object_skip_verify") {
++		vaultConfig.RegistrySkipVerify = viper.GetBool("registry_skip_verify")
++	}
++
+ 	initContainersMutated, err := mw.mutateContainers(ctx, pod.Spec.InitContainers, &pod.Spec, vaultConfig)
+ 	if err != nil {
+ 		return err
+@@ -239,6 +244,13 @@ func (mw *MutatingWebhook) MutatePod(ctx context.Context, pod *corev1.Pod, vault
+ // Vault endpoint before the agent sidecar is injected, so that an unreachable Vault
+ // shows up in the webhook logs. A failed probe never blocks the mutation.
+ func (mw *MutatingWebhook) probeVaultEndpoint(ctx context.Context, vaultConfig VaultConfig) {
++	if vaultConfig.AddrFromObject {
++		if err := common.ValidateObjectAddr(vaultConfig.Addr, vaultAddrPolicy()); err != nil {
++			mw.logger.Debug("not probing a Vault endpoint supplied by the object", slog.Any("err", err))
++			return
++		}
++	}
++
+ 	clientConfig := vaultapi.DefaultConfig()
+ 	if clientConfig.Error != nil {
+ 		return
+diff --git a/pkg/webhook/secret.go b/pkg/webhook/secret.go
+index 0750f03..26ab3ab 100644
+--- a/pkg/webhook/secret.go
++++ b/pkg/webhook/secret.go
+@@ -93,6 +93,10 @@ func (mw *MutatingWebhook) MutateSecret(ctx context.Context, secret *corev1.Secr
+ 		return nil
+ 	}
+ 
++	if err := assertObjectAddr(vaultConfig); err != nil {
++		return errors.Wrap(err, "refused Vault address from object annotation")
++	}
++
+ 	vaultClient, err := mw.newVaultClient(ctx, vaultConfig)
+ 	if err != nil {
+ 		return errors.Wrap(err, "failed to create vault client")
+diff --git a/pkg/webhook/webhook.go b/pkg/webhook/webhook.go
+index 78cf849..6696d1b 100644
+--- a/pkg/webhook/webhook.go
++++ b/pkg/webhook/webhook.go
+@@ -32,6 +32,7 @@ import (
+ 	"github.com/slok/kubewebhook/v2/pkg/log"
+ 	"github.com/slok/kubewebhook/v2/pkg/model"
+ 	"github.com/slok/kubewebhook/v2/pkg/webhook/mutating"
++	"github.com/spf13/viper"
+ 	authenticationv1 "k8s.io/api/authentication/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -193,6 +194,26 @@ func (mw *MutatingWebhook) lookForValueFrom(ctx context.Context, env corev1.EnvV
+ 	return nil, nil
+ }
+ 
++func assertObjectAddr(vaultConfig VaultConfig) error {
++	if !vaultConfig.AddrFromObject {
++		return nil
++	}
++
++	return common.ValidateObjectAddr(vaultConfig.Addr, vaultAddrPolicy())
++}
++
++func vaultAddrPolicy() common.AddrPolicy {
++	allowlist := common.SplitAndTrim(viper.GetString("vault_addr_allowlist"))
++	if addr := viper.GetString("vault_addr"); addr != "" {
++		allowlist = append(allowlist, addr) // the trusted operator default is implicitly allowed
++	}
++
++	return common.AddrPolicy{
++		Allowlist:    allowlist,
++		AllowPrivate: viper.GetBool("vault_allow_private_addr"),
++	}
++}
++
+ func (mw *MutatingWebhook) newVaultClient(ctx context.Context, vaultConfig VaultConfig) (*vault.Client, error) {
+ 	vaultAuthAttemptsCount.WithLabelValues().Inc()
+ 	clientConfig := vaultapi.DefaultConfig()

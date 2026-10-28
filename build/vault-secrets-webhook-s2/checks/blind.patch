@@ -1,0 +1,123 @@
+diff -ruN a/pkg/webhook/config.go b/pkg/webhook/config.go
+--- a/pkg/webhook/config.go	2026-10-27 19:34:03.000000000 +0000
++++ b/pkg/webhook/config.go	2026-10-27 20:14:05.366272545 +0000
+@@ -16,6 +16,7 @@
+ 
+ import (
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/slok/kubewebhook/v2/pkg/model"
+@@ -89,6 +90,11 @@
+ 	ObjectNamespace               string
+ 	MutateProbes                  bool
+ 	Token                         string
++
++	// addrFromObject records that Addr was read from an object annotation rather than
++	// the operator's configuration. Such an address is untrusted: it may not steer a
++	// connection the webhook itself opens, only be propagated to a mutated workload.
++	addrFromObject bool
+ }
+ 
+ func parseVaultConfig(obj metav1.Object, ar *model.AdmissionReview) VaultConfig {
+@@ -106,6 +112,7 @@
+ 
+ 	if val, ok := annotations[common.VaultAddrAnnotation]; ok {
+ 		vaultConfig.Addr = val
++		vaultConfig.addrFromObject = true
+ 	} else {
+ 		vaultConfig.Addr = viper.GetString("vault_addr")
+ 	}
+@@ -145,7 +152,7 @@
+ 	}
+ 
+ 	if val, ok := annotations[common.VaultSkipVerifyAnnotation]; ok {
+-		vaultConfig.SkipVerify, _ = strconv.ParseBool(val)
++		vaultConfig.SkipVerify = common.ResolveObjectSkipVerify(val, "vault_allow_object_skip_verify", "vault_skip_verify")
+ 	} else {
+ 		vaultConfig.SkipVerify = viper.GetBool("vault_skip_verify")
+ 	}
+@@ -281,7 +288,7 @@
+ 	}
+ 
+ 	if val, ok := annotations[common.RegistrySkipVerifyAnnotation]; ok {
+-		vaultConfig.RegistrySkipVerify, _ = strconv.ParseBool(val)
++		vaultConfig.RegistrySkipVerify = common.ResolveObjectSkipVerify(val, "registry_allow_object_skip_verify", "registry_skip_verify")
+ 	} else {
+ 		vaultConfig.RegistrySkipVerify, _ = strconv.ParseBool(viper.GetString("registry_skip_verify"))
+ 	}
+@@ -451,6 +458,24 @@
+ 	return vaultConfig
+ }
+ 
++// objectVaultAddrPolicy is the policy a Vault address taken from an object annotation
++// has to satisfy before the webhook will use it for a connection of its own. Only
++// endpoints the operator named qualify: the operator's own vault_addr and the entries
++// of vault_addr_allowlist. The operator's address may be private or loopback, so the
++// private-range guard is only lifted for object addresses when the operator opts in
++// with vault_allow_private_addr.
++func objectVaultAddrPolicy() common.AddrPolicy {
++	allowlist := common.SplitAndTrim(viper.GetString("vault_addr_allowlist"))
++	if operatorAddr := strings.TrimSpace(viper.GetString("vault_addr")); operatorAddr != "" {
++		allowlist = append(allowlist, operatorAddr)
++	}
++
++	return common.AddrPolicy{
++		Allowlist:    allowlist,
++		AllowPrivate: viper.GetBool("vault_allow_private_addr"),
++	}
++}
++
+ func getPullPolicy(pullPolicyStr string) corev1.PullPolicy {
+ 	switch pullPolicyStr {
+ 	case "Never", "never":
+@@ -473,6 +498,10 @@
+ 	viper.SetDefault("vault_ct_pull_policy", string(corev1.PullIfNotPresent))
+ 	viper.SetDefault("vault_addr", "https://vault:8200")
+ 	viper.SetDefault("vault_skip_verify", "false")
++	viper.SetDefault("vault_addr_allowlist", "")
++	viper.SetDefault("vault_allow_private_addr", "false")
++	viper.SetDefault("vault_allow_object_skip_verify", "false")
++	viper.SetDefault("registry_allow_object_skip_verify", "false")
+ 	viper.SetDefault("vault_path", "kubernetes")
+ 	viper.SetDefault("vault_auth_method", "jwt")
+ 	viper.SetDefault("vault_role", "")
+diff -ruN a/pkg/webhook/pod.go b/pkg/webhook/pod.go
+--- a/pkg/webhook/pod.go	2026-10-27 19:34:05.000000000 +0000
++++ b/pkg/webhook/pod.go	2026-10-27 20:13:51.882741839 +0000
+@@ -239,6 +239,14 @@
+ // Vault endpoint before the agent sidecar is injected, so that an unreachable Vault
+ // shows up in the webhook logs. A failed probe never blocks the mutation.
+ func (mw *MutatingWebhook) probeVaultEndpoint(ctx context.Context, vaultConfig VaultConfig) {
++	// The probe is only a diagnostic; it must not be the reason the webhook dials an
++	// endpoint the object named. The workload still gets the address through its env.
++	if vaultConfig.addrFromObject {
++		mw.logger.Debug("not probing a Vault endpoint supplied by the object")
++
++		return
++	}
++
+ 	clientConfig := vaultapi.DefaultConfig()
+ 	if clientConfig.Error != nil {
+ 		return
+diff -ruN a/pkg/webhook/webhook.go b/pkg/webhook/webhook.go
+--- a/pkg/webhook/webhook.go	2026-10-27 19:34:03.000000000 +0000
++++ b/pkg/webhook/webhook.go	2026-10-27 20:13:49.533828182 +0000
+@@ -201,6 +201,16 @@
+ 		return nil, clientConfig.Error
+ 	}
+ 
++	// An address read from the object is untrusted. Vet it before anything is dialed
++	// and before a ServiceAccount token is minted for the client: an object must not
++	// be able to send its minted token anywhere but an endpoint the operator named.
++	if vaultConfig.addrFromObject {
++		if err := common.ValidateObjectAddr(vaultConfig.Addr, objectVaultAddrPolicy()); err != nil {
++			vaultAuthAttemptsErrorsCount.WithLabelValues("config_error").Inc()
++			return nil, errors.Wrap(err, "refusing Vault address supplied by the object")
++		}
++	}
++
+ 	clientConfig.Address = vaultConfig.Addr
+ 
+ 	tlsConfig := vaultapi.TLSConfig{Insecure: vaultConfig.SkipVerify}

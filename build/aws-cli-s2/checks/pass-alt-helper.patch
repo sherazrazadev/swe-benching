@@ -1,0 +1,190 @@
+diff --git a/awscli/compat.py b/awscli/compat.py
+index 3c4b558..a6d7cd4 100644
+--- a/awscli/compat.py
++++ b/awscli/compat.py
+@@ -154,7 +154,14 @@ def compat_open(filename, mode='r', encoding=None, access_permissions=None):
+         opener = partial(os.open, mode=access_permissions)
+     if 'b' not in mode:
+         encoding = locale.getpreferredencoding()
+-    return open(filename, mode, encoding=encoding, opener=opener)
++    handle = open(filename, mode, encoding=encoding, opener=opener)
++    if access_permissions is not None and any(
++            flag in mode for flag in ('w', 'a', '+')):
++        try:
++            os.chmod(filename, access_permissions)
++        except OSError:
++            pass
++    return handle
+ 
+ 
+ def get_stdout_text_writer():
+diff --git a/awscli/customizations/codeartifact/login.py b/awscli/customizations/codeartifact/login.py
+index c6816db..ad56107 100644
+--- a/awscli/customizations/codeartifact/login.py
++++ b/awscli/customizations/codeartifact/login.py
+@@ -12,7 +12,7 @@ from botocore.utils import parse_timestamp
+ 
+ from awscli.compat import (
+     is_windows, urlparse, RawConfigParser, StringIO,
+-    get_stderr_encoding, is_macos
++    get_stderr_encoding, is_macos, compat_open
+ )
+ from awscli.customizations import utils as cli_utils
+ from awscli.customizations.commands import BasicCommand
+@@ -183,7 +183,8 @@ class SwiftLogin(BaseLogin):
+             if new_contents == contents:
+                 new_contents = self._append_netrc_entry(new_contents, new_entry)
+ 
+-            with open(netrc_path, 'w') as f:
++            with compat_open(
++                    netrc_path, 'w', access_permissions=0o600) as f:
+                 f.write(new_contents)
+ 
+     def _create_netrc_file(self, netrc_path, new_entry):
+@@ -631,7 +632,9 @@ password: {auth_token}'''
+             sys.stdout.write(pypi_rc_str)
+             sys.stdout.write(os.linesep)
+         else:
+-            with open(self.pypi_rc_path, 'w+') as fp:
++            with compat_open(
++                    self.pypi_rc_path, 'w',
++                    access_permissions=0o600) as fp:
+                 fp.write(pypi_rc_str)
+ 
+             self._write_success_message('twine')
+diff --git a/awscli/customizations/codedeploy/register.py b/awscli/customizations/codedeploy/register.py
+index e959044..f36e275 100644
+--- a/awscli/customizations/codedeploy/register.py
++++ b/awscli/customizations/codedeploy/register.py
+@@ -13,6 +13,7 @@
+ 
+ import sys
+ 
++from awscli.compat import compat_open
+ from awscli.customizations.commands import BasicCommand
+ from awscli.customizations.codedeploy.systems import DEFAULT_CONFIG_FILE
+ from awscli.customizations.codedeploy.utils import \
+@@ -179,7 +180,8 @@ class Register(BasicCommand):
+             'Creating the on-premises instance configuration file named {0}'
+             '...'.format(DEFAULT_CONFIG_FILE)
+         )
+-        with open(DEFAULT_CONFIG_FILE, 'w') as f:
++        with compat_open(
++                DEFAULT_CONFIG_FILE, 'w', access_permissions=0o600) as f:
+             f.write(
+                 '---\n'
+                 'region: {0}\n'
+diff --git a/awscli/customizations/configure/configure.py b/awscli/customizations/configure/configure.py
+index 1f23021..9fdef85 100644
+--- a/awscli/customizations/configure/configure.py
++++ b/awscli/customizations/configure/configure.py
+@@ -136,6 +136,8 @@ class ConfigureCommand(BasicCommand):
+                 credential_file_values['__section__'] = profile_name
+             shared_credentials_filename = os.path.expanduser(
+                 self._session.get_config_variable('credentials_file'))
++            self._config_writer.secure = True
+             self._config_writer.update_config(
+                 credential_file_values,
+                 shared_credentials_filename)
++            self._config_writer.secure = False
+diff --git a/awscli/customizations/configure/set.py b/awscli/customizations/configure/set.py
+index 9d4c441..1e19613 100644
+--- a/awscli/customizations/configure/set.py
++++ b/awscli/customizations/configure/set.py
+@@ -99,6 +99,7 @@ class ConfigureSetCommand(BasicCommand):
+             # When writing to the creds file, the section is just the profile
+             section = profile
+             config_filename = self._get_config_file('credentials_file')
++            self._config_writer.secure = True
+         elif profile in PREDEFINED_SECTION_NAMES or profile == 'default':
+             section = profile
+         else:
+diff --git a/awscli/customizations/configure/writer.py b/awscli/customizations/configure/writer.py
+index 06808e0..698899a 100644
+--- a/awscli/customizations/configure/writer.py
++++ b/awscli/customizations/configure/writer.py
+@@ -13,6 +13,8 @@
+ import os
+ import re
+ 
++from awscli.compat import compat_open
++
+ from . import SectionNotFoundError
+ 
+ 
+@@ -24,6 +26,9 @@ class ConfigFileWriter(object):
+         r'(?P<value>.*)$'
+     )
+ 
++    def __init__(self, secure=False):
++        self.secure = secure
++
+     def _validate_no_newlines_or_carriage_returns(
+         self,
+         value,
+@@ -107,7 +112,9 @@ class ConfigFileWriter(object):
+         # to find the section in question
+         try:
+             self._update_section_contents(contents, section_name, new_values)
+-            with open(config_filename, 'w') as f:
++            with compat_open(
++                    config_filename, 'w',
++                    access_permissions=0o600 if self.secure else None) as f:
+                 f.write(''.join(contents))
+         except SectionNotFoundError:
+             self._write_new_section(section_name, new_values, config_filename)
+@@ -134,7 +141,9 @@ class ConfigFileWriter(object):
+ 
+     def _write_new_section(self, section_name, new_values, config_filename):
+         needs_newline = self._check_file_needs_newline(config_filename)
+-        with open(config_filename, 'a') as f:
++        with compat_open(
++                config_filename, 'a',
++                access_permissions=0o600 if self.secure else None) as f:
+             if needs_newline:
+                 f.write('\n')
+             f.write('[%s]\n' % section_name)
+diff --git a/awscli/customizations/iamvirtmfa.py b/awscli/customizations/iamvirtmfa.py
+index c0ee358..1324fb8 100644
+--- a/awscli/customizations/iamvirtmfa.py
++++ b/awscli/customizations/iamvirtmfa.py
+@@ -24,6 +24,7 @@ fields from the response.
+ """
+ import base64
+ 
++from awscli.compat import compat_open
+ from awscli.customizations.arguments import StatefulArgument
+ from awscli.customizations.arguments import resolve_given_outfile_path
+ from awscli.customizations.arguments import is_parsed_result_successful
+@@ -71,7 +72,8 @@ class IAMVMFAWrapper(object):
+         outfile = self._outfile.value
+         if method in parsed['VirtualMFADevice']:
+             body = parsed['VirtualMFADevice'][method]
+-            with open(outfile, 'wb') as fp:
++            with compat_open(
++                    outfile, 'wb', access_permissions=0o600) as fp:
+                 fp.write(base64.b64decode(body))
+             for choice in CHOICES:
+                 if choice in parsed['VirtualMFADevice']:
+diff --git a/awscli/customizations/rds.py b/awscli/customizations/rds.py
+index a6fd803..95c9761 100644
+--- a/awscli/customizations/rds.py
++++ b/awscli/customizations/rds.py
+@@ -27,6 +27,7 @@ modify-option-group).
+ import os
+ 
+ from awscli.clidriver import ServiceOperation
++from awscli.compat import compat_open
+ from awscli.clidriver import CLIOperationCaller
+ from awscli.customizations import utils
+ from awscli.customizations.commands import BasicCommand
+@@ -117,7 +118,8 @@ class GenerateDBAuthTokenCommand(BasicCommand):
+             outfile = os.path.expanduser(
+                 os.path.expandvars(parsed_args.outfile)
+             )
+-            with open(outfile, 'w') as f:
++            with compat_open(
++                    outfile, 'w', access_permissions=0o600) as f:
+                 f.write(token)
+                 f.write('\n')
+         else:

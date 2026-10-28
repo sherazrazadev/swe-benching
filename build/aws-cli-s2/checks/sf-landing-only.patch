@@ -1,0 +1,45 @@
+diff --git a/awscli/customizations/iamvirtmfa.py b/awscli/customizations/iamvirtmfa.py
+index c0ee358..aea7a5e 100644
+--- a/awscli/customizations/iamvirtmfa.py
++++ b/awscli/customizations/iamvirtmfa.py
+@@ -23,12 +23,22 @@ to the specified file.  It will also remove the two bootstrap data
+ fields from the response.
+ """
+ import base64
++import os
++import sys
+ 
++from awscli.compat import compat_open
+ from awscli.customizations.arguments import StatefulArgument
+ from awscli.customizations.arguments import resolve_given_outfile_path
+ from awscli.customizations.arguments import is_parsed_result_successful
+ 
+ 
++def _warn_unable_to_set_permissions(path, error):
++    sys.stderr.write(
++        'Unable to set file permissions for %s: %s%s'
++        % (path, error, os.linesep)
++    )
++
++
+ CHOICES = ('QRCodePNG', 'Base32StringSeed')
+ OUTPUT_HELP = ('The output path and file name where the bootstrap '
+                'information will be stored.')
+@@ -71,8 +81,16 @@ class IAMVMFAWrapper(object):
+         outfile = self._outfile.value
+         if method in parsed['VirtualMFADevice']:
+             body = parsed['VirtualMFADevice'][method]
+-            with open(outfile, 'wb') as fp:
++            with compat_open(
++                    outfile, 'wb', access_permissions=0o600) as fp:
+                 fp.write(base64.b64decode(body))
++                try:
++                    if hasattr(os, 'fchmod'):
++                        os.fchmod(fp.fileno(), 0o600)
++                    else:
++                        os.chmod(outfile, 0o600)
++                except OSError as e:
++                    _warn_unable_to_set_permissions(outfile, e)
+             for choice in CHOICES:
+                 if choice in parsed['VirtualMFADevice']:
+                     del parsed['VirtualMFADevice'][choice]

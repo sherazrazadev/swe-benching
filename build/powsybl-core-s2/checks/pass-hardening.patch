@@ -1,0 +1,202 @@
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
+index 3235ab3d1..96336ea1f 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
+@@ -42,15 +42,18 @@ public class JobScriptLocalCommandExecutor extends AbstractLocalCommandExecutor
+         for (Map.Entry<String, String> entry : env.entrySet()) {
+             String name = entry.getKey();
+             String value = entry.getValue();
+-            script.append("export ").append(name).append("=").append("\"").append(value).append("\"");
++            if (!name.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
++                throw new IllegalArgumentException("Invalid environment variable name");
++            }
++            script.append("export ").append(name).append("=").append("'").append(singleQuoteEscape(checkedValue(value))).append("'");
+             if (name.endsWith("PATH")) {
+                 script.append(File.pathSeparator).append("$").append(name);
+             }
+             script.append(System.lineSeparator());
+         }
+-        script.append(program);
++        script.append("'").append(singleQuoteEscape(checkedValue(program))).append("'");
+         for (String arg : args) {
+-            script.append(" \"").append(arg).append("\"");
++            script.append(" '").append(singleQuoteEscape(checkedValue(arg))).append("'");
+         }
+         script.append(System.lineSeparator());
+ 
+@@ -68,4 +71,15 @@ public class JobScriptLocalCommandExecutor extends AbstractLocalCommandExecutor
+     void nonZeroLog(List<String> commandLine, int exitCode) {
+         LOGGER.debug(NON_ZERO_LOG_PATTERN, commandLine, exitCode);
+     }
++
++    private static String checkedValue(String value) {
++        if (value.indexOf('\0') >= 0 || value.length() > 1024 * 1024) {
++            throw new IllegalArgumentException("Invalid command line value");
++        }
++        return value;
++    }
++
++    private static String singleQuoteEscape(String value) {
++        return value.replace("'", "'\\''");
++    }
+ }
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
+index 45254d365..07183491e 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
+@@ -40,15 +40,18 @@ public class ShellLocalCommandExecutor extends AbstractLocalCommandExecutor {
+         for (Map.Entry<String, String> entry : env.entrySet()) {
+             String name = entry.getKey();
+             String value = entry.getValue();
+-            internalCmd.append(name).append("=").append(quote(value));
++            if (!name.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
++                throw new IllegalArgumentException("Invalid environment variable name");
++            }
++            internalCmd.append(name).append("=").append(quote(checkedValue(value)));
+             if (name.endsWith("PATH")) {
+                 internalCmd.append(File.pathSeparator).append("$").append(name);
+             }
+             internalCmd.append(" ");
+         }
+-        internalCmd.append(program);
++        internalCmd.append(quote(checkedValue(program)));
+         for (String arg : args) {
+-            internalCmd.append(" ").append(quote(arg));
++            internalCmd.append(" ").append(quote(checkedValue(arg)));
+         }
+ 
+         List<String> cmdLs = ImmutableList.<String>builder()
+@@ -64,7 +67,14 @@ public class ShellLocalCommandExecutor extends AbstractLocalCommandExecutor {
+         LOGGER.debug(NON_ZERO_LOG_PATTERN, commandLine, exitCode);
+     }
+ 
++    private static String checkedValue(String value) {
++        if (value.indexOf('\0') >= 0 || value.length() > 1024 * 1024) {
++            throw new IllegalArgumentException("Invalid command line value");
++        }
++        return value;
++    }
++
+     private static String quote(String value) {
+-        return "'" + value.replace("'", "\\'") + "'";
++        return "'" + value.replace("'", "'\\''") + "'";
+     }
+ }
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java
+index 69fabac1c..6506c1c37 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java
+@@ -42,15 +42,18 @@ public class UnixLocalCommandExecutor extends AbstractLocalCommandExecutor {
+         for (Map.Entry<String, String> entry : env2.entrySet()) {
+             String name = entry.getKey();
+             String value = entry.getValue();
+-            internalCmd.append(name).append("=").append(value);
++            if (!name.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
++                throw new IllegalArgumentException("Invalid environment variable name");
++            }
++            internalCmd.append(name).append("=").append("'").append(singleQuoteEscape(checkedValue(value))).append("'");
+             if (name.endsWith("PATH")) {
+                 internalCmd.append(File.pathSeparator).append("$").append(name);
+             }
+             internalCmd.append(" ");
+         }
+-        internalCmd.append(program);
++        internalCmd.append("'").append(singleQuoteEscape(checkedValue(program))).append("'");
+         for (String arg : args) {
+-            internalCmd.append(" \"").append(arg).append("\"");
++            internalCmd.append(" '").append(singleQuoteEscape(checkedValue(arg))).append("'");
+         }
+ 
+         List<String> cmdLs = ImmutableList.<String>builder()
+@@ -65,4 +68,15 @@ public class UnixLocalCommandExecutor extends AbstractLocalCommandExecutor {
+     void nonZeroLog(List<String> cmdLs, int exitCode) {
+         LOGGER.debug(NON_ZERO_LOG_PATTERN, cmdLs, exitCode);
+     }
++
++    private static String checkedValue(String value) {
++        if (value.indexOf('\0') >= 0 || value.length() > 1024 * 1024) {
++            throw new IllegalArgumentException("Invalid command line value");
++        }
++        return value;
++    }
++
++    private static String singleQuoteEscape(String value) {
++        return value.replace("'", "'\\''");
++    }
+ }
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java
+index 946336e19..cbc9b0dc5 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java
+@@ -45,15 +45,29 @@ public class WindowsLocalCommandExecutor extends AbstractLocalCommandExecutor {
+         for (Map.Entry<String, String> entry : env2.entrySet()) {
+             String name = entry.getKey();
+             String value = entry.getValue();
+-            internalCmd.append("set ").append("\"").append(name).append("=").append(value);
++            // Validate the variable name: only alphanumerics and underscores are allowed.
++            // This prevents injection via malicious variable names, which cannot be safely escaped.
++            if (!name.matches("[a-zA-Z_]\\w*")) {
++                throw new IllegalArgumentException("Invalid environment variable name");
++            }
++            // Use the 'set "NAME=VALUE"' form: value is inside the outer quotes, so
++            // double-quote doubling ("") is the correct escaping strategy here
++            internalCmd.append("set \"").append(name).append("=").append(escapeCmdEnvValue(value));
+             if (name.endsWith("PATH")) {
+                 internalCmd.append(File.pathSeparator).append("%").append(name).append("%");
+             }
+-            internalCmd.append("\"").append(" & ");
++            internalCmd.append("\" & ");
++        }
++        // Quote the program name to handle spaces in paths and validate it contains no quotes.
++        if (program.contains("\"")) {
++            throw new IllegalArgumentException("Program name must not contain double quotes");
++        }
++        if (program.contains(" ")) {
++            throw new IllegalArgumentException("Program name must not contain spaces");
+         }
+         internalCmd.append(program);
+         for (String arg : args) {
+-            internalCmd.append(" \"").append(arg).append("\"");
++            internalCmd.append(" \"").append(escapeCmdArg(arg)).append("\"");
+         }
+         internalCmd.append(" & endlocal");
+ 
+@@ -69,4 +83,38 @@ public class WindowsLocalCommandExecutor extends AbstractLocalCommandExecutor {
+     void nonZeroLog(List<String> cmdLs, int exitCode) {
+         LOGGER.debug(NON_ZERO_LOG_PATTERN, cmdLs, exitCode);
+     }
++
++    private static String escapeCmdEnvValue(String value) {
++        // This value is embedded inside set "NAME=VALUE", i.e. already inside double quotes.
++        // Inside a quoted set command:
++        //   - " must be doubled ("") — caret-escaping does NOT work inside quotes
++        //   - % must be doubled (%%) to prevent %VAR% expansion
++        //   - ! must be escaped (^!) to prevent delayed expansion (fires even inside quotes)
++        //   - ^ does NOT need escaping inside quotes (it is literal)
++        //   - &, |, <, > do NOT need escaping inside quotes (they are literal)
++        //   - newlines are stripped to prevent command structure breakout
++        return value
++            .replace("%", "%%")
++            .replace("!", "^!")
++            .replace("\"", "\"\"")
++            .replace("\n", "")
++            .replace("\r", "");
++    }
++
++    private static String escapeCmdArg(String arg) {
++        // Double any trailing backslashes before the closing quote
++        int trailingBackslashes = 0;
++        for (int i = arg.length() - 1; i >= 0 && arg.charAt(i) == '\\'; i--) {
++            trailingBackslashes++;
++        }
++        String suffix = "\\".repeat(trailingBackslashes); // repeat them once more
++        return arg
++            .replace("^", "^^")   // escape ^ first (outside-quote context for & | etc.)
++            .replace("%", "^%")   // prevent variable expansion like %PATH%
++            .replace("!", "^!")   // prevent delayed expansion like !VAR!
++            .replace("\"", "\"\"") // double quotes inside the quoted string
++            .replace("\n", "") // prevents newline-based injection
++            .replace("\r", "") // prevents newline-based injection
++            + suffix;
++    }
+ }

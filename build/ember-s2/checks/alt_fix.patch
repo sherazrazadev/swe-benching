@@ -1,0 +1,80 @@
+diff --git a/internal/app/diff.go b/internal/app/diff.go
+index d1d0920..93d82ed 100644
+--- a/internal/app/diff.go
++++ b/internal/app/diff.go
+@@ -10,6 +10,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ 	"github.com/spf13/cobra"
+ )
+ 
+@@ -314,7 +315,7 @@ func formatDiffBody(d diffResult) string {
+ 	if len(d.hosts) > 0 {
+ 		b.WriteString("\nPer-host changes\n")
+ 		for _, h := range d.hosts {
+-			fmt.Fprintf(&b, "\n  %s\n", h.host)
++			fmt.Fprintf(&b, "\n  %s\n", sanitize.Control(h.host))
+ 			writeDiffLines(&b, h.lines)
+ 		}
+ 	}
+diff --git a/internal/sanitize/sanitize.go b/internal/sanitize/sanitize.go
+new file mode 100644
+index 0000000..d13b1e9
+--- /dev/null
++++ b/internal/sanitize/sanitize.go
+@@ -0,0 +1,22 @@
++// Package sanitize removes terminal control code points before text is written.
++package sanitize
++
++import "strings"
++
++func Control(s string) string {
++	return strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
++			return -1
++		}
++		return r
++	}, s)
++}
++
++// Block cleans each line of a multi-line rendering and keeps the line breaks.
++func Block(s string) string {
++	lines := strings.Split(s, "\n")
++	for i := range lines {
++		lines[i] = Control(lines[i])
++	}
++	return strings.Join(lines, "\n")
++}
+diff --git a/internal/ui/app.go b/internal/ui/app.go
+index d38aa83..9edc040 100644
+--- a/internal/ui/app.go
++++ b/internal/ui/app.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ 	"github.com/alexandre-daubois/ember/pkg/plugin"
+ 	tea "github.com/charmbracelet/bubbletea"
+ 	"github.com/charmbracelet/lipgloss"
+@@ -201,6 +202,9 @@ func NewApp(f fetcher.Fetcher, cfg Config) *App {
+ }
+ 
+ // Close cancels the app context, signaling plugin fetches to stop.
++// View draws the frame with every rendered value neutralised.
++func (a *App) View() string { return sanitize.Block(a.viewFrame()) }
++
+ func (a *App) Close() {
+ 	if a.cancel != nil {
+ 		a.cancel()
+@@ -226,7 +230,7 @@ func (a *App) Init() tea.Cmd {
+ 	return tea.Batch(cmds...)
+ }
+ 
+-func (a *App) View() string {
++func (a *App) viewFrame() string {
+ 	if a.width == 0 {
+ 		return "Loading..."
+ 	}

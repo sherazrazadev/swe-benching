@@ -1,0 +1,239 @@
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
+new file mode 100644
+index 000000000..3235ab3d1
+--- /dev/null
++++ b/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
+@@ -0,0 +1,71 @@
++/**
++ * Copyright (c) 2026, RTE (https://www.rte-france.com)
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ * SPDX-License-Identifier: MPL-2.0
++ */
++package com.powsybl.computation.local;
++
++import com.google.common.collect.ImmutableList;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Runs a command through a job script written in the execution working directory, the way a
++ * scheduling backend records the job it launches next to the job outputs.
++ *
++ * @author Geoffroy Jamgotchian {@literal <geoffroy.jamgotchian at rte-france.com>}
++ */
++public class JobScriptLocalCommandExecutor extends AbstractLocalCommandExecutor {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger(JobScriptLocalCommandExecutor.class);
++
++    @Override
++    public int execute(String program, List<String> args, Path outFile, Path errFile,
++                       Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
++        return execute(program, -1, args, outFile, errFile, workingDir, env);
++    }
++
++    @Override
++    public int execute(String program, long timeoutSecondes, List<String> args, Path outFile, Path errFile,
++                       Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
++        StringBuilder script = new StringBuilder();
++        script.append("#!/bin/bash").append(System.lineSeparator());
++        for (Map.Entry<String, String> entry : env.entrySet()) {
++            String name = entry.getKey();
++            String value = entry.getValue();
++            script.append("export ").append(name).append("=").append("\"").append(value).append("\"");
++            if (name.endsWith("PATH")) {
++                script.append(File.pathSeparator).append("$").append(name);
++            }
++            script.append(System.lineSeparator());
++        }
++        script.append(program);
++        for (String arg : args) {
++            script.append(" \"").append(arg).append("\"");
++        }
++        script.append(System.lineSeparator());
++
++        Path scriptFile = Files.createTempFile(workingDir, "job-", ".sh");
++        Files.writeString(scriptFile, script.toString());
++        LOGGER.debug("Executing job script {}", scriptFile);
++
++        return execute(ImmutableList.<String>builder()
++                .add("bash")
++                .add(scriptFile.toString())
++                .build(), workingDir, outFile, errFile, timeoutSecondes);
++    }
++
++    @Override
++    void nonZeroLog(List<String> commandLine, int exitCode) {
++        LOGGER.debug(NON_ZERO_LOG_PATTERN, commandLine, exitCode);
++    }
++}
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationConfig.java b/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationConfig.java
+index 7dd15fb2f..997c0a205 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationConfig.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationConfig.java
+@@ -34,6 +34,8 @@ public class LocalComputationConfig {
+ 
+     private final int availableCore;
+ 
++    private final String executor;
++
+     public static LocalComputationConfig load() {
+         return load(PlatformConfig.defaultConfig());
+     }
+@@ -72,7 +74,8 @@ public class LocalComputationConfig {
+         if (availableCore <= 0) {
+             availableCore = Runtime.getRuntime().availableProcessors();
+         }
+-        return new LocalComputationConfig(localDir, availableCore);
++        String executor = config.flatMap(c -> c.getOptionalStringProperty("executor")).orElse(null);
++        return new LocalComputationConfig(localDir, availableCore, executor);
+     }
+ 
+     public LocalComputationConfig(Path localDir) {
+@@ -80,8 +83,13 @@ public class LocalComputationConfig {
+     }
+ 
+     public LocalComputationConfig(Path localDir, int availableCore) {
++        this(localDir, availableCore, null);
++    }
++
++    public LocalComputationConfig(Path localDir, int availableCore, String executor) {
+         this.localDir = localDir;
+         this.availableCore = availableCore;
++        this.executor = executor;
+     }
+ 
+     public Path getLocalDir() {
+@@ -92,10 +100,15 @@ public class LocalComputationConfig {
+         return availableCore;
+     }
+ 
++    public String getExecutor() {
++        return executor;
++    }
++
+     @Override
+     public String toString() {
+         return getClass().getSimpleName() + " [localDir=" + localDir +
+                 ", availableCore=" + availableCore +
++                ", executor=" + executor +
+                 "]";
+     }
+ }
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java b/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java
+index 318fe1e0c..cba7460ed 100644
+--- a/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java
++++ b/computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java
+@@ -75,7 +75,18 @@ public class LocalComputationManager implements ComputationManager {
+         }
+     }
+ 
+-    private static LocalCommandExecutor getLocalCommandExecutor() {
++    private static LocalCommandExecutor getLocalCommandExecutor(LocalComputationConfig config) {
++        String executor = config.getExecutor();
++        if (executor != null) {
++            switch (executor) {
++                case "job-script":
++                    return new JobScriptLocalCommandExecutor();
++                case "shell":
++                    return new ShellLocalCommandExecutor();
++                default:
++                    throw new IllegalArgumentException("Unsupported local command executor: " + executor);
++            }
++        }
+         if (SystemUtils.IS_OS_WINDOWS) {
+             return new WindowsLocalCommandExecutor();
+         } else if (SystemUtils.IS_OS_UNIX) {
+@@ -106,7 +117,7 @@ public class LocalComputationManager implements ComputationManager {
+     }
+ 
+     public LocalComputationManager(LocalComputationConfig config, Executor executor) throws IOException {
+-        this(config, getLocalCommandExecutor(), executor);
++        this(config, getLocalCommandExecutor(config), executor);
+     }
+ 
+     public LocalComputationManager(LocalComputationConfig config, LocalCommandExecutor localCommandExecutor, Executor executor) throws IOException {
+diff --git a/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java b/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
+new file mode 100644
+index 000000000..45254d365
+--- /dev/null
++++ b/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
+@@ -0,0 +1,70 @@
++/**
++ * Copyright (c) 2026, RTE (https://www.rte-france.com)
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ * SPDX-License-Identifier: MPL-2.0
++ */
++package com.powsybl.computation.local;
++
++import com.google.common.collect.ImmutableList;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Runs a command through the system shell, quoting every element of the command line so that it is
++ * passed as a single word.
++ *
++ * @author Geoffroy Jamgotchian {@literal <geoffroy.jamgotchian at rte-france.com>}
++ */
++public class ShellLocalCommandExecutor extends AbstractLocalCommandExecutor {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger(ShellLocalCommandExecutor.class);
++
++    @Override
++    public int execute(String program, List<String> args, Path outFile, Path errFile,
++                       Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
++        return execute(program, -1, args, outFile, errFile, workingDir, env);
++    }
++
++    @Override
++    public int execute(String program, long timeoutSecondes, List<String> args, Path outFile, Path errFile,
++                       Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
++        StringBuilder internalCmd = new StringBuilder();
++        for (Map.Entry<String, String> entry : env.entrySet()) {
++            String name = entry.getKey();
++            String value = entry.getValue();
++            internalCmd.append(name).append("=").append(quote(value));
++            if (name.endsWith("PATH")) {
++                internalCmd.append(File.pathSeparator).append("$").append(name);
++            }
++            internalCmd.append(" ");
++        }
++        internalCmd.append(program);
++        for (String arg : args) {
++            internalCmd.append(" ").append(quote(arg));
++        }
++
++        List<String> cmdLs = ImmutableList.<String>builder()
++                .add("bash")
++                .add("-c")
++                .add(internalCmd.toString())
++                .build();
++        return execute(cmdLs, workingDir, outFile, errFile, timeoutSecondes);
++    }
++
++    @Override
++    void nonZeroLog(List<String> commandLine, int exitCode) {
++        LOGGER.debug(NON_ZERO_LOG_PATTERN, commandLine, exitCode);
++    }
++
++    private static String quote(String value) {
++        return "'" + value.replace("'", "\\'") + "'";
++    }
++}

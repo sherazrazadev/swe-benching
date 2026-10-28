@@ -1,0 +1,258 @@
+{
+ "slug": "logging-operator-s2",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "18424",
+  "advisory_ids": [
+   "GHSA-MJQF-28PH-426H",
+   "CVE-2026-54680",
+   "GO-2026-6142"
+  ],
+  "repo": "kube-logging/logging-operator",
+  "pinned_commit": "8c34e9a61e6587f15acbf147fc1be895898c6b67",
+  "fix_commits": [
+   "cf437d7f1e056c78740bf5716ac8bdebcf002425"
+  ],
+  "landing_point": {
+   "where": "pkg/sdk/logging/model/render/fluent.go:64"
+  },
+  "O9_family": "configuration_injection",
+  "O11_fix_minutes": 45,
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "note": "Full screener record is in BUILD-PROMPT.md of this directory."
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "The logging controller's fluentd configuration pipeline (model.CreateSystem over Logging/Fluentd settings and Flow/ClusterFlow/Output/ClusterOutput resources, then render.FluentRender.Render) and fluentd.Reconciler.generateConfigSecret, which builds input.conf/fluent.conf. Both were driven in process against the pinned+injected tree with an in-memory secret reader: all 14 security tests fail by assertion and all 9 functional tests plus the 6 project render tests pass.",
+  "sites": [
+   "pkg/sdk/logging/model/render/fluent.go:47,52-58,64 (parameter line and directive header/meta lines) [published fix]",
+   "pkg/sdk/logging/model/types/flow.go:129 + pkg/sdk/logging/api/v1beta1/flow_types.go:43 (Flow.Spec.FlowLabel -> tag) [published fix, far site]",
+   "pkg/sdk/logging/model/filter/tagnormaliser.go:99 and filter/detect_exceptions.go:121 (MatchTag -> tag) [published fix, far site]",
+   "pkg/sdk/logging/model/output/relabel.go:112 (Label -> @label) [published fix, far site]",
+   "pkg/sdk/logging/model/filter/record_transformer.go:93-101 and filter/record_modifier.go:118-125 (Record map assigned straight to Params: user key = parameter name) [how-type producer off the mapper]",
+   "pkg/sdk/logging/model/types/stringmaps.go:109-118 (secret-loaded value into Params) [how-type producer]",
+   "pkg/sdk/logging/model/types/router.go:68-103 (joined selector lists; JSON metric labels) [how-type producer + coupled value]",
+   "pkg/resources/fluentd/config.go:33-81 + pkg/resources/fluentd/configsecret.go:61-92 (html/template keeps newlines -> input.conf) [route where the protection never existed]",
+   "pkg/resources/fluentd/config.go (renderSystemParameters) + configsecret.go (SystemParameters) [injected sibling 1]",
+   "pkg/resources/fluentd/config.go (renderConfigIncludes) + configsecret.go (ConfigIncludes) [injected sibling 2]"
+  ],
+  "routes": [
+   "output/filter values -> Params -> RenderDirectives parameter line",
+   "flow label, filter match tag, relabel label -> RenderDirectives header/meta lines",
+   "record map keys/values -> Params directly (bypasses StructToStringMapper)",
+   "secret-loaded values -> Params through SecretLoader",
+   "cluster-flow selector maps/lists -> joined Params",
+   "FluentdSpec.RootDir/Ignore*LogInterval/Metrics.Path -> html/template input.conf",
+   "FluentdSpec.SystemParameters keys/values -> hand-written input.conf lines (injected)",
+   "FluentdSpec.ConfigIncludes -> @include lines in fluent.conf (injected)"
+  ],
+  "services": [],
+  "project_tests_run": "go test -run '^(TestFunc_|TestRender|TestMultipleOutput)' ./pkg/resources/model ./pkg/resources/fluentd ./pkg/sdk/logging/model/render: the project's render suite (TestRenderDirective, TestMultipleOutput, TestRenderFullFluentConfig, TestRenderErrorOutput, TestRenderFullFluentConfigWithGlobalFilter, TestRenderS3) passes on the pinned+injected tree and on the oracle. The fix commit's own regression test (pkg/sdk/logging/model/render/fluent_injection_test.go) is NOT present at the pinned commit (verified: it is added by cf437d7f).",
+  "injected_siblings": [
+   "FluentdSpec.SystemParameters: extra <system> parameters written by a hand-written formatter (pkg/resources/fluentd/config.go, configsecret.go), plus API/deepcopy/CRD entries",
+   "FluentdSpec.ConfigIncludes: extra @include lines appended to fluent.conf (pkg/resources/fluentd/config.go, configsecret.go), plus API/deepcopy/CRD entries"
+  ]
+ },
+ "leak_terms": [
+  "fluent.go",
+  "configsecret.go",
+  "record_transformer",
+  "record_modifier",
+  "StructToStringMapper",
+  "FlowLabel",
+  "MatchTag",
+  "Relabel",
+  "SystemParameters",
+  "ConfigIncludes",
+  "escapeFluentValue",
+  "validateFluentToken",
+  "RootDir",
+  "IgnoreSameLogInterval",
+  "IgnoreRepeatedLogInterval",
+  "input.conf",
+  "fluent.conf",
+  "renderDirectives",
+  "CreateSystem",
+  "FluentRender",
+  "flowConfigOverride"
+ ],
+ "patch_checks": [
+  {
+   "patch": "alternative.patch",
+   "kind": "alternative",
+   "expect": "pass",
+   "why": "a different valid design: reject any parameter value that contains a line break instead of quoting it"
+  },
+  {
+   "patch": "hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "why": "the oracle plus defensive directive-name and NUL validation; output is unchanged so every test still passes"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  },
+  {
+   "patch": "sec_miss_param_value.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "why": "misses only the base parameter-value lever"
+  },
+  {
+   "patch": "sec_miss_tokens.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "why": "misses only the structural-token lever"
+  },
+  {
+   "patch": "sec_miss_derived.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "why": "guards the mapper but not the record map that becomes parameter names"
+  },
+  {
+   "patch": "sec_miss_admin.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "why": "fixes only the reported renderer, leaving the cluster-wide template writer and both injected writers open"
+  },
+  {
+   "patch": "functional_fail.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "why": "over-broad: quotes every parameter value, breaking structured and plain values"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "why": "refuses every parameter value, breaking all legitimate configuration"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "n/a: a panic aborts the whole Go test binary, so the security suite cannot pass; there is no crash-as-refusal path that could score",
+  "wrong_resource": "n/a: the task has no authorization check or proxy resource; the property is about generated configuration text",
+  "one_role_or_direction": "n/a: no roles, peers or request directions exist in the configuration-generation flow",
+  "reads_only": "n/a: the product only generates configuration; there is no read/write split to guard one side of",
+  "check_after_adjustment": "n/a: the only normalising step is the producer's join/JSON encoding; a guard there and the renderer guard are the same check, so no distinct wrong fix exists",
+  "unlisted_route": "sec_miss_admin.patch",
+  "malformed_identity": "n/a: nothing parses an identity or name into a routing or authorization decision",
+  "missing_authority": "n/a: no role, secret or authority lookup decides whether the guard runs",
+  "adjacent_api": "functional_fail.patch"
+ },
+ "traps": [
+  {
+   "id": "base_param_value",
+   "pattern": "A",
+   "shape": "the published fix's protected sink: the parameter line written by the renderer takes CR-controlled values (and names) with no line-break handling",
+   "where": "pkg/sdk/logging/model/render/fluent.go:64",
+   "reason_to_dismiss": "none - this is the sink the report's impact example lands on",
+   "security_tests": [
+    "TestSec_OutputParamValueNewline",
+    "TestSec_OutputParamValueCarriageReturn",
+    "TestSec_RecordValueNewline"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_OutputConfigUnchanged",
+    "TestFunc_SpecialCharactersUnchanged"
+   ],
+   "security_fail_patch": "sec_miss_param_value.patch",
+   "realistic_because": "published upstream code"
+  },
+  {
+   "id": "structural_tokens",
+   "pattern": "A",
+   "shape": "the directive header and meta lines (@type/@id/@label/@log_level, tag, directive name) take CR strings from flow labels, filter match tags and relabel targets; a value there cannot be quoted, only refused",
+   "where": "pkg/sdk/logging/model/render/fluent.go:47,52-58; pkg/sdk/logging/model/types/flow.go:129; pkg/sdk/logging/model/filter/tagnormaliser.go:99; pkg/sdk/logging/model/output/relabel.go:112",
+   "reason_to_dismiss": "these read as identifiers or plugin-specific fields, not as parameter values; match_tag is marked hidden in the model and looks derived",
+   "security_tests": [
+    "TestSec_FlowLabelNewline",
+    "TestSec_MatchTagNewline",
+    "TestSec_RelabelLabelNewline"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_StructuredSelectorsUnchanged",
+    "TestRenderDirective"
+   ],
+   "security_fail_patch": "sec_miss_tokens.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "derived_values",
+   "pattern": "A",
+   "shape": "values the check never sees as literal strings: the record map is assigned straight to Params so a user key becomes a parameter name; secret values are loaded into Params at render time; selector maps and lists are joined before they are written",
+   "where": "pkg/sdk/logging/model/filter/record_transformer.go:93-101; pkg/sdk/logging/model/types/stringmaps.go:109-118; pkg/sdk/logging/model/types/router.go:68-103",
+   "reason_to_dismiss": "they are machine-produced or secret data rather than configuration strings, and a generic quoting fix breaks the structured values fluentd consumes",
+   "security_tests": [
+    "TestSec_RecordKeyNewline",
+    "TestSec_SecretLoadedValueNewline",
+    "TestSec_ClusterFlowSelectorNewline"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_RecordMapUnchanged",
+    "TestFunc_StructuredSelectorsUnchanged",
+    "TestFunc_SecretValueUnchanged"
+   ],
+   "security_fail_patch": "sec_miss_derived.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "cluster_wide_template",
+   "pattern": "B",
+   "shape": "a second writer assembles the collector's other configuration files from the cluster-wide settings with html/template, which escapes HTML metacharacters but keeps line breaks, so a value adds parameter lines",
+   "where": "pkg/resources/fluentd/config.go:33-81; pkg/resources/fluentd/configsecret.go:61-92",
+   "reason_to_dismiss": "the fields are cluster-admin-only and the template looks escaped",
+   "security_tests": [
+    "TestSec_InputConfigRootDir",
+    "TestSec_InputConfigIgnoreInterval"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_InputConfigDefaults",
+    "TestFunc_InputConfigValuesUnchanged"
+   ],
+   "security_fail_patch": "sec_miss_admin.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "injected_system_parameters",
+   "pattern": "injected",
+   "shape": "extra system parameters are formatted into the generated configuration by hand, so a name or value containing a line break adds configuration lines",
+   "where": "pkg/resources/fluentd/config.go (renderSystemParameters); pkg/resources/fluentd/configsecret.go (SystemParameters)",
+   "reason_to_dismiss": "it is presented as trusted operator tuning, not as a user-supplied value, and it is outside the reported renderer",
+   "security_tests": [
+    "TestSec_SystemParameterValue",
+    "TestSec_SystemParameterName"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_SystemParametersUnchanged"
+   ],
+   "security_fail_patch": "sec_miss_admin.patch",
+   "realistic_because": "new cluster-wide option shaped like the file's existing hand-written config writers"
+  },
+  {
+   "id": "injected_config_includes",
+   "pattern": "injected",
+   "shape": "additional include files are appended to the generated configuration as raw lines, so a path containing a line break adds configuration",
+   "where": "pkg/resources/fluentd/config.go (renderConfigIncludes); pkg/resources/fluentd/configsecret.go (ConfigIncludes)",
+   "reason_to_dismiss": "it looks like a list of file paths rather than a configuration value",
+   "security_tests": [
+    "TestSec_ConfigIncludeNewline"
+   ],
+   "coupled_functional_tests": [
+    "TestFunc_ConfigIncludesUnchanged"
+   ],
+   "security_fail_patch": "sec_miss_admin.patch",
+   "realistic_because": "new cluster-wide option shaped like the file's existing hand-written config writers"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle x3, patches)"
+}

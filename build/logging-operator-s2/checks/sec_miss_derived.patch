@@ -1,0 +1,166 @@
+diff --git a/pkg/resources/fluentd/configsecret.go b/pkg/resources/fluentd/configsecret.go
+index c32504ee..8f04e5bf 100644
+--- a/pkg/resources/fluentd/configsecret.go
++++ b/pkg/resources/fluentd/configsecret.go
+@@ -58,7 +58,47 @@ func generateConfig(input fluentdConfig) (string, error) {
+ 	return output.String(), nil
+ }
+ 
++// validateConfigValue rejects values that would end the configuration line
++// they are written into.
++func validateConfigValue(kind, value string) error {
++	if strings.ContainsAny(value, "\n\r") {
++		return fmt.Errorf("invalid %s %q: must not contain newline characters", kind, value)
++	}
++	return nil
++}
++
+ func (r *Reconciler) generateConfigSecret(fluentdSpec v1beta1.FluentdSpec) (map[string][]byte, error) {
++	for kind, value := range map[string]string{
++		"log format":               fluentdSpec.LogFormat,
++		"log level":                fluentdSpec.LogLevel,
++		"root directory":           fluentdSpec.RootDir,
++		"ignore same interval":     fluentdSpec.IgnoreSameLogInterval,
++		"ignore repeated interval": fluentdSpec.IgnoreRepeatedLogInterval,
++		"fluent log destination":   fluentdSpec.FluentLogDestination,
++	} {
++		if err := validateConfigValue(kind, value); err != nil {
++			return nil, err
++		}
++	}
++	if fluentdSpec.Metrics != nil {
++		if err := validateConfigValue("metrics path", fluentdSpec.Metrics.Path); err != nil {
++			return nil, err
++		}
++	}
++	for name, value := range fluentdSpec.SystemParameters {
++		if err := validateConfigValue("system parameter name", name); err != nil {
++			return nil, err
++		}
++		if err := validateConfigValue("system parameter value", value); err != nil {
++			return nil, err
++		}
++	}
++	for _, include := range fluentdSpec.ConfigIncludes {
++		if err := validateConfigValue("include path", include); err != nil {
++			return nil, err
++		}
++	}
++
+ 	input := fluentdConfig{
+ 		IgnoreSameLogInterval:     fluentdSpec.IgnoreSameLogInterval,
+ 		IgnoreRepeatedLogInterval: fluentdSpec.IgnoreRepeatedLogInterval,
+diff --git a/pkg/sdk/logging/model/render/fluent.go b/pkg/sdk/logging/model/render/fluent.go
+index f7ff7d74..a8f61f99 100644
+--- a/pkg/sdk/logging/model/render/fluent.go
++++ b/pkg/sdk/logging/model/render/fluent.go
+@@ -44,6 +44,19 @@ func (f *FluentRender) RenderDirectives(directives []types.Directive, indent int
+ 		if meta.Directive == "" {
+ 			return fmt.Errorf("directive must have a name %s", meta)
+ 		}
++		// Structural tokens can't be quoted, so a newline would break out.
++		for _, t := range []struct{ kind, value string }{
++			{"directive name", meta.Directive},
++			{"@type", meta.Type},
++			{"@id", meta.Id},
++			{"@label", meta.Label},
++			{"@log_level", meta.LogLevel},
++			{"tag", meta.Tag},
++		} {
++			if err := validateFluentToken(t.kind, t.value); err != nil {
++				return err
++			}
++		}
+ 		f.indentedf(indent, "<%s%s>", meta.Directive, tag(meta.Tag))
+ 		if meta.Type != "" {
+ 			f.indentedf(indent+f.Indent, "@type %s", meta.Type)
+@@ -61,7 +74,7 @@ func (f *FluentRender) RenderDirectives(directives []types.Directive, indent int
+ 			keys := mapstrstr.Keys(params)
+ 			sort.Strings(keys)
+ 			for _, k := range keys {
+-				f.indentedf(indent+f.Indent, "%s %s", k, params[k])
++				f.indentedf(indent+f.Indent, "%s %s", k, escapeFluentValue(params[k]))
+ 			}
+ 		}
+ 		if sections := d.GetSections(); len(sections) > 0 {
+@@ -74,10 +87,10 @@ func (f *FluentRender) RenderDirectives(directives []types.Directive, indent int
+ 	return nil
+ }
+ 
+-func (f *FluentRender) indentedf(indent int, format string, values ...interface{}) {
++func (f *FluentRender) indentedf(indent int, format string, values ...any) {
+ 	indentString := strings.Repeat(" ", indent)
+ 	in := fmt.Sprintf(format, values...)
+-	for _, line := range strings.Split(in, "\n") {
++	for line := range strings.SplitSeq(in, "\n") {
+ 		if line != "" {
+ 			fmt.Fprint(f.Out, indentString+line+"\n") //nolint: errcheck
+ 		} else {
+@@ -92,3 +105,29 @@ func tag(tag string) string {
+ 	}
+ 	return tag
+ }
++
++func validateFluentToken(kind, value string) error {
++	if strings.ContainsAny(value, "\n\r") {
++		return fmt.Errorf("invalid %s %q: must not contain newline characters", kind, value)
++	}
++	return nil
++}
++
++var fluentEscaper = strings.NewReplacer(
++	`\`, `\\`,
++	`"`, `\"`,
++	"\n", `\n`,
++	"\r", `\r`,
++	"\t", `\t`,
++	`#`, `\#`,
++)
++
++// escapeFluentValue quotes values containing newlines, escaping '#' too so
++// quoting can't enable `#{...}` Ruby interpolation. Plain values are unchanged.
++func escapeFluentValue(value string) string {
++	if !strings.ContainsAny(value, "\n\r") {
++		return value
++	}
++
++	return `"` + fluentEscaper.Replace(value) + `"`
++}
+diff --git a/pkg/sdk/logging/model/types/stringmaps.go b/pkg/sdk/logging/model/types/stringmaps.go
+index 10186b2f..4726edca 100644
+--- a/pkg/sdk/logging/model/types/stringmaps.go
++++ b/pkg/sdk/logging/model/types/stringmaps.go
+@@ -47,6 +47,13 @@ func (s *StructToStringMapper) WithConverter(name string, c Converter) *StructTo
+ 	return s
+ }
+ 
++func validateMapperValue(name, value string) error {
++	if strings.ContainsAny(value, "\n\r") {
++		return errors.Errorf("invalid value for field %q: must not contain newline characters", name)
++	}
++	return nil
++}
++
+ func (s *StructToStringMapper) StringsMap(in interface{}) (map[string]string, error) {
+ 	out := make(map[string]string)
+ 	err := s.fillMap(strctVal(in), out)
+@@ -112,6 +119,9 @@ func (s *StructToStringMapper) processField(field reflect.StructField, value ref
+ 			if err != nil {
+ 				return errors.WrapIff(err, "failed to load secret for field %q", name)
+ 			}
++			if err := validateMapperValue(name, loadedSecret); err != nil {
++				return err
++			}
+ 			out[name] = loadedSecret
+ 			return nil
+ 		}
+@@ -139,6 +149,9 @@ func (s *StructToStringMapper) processField(field reflect.StructField, value ref
+ 		if val == "" && required {
+ 			return errors.Errorf("field %q is required", name)
+ 		}
++		if err := validateMapperValue(name, val); err != nil {
++			return err
++		}
+ 		out[name] = val
+ 	case reflect.Slice:
+ 		switch actual := value.Interface().(type) {

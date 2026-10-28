@@ -1,0 +1,215 @@
+diff -ruN a/pkg/resources/fluentd/config.go b/pkg/resources/fluentd/config.go
+--- a/pkg/resources/fluentd/config.go	2026-10-27 19:36:03.000000000 +0000
++++ b/pkg/resources/fluentd/config.go	2026-10-27 20:02:59.289969657 +0000
+@@ -20,9 +20,20 @@
+ 	"strings"
+ )
+ 
++// checkSingleLine reports an error for a value that would end the fluentd
++// configuration line it is written into. Every fluentd setting is written on a
++// line of its own and a line terminator in the value would make the rest of the
++// text a setting of its own, so such a value cannot be represented at all.
++func checkSingleLine(kind, value string) error {
++	if strings.ContainsAny(value, "\r\n") {
++		return fmt.Errorf("%s contains a line break, which cannot be written into the fluentd configuration", kind)
++	}
++	return nil
++}
++
+ // renderSystemParameters formats the extra system parameters given on the
+ // Fluentd spec as configuration lines, in a stable order.
+-func renderSystemParameters(parameters map[string]string) string {
++func renderSystemParameters(parameters map[string]string) (string, error) {
+ 	keys := make([]string, 0, len(parameters))
+ 	for key := range parameters {
+ 		keys = append(keys, key)
+@@ -31,24 +42,33 @@
+ 
+ 	var b strings.Builder
+ 	for _, key := range keys {
++		if err := checkSingleLine("system parameter name", key); err != nil {
++			return "", err
++		}
++		if err := checkSingleLine("system parameter value", parameters[key]); err != nil {
++			return "", err
++		}
+ 		fmt.Fprintf(&b, "  %s %s\n", key, parameters[key])
+ 	}
+-	return b.String()
++	return b.String(), nil
+ }
+ 
+ // renderConfigIncludes appends the requested include directives to a fluentd
+ // configuration document.
+-func renderConfigIncludes(config string, includes []string) string {
++func renderConfigIncludes(config string, includes []string) (string, error) {
+ 	if len(includes) == 0 {
+-		return config
++		return config, nil
+ 	}
+ 
+ 	var b strings.Builder
+ 	b.WriteString(config)
+ 	for _, include := range includes {
++		if err := checkSingleLine("include path", include); err != nil {
++			return "", err
++		}
+ 		fmt.Fprintf(&b, "@include %s\n", include)
+ 	}
+-	return b.String()
++	return b.String(), nil
+ }
+ 
+ var fluentdConfigCheckTemplate = `
+diff -ruN a/pkg/resources/fluentd/configsecret.go b/pkg/resources/fluentd/configsecret.go
+--- a/pkg/resources/fluentd/configsecret.go	2026-10-27 19:36:03.000000000 +0000
++++ b/pkg/resources/fluentd/configsecret.go	2026-10-27 20:03:06.408975879 +0000
+@@ -46,6 +46,26 @@
+ }
+ 
+ func generateConfig(input fluentdConfig) (string, error) {
++	// The template writes one setting per line; a line terminator in any of the
++	// values would end that line and turn the remainder into configuration. The
++	// template escapes HTML metacharacters but not line breaks, so check the
++	// values it interpolates before rendering.
++	fields := []struct{ kind, value string }{
++		{"log format", input.LogFormat},
++		{"log level", input.LogLevel},
++		{"root directory", input.RootDir},
++		{"ignore same log interval", input.IgnoreSameLogInterval},
++		{"ignore repeated log interval", input.IgnoreRepeatedLogInterval},
++	}
++	if input.Monitor.Enabled {
++		fields = append(fields, struct{ kind, value string }{"metrics path", input.Monitor.Path})
++	}
++	for _, field := range fields {
++		if err := checkSingleLine(field.kind, field.value); err != nil {
++			return "", err
++		}
++	}
++
+ 	output := new(bytes.Buffer)
+ 	tmpl, err := template.New("test").Parse(fluentdInputTemplate)
+ 	if err != nil {
+@@ -85,11 +105,20 @@
+ 		return nil, err
+ 	}
+ 	if len(fluentdSpec.SystemParameters) > 0 {
+-		inputConfig = strings.Replace(inputConfig, "</system>", renderSystemParameters(fluentdSpec.SystemParameters)+"</system>", 1)
++		systemParameters, err := renderSystemParameters(fluentdSpec.SystemParameters)
++		if err != nil {
++			return nil, err
++		}
++		inputConfig = strings.Replace(inputConfig, "</system>", systemParameters+"</system>", 1)
++	}
++
++	fluentConfig, err := renderConfigIncludes(fluentdDefaultTemplate, fluentdSpec.ConfigIncludes)
++	if err != nil {
++		return nil, err
+ 	}
+ 
+ 	configs := map[string][]byte{
+-		"fluent.conf":  []byte(renderConfigIncludes(fluentdDefaultTemplate, fluentdSpec.ConfigIncludes)),
++		"fluent.conf":  []byte(fluentConfig),
+ 		"input.conf":   []byte(inputConfig),
+ 		"devnull.conf": []byte(fluentdOutputTemplate),
+ 	}
+@@ -101,6 +130,9 @@
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
++	if err := checkSingleLine("fluent log destination", r.fluentdSpec.FluentLogDestination); err != nil {
++		return nil, nil, err
++	}
+ 	configMap["fluentlog.conf"] = fmt.Appendf(nil, fluentLog, r.fluentdSpec.FluentLogDestination)
+ 	meta := r.FluentdObjectMeta(SecretConfigName, ComponentFluentd)
+ 	meta.Labels = utils.MergeLabels(
+diff -ruN a/pkg/sdk/logging/model/render/fluent.go b/pkg/sdk/logging/model/render/fluent.go
+--- a/pkg/sdk/logging/model/render/fluent.go	2026-10-27 19:36:00.000000000 +0000
++++ b/pkg/sdk/logging/model/render/fluent.go	2026-10-27 20:02:55.609966368 +0000
+@@ -44,24 +44,36 @@
+ 		if meta.Directive == "" {
+ 			return fmt.Errorf("directive must have a name %s", meta)
+ 		}
+-		f.indentedf(indent, "<%s%s>", meta.Directive, tag(meta.Tag))
++		if err := f.indentedf(indent, "<%s%s>", meta.Directive, tag(meta.Tag)); err != nil {
++			return err
++		}
+ 		if meta.Type != "" {
+-			f.indentedf(indent+f.Indent, "@type %s", meta.Type)
++			if err := f.indentedf(indent+f.Indent, "@type %s", meta.Type); err != nil {
++				return err
++			}
+ 		}
+ 		if meta.Id != "" {
+-			f.indentedf(indent+f.Indent, "@id %s", meta.Id)
++			if err := f.indentedf(indent+f.Indent, "@id %s", meta.Id); err != nil {
++				return err
++			}
+ 		}
+ 		if meta.Label != "" {
+-			f.indentedf(indent+f.Indent, "@label %s", meta.Label)
++			if err := f.indentedf(indent+f.Indent, "@label %s", meta.Label); err != nil {
++				return err
++			}
+ 		}
+ 		if meta.LogLevel != "" {
+-			f.indentedf(indent+f.Indent, "@log_level %s", meta.LogLevel)
++			if err := f.indentedf(indent+f.Indent, "@log_level %s", meta.LogLevel); err != nil {
++				return err
++			}
+ 		}
+ 		if params := d.GetParams(); len(params) > 0 {
+ 			keys := mapstrstr.Keys(params)
+ 			sort.Strings(keys)
+ 			for _, k := range keys {
+-				f.indentedf(indent+f.Indent, "%s %s", k, params[k])
++				if err := f.indentedf(indent+f.Indent, "%s %s", k, params[k]); err != nil {
++					return err
++				}
+ 			}
+ 		}
+ 		if sections := d.GetSections(); len(sections) > 0 {
+@@ -69,21 +81,32 @@
+ 				return errors.WrapIff(err, "failed to render sections for %s", meta.Directive)
+ 			}
+ 		}
+-		f.indentedf(indent, "</%s>", meta.Directive)
++		if err := f.indentedf(indent, "</%s>", meta.Directive); err != nil {
++			return err
++		}
+ 	}
+ 	return nil
+ }
+ 
+-func (f *FluentRender) indentedf(indent int, format string, values ...interface{}) {
+-	indentString := strings.Repeat(" ", indent)
+-	in := fmt.Sprintf(format, values...)
+-	for _, line := range strings.Split(in, "\n") {
+-		if line != "" {
+-			fmt.Fprint(f.Out, indentString+line+"\n") //nolint: errcheck
+-		} else {
+-			fmt.Fprintln(f.Out, "") //nolint: errcheck
+-		}
++// indentedf writes one configuration line. Every line this renderer emits goes
++// through here, and every format string it is given is a single-line literal,
++// so a line terminator in the formatted result can only have come from a
++// supplied value (a parameter name or value, a tag, a label, a directive name).
++// Such a value would end the line it was written on and the rest of its text
++// would be read as configuration of its own. None of those positions can
++// represent a line break — the header and meta positions cannot be quoted at
++// all — so the render is refused instead of writing it.
++func (f *FluentRender) indentedf(indent int, format string, values ...interface{}) error {
++	line := fmt.Sprintf(format, values...)
++	if strings.ContainsAny(line, "\r\n") {
++		return errors.New("a supplied value contains a line break and cannot be written as a single configuration value")
+ 	}
++	if line == "" {
++		fmt.Fprintln(f.Out, "") //nolint: errcheck
++		return nil
++	}
++	fmt.Fprintln(f.Out, strings.Repeat(" ", indent)+line) //nolint: errcheck
++	return nil
+ }
+ 
+ func tag(tag string) string {

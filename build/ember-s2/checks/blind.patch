@@ -1,0 +1,388 @@
+diff -ruN a/internal/app/diff.go b/internal/app/diff.go
+--- a/internal/app/diff.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/app/diff.go	2026-10-27 19:54:53.718590509 +0000
+@@ -10,6 +10,7 @@
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/spf13/cobra"
+ )
+ 
+@@ -314,7 +315,9 @@
+ 	if len(d.hosts) > 0 {
+ 		b.WriteString("\nPer-host changes\n")
+ 		for _, h := range d.hosts {
+-			fmt.Fprintf(&b, "\n  %s\n", h.host)
++			// The label is Caddy's per-host metric name (the Host header).
++			// JSON escaped it in the file, but stdout is a terminal.
++			fmt.Fprintf(&b, "\n  %s\n", termtext.Clean(h.host))
+ 			writeDiffLines(&b, h.lines)
+ 		}
+ 	}
+diff -ruN a/internal/termtext/termtext.go b/internal/termtext/termtext.go
+--- a/internal/termtext/termtext.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/termtext/termtext.go	2026-10-27 19:54:24.466758457 +0000
+@@ -0,0 +1,47 @@
++// Package termtext prepares text that is about to be written to a terminal.
++//
++// Values that arrive over the network - a request path, a Host header, a
++// method, a raw log line, certificate metadata, text a plugin echoes - can
++// carry bytes a terminal acts on instead of printing them. Dropping those
++// bytes at the point where the value is drawn keeps the operator's terminal
++// under the operator's control, without touching the value the rest of the
++// program stores, compares or exports.
++package termtext
++
++import "strings"
++
++// control reports whether r is a code point a terminal consumes as a control
++// function rather than printing: C0 (0x00-0x1F, which covers ESC, BEL, CR,
++// LF, TAB and NUL), DEL (0x7F) and C1 (0x80-0x9F).
++func control(r rune) bool {
++	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
++}
++
++// Clean returns s with every control code point removed. Everything a
++// terminal prints as text - accented Latin, CJK, emoji - comes back unchanged,
++// so the display width of the remaining text is the same as before.
++//
++// strings.Map returns s itself, without allocating, when nothing is removed.
++// Invalid UTF-8 decodes to U+FFFD, which is inert.
++func Clean(s string) string {
++	return strings.Map(func(r rune) rune {
++		if control(r) {
++			return -1
++		}
++		return r
++	}, s)
++}
++
++// CleanLines is Clean for a block whose line breaks are part of its layout: a
++// newline is kept as a structural separator, every other control code point
++// is removed from each line.
++func CleanLines(s string) string {
++	if !strings.ContainsRune(s, '\n') {
++		return Clean(s)
++	}
++	lines := strings.Split(s, "\n")
++	for i, line := range lines {
++		lines[i] = Clean(line)
++	}
++	return strings.Join(lines, "\n")
++}
+diff -ruN a/internal/ui/app.go b/internal/ui/app.go
+--- a/internal/ui/app.go	2026-10-27 19:37:53.000000000 +0000
++++ b/internal/ui/app.go	2026-10-27 19:54:35.950689836 +0000
+@@ -9,6 +9,7 @@
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/alexandre-daubois/ember/pkg/plugin"
+ 	tea "github.com/charmbracelet/bubbletea"
+ 	"github.com/charmbracelet/lipgloss"
+@@ -356,16 +357,18 @@
+ 		if pt := a.activePluginTab(); pt != nil && pt.renderer != nil {
+ 			contentList = safePluginView(pt.renderer, listWidth, a.height-10)
+ 			if pt.group.err != nil && contentList == "" {
+-				contentList = greyStyle.Render(" " + pt.group.err.Error())
++				contentList = greyStyle.Render(" " + termtext.Clean(pt.group.err.Error()))
+ 			}
+ 		}
+ 	}
+ 
+ 	var statusLine string
+ 	if a.status != "" {
+-		statusLine = helpStyle.Render(" " + a.status)
++		// Status strings concatenate error text and snapshot Errors, both
++		// of which can quote remote input.
++		statusLine = helpStyle.Render(" " + termtext.Clean(a.status))
+ 	} else if a.err != nil {
+-		statusLine = helpStyle.Render(" ⚠ " + a.err.Error())
++		statusLine = helpStyle.Render(" ⚠ " + termtext.Clean(a.err.Error()))
+ 	}
+ 
+ 	var filterLine string
+diff -ruN a/internal/ui/certificates.go b/internal/ui/certificates.go
+--- a/internal/ui/certificates.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/certificates.go	2026-10-27 19:54:41.343659313 +0000
+@@ -9,6 +9,7 @@
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	tea "github.com/charmbracelet/bubbletea"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+@@ -91,6 +92,9 @@
+ 	if len(c.DNSNames) > 0 {
+ 		domain = c.DNSNames[0]
+ 	}
++	// The displayed name is the first DNS name, not the subject, and both it
++	// and the issuer are strings a remote peer supplied during the handshake.
++	domain = termtext.Clean(domain)
+ 	if len(domain) > domW-1 {
+ 		domain = domain[:domW-2] + "…"
+ 	}
+@@ -103,7 +107,7 @@
+ 	}
+ 
+ 	src := strings.ToUpper(c.Source)
+-	issuer := c.Issuer
++	issuer := termtext.Clean(c.Issuer)
+ 	if len(issuer) > colCertIssuer-1 {
+ 		issuer = issuer[:colCertIssuer-2] + "…"
+ 	}
+diff -ruN a/internal/ui/detail.go b/internal/ui/detail.go
+--- a/internal/ui/detail.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/detail.go	2026-10-27 19:54:49.163615617 +0000
+@@ -7,6 +7,7 @@
+ 	"unicode/utf8"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -54,10 +55,10 @@
+ 		lines = append(lines, "")
+ 		lines = append(lines, sectionHeader("Request", inner))
+ 		if t.CurrentMethod != "" {
+-			lines = append(lines, detailKV("Method", t.CurrentMethod))
++			lines = append(lines, detailKV("Method", termtext.Clean(t.CurrentMethod)))
+ 		}
+ 		if t.CurrentURI != "" {
+-			uri := truncateURI(t.CurrentURI, inner-10)
++			uri := truncateURI(termtext.Clean(t.CurrentURI), inner-10)
+ 			lines = append(lines, detailKV("URI", uri))
+ 		}
+ 		if t.RequestStartedAt > 0 {
+diff -ruN a/internal/ui/hostdetail.go b/internal/ui/hostdetail.go
+--- a/internal/ui/hostdetail.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/hostdetail.go	2026-10-27 19:54:45.012638518 +0000
+@@ -7,6 +7,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -22,6 +23,7 @@
+ 	if host == "*" {
+ 		host = "* (All traffic)"
+ 	}
++	host = termtext.Clean(host)
+ 	crumb := greyStyle.Render("Caddy › ")
+ 	avail := inner - lipgloss.Width(crumb)
+ 	if avail < 1 {
+@@ -98,7 +100,7 @@
+ 			if totalRate > 0 {
+ 				pct = fmt.Sprintf(" (%d%%)", int(m.rate/totalRate*100+0.5))
+ 			}
+-			lines = append(lines, detailKV(m.method, fmt.Sprintf("%s/s%s", formatRate(m.rate), pct)))
++			lines = append(lines, detailKV(termtext.Clean(m.method), fmt.Sprintf("%s/s%s", formatRate(m.rate), pct)))
+ 		}
+ 	}
+ 
+diff -ruN a/internal/ui/hosttable.go b/internal/ui/hosttable.go
+--- a/internal/ui/hosttable.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/hosttable.go	2026-10-27 19:54:43.771645539 +0000
+@@ -7,6 +7,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -90,6 +91,9 @@
+ 	if host == "*" {
+ 		host = "* (All traffic)"
+ 	}
++	// The host label is Caddy's per-host metric name, ultimately the request
++	// Host header.
++	host = termtext.Clean(host)
+ 	if len(host) > hostW-1 {
+ 		host = host[:hostW-2] + "…"
+ 	}
+diff -ruN a/internal/ui/logdetail.go b/internal/ui/logdetail.go
+--- a/internal/ui/logdetail.go	2026-10-27 19:37:53.000000000 +0000
++++ b/internal/ui/logdetail.go	2026-10-27 19:54:30.493720378 +0000
+@@ -5,6 +5,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -19,19 +20,21 @@
+ 
+ 	var lines []string
+ 	lines = append(lines, sectionHeader("Request", inner))
+-	lines = append(lines, detailKV("Request", e.Summary))
+-	lines = append(lines, detailKV("Host", e.Host))
+-	lines = append(lines, detailKV("Method", e.Method))
+-	lines = append(lines, detailKV("URI", e.URI))
++	// Summary is a label the parser assembled at ingest; the panel never
++	// rebuilds it, so it needs the same treatment as the raw fields.
++	lines = append(lines, detailKV("Request", termtext.Clean(e.Summary)))
++	lines = append(lines, detailKV("Host", termtext.Clean(e.Host)))
++	lines = append(lines, detailKV("Method", termtext.Clean(e.Method)))
++	lines = append(lines, detailKV("URI", termtext.Clean(e.URI)))
+ 	lines = append(lines, detailKV("Status", fmt.Sprintf("%d", e.Status)))
+ 	if e.RemoteIP != "" {
+-		lines = append(lines, detailKV("Remote", e.RemoteIP))
++		lines = append(lines, detailKV("Remote", termtext.Clean(e.RemoteIP)))
+ 	}
+ 	if e.Duration > 0 {
+ 		lines = append(lines, detailKV("Duration", formatMs(e.Duration*1000)))
+ 	}
+ 	if e.Logger != "" {
+-		lines = append(lines, detailKV("Logger", e.Logger))
++		lines = append(lines, detailKV("Logger", termtext.Clean(e.Logger)))
+ 	}
+ 
+ 	body := strings.Join(lines, "\n")
+diff -ruN a/internal/ui/logs.go b/internal/ui/logs.go
+--- a/internal/ui/logs.go	2026-10-27 19:37:53.000000000 +0000
++++ b/internal/ui/logs.go	2026-10-27 19:54:52.754595806 +0000
+@@ -6,6 +6,7 @@
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	tea "github.com/charmbracelet/bubbletea"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+@@ -214,7 +215,7 @@
+ 		return "No matching log lines (filter: " + a.filter + ")"
+ 	}
+ 	if sourceLen > 0 && a.logSel.kind == logSelAccessHost {
+-		return "No access logs yet for " + a.logSel.host
++		return "No access logs yet for " + termtext.Clean(a.logSel.host)
+ 	}
+ 	if a.logSource != "" {
+ 		return "Listening on " + a.logSource + " — waiting for log lines (it can take up to 30s)..."
+diff -ruN a/internal/ui/logsidepanel.go b/internal/ui/logsidepanel.go
+--- a/internal/ui/logsidepanel.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/logsidepanel.go	2026-10-27 19:54:51.803601053 +0000
+@@ -4,6 +4,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -231,6 +232,9 @@
+ // header and row labels so the column edges align and the border renders
+ // cleanly at a fixed width.
+ func padOrTrunc(s string, width int) string {
++	// Sidepanel rows include access-log host names, which a remote client
++	// chooses; clean before measuring so the border still aligns.
++	s = termtext.Clean(s)
+ 	w := lipgloss.Width(s)
+ 	if w == width {
+ 		return s
+diff -ruN a/internal/ui/logtable.go b/internal/ui/logtable.go
+--- a/internal/ui/logtable.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/logtable.go	2026-10-27 19:54:27.510737045 +0000
+@@ -5,6 +5,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ 	"github.com/mattn/go-runewidth"
+ )
+@@ -19,6 +20,9 @@
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	// Every cell drawn here can carry a request field or a raw log line.
++	// Neutralise before measuring so removed bytes cannot skew the padding.
++	s = termtext.Clean(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+@@ -34,6 +38,7 @@
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	s = termtext.Clean(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+diff -ruN a/internal/ui/plugin_bridge.go b/internal/ui/plugin_bridge.go
+--- a/internal/ui/plugin_bridge.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/plugin_bridge.go	2026-10-27 19:54:33.303704651 +0000
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"fmt"
+ 
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/alexandre-daubois/ember/pkg/plugin"
+ 	tea "github.com/charmbracelet/bubbletea"
+ )
+@@ -102,6 +103,11 @@
+ 		if rec := recover(); rec != nil {
+ 			s = fmt.Sprintf("plugin error: %v", rec)
+ 		}
++		// Ember owns the terminal here, not the plugin: a view may echo
++		// live Caddy data (host labels, request paths), and a panic value
++		// may quote it too. Line breaks are the plugin's layout, so they
++		// stay; every other control code point is removed.
++		s = termtext.CleanLines(s)
+ 	}()
+ 	return r.View(w, h)
+ }
+diff -ruN a/internal/ui/routestable.go b/internal/ui/routestable.go
+--- a/internal/ui/routestable.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/routestable.go	2026-10-27 19:54:47.119626894 +0000
+@@ -6,6 +6,7 @@
+ 	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -122,7 +123,10 @@
+ 		prefix = ">"
+ 	}
+ 
+-	method := s.Key.Method
++	// The method goes straight through padCellRight, which does not clean;
++	// the pattern (and the host prefix folded into it) is cleaned inside
++	// fitCellLeft.
++	method := termtext.Clean(s.Key.Method)
+ 	if method == "" {
+ 		method = "—"
+ 	}
+diff -ruN a/internal/ui/workerlist.go b/internal/ui/workerlist.go
+--- a/internal/ui/workerlist.go	2026-10-27 19:37:49.000000000 +0000
++++ b/internal/ui/workerlist.go	2026-10-27 19:54:48.142621250 +0000
+@@ -10,6 +10,7 @@
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/termtext"
+ 	"github.com/charmbracelet/lipgloss"
+ )
+ 
+@@ -139,10 +140,10 @@
+ 	method := "—"
+ 	uri := "—"
+ 	if t.IsBusy && t.CurrentMethod != "" {
+-		method = t.CurrentMethod
++		method = termtext.Clean(t.CurrentMethod)
+ 	}
+ 	if t.IsBusy && t.CurrentURI != "" {
+-		uri = t.CurrentURI
++		uri = termtext.Clean(t.CurrentURI)
+ 		if len(uri) > uriW {
+ 			uri = uri[:uriW-1] + "…"
+ 		}

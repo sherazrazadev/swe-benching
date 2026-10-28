@@ -1,0 +1,238 @@
+diff -ruN pristine/computation-local/src/main/java/com/powsybl/computation/local/AbstractLocalCommandExecutor.java app/computation-local/src/main/java/com/powsybl/computation/local/AbstractLocalCommandExecutor.java
+--- a/computation-local/src/main/java/com/powsybl/computation/local/AbstractLocalCommandExecutor.java	2026-10-27 19:31:48.000000000 +0000
++++ b/computation-local/src/main/java/com/powsybl/computation/local/AbstractLocalCommandExecutor.java	2026-10-27 19:48:46.372307903 +0000
+@@ -14,6 +14,7 @@
+ import java.util.Map;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.regex.Pattern;
+ 
+ public abstract class AbstractLocalCommandExecutor implements LocalCommandExecutor {
+ 
+@@ -22,6 +23,34 @@
+ 
+     protected static final String NON_ZERO_LOG_PATTERN = "Command '{}' has failed (exitValue={})";
+ 
++    /**
++     * A name the shell accepts on the left of an assignment word. Environment entries are composed
++     * as {@code NAME=value} before they reach the shell, so anything outside this set could rewrite
++     * the command line instead of naming a variable.
++     */
++    private static final Pattern ENVIRONMENT_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
++
++    /**
++     * Reject an environment entry whose name cannot be written as a plain shell assignment target.
++     * Refusing is the only safe option: a name has no quoting context of its own.
++     */
++    protected static String checkEnvironmentName(String name) {
++        if (name == null || !ENVIRONMENT_NAME.matcher(name).matches()) {
++            throw new IllegalArgumentException("Invalid environment variable name: " + name);
++        }
++        return name;
++    }
++
++    /**
++     * Quote a value so that a POSIX shell reads it back as exactly one literal word. The value is
++     * enclosed in single quotes, where the shell interprets nothing. An embedded single quote is
++     * written as close-quote, an escaped quote, and reopen-quote ({@code '\''}); the escaped quote
++     * is outside every quoted region, so it cannot terminate the word.
++     */
++    protected static String posixQuote(String value) {
++        return "'" + value.replace("'", "'\\''") + "'";
++    }
++
+     @Override
+     public void stop(Path workingDir) {
+         Process process = getProcessByWorkingDir(workingDir);
+@@ -49,13 +78,26 @@
+     }
+ 
+     protected int execute(List<String> cmdLs, Path workingDir, Path outFile, Path errFile, long timeout) throws IOException, InterruptedException {
++        return execute(cmdLs, null, workingDir, outFile, errFile, timeout);
++    }
++
++    /**
++     * Launch a command from an argument list, optionally overriding entries of the child
++     * environment. A null map leaves the inherited environment untouched. Nothing here is passed
++     * through a shell, so no element of {@code cmdLs} or of the environment is interpreted.
++     */
++    protected int execute(List<String> cmdLs, Map<String, String> extraEnv, Path workingDir, Path outFile, Path errFile,
++                          long timeout) throws IOException, InterruptedException {
+         ProcessBuilder.Redirect outRedirect = ProcessBuilder.Redirect.appendTo(outFile.toFile());
+         ProcessBuilder.Redirect errRedirect = ProcessBuilder.Redirect.appendTo(errFile.toFile());
+-        Process process = new ProcessBuilder(cmdLs)
++        ProcessBuilder processBuilder = new ProcessBuilder(cmdLs)
+                 .directory(workingDir.toFile())
+                 .redirectOutput(outRedirect)
+-                .redirectError(errRedirect)
+-                .start();
++                .redirectError(errRedirect);
++        if (extraEnv != null) {
++            processBuilder.environment().putAll(extraEnv);
++        }
++        Process process = processBuilder.start();
+ 
+         try {
+             lock.writeLock().lock();
+diff -ruN pristine/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java app/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java
+--- a/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java	2026-10-27 19:31:54.000000000 +0000
++++ b/computation-local/src/main/java/com/powsybl/computation/local/JobScriptLocalCommandExecutor.java	2026-10-27 19:48:51.148918228 +0000
+@@ -40,17 +40,19 @@
+         StringBuilder script = new StringBuilder();
+         script.append("#!/bin/bash").append(System.lineSeparator());
+         for (Map.Entry<String, String> entry : env.entrySet()) {
+-            String name = entry.getKey();
++            String name = checkEnvironmentName(entry.getKey());
+             String value = entry.getValue();
+-            script.append("export ").append(name).append("=").append("\"").append(value).append("\"");
++            // The script content is shell text too: quote every value as one literal word and keep
++            // the search-path suffix outside the quoting so it still expands.
++            script.append("export ").append(name).append("=").append(posixQuote(value));
+             if (name.endsWith("PATH")) {
+                 script.append(File.pathSeparator).append("$").append(name);
+             }
+             script.append(System.lineSeparator());
+         }
+-        script.append(program);
++        script.append(posixQuote(program));
+         for (String arg : args) {
+-            script.append(" \"").append(arg).append("\"");
++            script.append(" ").append(posixQuote(arg));
+         }
+         script.append(System.lineSeparator());
+ 
+diff -ruN pristine/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java app/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java
+--- a/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java	2026-10-27 19:31:54.000000000 +0000
++++ b/computation-local/src/main/java/com/powsybl/computation/local/ShellLocalCommandExecutor.java	2026-10-27 19:48:55.640355196 +0000
+@@ -38,17 +38,17 @@
+                        Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
+         StringBuilder internalCmd = new StringBuilder();
+         for (Map.Entry<String, String> entry : env.entrySet()) {
+-            String name = entry.getKey();
++            String name = checkEnvironmentName(entry.getKey());
+             String value = entry.getValue();
+-            internalCmd.append(name).append("=").append(quote(value));
++            internalCmd.append(name).append("=").append(posixQuote(value));
+             if (name.endsWith("PATH")) {
+                 internalCmd.append(File.pathSeparator).append("$").append(name);
+             }
+             internalCmd.append(" ");
+         }
+-        internalCmd.append(program);
++        internalCmd.append(posixQuote(program));
+         for (String arg : args) {
+-            internalCmd.append(" ").append(quote(arg));
++            internalCmd.append(" ").append(posixQuote(arg));
+         }
+ 
+         List<String> cmdLs = ImmutableList.<String>builder()
+@@ -63,8 +63,4 @@
+     void nonZeroLog(List<String> commandLine, int exitCode) {
+         LOGGER.debug(NON_ZERO_LOG_PATTERN, commandLine, exitCode);
+     }
+-
+-    private static String quote(String value) {
+-        return "'" + value.replace("'", "\\'") + "'";
+-    }
+ }
+diff -ruN pristine/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java app/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java
+--- a/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java	2026-10-27 19:31:48.000000000 +0000
++++ b/computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java	2026-10-27 19:48:48.570236314 +0000
+@@ -40,17 +40,19 @@
+ 
+         StringBuilder internalCmd = new StringBuilder();
+         for (Map.Entry<String, String> entry : env2.entrySet()) {
+-            String name = entry.getKey();
++            String name = checkEnvironmentName(entry.getKey());
+             String value = entry.getValue();
+-            internalCmd.append(name).append("=").append(value);
++            // The whole value is one literal word; the search-path suffix stays outside the
++            // quoting on purpose so the child still inherits the parent value.
++            internalCmd.append(name).append("=").append(posixQuote(value));
+             if (name.endsWith("PATH")) {
+                 internalCmd.append(File.pathSeparator).append("$").append(name);
+             }
+             internalCmd.append(" ");
+         }
+-        internalCmd.append(program);
++        internalCmd.append(posixQuote(program));
+         for (String arg : args) {
+-            internalCmd.append(" \"").append(arg).append("\"");
++            internalCmd.append(" ").append(posixQuote(arg));
+         }
+ 
+         List<String> cmdLs = ImmutableList.<String>builder()
+diff -ruN pristine/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java app/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java
+--- a/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java	2026-10-27 19:31:48.000000000 +0000
++++ b/computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java	2026-10-27 19:49:03.883397278 +0000
+@@ -8,13 +8,13 @@
+ package com.powsybl.computation.local;
+ 
+ import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.ImmutableMap;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.io.File;
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -33,36 +33,33 @@
+ 
+     @Override
+     public int execute(String program, long timeoutSecondes, List<String> args, Path outFile, Path errFile, Path workingDir, Map<String, String> env) throws IOException, InterruptedException {
+-        // set TMP and TEMP to working dir to avoid issues
+-        Map<String, String> env2 = ImmutableMap.<String, String>builder()
+-                .putAll(env)
+-                .put("TEMP", workingDir.toAbsolutePath().toString())
+-                .put("TMP", workingDir.toAbsolutePath().toString())
++        // This backend does not build a cmd.exe command line. The program, its arguments and the
++        // environment entries are handed to the operating system as a list, so no element is ever
++        // re-parsed by a shell and every value reaches the child unchanged.
++        List<String> cmdLs = ImmutableList.<String>builder()
++                .add(program)
++                .addAll(args)
+                 .build();
+ 
+-        StringBuilder internalCmd = new StringBuilder();
+-        internalCmd.append("setlocal & ");
+-        for (Map.Entry<String, String> entry : env2.entrySet()) {
++        Map<String, String> childEnv = new LinkedHashMap<>();
++        for (Map.Entry<String, String> entry : env.entrySet()) {
+             String name = entry.getKey();
+             String value = entry.getValue();
+-            internalCmd.append("set ").append("\"").append(name).append("=").append(value);
+             if (name.endsWith("PATH")) {
+-                internalCmd.append(File.pathSeparator).append("%").append(name).append("%");
++                // Keep the search-path setting additive: the new value leads, the inherited one
++                // follows, exactly as `%NAME%` expansion did on the command line.
++                String inherited = System.getenv(name);
++                if (inherited != null && !inherited.isEmpty()) {
++                    value = value + File.pathSeparator + inherited;
++                }
+             }
+-            internalCmd.append("\"").append(" & ");
+-        }
+-        internalCmd.append(program);
+-        for (String arg : args) {
+-            internalCmd.append(" \"").append(arg).append("\"");
++            childEnv.put(name, value);
+         }
+-        internalCmd.append(" & endlocal");
++        // set TEMP and TMP to the working directory to avoid issues
++        childEnv.put("TEMP", workingDir.toAbsolutePath().toString());
++        childEnv.put("TMP", workingDir.toAbsolutePath().toString());
+ 
+-        List<String> cmdLs = ImmutableList.<String>builder()
+-                .add("cmd")
+-                .add("/c")
+-                .add(internalCmd.toString())
+-                .build();
+-        return execute(cmdLs, workingDir, outFile, errFile, timeoutSecondes);
++        return execute(cmdLs, childEnv, workingDir, outFile, errFile, timeoutSecondes);
+     }
+ 
+     @Override

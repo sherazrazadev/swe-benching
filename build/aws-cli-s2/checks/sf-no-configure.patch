@@ -1,0 +1,164 @@
+diff --git a/awscli/customizations/codeartifact/login.py b/awscli/customizations/codeartifact/login.py
+index c6816db..8148c01 100644
+--- a/awscli/customizations/codeartifact/login.py
++++ b/awscli/customizations/codeartifact/login.py
+@@ -183,7 +183,19 @@ class SwiftLogin(BaseLogin):
+             if new_contents == contents:
+                 new_contents = self._append_netrc_entry(new_contents, new_entry)
+ 
+-            with open(netrc_path, 'w') as f:
++            fd = os.open(
++                netrc_path,
++                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
++                0o600
++            )
++            try:
++                os.chmod(netrc_path, 0o600)
++            except OSError as e:
++                uni_print('Unable to set file permissions '
++                          'for %s: %s%s' % (netrc_path, e, os.linesep),
++                          sys.stderr)
++
++            with os.fdopen(fd, 'w') as f:
+                 f.write(new_contents)
+ 
+     def _create_netrc_file(self, netrc_path, new_entry):
+@@ -631,7 +643,19 @@ password: {auth_token}'''
+             sys.stdout.write(pypi_rc_str)
+             sys.stdout.write(os.linesep)
+         else:
+-            with open(self.pypi_rc_path, 'w+') as fp:
++            fd = os.open(
++                self.pypi_rc_path,
++                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
++                0o600
++            )
++            try:
++                os.chmod(self.pypi_rc_path, 0o600)
++            except OSError as e:
++                uni_print('Unable to set file permissions '
++                          'for %s: %s%s' % (self.pypi_rc_path, e, os.linesep),
++                          sys.stderr)
++
++            with os.fdopen(fd, 'w') as fp:
+                 fp.write(pypi_rc_str)
+ 
+             self._write_success_message('twine')
+diff --git a/awscli/customizations/codedeploy/register.py b/awscli/customizations/codedeploy/register.py
+index e959044..220f819 100644
+--- a/awscli/customizations/codedeploy/register.py
++++ b/awscli/customizations/codedeploy/register.py
+@@ -11,6 +11,7 @@
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
+ 
++import os
+ import sys
+ 
+ from awscli.customizations.commands import BasicCommand
+@@ -179,7 +180,26 @@ class Register(BasicCommand):
+             'Creating the on-premises instance configuration file named {0}'
+             '...'.format(DEFAULT_CONFIG_FILE)
+         )
+-        with open(DEFAULT_CONFIG_FILE, 'w') as f:
++        try:
++            fd = os.open(
++                DEFAULT_CONFIG_FILE,
++                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
++                0o600,
++            )
++        except OSError as e:
++            raise RuntimeError(
++                'Failed to create config file {0}: {1}'.format(
++                    DEFAULT_CONFIG_FILE, e
++                )
++            )
++        try:
++            os.chmod(DEFAULT_CONFIG_FILE, 0o600)
++        except OSError as e:
++            sys.stderr.write(
++                'Unable to set file permissions for %s: %s%s'
++                % (DEFAULT_CONFIG_FILE, e, os.linesep)
++            )
++        with os.fdopen(fd, 'w') as f:
+             f.write(
+                 '---\n'
+                 'region: {0}\n'
+diff --git a/awscli/customizations/iamvirtmfa.py b/awscli/customizations/iamvirtmfa.py
+index c0ee358..aea7a5e 100644
+--- a/awscli/customizations/iamvirtmfa.py
++++ b/awscli/customizations/iamvirtmfa.py
+@@ -23,12 +23,22 @@ to the specified file.  It will also remove the two bootstrap data
+ fields from the response.
+ """
+ import base64
++import os
++import sys
+ 
++from awscli.compat import compat_open
+ from awscli.customizations.arguments import StatefulArgument
+ from awscli.customizations.arguments import resolve_given_outfile_path
+ from awscli.customizations.arguments import is_parsed_result_successful
+ 
+ 
++def _warn_unable_to_set_permissions(path, error):
++    sys.stderr.write(
++        'Unable to set file permissions for %s: %s%s'
++        % (path, error, os.linesep)
++    )
++
++
+ CHOICES = ('QRCodePNG', 'Base32StringSeed')
+ OUTPUT_HELP = ('The output path and file name where the bootstrap '
+                'information will be stored.')
+@@ -71,8 +81,16 @@ class IAMVMFAWrapper(object):
+         outfile = self._outfile.value
+         if method in parsed['VirtualMFADevice']:
+             body = parsed['VirtualMFADevice'][method]
+-            with open(outfile, 'wb') as fp:
++            with compat_open(
++                    outfile, 'wb', access_permissions=0o600) as fp:
+                 fp.write(base64.b64decode(body))
++                try:
++                    if hasattr(os, 'fchmod'):
++                        os.fchmod(fp.fileno(), 0o600)
++                    else:
++                        os.chmod(outfile, 0o600)
++                except OSError as e:
++                    _warn_unable_to_set_permissions(outfile, e)
+             for choice in CHOICES:
+                 if choice in parsed['VirtualMFADevice']:
+                     del parsed['VirtualMFADevice'][choice]
+diff --git a/awscli/customizations/rds.py b/awscli/customizations/rds.py
+index a6fd803..1019f05 100644
+--- a/awscli/customizations/rds.py
++++ b/awscli/customizations/rds.py
+@@ -25,6 +25,7 @@ modify-option-group).
+ """
+ 
+ import os
++import sys
+ 
+ from awscli.clidriver import ServiceOperation
+ from awscli.clidriver import CLIOperationCaller
+@@ -117,7 +118,19 @@ class GenerateDBAuthTokenCommand(BasicCommand):
+             outfile = os.path.expanduser(
+                 os.path.expandvars(parsed_args.outfile)
+             )
+-            with open(outfile, 'w') as f:
++            fd = os.open(
++                outfile,
++                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
++                0o600
++            )
++            try:
++                os.chmod(outfile, 0o600)
++            except OSError as e:
++                sys.stderr.write(
++                    'Unable to set file permissions for %s: %s%s'
++                    % (outfile, e, os.linesep)
++                )
++            with os.fdopen(fd, 'w') as f:
+                 f.write(token)
+                 f.write('\n')
+         else:

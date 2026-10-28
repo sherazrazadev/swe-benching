@@ -1,0 +1,395 @@
+diff --git a/internal/app/diff.go b/internal/app/diff.go
+index d1d0920..93d82ed 100644
+--- a/internal/app/diff.go
++++ b/internal/app/diff.go
+@@ -10,6 +10,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ 	"github.com/spf13/cobra"
+ )
+ 
+@@ -314,7 +315,7 @@ func formatDiffBody(d diffResult) string {
+ 	if len(d.hosts) > 0 {
+ 		b.WriteString("\nPer-host changes\n")
+ 		for _, h := range d.hosts {
+-			fmt.Fprintf(&b, "\n  %s\n", h.host)
++			fmt.Fprintf(&b, "\n  %s\n", sanitize.Control(h.host))
+ 			writeDiffLines(&b, h.lines)
+ 		}
+ 	}
+diff --git a/internal/app/json.go b/internal/app/json.go
+index 04831a3..dfd97e5 100644
+--- a/internal/app/json.go
++++ b/internal/app/json.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
+ 	"github.com/alexandre-daubois/ember/internal/model"
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ )
+ 
+ type jsonOutput struct {
+@@ -182,7 +183,7 @@ func buildJSONOutput(snap *fetcher.Snapshot, state *model.State) jsonOutput {
+ 	}
+ 	for _, hd := range state.HostDerived {
+ 		jh := jsonHost{
+-			Host:           hd.Host,
++			Host:           sanitize.Control(hd.Host),
+ 			RPS:            hd.RPS,
+ 			AvgTime:        hd.AvgTime,
+ 			ErrorRate:      hd.ErrorRate,
+@@ -230,8 +231,8 @@ func convertThreads(t fetcher.ThreadsResponse) jsonThreadsResponse {
+ 			IsWaiting:                s.IsWaiting,
+ 			IsBusy:                   s.IsBusy,
+ 			WaitingSinceMilliseconds: s.WaitingSinceMilliseconds,
+-			CurrentURI:               s.CurrentURI,
+-			CurrentMethod:            s.CurrentMethod,
++			CurrentURI:               sanitize.Control(s.CurrentURI),
++			CurrentMethod:            sanitize.Control(s.CurrentMethod),
+ 			RequestStartedAt:         s.RequestStartedAt,
+ 			MemoryUsage:              s.MemoryUsage,
+ 			RequestCount:             s.RequestCount,
+diff --git a/internal/model/logbuffer.go b/internal/model/logbuffer.go
+index 3ba24db..95a379e 100644
+--- a/internal/model/logbuffer.go
++++ b/internal/model/logbuffer.go
+@@ -7,6 +7,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ )
+ 
+ // DefaultLogBufferCapacity is the number of recent log entries kept in memory
+@@ -42,6 +43,14 @@ func (b *LogBuffer) Append(e fetcher.LogEntry) {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 
++	// Clean control bytes at ingest so every consumer sees safe strings.
++	e.Host = sanitize.Control(e.Host)
++	e.Method = sanitize.Control(e.Method)
++	e.URI = sanitize.Control(e.URI)
++	e.Logger = sanitize.Control(e.Logger)
++	e.Message = sanitize.Control(e.Message)
++	e.RawLine = sanitize.Control(e.RawLine)
++	e.Summary = sanitize.Control(e.Summary)
+ 	b.entries[b.head] = e
+ 	b.head = (b.head + 1) % b.capacity
+ 	if b.head == 0 {
+diff --git a/internal/model/routeaggregator.go b/internal/model/routeaggregator.go
+index de3e563..a7371a2 100644
+--- a/internal/model/routeaggregator.go
++++ b/internal/model/routeaggregator.go
+@@ -5,6 +5,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/alexandre-daubois/ember/internal/fetcher"
++	"github.com/alexandre-daubois/ember/internal/sanitize"
+ )
+ 
+ // RouteAggregator maintains per-route stats over the entire lifetime of an
+@@ -33,7 +34,7 @@ func (a *RouteAggregator) Track(e fetcher.LogEntry) {
+ 	if !e.IsAccessLog() || e.Method == "" || e.URI == "" {
+ 		return
+ 	}
+-	key := RouteKey{Host: e.Host, Method: e.Method, Pattern: NormalizeURI(e.URI)}
++	key := RouteKey{Host: sanitize.Control(e.Host), Method: sanitize.Control(e.Method), Pattern: sanitize.Control(NormalizeURI(e.URI))}
+ 
+ 	a.mu.Lock()
+ 	defer a.mu.Unlock()
+diff --git a/internal/sanitize/sanitize.go b/internal/sanitize/sanitize.go
+new file mode 100644
+index 0000000..85c0ff2
+--- /dev/null
++++ b/internal/sanitize/sanitize.go
+@@ -0,0 +1,20 @@
++// Package sanitize neutralises text that is about to be written to a
++// terminal by removing the code points a terminal would act on instead of
++// printing: C0 controls (including ESC, BEL, CR, LF and TAB), DEL and C1
++// controls.
++package sanitize
++
++import "strings"
++
++// Control returns s without C0 controls (0x00-0x1F), DEL (0x7F) or C1
++// controls (0x80-0x9F). Printable UTF-8 is preserved unchanged; invalid
++// bytes become U+FFFD, which is inert. strings.Map returns s itself, with no
++// allocation, when it is already clean.
++func Control(s string) string {
++	return strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
++			return -1
++		}
++		return r
++	}, s)
++}
+diff --git a/internal/ui/app.go b/internal/ui/app.go
+index d38aa83..e76959c 100644
+--- a/internal/ui/app.go
++++ b/internal/ui/app.go
+@@ -356,16 +356,18 @@ func (a *App) View() string {
+ 		if pt := a.activePluginTab(); pt != nil && pt.renderer != nil {
+ 			contentList = safePluginView(pt.renderer, listWidth, a.height-10)
+ 			if pt.group.err != nil && contentList == "" {
+-				contentList = greyStyle.Render(" " + pt.group.err.Error())
++				contentList = greyStyle.Render(" " + sanitizeControl(pt.group.err.Error()))
+ 			}
+ 		}
+ 	}
+ 
+ 	var statusLine string
+ 	if a.status != "" {
+-		statusLine = helpStyle.Render(" " + a.status)
++		// Status and error strings concatenate .Error() output, which can
++		// carry bytes from external sources.
++		statusLine = helpStyle.Render(" " + sanitizeControl(a.status))
+ 	} else if a.err != nil {
+-		statusLine = helpStyle.Render(" ⚠ " + a.err.Error())
++		statusLine = helpStyle.Render(" ⚠ " + sanitizeControl(a.err.Error()))
+ 	}
+ 
+ 	var filterLine string
+diff --git a/internal/ui/certificates.go b/internal/ui/certificates.go
+index 081352c..055b83c 100644
+--- a/internal/ui/certificates.go
++++ b/internal/ui/certificates.go
+@@ -91,6 +91,9 @@ func formatCertRow(c fetcher.CertificateInfo, width, domW int, selected bool) st
+ 	if len(c.DNSNames) > 0 {
+ 		domain = c.DNSNames[0]
+ 	}
++	// Certificate metadata is rendered through fmt.Sprintf rather than the
++	// cell helpers, so strip control bytes here (CWE-150).
++	domain = sanitizeControl(domain)
+ 	if len(domain) > domW-1 {
+ 		domain = domain[:domW-2] + "…"
+ 	}
+@@ -103,7 +106,7 @@ func formatCertRow(c fetcher.CertificateInfo, width, domW int, selected bool) st
+ 	}
+ 
+ 	src := strings.ToUpper(c.Source)
+-	issuer := c.Issuer
++	issuer := sanitizeControl(c.Issuer)
+ 	if len(issuer) > colCertIssuer-1 {
+ 		issuer = issuer[:colCertIssuer-2] + "…"
+ 	}
+diff --git a/internal/ui/detail.go b/internal/ui/detail.go
+index d92515d..983f523 100644
+--- a/internal/ui/detail.go
++++ b/internal/ui/detail.go
+@@ -54,10 +54,10 @@ func renderDetailPanel(t fetcher.ThreadDebugState, width, height int, memSamples
+ 		lines = append(lines, "")
+ 		lines = append(lines, sectionHeader("Request", inner))
+ 		if t.CurrentMethod != "" {
+-			lines = append(lines, detailKV("Method", t.CurrentMethod))
++			lines = append(lines, detailKV("Method", sanitizeControl(t.CurrentMethod)))
+ 		}
+ 		if t.CurrentURI != "" {
+-			uri := truncateURI(t.CurrentURI, inner-10)
++			uri := truncateURI(sanitizeControl(t.CurrentURI), inner-10)
+ 			lines = append(lines, detailKV("URI", uri))
+ 		}
+ 		if t.RequestStartedAt > 0 {
+diff --git a/internal/ui/hostdetail.go b/internal/ui/hostdetail.go
+index 738ff18..6315131 100644
+--- a/internal/ui/hostdetail.go
++++ b/internal/ui/hostdetail.go
+@@ -22,6 +22,7 @@ func renderHostDetailPanel(h model.HostDerived, width, height int) string {
+ 	if host == "*" {
+ 		host = "* (All traffic)"
+ 	}
++	host = sanitizeControl(host)
+ 	crumb := greyStyle.Render("Caddy › ")
+ 	avail := inner - lipgloss.Width(crumb)
+ 	if avail < 1 {
+@@ -98,7 +99,7 @@ func renderHostDetailPanel(h model.HostDerived, width, height int) string {
+ 			if totalRate > 0 {
+ 				pct = fmt.Sprintf(" (%d%%)", int(m.rate/totalRate*100+0.5))
+ 			}
+-			lines = append(lines, detailKV(m.method, fmt.Sprintf("%s/s%s", formatRate(m.rate), pct)))
++			lines = append(lines, detailKV(sanitizeControl(m.method), fmt.Sprintf("%s/s%s", formatRate(m.rate), pct)))
+ 		}
+ 	}
+ 
+diff --git a/internal/ui/hosttable.go b/internal/ui/hosttable.go
+index 811c227..564e58d 100644
+--- a/internal/ui/hosttable.go
++++ b/internal/ui/hosttable.go
+@@ -90,6 +90,7 @@ func formatHostRow(h model.HostDerived, width, hostW int, selected bool, hostRPS
+ 	if host == "*" {
+ 		host = "* (All traffic)"
+ 	}
++	host = sanitizeControl(host)
+ 	if len(host) > hostW-1 {
+ 		host = host[:hostW-2] + "…"
+ 	}
+diff --git a/internal/ui/logdetail.go b/internal/ui/logdetail.go
+index 302e8ec..42fc666 100644
+--- a/internal/ui/logdetail.go
++++ b/internal/ui/logdetail.go
+@@ -19,19 +19,19 @@ func renderLogDetailPanel(e fetcher.LogEntry, width, height int) string {
+ 
+ 	var lines []string
+ 	lines = append(lines, sectionHeader("Request", inner))
+-	lines = append(lines, detailKV("Request", e.Summary))
+-	lines = append(lines, detailKV("Host", e.Host))
+-	lines = append(lines, detailKV("Method", e.Method))
+-	lines = append(lines, detailKV("URI", e.URI))
++	lines = append(lines, detailKV("Request", sanitizeControl(e.Summary)))
++	lines = append(lines, detailKV("Host", sanitizeControl(e.Host)))
++	lines = append(lines, detailKV("Method", sanitizeControl(e.Method)))
++	lines = append(lines, detailKV("URI", sanitizeControl(e.URI)))
+ 	lines = append(lines, detailKV("Status", fmt.Sprintf("%d", e.Status)))
+ 	if e.RemoteIP != "" {
+-		lines = append(lines, detailKV("Remote", e.RemoteIP))
++		lines = append(lines, detailKV("Remote", sanitizeControl(e.RemoteIP)))
+ 	}
+ 	if e.Duration > 0 {
+ 		lines = append(lines, detailKV("Duration", formatMs(e.Duration*1000)))
+ 	}
+ 	if e.Logger != "" {
+-		lines = append(lines, detailKV("Logger", e.Logger))
++		lines = append(lines, detailKV("Logger", sanitizeControl(e.Logger)))
+ 	}
+ 
+ 	body := strings.Join(lines, "\n")
+diff --git a/internal/ui/logs.go b/internal/ui/logs.go
+index ea3e4f9..004dc7a 100644
+--- a/internal/ui/logs.go
++++ b/internal/ui/logs.go
+@@ -214,7 +214,7 @@ func (a *App) logsEmptyHint(visibleCount int) string {
+ 		return "No matching log lines (filter: " + a.filter + ")"
+ 	}
+ 	if sourceLen > 0 && a.logSel.kind == logSelAccessHost {
+-		return "No access logs yet for " + a.logSel.host
++		return "No access logs yet for " + sanitizeControl(a.logSel.host)
+ 	}
+ 	if a.logSource != "" {
+ 		return "Listening on " + a.logSource + " — waiting for log lines (it can take up to 30s)..."
+diff --git a/internal/ui/logsidepanel.go b/internal/ui/logsidepanel.go
+index 26bc969..2e66a9a 100644
+--- a/internal/ui/logsidepanel.go
++++ b/internal/ui/logsidepanel.go
+@@ -231,6 +231,9 @@ func renderSidepanel(items []sidepanelItem, selectedIdx int, focused bool, width
+ // header and row labels so the column edges align and the border renders
+ // cleanly at a fixed width.
+ func padOrTrunc(s string, width int) string {
++	// Sidepanel labels include access-log host names, which are attacker-
++	// controlled; neutralise control bytes before they reach the terminal.
++	s = sanitizeControl(s)
+ 	w := lipgloss.Width(s)
+ 	if w == width {
+ 		return s
+diff --git a/internal/ui/logtable.go b/internal/ui/logtable.go
+index a1ecb37..d18fd08 100644
+--- a/internal/ui/logtable.go
++++ b/internal/ui/logtable.go
+@@ -19,6 +19,9 @@ func fitCellLeft(s string, cells int) string {
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	// Log fields are attacker-controlled (request URI/host/method, raw
++	// lines); strip terminal control bytes before the width math.
++	s = sanitizeControl(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+@@ -34,6 +37,7 @@ func fitCellRight(s string, cells int) string {
+ 	if cells <= 0 {
+ 		return ""
+ 	}
++	s = sanitizeControl(s)
+ 	truncated := runewidth.Truncate(s, cells, "…")
+ 	pad := cells - runewidth.StringWidth(truncated)
+ 	if pad > 0 {
+diff --git a/internal/ui/plugin_bridge.go b/internal/ui/plugin_bridge.go
+index 30f26a9..f107a52 100644
+--- a/internal/ui/plugin_bridge.go
++++ b/internal/ui/plugin_bridge.go
+@@ -3,6 +3,7 @@ package ui
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/alexandre-daubois/ember/pkg/plugin"
+ 	tea "github.com/charmbracelet/bubbletea"
+@@ -102,10 +103,24 @@ func safePluginView(r plugin.Renderer, w, h int) (s string) {
+ 		if rec := recover(); rec != nil {
+ 			s = fmt.Sprintf("plugin error: %v", rec)
+ 		}
++		// Plugin views may echo live Caddy data; they are drawn by Ember
++		// and must be neutralised like any other render sink. Line breaks
++		// are the plugin's layout, so clean each line and keep them.
++		s = sanitizeBlock(s)
+ 	}()
+ 	return r.View(w, h)
+ }
+ 
++// sanitizeBlock neutralises every line of a pre-rendered block while keeping
++// the line structure the block uses for layout.
++func sanitizeBlock(s string) string {
++	lines := strings.Split(s, "\n")
++	for i := range lines {
++		lines[i] = sanitizeControl(lines[i])
++	}
++	return strings.Join(lines, "\n")
++}
++
+ func safePluginHandleKey(r plugin.Renderer, msg tea.KeyMsg) (consumed bool, err error) {
+ 	defer func() {
+ 		if rec := recover(); rec != nil {
+diff --git a/internal/ui/routestable.go b/internal/ui/routestable.go
+index 54adb21..d5eb5f5 100644
+--- a/internal/ui/routestable.go
++++ b/internal/ui/routestable.go
+@@ -122,7 +122,9 @@ func formatRouteRow(s model.RouteStat, width, patternW, gap int, showHost, selec
+ 		prefix = ">"
+ 	}
+ 
+-	method := s.Key.Method
++	// Method bypasses fitCellLeft (it goes straight through padCellRight),
++	// so neutralise it here; pattern/host are sanitised via fitCellLeft.
++	method := sanitizeControl(s.Key.Method)
+ 	if method == "" {
+ 		method = "—"
+ 	}
+diff --git a/internal/ui/sanitize.go b/internal/ui/sanitize.go
+new file mode 100644
+index 0000000..153cf0f
+--- /dev/null
++++ b/internal/ui/sanitize.go
+@@ -0,0 +1,15 @@
++package ui
++
++import "github.com/alexandre-daubois/ember/internal/sanitize"
++
++// sanitizeControl drops terminal control bytes from a value before it is
++// drawn, so attacker-supplied log fields (request URI, host, method, raw log
++// lines, in-flight requests, certificate metadata) cannot smuggle ANSI/OSC/
++// CSI escape sequences into the operator's terminal (CWE-150).
++//
++// Neutralising happens at the render boundary, not in ParseLogLine: the
++// parsed fields also feed the JSON/metrics output and the aggregation keys,
++// which must keep the raw values.
++func sanitizeControl(s string) string {
++	return sanitize.Control(s)
++}
+diff --git a/internal/ui/workerlist.go b/internal/ui/workerlist.go
+index 21e39c6..64abe59 100644
+--- a/internal/ui/workerlist.go
++++ b/internal/ui/workerlist.go
+@@ -139,10 +139,10 @@ func formatThreadRow(t fetcher.ThreadDebugState, width int, uriW int, opts rende
+ 	method := "—"
+ 	uri := "—"
+ 	if t.IsBusy && t.CurrentMethod != "" {
+-		method = t.CurrentMethod
++		method = sanitizeControl(t.CurrentMethod)
+ 	}
+ 	if t.IsBusy && t.CurrentURI != "" {
+-		uri = t.CurrentURI
++		uri = sanitizeControl(t.CurrentURI)
+ 		if len(uri) > uriW {
+ 			uri = uri[:uriW-1] + "…"
+ 		}

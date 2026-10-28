@@ -1,0 +1,312 @@
+diff -ruN pristine/awscli/customizations/codeartifact/login.py app/awscli/customizations/codeartifact/login.py
+--- a/awscli/customizations/codeartifact/login.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/codeartifact/login.py	2026-10-27 19:47:54.004200568 +0000
+@@ -16,6 +16,7 @@
+ )
+ from awscli.customizations import utils as cli_utils
+ from awscli.customizations.commands import BasicCommand
++from awscli.customizations.securefile import secure_open
+ from awscli.customizations.utils import uni_print
+ 
+ 
+@@ -183,7 +184,7 @@
+             if new_contents == contents:
+                 new_contents = self._append_netrc_entry(new_contents, new_entry)
+ 
+-            with open(netrc_path, 'w') as f:
++            with secure_open(netrc_path, 'w') as f:
+                 f.write(new_contents)
+ 
+     def _create_netrc_file(self, netrc_path, new_entry):
+@@ -631,7 +632,7 @@
+             sys.stdout.write(pypi_rc_str)
+             sys.stdout.write(os.linesep)
+         else:
+-            with open(self.pypi_rc_path, 'w+') as fp:
++            with secure_open(self.pypi_rc_path, 'w') as fp:
+                 fp.write(pypi_rc_str)
+ 
+             self._write_success_message('twine')
+diff -ruN pristine/awscli/customizations/codedeploy/register.py app/awscli/customizations/codedeploy/register.py
+--- a/awscli/customizations/codedeploy/register.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/codedeploy/register.py	2026-10-27 19:47:51.607163453 +0000
+@@ -14,6 +14,7 @@
+ import sys
+ 
+ from awscli.customizations.commands import BasicCommand
++from awscli.customizations.securefile import secure_open
+ from awscli.customizations.codedeploy.systems import DEFAULT_CONFIG_FILE
+ from awscli.customizations.codedeploy.utils import \
+     validate_region, validate_instance_name, validate_tags, \
+@@ -179,7 +180,7 @@
+             'Creating the on-premises instance configuration file named {0}'
+             '...'.format(DEFAULT_CONFIG_FILE)
+         )
+-        with open(DEFAULT_CONFIG_FILE, 'w') as f:
++        with secure_open(DEFAULT_CONFIG_FILE, 'w') as f:
+             f.write(
+                 '---\n'
+                 'region: {0}\n'
+diff -ruN pristine/awscli/customizations/configure/configure.py app/awscli/customizations/configure/configure.py
+--- a/awscli/customizations/configure/configure.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/configure/configure.py	2026-10-27 19:48:06.442376150 +0000
+@@ -22,6 +22,7 @@
+ from awscli.customizations.configure.get import ConfigureGetCommand
+ from awscli.customizations.configure.list import ConfigureListCommand
+ from awscli.customizations.configure.writer import ConfigFileWriter
++from awscli.customizations.securefile import owner_only_writer
+ 
+ from . import mask_value, profile_to_section
+ 
+@@ -136,6 +137,7 @@
+                 credential_file_values['__section__'] = profile_name
+             shared_credentials_filename = os.path.expanduser(
+                 self._session.get_config_variable('credentials_file'))
+-            self._config_writer.update_config(
+-                credential_file_values,
+-                shared_credentials_filename)
++            with owner_only_writer(self._config_writer):
++                self._config_writer.update_config(
++                    credential_file_values,
++                    shared_credentials_filename)
+diff -ruN pristine/awscli/customizations/configure/set.py app/awscli/customizations/configure/set.py
+--- a/awscli/customizations/configure/set.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/configure/set.py	2026-10-27 19:48:02.863323734 +0000
+@@ -10,10 +10,12 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import contextlib
+ import os
+ 
+ from awscli.customizations.commands import BasicCommand
+ from awscli.customizations.configure.writer import ConfigFileWriter
++from awscli.customizations.securefile import owner_only_writer
+ 
+ from . import PREDEFINED_SECTION_NAMES, profile_to_section
+ 
+@@ -95,7 +97,8 @@
+                 # of something in the [plugin] section.
+                 profile, varname = parts
+         config_filename = self._get_config_file('config_file')
+-        if varname in self._WRITE_TO_CREDS_FILE:
++        writes_credentials = varname in self._WRITE_TO_CREDS_FILE
++        if writes_credentials:
+             # When writing to the creds file, the section is just the profile
+             section = profile
+             config_filename = self._get_config_file('credentials_file')
+@@ -104,5 +107,10 @@
+         else:
+             section = profile_to_section(profile)
+         updated_config = {'__section__': section, varname: value}
+-        self._config_writer.update_config(updated_config, config_filename)
++        if writes_credentials:
++            writer_scope = owner_only_writer(self._config_writer)
++        else:
++            writer_scope = contextlib.nullcontext(self._config_writer)
++        with writer_scope as writer:
++            writer.update_config(updated_config, config_filename)
+         return 0
+diff -ruN pristine/awscli/customizations/configure/writer.py app/awscli/customizations/configure/writer.py
+--- a/awscli/customizations/configure/writer.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/configure/writer.py	2026-10-27 19:47:58.127252685 +0000
+@@ -13,6 +13,8 @@
+ import os
+ import re
+ 
++from awscli.customizations.securefile import secure_open
++
+ from . import SectionNotFoundError
+ 
+ 
+@@ -24,6 +26,16 @@
+         r'(?P<value>.*)$'
+     )
+ 
++    # Set while this writer is updating a file that holds credentials; see
++    # ``securefile.owner_only_writer``.  Ordinary configuration files keep
++    # their existing behaviour.
++    secure = False
++
++    def _open_for_write(self, config_filename, mode):
++        if self.secure:
++            return secure_open(config_filename, mode)
++        return open(config_filename, mode)
++
+     def _validate_no_newlines_or_carriage_returns(
+         self,
+         value,
+@@ -107,7 +119,7 @@
+         # to find the section in question
+         try:
+             self._update_section_contents(contents, section_name, new_values)
+-            with open(config_filename, 'w') as f:
++            with self._open_for_write(config_filename, 'w') as f:
+                 f.write(''.join(contents))
+         except SectionNotFoundError:
+             self._write_new_section(section_name, new_values, config_filename)
+@@ -134,7 +146,7 @@
+ 
+     def _write_new_section(self, section_name, new_values, config_filename):
+         needs_newline = self._check_file_needs_newline(config_filename)
+-        with open(config_filename, 'a') as f:
++        with self._open_for_write(config_filename, 'a') as f:
+             if needs_newline:
+                 f.write('\n')
+             f.write('[%s]\n' % section_name)
+diff -ruN pristine/awscli/customizations/iamvirtmfa.py app/awscli/customizations/iamvirtmfa.py
+--- a/awscli/customizations/iamvirtmfa.py	2026-10-27 19:34:04.000000000 +0000
++++ b/awscli/customizations/iamvirtmfa.py	2026-10-27 19:47:50.953154415 +0000
+@@ -27,6 +27,7 @@
+ from awscli.customizations.arguments import StatefulArgument
+ from awscli.customizations.arguments import resolve_given_outfile_path
+ from awscli.customizations.arguments import is_parsed_result_successful
++from awscli.customizations.securefile import secure_open
+ 
+ 
+ CHOICES = ('QRCodePNG', 'Base32StringSeed')
+@@ -71,7 +72,7 @@
+         outfile = self._outfile.value
+         if method in parsed['VirtualMFADevice']:
+             body = parsed['VirtualMFADevice'][method]
+-            with open(outfile, 'wb') as fp:
++            with secure_open(outfile, 'wb') as fp:
+                 fp.write(base64.b64decode(body))
+             for choice in CHOICES:
+                 if choice in parsed['VirtualMFADevice']:
+diff -ruN pristine/awscli/customizations/rds.py app/awscli/customizations/rds.py
+--- a/awscli/customizations/rds.py	2026-10-27 19:34:10.000000000 +0000
++++ b/awscli/customizations/rds.py	2026-10-27 19:47:54.766213553 +0000
+@@ -30,6 +30,7 @@
+ from awscli.clidriver import CLIOperationCaller
+ from awscli.customizations import utils
+ from awscli.customizations.commands import BasicCommand
++from awscli.customizations.securefile import secure_open
+ from awscli.customizations.utils import uni_print
+ from awscli.utils import create_nested_client
+ 
+@@ -117,7 +118,7 @@
+             outfile = os.path.expanduser(
+                 os.path.expandvars(parsed_args.outfile)
+             )
+-            with open(outfile, 'w') as f:
++            with secure_open(outfile, 'w') as f:
+                 f.write(token)
+                 f.write('\n')
+         else:
+diff -ruN pristine/awscli/customizations/securefile.py app/awscli/customizations/securefile.py
+--- a/awscli/customizations/securefile.py	1970-01-01 00:00:00.000000000 +0000
++++ b/awscli/customizations/securefile.py	2026-10-27 19:47:47.884111743 +0000
+@@ -0,0 +1,112 @@
++# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License"). You
++# may not use this file except in compliance with the License. A copy of
++# the License is located at
++#
++#     http://aws.amazon.com/apache2.0/
++#
++# or in the "license" file accompanying this file. This file is
++# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
++# ANY KIND, either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++"""Helpers for writing files that hold authentication material.
++
++Several commands persist credentials on the user's behalf: MFA bootstrap
++seeds, repository auth tokens, generated database tokens, on-premises
++instance keys and the shared credentials file.  Those files must be
++readable only by their owner.
++
++``open(path, 'w')`` applies its mode argument only when the file is
++created, so a file that already exists keeps the permissions it had.  The
++helpers below open the file and then re-assert owner-only permissions on
++the open descriptor, which covers both a fresh file and a replacement or
++append to a pre-existing one.
++
++If the permissions cannot be changed the helpers report the problem on
++stderr and carry on: the command still succeeds and still writes exactly
++the same content.
++"""
++import contextlib
++import locale
++import os
++import sys
++
++
++def _warn_unable_to_set_permissions(path, error):
++    sys.stderr.write(
++        'Unable to set file permissions for %s: %s%s'
++        % (path, error, os.linesep)
++    )
++
++
++def enforce_owner_only(path, fd=None):
++    """Remove all group and other access from ``path``.
++
++    When ``fd`` is supplied the permission change is applied to that open
++    descriptor, so it cannot be redirected to a different file.  Failures
++    are reported but never raised.
++    """
++    try:
++        if fd is not None and hasattr(os, 'fchmod'):
++            os.fchmod(fd, 0o600)
++        else:
++            os.chmod(path, 0o600)
++    except OSError as error:
++        _warn_unable_to_set_permissions(path, error)
++    # A platform without fchmod still needs the path-based fallback.
++    except AttributeError:
++        try:
++            os.chmod(path, 0o600)
++        except OSError as error:
++            _warn_unable_to_set_permissions(path, error)
++
++
++@contextlib.contextmanager
++def secure_open(path, mode='w', encoding=None):
++    """Open ``path`` for writing and leave it accessible only to its owner.
++
++    Only the write modes actually used by the credential writers are
++    supported (``w``, ``a``, ``wb`` and friends).  A pre-existing file is
++    tightened even though creating or truncating it does not change its
++    mode.
++    """
++    flags = os.O_WRONLY | os.O_CREAT
++    if 'a' in mode:
++        flags |= os.O_APPEND
++    else:
++        flags |= os.O_TRUNC
++    fd = os.open(path, flags, 0o600)
++    try:
++        enforce_owner_only(path, fd)
++        if 'b' in mode:
++            handle = os.fdopen(fd, mode)
++        else:
++            handle = os.fdopen(
++                fd, mode,
++                encoding=encoding or locale.getpreferredencoding()
++            )
++    except BaseException:
++        try:
++            os.close(fd)
++        except OSError:
++            pass
++        raise
++    with handle:
++        yield handle
++
++
++@contextlib.contextmanager
++def owner_only_writer(config_writer):
++    """Mark ``config_writer`` as writing a credentials file for this update.
++
++    ``ConfigFileWriter`` is shared by the credentials file and the ordinary
++    configuration file; only the former needs owner-only permissions.  The
++    marker is restored afterwards so unrelated writes are unaffected.
++    """
++    previous = getattr(config_writer, 'secure', False)
++    config_writer.secure = True
++    try:
++        yield config_writer
++    finally:
++        config_writer.secure = previous

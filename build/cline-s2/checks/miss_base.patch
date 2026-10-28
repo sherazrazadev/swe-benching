@@ -1,0 +1,357 @@
+diff --git a/apps/cline-hub/src/options.ts b/apps/cline-hub/src/options.ts
+index 79aeed6..e1da93d 100644
+--- a/apps/cline-hub/src/options.ts
++++ b/apps/cline-hub/src/options.ts
+@@ -1,3 +1,5 @@
++import { isIP } from "node:net";
++
+ export interface ClineHubServerOptions {
+ 	host: string;
+ 	port: number;
+@@ -47,6 +49,9 @@ function normalizePublicUrl(
+ 			`PUBLIC_URL must use http: or https:, got ${parsed.protocol}`,
+ 		);
+ 	}
++	if (shouldAddDashboardPortToPublicUrl(parsed, port)) {
++		parsed.port = String(port);
++	}
+ 	parsed.hash = "";
+ 	return parsed.toString().replace(/\/$/, "");
+ }
+@@ -85,12 +90,26 @@ export function resolveClineHubServerOptions(
+ 	};
+ }
+ 
++function isDefaultProtocolPort(url: URL, port: number): boolean {
++	return (
++		(url.protocol === "http:" && port === 80) ||
++		(url.protocol === "https:" && port === 443)
++	);
++}
++
++function shouldAddDashboardPortToPublicUrl(url: URL, port: number): boolean {
++	if (url.port || isDefaultProtocolPort(url, port)) return false;
++	const hostname = url.hostname.replace(/^\[|\]$/g, "");
++	return hostname === "localhost" || isIP(hostname) !== 0;
++}
++
+ export function buildInviteUrl(
+ 	publicUrl: string,
+ 	roomSecret: string | undefined,
+ ): string {
+-	if (!roomSecret) return publicUrl;
+ 	const url = new URL(publicUrl);
+-	url.searchParams.set("roomSecret", roomSecret);
++	if (roomSecret) {
++		url.searchParams.set("roomSecret", roomSecret);
++	}
+ 	return url.toString();
+ }
+diff --git a/apps/cline-hub/src/server.ts b/apps/cline-hub/src/server.ts
+index e90ea07..4a036ed 100644
+--- a/apps/cline-hub/src/server.ts
++++ b/apps/cline-hub/src/server.ts
+@@ -4,6 +4,7 @@ import {
+ 	handleToolApprovalResponse,
+ 	rejectOrphanedApprovals,
+ } from "./server/approvals";
++import { isAuthorizedBrowserToDesktopRequest } from "./server/browser-auth";
+ import {
+ 	browserConfig,
+ 	host,
+@@ -15,7 +16,11 @@ import {
+ } from "./server/deps";
+ import { handleDesktopCommand } from "./server/desktop-commands";
+ import { handleDesktopCommandApi } from "./server/desktop-command-api";
+-import { createJsonResponse, WebviewAssets } from "./server/http";
++import {
++	createJsonResponse,
++	isWebviewRoute,
++	WebviewAssets,
++} from "./server/http";
+ import { handleLiveSettingsUpgrade } from "./server/live-settings";
+ import {
+ 	attachHub,
+@@ -55,17 +60,33 @@ export interface ClineHubDashboardServer {
+ 	stop: () => Promise<void>;
+ }
+ 
++const PUBLIC_BROWSER_PATHS = new Set([
++	"/version",
++	"/health",
++	"/config.json",
++	"/api/marketplace/catalog",
++	"/icon.png",
++	"/icon.svg",
++	"/icon.ico",
++	"/32x32.png",
++	"/cline-logo-filled.svg",
++	"/favicon.svg",
++]);
++
++function isPublicStaticAssetPath(pathname: string): boolean {
++	return pathname.startsWith("/assets/") || PUBLIC_BROWSER_PATHS.has(pathname);
++}
++
++function isPublicBrowserRoute(_req: Request, url: URL): boolean {
++	return isWebviewRoute(url.pathname) || isPublicStaticAssetPath(url.pathname);
++}
++
+ export async function startClineHubDashboardServer(): Promise<ClineHubDashboardServer> {
+ 	const ctx = new HubContext();
+ 	const assets = new WebviewAssets(webviewDistDir);
+ 	const syncClientsAndSessions = () => syncHubClientsAndSessions(ctx);
+ 	let stopped = false;
+ 
+-	function isAuthorizedBrowserRequest(url: URL): boolean {
+-		if (!roomSecret) return true;
+-		return url.searchParams.get("roomSecret") === roomSecret;
+-	}
+-
+ 	await attachHub(ctx);
+ 	const healthInterval = setInterval(() => {
+ 		void (async () => {
+@@ -79,6 +100,22 @@ export async function startClineHubDashboardServer(): Promise<ClineHubDashboardS
+ 		hostname: host,
+ 		async fetch(req, server) {
+ 			const url = new URL(req.url);
++			if (
++				url.pathname !== "/browser" &&
++				!isAuthorizedBrowserToDesktopRequest(
++					req,
++					url,
++					{
++						bindHost: host,
++						port,
++						publicUrl,
++						roomSecret,
++					},
++					isPublicBrowserRoute,
++				)
++			) {
++				return createJsonResponse({ error: "unauthorized_browser" }, 403);
++			}
+ 			const liveSettingsRoute = handleLiveSettingsUpgrade(req, url, server);
+ 			if (liveSettingsRoute.handled) return liveSettingsRoute.response;
+ 			const commandRoute = await handleDesktopCommandApi(req, url, ctx);
+@@ -91,9 +128,6 @@ export async function startClineHubDashboardServer(): Promise<ClineHubDashboardS
+ 				return createJsonResponse(hubStatusPayload(ctx));
+ 			}
+ 			if (url.pathname === "/browser") {
+-				if (!isAuthorizedBrowserRequest(url)) {
+-					return createJsonResponse({ error: "invalid_room_secret" }, 401);
+-				}
+ 				const displayName = `Browser ${Math.random().toString(36).slice(2, 6)}`;
+ 				const data = {
+ 					socket: undefined as never,
+diff --git a/apps/cline-hub/src/server/browser-auth.ts b/apps/cline-hub/src/server/browser-auth.ts
+new file mode 100644
+index 0000000..628e8f9
+--- /dev/null
++++ b/apps/cline-hub/src/server/browser-auth.ts
+@@ -0,0 +1,134 @@
++import { isNonLocalBindHost } from "../options";
++
++export interface BrowserRequestAuthOptions {
++	bindHost: string;
++	port: number;
++	publicUrl: string;
++	roomSecret?: string;
++}
++
++const SAFE_HTTP_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
++
++export type PublicBrowserRoutePredicate = (req: Request, url: URL) => boolean;
++
++function isWebSocketUpgrade(req: Request): boolean {
++	return req.headers.get("upgrade")?.toLowerCase() === "websocket";
++}
++
++function parseOrigin(value: string | null): string | undefined {
++	const origin = parseHeader(value);
++	try {
++		return new URL(origin ?? "").origin;
++	} catch {
++		return undefined;
++	}
++}
++
++function parseHeader(value: string | null): string | undefined {
++	const host = value?.trim().toLowerCase();
++	return host || undefined;
++}
++
++function formatHostForOrigin(host: string): string {
++	return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
++}
++
++function isDefaultProtocolPort(protocol: string, port: number): boolean {
++	return (
++		(protocol === "http:" && port === 80) ||
++		(protocol === "https:" && port === 443)
++	);
++}
++
++function originForHost(protocol: string, host: string, port: number): string {
++	return new URL(`${protocol}//${formatHostForOrigin(host)}:${port}`).origin;
++}
++
++function hostHeaderForHost(
++	protocol: string,
++	host: string,
++	port: number,
++): string {
++	const formattedHost = formatHostForOrigin(host).toLowerCase();
++	return isDefaultProtocolPort(protocol, port)
++		? formattedHost
++		: `${formattedHost}:${port}`;
++}
++
++export function allowedBrowserOrigins({
++	bindHost,
++	port,
++	publicUrl,
++}: BrowserRequestAuthOptions): Set<string> {
++	const publicUrlParts = new URL(publicUrl);
++	const origins = new Set<string>();
++	origins.add(publicUrlParts.origin);
++
++	origins.add(originForHost(publicUrlParts.protocol, bindHost, port));
++
++	if (!isNonLocalBindHost(bindHost)) {
++		for (const hostname of ["127.0.0.1", "localhost", "[::1]"]) {
++			origins.add(originForHost(publicUrlParts.protocol, hostname, port));
++		}
++	}
++
++	return origins;
++}
++
++export function allowedBrowserHosts({
++	bindHost,
++	port,
++	publicUrl,
++}: BrowserRequestAuthOptions): Set<string> {
++	const publicUrlParts = new URL(publicUrl);
++	const hosts = new Set<string>();
++	const publicHost = publicUrlParts.host.toLowerCase();
++	hosts.add(publicHost);
++
++	hosts.add(hostHeaderForHost(publicUrlParts.protocol, bindHost, port));
++
++	if (!isNonLocalBindHost(bindHost)) {
++		for (const hostname of ["127.0.0.1", "localhost", "[::1]"]) {
++			hosts.add(hostHeaderForHost(publicUrlParts.protocol, hostname, port));
++		}
++	}
++
++	return hosts;
++}
++
++export function requiresBrowserRequestAuth(
++	req: Request,
++	url: URL,
++	isPublicBrowserRoute: PublicBrowserRoutePredicate,
++): boolean {
++	if (isWebSocketUpgrade(req)) return true;
++	if (!SAFE_HTTP_METHODS.has(req.method.toUpperCase())) return true;
++	return !isPublicBrowserRoute(req, url);
++}
++
++export function isAuthorizedBrowserRequest(
++	req: Request,
++	url: URL,
++	options: BrowserRequestAuthOptions,
++): boolean {
++	const host = parseHeader(req.headers.get("host"));
++	if (!host || !allowedBrowserHosts(options).has(host)) return false;
++
++	const origin = parseOrigin(req.headers.get("origin"));
++	if (!origin || !allowedBrowserOrigins(options).has(origin)) return false;
++
++	if (!options.roomSecret) return true;
++	return url.searchParams.get("roomSecret") === options.roomSecret;
++}
++
++export function isAuthorizedBrowserToDesktopRequest(
++	req: Request,
++	url: URL,
++	options: BrowserRequestAuthOptions,
++	isPublicBrowserRoute: PublicBrowserRoutePredicate,
++): boolean {
++	return (
++		!requiresBrowserRequestAuth(req, url, isPublicBrowserRoute) ||
++		isAuthorizedBrowserRequest(req, url, options)
++	);
++}
+diff --git a/apps/cline-hub/src/validate-options.ts b/apps/cline-hub/src/validate-options.ts
+index 5b38178..78e6687 100644
+--- a/apps/cline-hub/src/validate-options.ts
++++ b/apps/cline-hub/src/validate-options.ts
+@@ -41,6 +41,23 @@ expectEqual(
+ 	"invite URL",
+ );
+ 
++const tailscale = resolveClineHubServerOptions({
++	HOST: "0.0.0.0",
++	CLINE_HUB_DASHBOARD_PORT: "8787",
++	PUBLIC_URL: "http://100.82.5.118",
++	ROOM_SECRET: "invite-123",
++});
++expectEqual(
++	tailscale.publicUrl,
++	"http://100.82.5.118:8787",
++	"direct IP public URL gets dashboard port",
++);
++expectEqual(
++	buildInviteUrl(tailscale.publicUrl, tailscale.roomSecret),
++	"http://100.82.5.118:8787/?roomSecret=invite-123",
++	"invite URL for direct IP public URL",
++);
++
+ expectThrows(
+ 	() => resolveClineHubServerOptions({ HOST: "0.0.0.0" }),
+ 	"non-local bind without ROOM_SECRET",
+diff --git a/apps/examples/desktop-app/sidecar/server.ts b/apps/examples/desktop-app/sidecar/server.ts
+index a4b83e6..cc22ddc 100644
+--- a/apps/examples/desktop-app/sidecar/server.ts
++++ b/apps/examples/desktop-app/sidecar/server.ts
+@@ -18,6 +18,24 @@ type SidecarServer = {
+ // JSON response helper
+ // ---------------------------------------------------------------------------
+ 
++function isTrustedTransportOrigin(value: string | null): boolean {
++	const origin = value?.trim().toLowerCase();
++	if (!origin) return false;
++	try {
++		const url = new URL(origin);
++		const hostname = url.hostname.replace(/^\[|\]$/g, "");
++		return (
++			url.protocol === "tauri:" ||
++			hostname === "localhost" ||
++			hostname === "127.0.0.1" ||
++			hostname === "::1" ||
++			hostname.endsWith(".localhost")
++		);
++	} catch {
++		return false;
++	}
++}
++
+ function jsonResponse(
+ 	id: string,
+ 	ok: boolean,
+@@ -84,8 +102,11 @@ function createFetchHandler(
+ 			);
+ 		}
+ 
+-		if (url.pathname === "/transport" && server.upgrade(req)) {
+-			return undefined;
++		if (url.pathname === "/transport") {
++			if (!isTrustedTransportOrigin(req.headers.get("origin"))) {
++				return new Response("Forbidden", { status: 403 });
++			}
++			if (server.upgrade(req)) return undefined;
+ 		}
+ 
+ 		if (url.pathname === "/shutdown" && req.method === "POST") {
