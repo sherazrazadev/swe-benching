@@ -1,0 +1,192 @@
+diff --git a/repository.go b/repository.go
+index c88ccd4..dfa4543 100644
+--- a/repository.go
++++ b/repository.go
+@@ -1030,7 +1030,7 @@ func (r *Repository) buildTagSignature(tag *object.Tag, signer Signer) (string,
+ //	  // Some other error
+ //	}
+ func (r *Repository) Tag(name string) (*plumbing.Reference, error) {
+-	ref, err := r.Reference(plumbing.ReferenceName(path.Join("refs", "tags", name)), false)
++	ref, err := r.Reference(plumbing.NewTagReferenceName(name), false)
+ 	if err != nil {
+ 		if err == plumbing.ErrReferenceNotFound {
+ 			// Return a friendly error for this one, versus just ReferenceNotFound.
+@@ -1050,7 +1050,7 @@ func (r *Repository) DeleteTag(name string) error {
+ 		return err
+ 	}
+ 
+-	return r.Storer.RemoveReference(plumbing.ReferenceName(path.Join("refs", "tags", name)))
++	return r.Storer.RemoveReference(plumbing.NewTagReferenceName(name))
+ }
+ 
+ func (r *Repository) resolveToCommitHash(h plumbing.Hash) (plumbing.Hash, error) {
+diff --git a/storage/filesystem/dotgit/dotgit.go b/storage/filesystem/dotgit/dotgit.go
+index f814cf6..beda46a 100644
+--- a/storage/filesystem/dotgit/dotgit.go
++++ b/storage/filesystem/dotgit/dotgit.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/go-git/go-billy/v6"
+ 
+ 	"github.com/go-git/go-git/v6/internal/packhandle"
++	"github.com/go-git/go-git/v6/internal/pathutil"
+ 	"github.com/go-git/go-git/v6/plumbing"
+ 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
+ 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+@@ -89,8 +90,83 @@ var (
+ 	// resolve outside the modules/ subtree, mirroring canonical Git's
+ 	// "ignoring suspicious submodule name" defence.
+ 	ErrModuleNameEscape = errors.New("submodule name escapes modules/ directory")
++	// ErrReferenceNameEscape is returned when a reference name would resolve
++	// outside the reference storage once turned into a path under the git
++	// directory, or onto an entry that holds repository metadata rather than a
++	// reference.
++	ErrReferenceNameEscape = errors.New("reference name escapes the reference storage")
+ )
+ 
++// reservedStorageNames are the entries of the git directory that hold
++// repository metadata rather than references. A reference name whose leading
++// component is one of them would read, overwrite or remove that metadata
++// instead of a reference. The comparison ignores case because a name can be
++// authored on one filesystem and opened on another that folds case.
++var reservedStorageNames = []string{
++	configPath, configWorktreePath, indexPath, shallowPath, modulePath,
++	objectsPath, branchesPath, hooksPath, infoPath, remotesPath, logsPath,
++	worktreesPath, alternatesPath, packedRefsPath,
++	"commondir", "gitdir", "description",
++	"COMMIT_EDITMSG", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG", "TAG_EDITMSG",
++}
++
++// isReservedStorageName reports whether a leading path component names an entry
++// of the git directory that does not hold references.
++func isReservedStorageName(component string) bool {
++	for _, reserved := range reservedStorageNames {
++		if strings.EqualFold(component, reserved) {
++			return true
++		}
++	}
++	return false
++}
++
++// validReferenceName rejects a reference name that cannot safely be turned into
++// a path under the directory where it is stored. A loose reference and its
++// reflog are stored verbatim below their directory, so a name carrying a "."
++// or ".." component, a volume prefix or a control character could otherwise
++// climb out of its storage area. The per-component check uses the same HFS+
++// and NTFS normalisation helpers as the submodule-name defence, so disguises of
++// ".." are refused on every host filesystem.
++func validReferenceName(name plumbing.ReferenceName) error {
++	s := string(name)
++	if s == "" {
++		return fmt.Errorf("%w: empty name", ErrReferenceNameEscape)
++	}
++	for i := 0; i < len(s); i++ {
++		if s[i] < 0x20 || s[i] == 0x7f {
++			return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++		}
++	}
++	if filepath.VolumeName(s) != "" {
++		return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++	}
++	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == '\\' })
++	if len(parts) == 0 {
++		return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++	}
++	for _, part := range parts {
++		if part == "." || pathutil.IsHFSDot(part, ".") || pathutil.IsNTFSDot(part, ".", "") {
++			return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++		}
++	}
++	return nil
++}
++
++// validStorageName is validReferenceName plus the rule that a name stored below
++// the git directory root must not take the place of one of the directory's
++// metadata entries.
++func validStorageName(name plumbing.ReferenceName) error {
++	if err := validReferenceName(name); err != nil {
++		return err
++	}
++	parts := strings.FieldsFunc(string(name), func(r rune) bool { return r == '/' || r == '\\' })
++	if len(parts) > 0 && isReservedStorageName(parts[0]) {
++		return fmt.Errorf("%w: %q names repository metadata", ErrReferenceNameEscape, string(name))
++	}
++	return nil
++}
++
+ // Options holds configuration for the storage.
+ type Options struct {
+ 	// ExclusiveAccess means that the filesystem is not modified externally
+@@ -269,6 +345,9 @@ func (d *DotGit) Shallow() (billy.File, error) {
+ // ReflogReader returns a file pointer for reading the reflog for the given reference.
+ // Returns nil, nil if the reflog file does not exist.
+ func (d *DotGit) ReflogReader(name plumbing.ReferenceName) (billy.File, error) {
++	if err := validReferenceName(name); err != nil {
++		return nil, err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	f, err := d.fs.Open(p)
+ 	if err != nil {
+@@ -283,6 +362,9 @@ func (d *DotGit) ReflogReader(name plumbing.ReferenceName) (billy.File, error) {
+ // ReflogWriter returns a file pointer for appending to the reflog for the given reference.
+ // It creates the file and any necessary parent directories if they don't exist.
+ func (d *DotGit) ReflogWriter(name plumbing.ReferenceName) (billy.File, error) {
++	if err := validReferenceName(name); err != nil {
++		return nil, err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	if err := d.fs.MkdirAll(filepath.Dir(p), os.ModePerm); err != nil {
+ 		return nil, err
+@@ -292,6 +374,9 @@ func (d *DotGit) ReflogWriter(name plumbing.ReferenceName) (billy.File, error) {
+ 
+ // DeleteReflog removes the reflog file for the given reference.
+ func (d *DotGit) DeleteReflog(name plumbing.ReferenceName) error {
++	if err := validReferenceName(name); err != nil {
++		return err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	err := d.fs.Remove(p)
+ 	if os.IsNotExist(err) {
+@@ -305,6 +390,9 @@ func (d *DotGit) DeleteReflog(name plumbing.ReferenceName) error {
+ // When no entry remains, the reflog file is removed. A reference without a
+ // reflog is not an error.
+ func (d *DotGit) ExpireReflog(name plumbing.ReferenceName, before time.Time) error {
++	if err := validReferenceName(name); err != nil {
++		return err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 
+ 	f, err := d.fs.Open(p)
+@@ -1113,6 +1201,10 @@ func (d *DotGit) checkReferenceAndTruncate(f billy.File, old *plumbing.Reference
+ 
+ // SetRef stores a reference, optionally checking that old matches the current value.
+ func (d *DotGit) SetRef(r, old *plumbing.Reference) error {
++	if err := validStorageName(r.Name()); err != nil {
++		return err
++	}
++
+ 	var content string
+ 	switch r.Type() {
+ 	case plumbing.SymbolicReference:
+@@ -1148,6 +1240,9 @@ func (d *DotGit) Refs() ([]*plumbing.Reference, error) {
+ 
+ // Ref returns the reference for a given reference name.
+ func (d *DotGit) Ref(name plumbing.ReferenceName) (*plumbing.Reference, error) {
++	if err := validStorageName(name); err != nil {
++		return nil, err
++	}
+ 	ref, err := d.readReferenceFile(".", name.String())
+ 	if err == nil {
+ 		return ref, nil
+@@ -1229,6 +1324,12 @@ func (d *DotGit) RemoveRef(name plumbing.ReferenceName) error {
+ // moved; an entry that exists only in packed-refs is left untouched. Missing
+ // parent directories of the destination are created.
+ func (d *DotGit) RenameRef(oldName, newName plumbing.ReferenceName) error {
++	if err := validStorageName(oldName); err != nil {
++		return err
++	}
++	if err := validStorageName(newName); err != nil {
++		return err
++	}
+ 	src := d.fs.Join(".", oldName.String())
+ 	dst := d.fs.Join(".", newName.String())
+ 

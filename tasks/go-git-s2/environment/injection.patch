@@ -1,0 +1,147 @@
+diff --git a/storage/filesystem/dotgit/dotgit.go b/storage/filesystem/dotgit/dotgit.go
+index 73cc2eb..f814cf6 100644
+--- a/storage/filesystem/dotgit/dotgit.go
++++ b/storage/filesystem/dotgit/dotgit.go
+@@ -17,6 +17,7 @@ import (
+ 	"runtime"
+ 	"slices"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -299,6 +300,73 @@ func (d *DotGit) DeleteReflog(name plumbing.ReferenceName) error {
+ 	return err
+ }
+ 
++// ExpireReflog drops the entries older than the given time from the reflog for
++// the given reference. Lines whose timestamp cannot be read are dropped too.
++// When no entry remains, the reflog file is removed. A reference without a
++// reflog is not an error.
++func (d *DotGit) ExpireReflog(name plumbing.ReferenceName, before time.Time) error {
++	p := d.fs.Join(logsPath, string(name))
++
++	f, err := d.fs.Open(p)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++
++	var kept []string
++	scanner := bufio.NewScanner(f)
++	for scanner.Scan() {
++		line := scanner.Text()
++		if ts, ok := reflogTimestamp(line); ok && ts >= before.Unix() {
++			kept = append(kept, line)
++		}
++	}
++	scanErr := scanner.Err()
++	closeErr := f.Close()
++	if scanErr != nil {
++		return scanErr
++	}
++	if closeErr != nil {
++		return closeErr
++	}
++
++	if len(kept) == 0 {
++		if err := d.fs.Remove(p); err != nil && !os.IsNotExist(err) {
++			return err
++		}
++		return nil
++	}
++
++	w, err := d.fs.Create(p)
++	if err != nil {
++		return err
++	}
++	for _, line := range kept {
++		if _, err := fmt.Fprintln(w, line); err != nil {
++			_ = w.Close()
++			return err
++		}
++	}
++	return w.Close()
++}
++
++// reflogTimestamp returns the committer time recorded in a reflog line, which
++// sits just before the timezone field and the optional message.
++func reflogTimestamp(line string) (int64, bool) {
++	head, _, _ := strings.Cut(line, "\t")
++	fields := strings.Fields(head)
++	if len(fields) < 2 {
++		return 0, false
++	}
++	ts, err := strconv.ParseInt(fields[len(fields)-2], 10, 64)
++	if err != nil {
++		return 0, false
++	}
++	return ts, true
++}
++
+ // NewObjectPack return a writer for a new packfile, it saves the packfile to
+ // disk and also generates and save the index for the given packfile.
+ func (d *DotGit) NewObjectPack() (*PackWriter, error) {
+@@ -1157,6 +1225,24 @@ func (d *DotGit) RemoveRef(name plumbing.ReferenceName) error {
+ 	return d.rewritePackedRefsWithoutRef(name)
+ }
+ 
++// RenameRef moves a loose reference to a new name. Only loose references are
++// moved; an entry that exists only in packed-refs is left untouched. Missing
++// parent directories of the destination are created.
++func (d *DotGit) RenameRef(oldName, newName plumbing.ReferenceName) error {
++	src := d.fs.Join(".", oldName.String())
++	dst := d.fs.Join(".", newName.String())
++
++	if _, err := d.fs.Stat(src); err != nil {
++		return err
++	}
++
++	if err := d.fs.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
++		return err
++	}
++
++	return d.fs.Rename(src, dst)
++}
++
+ func refsRecvFunc(refs *[]*plumbing.Reference, seen map[plumbing.ReferenceName]bool) refsRecv {
+ 	return func(r *plumbing.Reference) bool {
+ 		if r != nil && !seen[r.Name()] {
+diff --git a/storage/filesystem/reference.go b/storage/filesystem/reference.go
+index 434710a..731e0e6 100644
+--- a/storage/filesystem/reference.go
++++ b/storage/filesystem/reference.go
+@@ -50,3 +50,8 @@ func (r *ReferenceStorage) CountLooseRefs() (int, error) {
+ func (r *ReferenceStorage) PackRefs() error {
+ 	return r.dir.PackRefs()
+ }
++
++// RenameReference moves a loose reference to a new name.
++func (r *ReferenceStorage) RenameReference(oldName, newName plumbing.ReferenceName) error {
++	return r.dir.RenameRef(oldName, newName)
++}
+diff --git a/storage/filesystem/reflog.go b/storage/filesystem/reflog.go
+index 1819aa5..10e95ca 100644
+--- a/storage/filesystem/reflog.go
++++ b/storage/filesystem/reflog.go
+@@ -1,6 +1,8 @@
+ package filesystem
+ 
+ import (
++	"time"
++
+ 	"github.com/go-git/go-git/v6/plumbing"
+ 	"github.com/go-git/go-git/v6/plumbing/format/reflog"
+ 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+@@ -39,3 +41,9 @@ func (r *ReflogStorage) AppendReflog(name plumbing.ReferenceName, entry *reflog.
+ func (r *ReflogStorage) DeleteReflog(name plumbing.ReferenceName) error {
+ 	return r.dir.DeleteReflog(name)
+ }
++
++// ExpireReflog drops entries older than the given time from the reflog for the
++// given reference.
++func (r *ReflogStorage) ExpireReflog(name plumbing.ReferenceName, before time.Time) error {
++	return r.dir.ExpireReflog(name, before)
++}
