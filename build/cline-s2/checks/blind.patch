@@ -1,0 +1,325 @@
+diff -ruN a/apps/cline-hub/src/options.ts b/apps/cline-hub/src/options.ts
+--- a/apps/cline-hub/src/options.ts	2026-10-27 19:56:42.000000000 +0000
++++ b/apps/cline-hub/src/options.ts	2026-10-27 20:32:11.099368831 +0000
+@@ -1,3 +1,5 @@
++import { isIP } from "node:net";
++
+ export interface ClineHubServerOptions {
+ 	host: string;
+ 	port: number;
+@@ -25,6 +27,27 @@
+ 	return value?.trim() || DEFAULT_HOST;
+ }
+ 
++const DEFAULT_PROTOCOL_PORT: Record<string, number> = {
++	"http:": 80,
++	"https:": 443,
++};
++
++/**
++ * A browser sends the dashboard's real listening port in the `Origin` header. When
++ * `PUBLIC_URL` names a bare machine address (an IP literal or localhost) without a
++ * port, that port has to be adopted so the advertised address matches what the
++ * browser really uses. A named host — a tunnel — keeps exactly the port it was
++ * configured with, including none at all.
++ */
++function adoptListeningPort(parsed: URL, port: number): void {
++	if (parsed.port) return;
++	if (DEFAULT_PROTOCOL_PORT[parsed.protocol] === port) return;
++	const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
++	if (hostname === "localhost" || isIP(hostname) !== 0) {
++		parsed.port = String(port);
++	}
++}
++
+ function normalizePublicUrl(
+ 	value: string | undefined,
+ 	host: string,
+@@ -47,6 +70,7 @@
+ 			`PUBLIC_URL must use http: or https:, got ${parsed.protocol}`,
+ 		);
+ 	}
++	adoptListeningPort(parsed, port);
+ 	parsed.hash = "";
+ 	return parsed.toString().replace(/\/$/, "");
+ }
+diff -ruN a/apps/cline-hub/src/server/access-control.ts b/apps/cline-hub/src/server/access-control.ts
+--- a/apps/cline-hub/src/server/access-control.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/apps/cline-hub/src/server/access-control.ts	2026-10-27 20:32:16.561378418 +0000
+@@ -0,0 +1,153 @@
++import { isIP } from "node:net";
++
++/** How the dashboard is reached, used to decide which requests are its own. */
++export interface LocalServiceAccessConfig {
++	bindHost: string;
++	port: number;
++	publicUrl: string;
++	roomSecret?: string;
++}
++
++export interface TrustedAddresses {
++	hosts: Set<string>;
++	origins: Set<string>;
++}
++
++const SAFE_HTTP_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
++
++/**
++ * Paths that dispatch privileged work on the dashboard: they open a runtime
++ * socket or call the desktop command dispatcher. Every other safe-method request
++ * only reads page content, which is public by design.
++ */
++const ACTION_PATHS = new Set([
++	"/browser",
++	"/settings/live",
++	"/api/desktop-command",
++]);
++
++const LOOPBACK_HOSTNAMES = ["127.0.0.1", "localhost", "::1"];
++
++function isWebSocketUpgrade(req: Request): boolean {
++	return req.headers.get("upgrade")?.trim().toLowerCase() === "websocket";
++}
++
++/**
++ * True when the request can change runtime state, drive a session, read or change
++ * configuration, or otherwise act on the user's machine. Those requests must prove
++ * where they came from; page and asset reads must not.
++ */
++export function needsTrustedOrigin(req: Request, url: URL): boolean {
++	if (isWebSocketUpgrade(req)) return true;
++	if (!SAFE_HTTP_METHODS.has(req.method.toUpperCase())) return true;
++	return ACTION_PATHS.has(url.pathname);
++}
++
++function bareHostname(hostname: string): string {
++	return hostname.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
++}
++
++function urlHostname(hostname: string): string {
++	const bare = bareHostname(hostname);
++	return isIP(bare) === 6 ? `[${bare}]` : bare;
++}
++
++function isDefaultPort(protocol: string, port: number): boolean {
++	return (
++		(protocol === "http:" && port === 80) ||
++		(protocol === "https:" && port === 443)
++	);
++}
++
++function hostHeaderValue(
++	protocol: string,
++	hostname: string,
++	port: number,
++): string {
++	const host = urlHostname(hostname);
++	return isDefaultPort(protocol, port) ? host : `${host}:${port}`;
++}
++
++function originValue(protocol: string, hostname: string, port: number): string {
++	const host = urlHostname(hostname);
++	return isDefaultPort(protocol, port)
++		? `${protocol}//${host}`
++		: `${protocol}//${host}:${port}`;
++}
++
++function isLoopbackHostname(bare: string): boolean {
++	return (
++		bare === "127.0.0.1" ||
++		bare === "localhost" ||
++		bare === "::1" ||
++		bare.endsWith(".localhost")
++	);
++}
++
++function isWildcardHostname(bare: string): boolean {
++	return bare === "0.0.0.0" || bare === "::";
++}
++
++/**
++ * The Host and Origin values a browser can legitimately present for this
++ * deployment: its configured public address, the address it actually binds, and
++ * loopback aliases when it is reachable on loopback.
++ */
++export function trustedAddresses(
++	config: LocalServiceAccessConfig,
++): TrustedAddresses {
++	const publicUrl = new URL(config.publicUrl);
++	const protocol = publicUrl.protocol;
++	const hosts = new Set<string>([publicUrl.host.toLowerCase()]);
++	const origins = new Set<string>([publicUrl.origin]);
++
++	const bindHost = bareHostname(config.bindHost);
++	hosts.add(hostHeaderValue(protocol, bindHost, config.port));
++	origins.add(originValue(protocol, bindHost, config.port));
++
++	if (isWildcardHostname(bindHost) || isLoopbackHostname(bindHost)) {
++		for (const alias of LOOPBACK_HOSTNAMES) {
++			hosts.add(hostHeaderValue(protocol, alias, config.port));
++			origins.add(originValue(protocol, alias, config.port));
++		}
++	}
++
++	return { hosts, origins };
++}
++
++function normalizedOrigin(header: string | null): string | undefined {
++	const raw = header?.trim();
++	if (!raw) return undefined;
++	try {
++		return new URL(raw).origin;
++	} catch {
++		return undefined;
++	}
++}
++
++function hasTrustedAddress(
++	req: Request,
++	url: URL,
++	config: LocalServiceAccessConfig,
++	addresses: TrustedAddresses,
++): boolean {
++	const host = req.headers.get("host")?.trim().toLowerCase();
++	if (!host || !addresses.hosts.has(host)) return false;
++
++	const origin = normalizedOrigin(req.headers.get("origin"));
++	if (!origin || !addresses.origins.has(origin)) return false;
++
++	if (!config.roomSecret) return true;
++	return url.searchParams.get("roomSecret") === config.roomSecret;
++}
++
++/** The single gate every dashboard request passes before any handler runs. */
++export function isRequestAuthorized(
++	req: Request,
++	url: URL,
++	config: LocalServiceAccessConfig,
++	addresses: TrustedAddresses = trustedAddresses(config),
++): boolean {
++	if (!needsTrustedOrigin(req, url)) return true;
++	return hasTrustedAddress(req, url, config, addresses);
++}
+diff -ruN a/apps/cline-hub/src/server.ts b/apps/cline-hub/src/server.ts
+--- a/apps/cline-hub/src/server.ts	2026-10-27 19:56:46.000000000 +0000
++++ b/apps/cline-hub/src/server.ts	2026-10-27 20:32:25.107396630 +0000
+@@ -1,6 +1,11 @@
+ import { CORE_BUILD_VERSION } from "@cline/core";
+ import { isNonLocalBindHost } from "./options";
+ import {
++	isRequestAuthorized,
++	type LocalServiceAccessConfig,
++	trustedAddresses,
++} from "./server/access-control";
++import {
+ 	handleToolApprovalResponse,
+ 	rejectOrphanedApprovals,
+ } from "./server/approvals";
+@@ -61,10 +66,13 @@
+ 	const syncClientsAndSessions = () => syncHubClientsAndSessions(ctx);
+ 	let stopped = false;
+ 
+-	function isAuthorizedBrowserRequest(url: URL): boolean {
+-		if (!roomSecret) return true;
+-		return url.searchParams.get("roomSecret") === roomSecret;
+-	}
++	const accessConfig: LocalServiceAccessConfig = {
++		bindHost: host,
++		port,
++		publicUrl,
++		roomSecret,
++	};
++	const trusted = trustedAddresses(accessConfig);
+ 
+ 	await attachHub(ctx);
+ 	const healthInterval = setInterval(() => {
+@@ -79,6 +87,11 @@
+ 		hostname: host,
+ 		async fetch(req, server) {
+ 			const url = new URL(req.url);
++			// Every privileged request must come from a page this deployment serves,
++			// and name the deployment in its Host header, before any handler runs.
++			if (!isRequestAuthorized(req, url, accessConfig, trusted)) {
++				return createJsonResponse({ error: "unauthorized_request" }, 403);
++			}
+ 			const liveSettingsRoute = handleLiveSettingsUpgrade(req, url, server);
+ 			if (liveSettingsRoute.handled) return liveSettingsRoute.response;
+ 			const commandRoute = await handleDesktopCommandApi(req, url, ctx);
+@@ -91,9 +104,6 @@
+ 				return createJsonResponse(hubStatusPayload(ctx));
+ 			}
+ 			if (url.pathname === "/browser") {
+-				if (!isAuthorizedBrowserRequest(url)) {
+-					return createJsonResponse({ error: "invalid_room_secret" }, 401);
+-				}
+ 				const displayName = `Browser ${Math.random().toString(36).slice(2, 6)}`;
+ 				const data = {
+ 					socket: undefined as never,
+diff -ruN a/apps/examples/desktop-app/sidecar/bridge-access.ts b/apps/examples/desktop-app/sidecar/bridge-access.ts
+--- a/apps/examples/desktop-app/sidecar/bridge-access.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/apps/examples/desktop-app/sidecar/bridge-access.ts	2026-10-27 20:32:35.102417184 +0000
+@@ -0,0 +1,38 @@
++const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "::1"]);
++
++function isLoopbackName(name: string): boolean {
++	return LOOPBACK_NAMES.has(name) || name.endsWith(".localhost");
++}
++
++/**
++ * The bridge socket is driven by pages the desktop application serves itself:
++ * the Tauri webview (`tauri://localhost`, `http://tauri.localhost`) and its
++ * development page (for example `http://localhost:3125`), which runs on a
++ * different local port than the bridge. Pages from anywhere else, and
++ * handshakes with no usable Origin, are refused.
++ */
++export function isTrustedBridgeOrigin(header: string | null): boolean {
++	const raw = header?.trim().toLowerCase();
++	if (!raw) return false;
++	let origin: URL;
++	try {
++		origin = new URL(raw);
++	} catch {
++		return false;
++	}
++	if (origin.protocol === "tauri:") return true;
++	return isLoopbackName(origin.hostname.replace(/^\[|\]$/g, ""));
++}
++
++/** The bridge only answers to loopback names; a rebinding host is refused. */
++export function isTrustedBridgeHost(header: string | null): boolean {
++	const raw = header?.trim().toLowerCase();
++	if (!raw) return false;
++	const closingBracket = raw.indexOf("]");
++	const name = raw.startsWith("[")
++		? closingBracket > 0
++			? raw.slice(1, closingBracket)
++			: ""
++		: raw.split(":")[0];
++	return isLoopbackName(name);
++}
+diff -ruN a/apps/examples/desktop-app/sidecar/server.ts b/apps/examples/desktop-app/sidecar/server.ts
+--- a/apps/examples/desktop-app/sidecar/server.ts	2026-10-27 19:56:42.000000000 +0000
++++ b/apps/examples/desktop-app/sidecar/server.ts	2026-10-27 20:32:39.583426584 +0000
+@@ -1,4 +1,5 @@
+ import type { DesktopTransportRequest } from "../webview/lib/desktop-transport";
++import { isTrustedBridgeHost, isTrustedBridgeOrigin } from "./bridge-access";
+ import { handleCommand } from "./commands";
+ import { sendEvent } from "./context";
+ import {
+@@ -84,8 +85,14 @@
+ 			);
+ 		}
+ 
+-		if (url.pathname === "/transport" && server.upgrade(req)) {
+-			return undefined;
++		if (url.pathname === "/transport") {
++			if (
++				!isTrustedBridgeOrigin(req.headers.get("origin")) ||
++				!isTrustedBridgeHost(req.headers.get("host"))
++			) {
++				return new Response("Forbidden", { status: 403 });
++			}
++			if (server.upgrade(req)) return undefined;
+ 		}
+ 
+ 		if (url.pathname === "/shutdown" && req.method === "POST") {
