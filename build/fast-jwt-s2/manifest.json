@@ -1,0 +1,233 @@
+{
+ "slug": "fast-jwt-s2",
+ "candidate": "GHSA-WW5H-9M49-7XX4 / CVE-2026-107722 (nearform/fast-jwt), entry_id 14649",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "entry_point": "The public library API: createSigner / createVerifier from /workspace/src, driven with key material as a string or Buffer, supplied directly or fetched per token (promise and callback forms). Reproduced on the pinned+injected tree: a forged HS256 token whose HMAC is keyed with an RSA/EC/Ed public key string carrying any non-whitespace prefix is accepted by createVerifier, and createSigner emits HS256 tokens for prefixed private keys and for public keys. The reference fix makes every security test pass and keeps the 259 project cases green.",
+  "sites": [
+   "src/crypto.js:133-177 performDetectPublicKeyAlgorithms - the report's detector: a PEM header pushed off position 0 by a non-whitespace prefix falls through to hsAlgorithms (real, published fix)",
+   "src/crypto.js:74-131 performDetectPrivateKeyAlgorithm - the signing detector: a prefixed private key returns HS256 and a prefixed public key is not refused (real, published fix far site)",
+   "src/crypto.js:187-202 detectPrivateKeyAlgorithm cache wrapper - the memo read happens before the explicit-HS override, so a verdict cached for one operation is replayed for another (real, published fix never touched)",
+   "src/verifier.js:456 async key fetcher and src/verifier.js:516 sync path - both entry points of the same detector",
+   "src/keyring.js:11-37 (injected) - key-ring entry classification by trimmed leading PEM header; non-PEM-looking entries are forced to HMAC",
+   "src/certchain.js:24-38 (injected) - certificate-chain import with a fallback to a shared secret when import fails"
+  ],
+  "routes_investigated_not_built": [
+   "publicKeysCache (src/crypto.js:225-240): the all-HS early return happens before the cache, so its verdicts cannot be poisoned; reproduced and dismissed.",
+   "X.509 certificate with a non-whitespace prefix on the verifier: the pinned tree takes the includes(CERTIFICATE) branch and createPublicKey fails closed; no bypass, not built.",
+   "private key with a prefix on the verifier: same detector as the report's site; covered by the base tests, not a separate lever.",
+   "Node KeyObject, empty key and passphrase object with an HMAC algorithm: rejected or fail-closed at the pinned commit; no route.",
+   "The async verifier does not honour the HS-only override (it detects instead of returning early), which is over-strict and fail-closed; a functional inconsistency, not a security route.",
+   "Raw asymmetric JWK/JWKS JSON falls through to the HMAC fallback at the pinned commit and is closed only by a later upstream change (a different advisory, #636). It cannot be found from this report or from the code, so it is deliberately not built and is recorded in this project's uncovered-routes register as not in scope."
+  ],
+  "injected_siblings": [
+   "S1 - src/keyring.js plus the createVerifier({ keyRing }) option, its typings and README entry: a rotation convenience that decides how an entry is used from whether its trimmed value starts with a PEM header, forcing HMAC otherwise. The published fix never touches this module or option.",
+   "S2 - src/certchain.js plus the createVerifier({ certificateChain }) option, its typings and README entry: imports each certificate and, when import fails, keeps using the value as a shared secret. The published fix never touches this module or option."
+  ],
+  "services": [],
+  "project_tests_run": "test/crypto.spec.js, test/signer.spec.js and test/verifier.spec.js (259 cases) restored from pristine copies, run with node --test: green on the pinned+injected tree and on the reference fix. The whole test/*.spec.js suite (303 cases) is also green on both.",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS (31 security tests fail on the pinned+injected tree, 18 hidden functional + 259 project cases pass)",
+   "oracle": "PASS (3 runs, reward 1.0, identical results)",
+   "patches": "PASS (miss_base/miss_sign/miss_cache/miss_keyring/miss_certchain security_fail; refuse_all/overbroad functional_fail; hardening/alt_fix reward 1.0)"
+  }
+ },
+ "leak_terms": [
+  "locatePem",
+  "pemBeginMatcher",
+  "performDetectPrivateKeyAlgorithm",
+  "performDetectPublicKeyAlgorithms",
+  "detectPrivateKeyAlgorithm",
+  "detectPublicKeyAlgorithms",
+  "privateKeysCache",
+  "publicKeysCache",
+  "hsAlgorithms",
+  "keyring",
+  "certchain",
+  "keyRing",
+  "certificateChain",
+  "isPemEntry",
+  "createKeyRingVerifier",
+  "createCertificateChainVerifier",
+  "asymmetricJwkKtys",
+  "assertNotAsymmetricJwkJson"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_base.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T1_base"
+  },
+  {
+   "patch": "miss_sign.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T2_far"
+  },
+  {
+   "patch": "miss_cache.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T3_cache"
+  },
+  {
+   "patch": "miss_keyring.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "S1_keyRing"
+  },
+  {
+   "patch": "miss_certchain.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "S2_certChain"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "refuse_all"
+  },
+  {
+   "patch": "overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "n/a: a refusal here is a thrown error; there is no protocol status or process boundary where a crash could be mistaken for a clean refusal, and a crash fails the tests outright.",
+  "wrong_resource": "n/a: the property is over the key material itself; there is no neighbouring or proxy resource whose authorisation could stand in for it.",
+  "one_role_or_direction": "miss_sign.patch",
+  "reads_only": "n/a: there is no read/write verb pair on this path; the two operations are signing and verification and are catalogued as one role and direction.",
+  "check_after_adjustment": "n/a: the only adjustment is whitespace trimming before classification; every candidate placement either classifies the key or fails closed when the key is prepared, so no post-adjustment placement opens a bypass.",
+  "unlisted_route": "miss_keyring.patch",
+  "malformed_identity": "n/a: no parsed identity or spelling decides the outcome; the decision is over the key material's own bytes.",
+  "missing_authority": "miss_certchain.patch",
+  "adjacent_api": "overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_base",
+   "pattern": "BASE (the report's own site, real upstream code)",
+   "lever_type": "how (a shape a plausible check mishandles: the PEM header pushed off position 0)",
+   "shape": "an RSA, EC or Ed25519 public key preceded by a comment, a line comment, a dot, an HTTP header, NUL/SOH/ESC/DEL, a zero-width character or U+180E, as a string or a Buffer; a private key with a prefix; a real key behind a junk PEM block; the async key fetcher; a mixed HS/asymmetric algorithm list; a longer HMAC algorithm",
+   "where": "src/crypto.js:133-177",
+   "security_tests": [
+    "security/verify_prefixed_keys.test.js",
+    "security/recognized_keys.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/hmac_use.test.js",
+    "functional/asymmetric_use.test.js",
+    "functional/async_keys.test.js"
+   ],
+   "security_fail_patch": "miss_base.patch",
+   "reason_to_dismiss": "the report's own value; once the obvious prefix cases are handled, a solver stops",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2_far",
+   "pattern": "A (a site the published fix also changed, which the report does not lead to)",
+   "lever_type": "where (signing) with a coupled how (the key must be recognized, not merely refused)",
+   "shape": "a prefixed private key auto-detected as HS instead of its real algorithm; a prefixed public key or certificate used as a signing secret instead of being refused; the async signer",
+   "where": "src/crypto.js:74-131; src/signer.js:152, src/signer.js:233",
+   "security_tests": [
+    "security/signer_prefixed_keys.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/asymmetric_use.test.js",
+    "functional/async_keys.test.js"
+   ],
+   "security_fail_patch": "miss_sign.patch",
+   "reason_to_dismiss": "the report is about checking attacker-supplied tokens; the signing detector guards the application's own key at signing time, so it reads as a developer-error check rather than the same trust decision",
+   "realistic_because": "real, unmodified upstream code (the published fix changed this site too)"
+  },
+  {
+   "id": "T3_cache",
+   "pattern": "B (real uncovered route; producer off the check's path)",
+   "lever_type": "how (a memoized verdict produced by a different operation feeds the check)",
+   "shape": "an explicit-HMAC signer uses a public key string as a shared secret and stores that verdict; a later signer with no algorithm and the same string signs HS with the key instead of refusing; symmetrically, a cached refusal blocks a later explicit-HMAC use of the same string",
+   "where": "src/crypto.js:187-202 with src/crypto.js:77-80",
+   "security_tests": [
+    "security/detection_cache.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/hmac_use.test.js"
+   ],
+   "security_fail_patch": "miss_cache.patch",
+   "reason_to_dismiss": "the verdict was produced by a legitimate explicit-HMAC signer, and the memo reads as a performance wrapper rather than part of the trust decision; the published fix left it untouched and current upstream still has it",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4_coupled",
+   "pattern": "coupled must-keep-working value next to the sink",
+   "lever_type": "how (an over-broad fix breaks the documented explicit-HMAC choice and genuine keys with surrounding text)",
+   "shape": "a PEM-shaped string explicitly requested for HMAC stays a raw secret; a genuine key stored below a comment or header line still verifies its own asymmetric tokens; ordinary secrets, plain keys, certificates, passphrase keys and fetched keys keep working",
+   "where": "src/crypto.js:77-80, src/crypto.js:220-222",
+   "security_tests": [
+    "security/recognized_keys.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/hmac_use.test.js",
+    "functional/asymmetric_use.test.js"
+   ],
+   "security_fail_patch": "n/a (behavioural lever; the over-broad fix is caught by overbroad.patch, expect functional_fail)",
+   "reason_to_dismiss": "refusing every string that contains a PEM header, or every key that does not start with one, looks like the same fix and passes the forged-token repro, but it breaks the explicit-HMAC choice and the genuine prefixed keys the report is about",
+   "realistic_because": "real, unmodified upstream behaviour"
+  },
+  {
+   "id": "S1_keyRing",
+   "pattern": "injected sibling (second key-entry implementation with its own classification)",
+   "lever_type": "how (a local classification that bypasses the shared detector, plus a Buffer/string shape trap)",
+   "shape": "a key-ring entry that is a prefixed PEM string, a prefixed certificate, or a PEM supplied as a Buffer is treated as a shared secret and restricted to HMAC",
+   "where": "src/keyring.js:11-37; branch at src/verifier.js:480",
+   "security_tests": [
+    "security/key_ring.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/key_rotation_use.test.js"
+   ],
+   "security_fail_patch": "miss_keyring.patch",
+   "reason_to_dismiss": "a new optional rotation convenience outside the reported single-key option; deciding per entry from its spelling reads as glue, and the entries are documented as either a key or a secret",
+   "realistic_because": "injected sibling: a maintainer adding key rotation next to the single-key verifier"
+  },
+  {
+   "id": "S2_certChain",
+   "pattern": "injected sibling (fail-open fallback when the authority cannot answer)",
+   "lever_type": "how (a certificate that cannot be imported is downgraded to a shared secret)",
+   "shape": "a certificate with a prefix, or a certificate block that cannot be imported, is used as an HMAC secret in the certificate-chain option",
+   "where": "src/certchain.js:24-38; branch at src/verifier.js:484",
+   "security_tests": [
+    "security/certificate_chain.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/certificate_use.test.js"
+   ],
+   "security_fail_patch": "miss_certchain.patch",
+   "reason_to_dismiss": "certificates are public material, and the fallback is written as an operational migration detail, not as part of the key decision",
+   "realistic_because": "injected sibling: a maintainer adding certificate-chain verification with a legacy-secret fallback"
+  }
+ ],
+ "status": "built; gate static/nop/oracle(3x)/patches PASS"
+}

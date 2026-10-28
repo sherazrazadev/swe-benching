@@ -1,0 +1,188 @@
+diff --git a/README.md b/README.md
+index 2e234bf..df04412 100644
+--- a/README.md
++++ b/README.md
+@@ -144,6 +144,10 @@ Create a verifier function by calling `createVerifier` and providing one or more
+ 
+ - `key`: A string or a buffer containing the secret for `HS*` algorithms or the PEM encoded public key for `RS*`, `PS*`, `ES*` and `EdDSA` algorithms. The key can also be a function accepting a Node style callback or a function returning a promise. This is the only mandatory option, which MUST NOT be provided if the token algorithm is `none`.
+ 
++- `keyRing`: An array of strings or buffers used to verify a token during a key rotation. Each entry is either the secret for `HS*` algorithms or the PEM encoded public key for `RS*`, `PS*`, `ES*` and `EdDSA` algorithms, and the entry that verifies the token is used. Takes precedence over `key`.
++
++- `certificateChain`: An array of strings or buffers containing the PEM encoded X.509 certificates used to verify `RS*`, `PS*`, `ES*` and `EdDSA` tokens. Takes precedence over `key`.
++
+ - `algorithms`: List of strings with the names of the allowed algorithms. By default, all algorithms are accepted.
+ 
+ - `complete`: Return an object with the decoded header, payload, signature and input (the token part before the signature), instead of just the content of the payload. Default is `false`.
+diff --git a/src/certchain.js b/src/certchain.js
+new file mode 100644
+index 0000000..c71a36d
+--- /dev/null
++++ b/src/certchain.js
+@@ -0,0 +1,64 @@
++'use strict'
++
++const { createPublicKey } = require('node:crypto')
++
++const { hsAlgorithms } = require('./crypto')
++const { TokenError } = require('./error')
++
++// A certificate chain is a list of PEM-encoded X.509 certificates. The leaf
++// certificate provides the public key used to verify RS*, PS*, ES* and EdDSA
++// tokens.
++function createCertificateChainVerifier(createVerifier, options) {
++  const { certificateChain, ...rest } = options
++
++  const verifiers = certificateChain.map(certificate => {
++    if (typeof certificate !== 'string' && !(certificate instanceof Buffer)) {
++      throw new TokenError(
++        TokenError.codes.invalidOption,
++        'Each certificate chain entry must be a string or a buffer containing a certificate.'
++      )
++    }
++
++    const base = { ...rest, key: certificate }
++
++    let importable = true
++
++    try {
++      createPublicKey(certificate)
++    } catch {
++      importable = false
++    }
++
++    if (importable || rest.algorithms) {
++      return createVerifier(base)
++    }
++
++    // A deployment that has not finished migrating may keep a shared secret in
++    // the same configuration field, so keep honouring it for HMAC tokens.
++    return createVerifier({ ...base, algorithms: hsAlgorithms })
++  })
++
++  return function verifyWithCertificateChain(token, callback) {
++    let lastError
++
++    for (const verifier of verifiers) {
++      try {
++        const result = verifier(token)
++        if (typeof callback === 'function') {
++          return callback(null, result)
++        }
++        return result
++      } catch (error) {
++        lastError = error
++      }
++    }
++
++    if (typeof callback === 'function') {
++      return callback(lastError)
++    }
++
++    throw lastError
++  }
++}
++
++module.exports = { createCertificateChainVerifier }
+diff --git a/src/index.d.ts b/src/index.d.ts
+index 597c1b7..bf77d2f 100644
+--- a/src/index.d.ts
++++ b/src/index.d.ts
+@@ -90,6 +90,8 @@ type VerifierAllowed = VerifierAllowedBase | Array<VerifierAllowedBase>
+ 
+ export interface VerifierOptions {
+   algorithms?: Algorithm[]
++  keyRing?: Array<Bufferable>
++  certificateChain?: Array<Bufferable>
+   complete?: boolean
+   cache?: boolean | number
+   cacheTTL?: number
+diff --git a/src/keyring.js b/src/keyring.js
+new file mode 100644
+index 0000000..a388fa1
+--- /dev/null
++++ b/src/keyring.js
+@@ -0,0 +1,63 @@
++'use strict'
++
++const { hsAlgorithms } = require('./crypto')
++const { TokenError } = require('./error')
++
++const pemBlockMatcher = /^-----BEGIN [A-Z0-9 ]+-----/
++
++// A key ring holds more than one verification key so tokens signed with a key
++// that is being rotated out are still accepted. An entry is either the PEM
++// block of a public key or certificate, or the value of a shared secret.
++function isPemEntry(value) {
++  if (typeof value !== 'string') {
++    return false
++  }
++
++  return pemBlockMatcher.test(value.trim())
++}
++
++function createKeyRingVerifier(createVerifier, options) {
++  const { keyRing, ...rest } = options
++
++  const verifiers = keyRing.map(entry => {
++    if (typeof entry !== 'string' && !(entry instanceof Buffer)) {
++      throw new TokenError(
++        TokenError.codes.invalidOption,
++        'Each key ring entry must be a string or a buffer containing a secret or a public key.'
++      )
++    }
++
++    const base = { ...rest, key: entry }
++
++    if (isPemEntry(entry) || rest.algorithms) {
++      return createVerifier(base)
++    }
++
++    // A value that is not a PEM block is a shared secret, so only the HMAC algorithms apply.
++    return createVerifier({ ...base, algorithms: hsAlgorithms })
++  })
++
++  return function verifyWithKeyRing(token, callback) {
++    let lastError
++
++    for (const verifier of verifiers) {
++      try {
++        const result = verifier(token)
++        if (typeof callback === 'function') {
++          return callback(null, result)
++        }
++        return result
++      } catch (error) {
++        lastError = error
++      }
++    }
++
++    if (typeof callback === 'function') {
++      return callback(lastError)
++    }
++
++    throw lastError
++  }
++}
++
++module.exports = { createKeyRingVerifier, isPemEntry }
+diff --git a/src/verifier.js b/src/verifier.js
+index d7f45d4..0413856 100644
+--- a/src/verifier.js
++++ b/src/verifier.js
+@@ -475,6 +475,16 @@ function verify(
+ }
+ 
+ module.exports = function createVerifier(options) {
++  options = options || {}
++
++  if (Array.isArray(options.keyRing) && options.keyRing.length > 0) {
++    return require('./keyring').createKeyRingVerifier(createVerifier, options)
++  }
++
++  if (Array.isArray(options.certificateChain) && options.certificateChain.length > 0) {
++    return require('./certchain').createCertificateChainVerifier(createVerifier, options)
++  }
++
+   let {
+     key,
+     algorithms: allowedAlgorithms,
