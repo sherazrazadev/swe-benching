@@ -5,7 +5,7 @@ Started 2026-10-27T19:08Z. [run 40566307793](https://github.com/sherazrazadev/sw
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
 | `aws-cli-s2` | sound | 1 | 0.8462 | **REJECTED** |
-| `cline-s2` | sound | 0 0 0.875 | 0.875 0.75 0.6875 | **in final checks** |
+| `cline-s2` | sound | 0 0 1 | 0.75 0.9583 0.75 | **REJECTED** |
 | `logging-operator-s2` | sound | 0.7857 1 1 | 0.6429 0.6429 1 | **REJECTED** |
 | `vault-secrets-webhook-s2` | sound | 1 | 1 | **REJECTED** |
 | `ember-s2` | sound | 1 | 1 | **REJECTED** |
