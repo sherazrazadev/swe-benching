@@ -1,0 +1,106 @@
+--- a/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java
+@@ -49,6 +49,7 @@
+ import jakarta.ws.rs.core.MediaType;
+ import jakarta.ws.rs.core.Response;
+ import org.apache.shiro.authz.annotation.RequiresAuthentication;
++import org.graylog.grn.GRNType;
+ import org.graylog.grn.GRNTypes;
+ import org.graylog.plugins.views.audit.ViewsAuditEventTypes;
+ import org.graylog.plugins.views.search.Query;
+@@ -291,6 +292,16 @@
+         });
+     }
+ 
++    private GRNType grnTypeOf(ViewDTO dto) {
++        return dto.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH;
++    }
++
++    private void requireOwner(org.graylog.grn.GRN entity) {
++        if (!isPermitted(org.graylog2.plugin.security.Permission.ENTITY_OWN.permission(), entity.toString())) {
++            throw new jakarta.ws.rs.ForbiddenException("Not authorized to access entity <" + entity + ">");
++        }
++    }
++
+     private void validateIntegrity(ViewDTO dto, SearchUser searchUser, boolean newCreation) {
+         final Search search = searchDomain.getForUser(dto.searchId(), searchUser)
+                 .orElseThrow(() -> new BadRequestException("Search " + dto.searchId() + " not available"));
+@@ -396,6 +407,9 @@
+         final ViewDTO dto = createEntityRequest.entity();
+         final ViewDTO updatedDTO = dto.toBuilder().id(id).build();
+         validateDto(updatedDTO, searchUser);
++
++        final var grnType = grnTypeOf(updatedDTO);
++        createEntityRequest.shareRequest().ifPresent(request -> requireOwner(grnType.toGRN(id)));
+ 
+         var result = dbService.update(updatedDTO);
+         recentActivityService.update(result.id(), result.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH, searchUser);
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
+@@ -159,6 +159,12 @@
+     private final EventResolver eventResolver;
+     private final EntitySharesService entitySharesService;
+ 
++    private void requireOwner(org.graylog.grn.GRN entity) {
++        if (!isPermitted(org.graylog2.plugin.security.Permission.ENTITY_OWN.permission(), entity.toString())) {
++            throw new jakarta.ws.rs.ForbiddenException("Not authorized to access entity <" + entity + ">");
++        }
++    }
++
+     @Inject
+     public EventDefinitionsResource(DBEventDefinitionService dbService,
+                                     EventDefinitionHandler eventDefinitionHandler,
+@@ -346,6 +352,7 @@
+                            @Context UserContext userContext) {
+         EventDefinitionDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_DEFINITIONS_EDIT, definitionId);
++        createEntityRequest.shareRequest().ifPresent(request -> requireOwner(GRNTypes.EVENT_DEFINITION.toGRN(definitionId)));
+         checkEventDefinitionPermissions(dto, "update");
+         EventDefinitionDto oldDto = dbService.get(definitionId)
+                 .orElseThrow(() -> new NotFoundException("Event definition <" + definitionId + "> doesn't exist"));
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
+@@ -117,6 +117,12 @@
+     private final RecentActivityService recentActivityService;
+     private final EntitySharesService entitySharesService;
+ 
++    private void requireOwner(org.graylog.grn.GRN entity) {
++        if (!isPermitted(org.graylog2.plugin.security.Permission.ENTITY_OWN.permission(), entity.toString())) {
++            throw new jakarta.ws.rs.ForbiddenException("Not authorized to access entity <" + entity + ">");
++        }
++    }
++
+     @Inject
+     public EventNotificationsResource(DBNotificationService dbNotificationService,
+                                       Set<AlarmCallback> availableLegacyAlarmCallbacks,
+@@ -214,6 +220,7 @@
+                            @Context UserContext userContext) {
+         final NotificationDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_NOTIFICATIONS_EDIT, notificationId);
++        createEntityRequest.shareRequest().ifPresent(request -> requireOwner(GRNTypes.EVENT_NOTIFICATION.toGRN(notificationId)));
+         if (dbNotificationService.get(notificationId).isEmpty()) {
+             throw new NotFoundException("Notification " + notificationId + " doesn't exist");
+         }
+--- a/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
++++ b/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
+@@ -177,6 +177,12 @@
+     private final PipelineService pipelineService;
+     private final EntitySharesService entitySharesService;
+ 
++    private void requireOwner(org.graylog.grn.GRN entity) {
++        if (!isPermitted(org.graylog2.plugin.security.Permission.ENTITY_OWN.permission(), entity.toString())) {
++            throw new jakarta.ws.rs.ForbiddenException("Not authorized to access entity <" + entity + ">");
++        }
++    }
++
+     private final DbQueryCreator dbQueryCreator;
+ 
+     @Inject
+@@ -394,6 +400,7 @@
+         final UpdateStreamRequest request = createEntityRequest.entity();
+         checkPermission(RestPermissions.STREAMS_EDIT, streamId);
+         checkNotEditableStream(streamId, "The stream cannot be edited.");
++        createEntityRequest.shareRequest().ifPresent(shareRequest -> requireOwner(GRNTypes.STREAM.toGRN(streamId)));
+ 
+         final Stream stream = streamService.update(streamId, request);
+ 

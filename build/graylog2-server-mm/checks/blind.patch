@@ -1,0 +1,139 @@
+diff -ruN a/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java b/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java	2026-10-28 07:22:32.000000000 +0000
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java	2026-10-28 07:55:29.719676666 +0000
+@@ -71,6 +71,7 @@
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.scheduler.schedule.CronUtils;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.ShareOwnership;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -346,6 +347,9 @@
+                            @Context UserContext userContext) {
+         EventDefinitionDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_DEFINITIONS_EDIT, definitionId);
++        if (createEntityRequest.shareRequest().isPresent()) {
++            ShareOwnership.requireOwner(getSubject(), GRNTypes.EVENT_DEFINITION.toGRN(definitionId));
++        }
+         checkEventDefinitionPermissions(dto, "update");
+         EventDefinitionDto oldDto = dbService.get(definitionId)
+                 .orElseThrow(() -> new NotFoundException("Event definition <" + definitionId + "> doesn't exist"));
+diff -ruN a/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java b/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java	2026-10-28 07:22:32.000000000 +0000
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java	2026-10-28 07:55:35.835790444 +0000
+@@ -51,6 +51,7 @@
+ import org.graylog.grn.GRNTypes;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.ShareOwnership;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.alarmcallbacks.EmailAlarmCallback;
+@@ -214,6 +215,9 @@
+                            @Context UserContext userContext) {
+         final NotificationDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_NOTIFICATIONS_EDIT, notificationId);
++        if (createEntityRequest.shareRequest().isPresent()) {
++            ShareOwnership.requireOwner(getSubject(), GRNTypes.EVENT_NOTIFICATION.toGRN(notificationId));
++        }
+         if (dbNotificationService.get(notificationId).isEmpty()) {
+             throw new NotFoundException("Notification " + notificationId + " doesn't exist");
+         }
+diff -ruN a/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java b/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java
+--- a/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java	2026-10-28 07:22:32.000000000 +0000
++++ b/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java	2026-10-28 07:55:24.150572974 +0000
+@@ -68,6 +68,7 @@
+ import org.graylog.plugins.views.startpage.StartPageService;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.ShareOwnership;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -397,6 +398,13 @@
+         final ViewDTO updatedDTO = dto.toBuilder().id(id).build();
+         validateDto(updatedDTO, searchUser);
+ 
++        if (createEntityRequest.shareRequest().isPresent()) {
++            // Sharing is applied to the target view (the request path id), so ownership is
++            // judged on that view, regardless of any id carried inside the entity body.
++            final var grnType = updatedDTO.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH;
++            ShareOwnership.requireOwner(getSubject(), grnType.toGRN(id));
++        }
++
+         var result = dbService.update(updatedDTO);
+         recentActivityService.update(result.id(), result.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH, searchUser);
+         updateViewSharing(createEntityRequest, searchUser, result);
+diff -ruN a/graylog2-server/src/main/java/org/graylog/security/rest/ShareOwnership.java b/graylog2-server/src/main/java/org/graylog/security/rest/ShareOwnership.java
+--- a/graylog2-server/src/main/java/org/graylog/security/rest/ShareOwnership.java	1970-01-01 00:00:00.000000000 +0000
++++ b/graylog2-server/src/main/java/org/graylog/security/rest/ShareOwnership.java	2026-10-28 07:55:17.727453306 +0000
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2020 Graylog, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the Server Side Public License, version 1,
++ * as published by MongoDB, Inc.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * Server Side Public License for more details.
++ *
++ * You should have received a copy of the Server Side Public License
++ * along with this program. If not, see
++ * <http://www.mongodb.com/licensing/server-side-public-license>.
++ */
++package org.graylog.security.rest;
++
++import jakarta.ws.rs.ForbiddenException;
++import org.apache.shiro.subject.Subject;
++import org.graylog.grn.GRN;
++import org.graylog2.plugin.security.Permission;
++
++/**
++ * Guard for requests that carry a sharing instruction alongside a content update.
++ * <p>
++ * Being allowed to edit an entity's content is not the same authority as deciding who may reach
++ * it: the grant set may only be changed by the entity's owner. Callers have already established
++ * whatever edit permission they require; this guard adds the owner requirement on top.
++ * <p>
++ * The entity passed in must be the one the sharing instruction will be applied to, never an
++ * entity merely mentioned in the request body.
++ */
++public final class ShareOwnership {
++    private ShareOwnership() {
++    }
++
++    /**
++     * Refuses the request with a client error unless {@code subject} holds the owner capability
++     * on {@code entity}.
++     */
++    public static void requireOwner(Subject subject, GRN entity) {
++        if (!subject.isPermitted(Permission.ENTITY_OWN.toShiroPermission(entity))) {
++            throw new ForbiddenException("Not authorized to change the sharing of <" + entity + ">");
++        }
++    }
++}
+diff -ruN a/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java b/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
+--- a/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java	2026-10-28 07:22:32.000000000 +0000
++++ b/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java	2026-10-28 07:55:42.270985740 +0000
+@@ -60,6 +60,7 @@
+ import org.graylog.plugins.pipelineprocessor.rest.PipelineConnections;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.ShareOwnership;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -394,6 +395,9 @@
+         final UpdateStreamRequest request = createEntityRequest.entity();
+         checkPermission(RestPermissions.STREAMS_EDIT, streamId);
+         checkNotEditableStream(streamId, "The stream cannot be edited.");
++        if (createEntityRequest.shareRequest().isPresent()) {
++            ShareOwnership.requireOwner(getSubject(), GRNTypes.STREAM.toGRN(streamId));
++        }
+ 
+         final Stream stream = streamService.update(streamId, request);
+ 

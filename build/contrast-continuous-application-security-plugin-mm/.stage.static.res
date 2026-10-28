@@ -1,0 +1,1 @@
+task	manifest.patch_checks has no expect=pass patch with kind='blind' || full evidence: /home/runner/work/swe-benching/swe-benching/build/contrast-continuous-application-security-plugin-mm/evidence/20261028T094617Z-gate-static.txt

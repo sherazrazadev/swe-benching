@@ -1,0 +1,138 @@
+--- a/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java
+@@ -49,6 +49,7 @@
+ import jakarta.ws.rs.core.MediaType;
+ import jakarta.ws.rs.core.Response;
+ import org.apache.shiro.authz.annotation.RequiresAuthentication;
++import org.graylog.grn.GRNType;
+ import org.graylog.grn.GRNTypes;
+ import org.graylog.plugins.views.audit.ViewsAuditEventTypes;
+ import org.graylog.plugins.views.search.Query;
+@@ -68,6 +69,7 @@
+ import org.graylog.plugins.views.startpage.StartPageService;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.RestResourceWithOwnerCheck;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -108,7 +110,7 @@
+ @Path("/views")
+ @Produces(MediaType.APPLICATION_JSON)
+ @RequiresAuthentication
+-public class ViewsResource extends RestResource implements PluginRestResource {
++public class ViewsResource extends RestResourceWithOwnerCheck implements PluginRestResource {
+     private static final ImmutableMap<String, SearchQueryField> SEARCH_FIELD_MAPPING = ImmutableMap.<String, SearchQueryField>builder()
+             .put("id", SearchQueryField.create(ViewDTO.FIELD_ID))
+             .put("title", SearchQueryField.create(ViewDTO.FIELD_TITLE))
+@@ -291,6 +293,11 @@
+         });
+     }
+ 
++    private GRNType toGRNType(ViewDTO dto) {
++        return dto.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH;
++    }
++
++
+     private void validateIntegrity(ViewDTO dto, SearchUser searchUser, boolean newCreation) {
+         final Search search = searchDomain.getForUser(dto.searchId(), searchUser)
+                 .orElseThrow(() -> new BadRequestException("Search " + dto.searchId() + " not available"));
+@@ -396,6 +403,11 @@
+         final ViewDTO dto = createEntityRequest.entity();
+         final ViewDTO updatedDTO = dto.toBuilder().id(id).build();
+         validateDto(updatedDTO, searchUser);
++
++        final var grnType = toGRNType(updatedDTO);
++        if (createEntityRequest.shareRequest().isPresent() && !isOwner(grnType.toGRN(id))) {
++            throw new IllegalStateException("Not authorized to access entity <" + grnType.toGRN(id) + ">");
++        }
+ 
+         var result = dbService.update(updatedDTO);
+         recentActivityService.update(result.id(), result.type().equals(ViewDTO.Type.DASHBOARD) ? GRNTypes.DASHBOARD : GRNTypes.SEARCH, searchUser);
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
+@@ -71,6 +71,7 @@
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.scheduler.schedule.CronUtils;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.RestResourceWithOwnerCheck;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -119,7 +120,7 @@
+ @Produces(MediaType.APPLICATION_JSON)
+ @Consumes(MediaType.APPLICATION_JSON)
+ @RequiresAuthentication
+-public class EventDefinitionsResource extends RestResource implements PluginRestResource {
++public class EventDefinitionsResource extends RestResourceWithOwnerCheck implements PluginRestResource {
+     private static final Logger LOG = LoggerFactory.getLogger(EventDefinitionsResource.class);
+ 
+     private static final ImmutableMap<String, SearchQueryField> SEARCH_FIELD_MAPPING = ImmutableMap.<String, SearchQueryField>builder()
+@@ -346,6 +347,9 @@
+                            @Context UserContext userContext) {
+         EventDefinitionDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_DEFINITIONS_EDIT, definitionId);
++        if (createEntityRequest.shareRequest().isPresent()) {
++            checkOwnership(GRNTypes.EVENT_DEFINITION.toGRN(definitionId));
++        }
+         checkEventDefinitionPermissions(dto, "update");
+         EventDefinitionDto oldDto = dbService.get(definitionId)
+                 .orElseThrow(() -> new NotFoundException("Event definition <" + definitionId + "> doesn't exist"));
+--- a/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
++++ b/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
+@@ -51,6 +51,7 @@
+ import org.graylog.grn.GRNTypes;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.RestResourceWithOwnerCheck;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.alarmcallbacks.EmailAlarmCallback;
+@@ -91,7 +92,7 @@
+ @Produces(MediaType.APPLICATION_JSON)
+ @Consumes(MediaType.APPLICATION_JSON)
+ @RequiresAuthentication
+-public class EventNotificationsResource extends RestResource implements PluginRestResource {
++public class EventNotificationsResource extends RestResourceWithOwnerCheck implements PluginRestResource {
+     private static final ImmutableMap<String, SearchQueryField> SEARCH_FIELD_MAPPING = ImmutableMap.<String, SearchQueryField>builder()
+             .put("id", SearchQueryField.create("_id", SearchQueryField.Type.OBJECT_ID))
+             .put("title", SearchQueryField.create(NotificationDto.FIELD_TITLE))
+@@ -214,6 +215,9 @@
+                            @Context UserContext userContext) {
+         final NotificationDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_NOTIFICATIONS_EDIT, notificationId);
++        if (createEntityRequest.shareRequest().isPresent()) {
++            checkOwnership(GRNTypes.EVENT_NOTIFICATION.toGRN(notificationId));
++        }
+         if (dbNotificationService.get(notificationId).isEmpty()) {
+             throw new NotFoundException("Notification " + notificationId + " doesn't exist");
+         }
+--- a/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
++++ b/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
+@@ -60,6 +60,7 @@
+ import org.graylog.plugins.pipelineprocessor.rest.PipelineConnections;
+ import org.graylog.plugins.views.startpage.recentActivities.RecentActivityService;
+ import org.graylog.security.UserContext;
++import org.graylog.security.rest.RestResourceWithOwnerCheck;
+ import org.graylog.security.shares.CreateEntityRequest;
+ import org.graylog.security.shares.EntitySharesService;
+ import org.graylog2.audit.AuditEventSender;
+@@ -141,7 +142,7 @@
+ @PublicCloudAPI
+ @Tag(name = "Streams", description = "Manage streams")
+ @Path("/streams")
+-public class StreamResource extends RestResource {
++public class StreamResource extends RestResourceWithOwnerCheck {
+     private static final String DEFAULT_SORT_FIELD = StreamImpl.FIELD_TITLE;
+     private static final String DEFAULT_SORT_DIRECTION = "asc";
+     private static final List<EntityAttribute> attributes = List.of(
+@@ -394,6 +395,9 @@
+         final UpdateStreamRequest request = createEntityRequest.entity();
+         checkPermission(RestPermissions.STREAMS_EDIT, streamId);
+         checkNotEditableStream(streamId, "The stream cannot be edited.");
++        if (createEntityRequest.shareRequest().isPresent()) {
++            checkOwnership(GRNTypes.STREAM.toGRN(streamId));
++        }
+ 
+         final Stream stream = streamService.update(streamId, request);
+ 

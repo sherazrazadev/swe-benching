@@ -1,0 +1,138 @@
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
+index 884aeba..c430a0f 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
+@@ -19,6 +19,7 @@ import org.jenkinsci.plugins.workflow.steps.AbstractSynchronousStepExecution;
+ import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.DataBoundSetter;
++import org.kohsuke.stapler.QueryParameter;
+ 
+ import java.io.*;
+ import java.util.Arrays;
+@@ -96,6 +97,24 @@ public class ContrastAgentStep extends AbstractStepImpl {
+             return VulnerabilityTrendHelper.getAgentTypeListBoxModel();
+         }
+ 
++        /**
++         * Fills the connection details shown for the selected TeamServer profile.
++         *
++         * @param teamServerProfileName Name of the selected TeamServer profile.
++         * @return ListBoxModel with the profile's TeamServer URL and organization.
++         */
++        @SuppressWarnings("unused")
++        public ListBoxModel doFillTeamServerConnectionItems(
++                @QueryParameter("profile") final String teamServerProfileName) {
++            ListBoxModel items = new ListBoxModel();
++            TeamServerProfile teamServerProfile = VulnerabilityTrendHelper.getProfile(teamServerProfileName);
++            if (teamServerProfile != null) {
++                items.add(teamServerProfile.getTeamServerUrl(), teamServerProfile.getTeamServerUrl());
++                items.add(teamServerProfile.getOrgUuid(), teamServerProfile.getOrgUuid());
++            }
++            return items;
++        }
++
+     }
+ 
+     public static class Execution extends AbstractSynchronousStepExecution<Void> {
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
+index eabaa21..38f7ce8 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
+@@ -1,15 +1,21 @@
+ package com.aspectsecurity.contrast.contrastjenkins;
+ 
++import hudson.Extension;
++import hudson.model.AbstractDescribableImpl;
++import hudson.model.Descriptor;
++import hudson.util.ListBoxModel;
+ import lombok.Getter;
+ import lombok.Setter;
+ import org.kohsuke.stapler.DataBoundConstructor;
++import org.kohsuke.stapler.QueryParameter;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+ @Getter
+ @Setter
+-public class GlobalThresholdCondition {
++public class GlobalThresholdCondition extends AbstractDescribableImpl<GlobalThresholdCondition> {
+ 
+     private String teamServerProfileName;
+ 
+@@ -49,6 +55,24 @@ public class GlobalThresholdCondition {
+         this.untracked = untracked;
+     }
+ 
++    @Extension
++    public static class DescriptorImpl extends Descriptor<GlobalThresholdCondition> {
++
++        @Override
++        public String getDisplayName() {
++            return "Global Threshold Condition";
++        }
++
++        public ListBoxModel doFillTeamServerProfileNameItems() {
++            return VulnerabilityTrendHelper.getProfileNames();
++        }
++
++        public ListBoxModel doFillThresholdVulnTypeItems(
++                @QueryParameter("teamServerProfileName") final String teamServerProfileName) throws IOException {
++            return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
++        }
++    }
++
+     public List<String> getVulnerabilityStatuses() {
+         List<String> status = new ArrayList();
+         if (autoRemediated) {
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
+index 5d7d58f..a5b0e7a 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
+@@ -15,6 +15,7 @@ import hudson.model.Item;
+ import hudson.model.Result;
+ import hudson.model.Run;
+ import hudson.model.TaskListener;
++import hudson.util.FormValidation;
+ import hudson.util.ListBoxModel;
+ import jenkins.model.Jenkins;
+ import lombok.Getter;
+@@ -245,6 +246,36 @@ public class VulnerabilityTrendStep extends AbstractStepImpl {
+             return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+         }
+ 
++        /**
++         * Validates the configured application id by checking it against the selected profile.
++         *
++         * @param teamServerProfileName Name of the selected TeamServer profile.
++         * @param value                 The value that the user has typed.
++         * @return Indicates the outcome of the validation. This is sent to the browser.
++         */
++        public FormValidation doCheckApplicationId(@QueryParameter("profile") final String teamServerProfileName,
++                                                   @QueryParameter String value) {
++            if (VulnerabilityTrendHelper.appExistsInProfile(teamServerProfileName, value)) {
++                TeamServerProfile profile = VulnerabilityTrendHelper.getProfile(teamServerProfileName);
++                ContrastSDK contrastSDK = VulnerabilityTrendHelper.createSDK(profile.getUsername(), profile.getServiceKey(),
++                        profile.getApiKey(), profile.getTeamServerUrl());
++                String appId = value;
++                if (value.contains("(") && value.contains(")")) {
++                    appId = VulnerabilityTrendHelper.getAppIdFromAppTitle(value);
++                }
++                try {
++                    if (VulnerabilityTrendHelper.isApplicableEnabledJobOutcomePolicyExist(contrastSDK, profile.getOrgUuid(), appId)) {
++                        return FormValidation.warning("Your Contrast administrator has set a policy for vulnerability thresholds for this application.");
++                    }
++                } catch (IOException | UnauthorizedException e) {
++                    return FormValidation.warning("Unable to make connection with Contrast: " + e.getMessage());
++                }
++            } else if (!value.isEmpty()) {
++                return FormValidation.warning("Application not found.");
++            }
++            return FormValidation.ok();
++        }
++
+         @SuppressWarnings("unused")
+         public ListBoxModel doFillSeverityItems() {
+             return VulnerabilityTrendHelper.getSeverityListBoxModel();

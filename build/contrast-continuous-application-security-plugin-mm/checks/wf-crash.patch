@@ -1,0 +1,358 @@
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
+index c430a0f..eb60d09 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastAgentStep.java
+@@ -17,6 +17,7 @@ import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
+ import org.jenkinsci.plugins.workflow.steps.AbstractStepImpl;
+ import org.jenkinsci.plugins.workflow.steps.AbstractSynchronousStepExecution;
+ import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.DataBoundSetter;
+ import org.kohsuke.stapler.QueryParameter;
+@@ -85,9 +86,13 @@ public class ContrastAgentStep extends AbstractStepImpl {
+ 
+ 
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillProfileItems() {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
+-                return new ListBoxModel();
++        public ListBoxModel doFillProfileItems(@AncestorInPath Item item) {
++            if (item == null) {
++                if (!Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)) {
++                    throw new RuntimeException("access denied");
++                }
++            } else if (!item.hasPermission(Item.CONFIGURE)) {
++                throw new RuntimeException("access denied");
+             }
+             return VulnerabilityTrendHelper.getProfileNames();
+         }
+@@ -104,8 +109,15 @@ public class ContrastAgentStep extends AbstractStepImpl {
+          * @return ListBoxModel with the profile's TeamServer URL and organization.
+          */
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillTeamServerConnectionItems(
++        public ListBoxModel doFillTeamServerConnectionItems(@AncestorInPath Item item,
+                 @QueryParameter("profile") final String teamServerProfileName) {
++            if (item == null) {
++                if (!Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)) {
++                    throw new RuntimeException("access denied");
++                }
++            } else if (!item.hasPermission(Item.CONFIGURE)) {
++                throw new RuntimeException("access denied");
++            }
+             ListBoxModel items = new ListBoxModel();
+             TeamServerProfile teamServerProfile = VulnerabilityTrendHelper.getProfile(teamServerProfileName);
+             if (teamServerProfile != null) {
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastPluginConfig.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastPluginConfig.java
+index 8979839..e0305ea 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastPluginConfig.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ContrastPluginConfig.java
+@@ -17,6 +17,7 @@ import jenkins.model.Jenkins;
+ import net.sf.json.JSONArray;
+ import net.sf.json.JSONObject;
+ import org.apache.commons.lang.StringUtils;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.QueryParameter;
+ import org.kohsuke.stapler.interceptor.RequirePOST;
+@@ -107,8 +108,8 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
+         }
+ 
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillTeamServerProfileNameItems() {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
++        public ListBoxModel doFillTeamServerProfileNameItems(@AncestorInPath Item item) {
++            if (!hasFillPermission(item)) {
+                 return new ListBoxModel();
+             }
+             return VulnerabilityTrendHelper.getProfileNames();
+@@ -119,13 +120,23 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
+          *
+          * @return ListBoxModel filled with vulnerability types.
+          */
+-        public ListBoxModel doFillThresholdVulnTypeItems(@QueryParameter("teamServerProfileName") final String teamServerProfileName) throws IOException {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
++        public ListBoxModel doFillThresholdVulnTypeItems(@AncestorInPath Item item, @QueryParameter("teamServerProfileName") final String teamServerProfileName) throws IOException {
++            if (!hasFillPermission(item)) {
+                 return new ListBoxModel();
+             }
+             return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+         }
+ 
++        private static boolean hasFillPermission(Item item) {
++            boolean allowed = item == null
++                    ? Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)
++                    : item.hasPermission(Item.CONFIGURE);
++            if (!allowed) {
++                throw new RuntimeException("access denied");
++            }
++            return true;
++        }
++
+         /**
+          * Validates the configured TeamServer profile by attempting to get the default profile for the username.
+          *
+@@ -167,8 +178,11 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
+                 if (!protocol.equals("http") && !protocol.equals("https")) {
+                     return FormValidation.error("Connection error: Contrast URL must use http or https.");
+                 }
++                if (StringUtils.isEmpty(parsedUrl.getHost())) {
++                    return FormValidation.error("Connection error: Contrast URL is not a valid URL.");
++                }
+                 if (!parsedUrl.getPath().endsWith("/Contrast/api")) {
+-                    return FormValidation.error("Connection error: Contrast Url does not end with /Contrast/api.");
++                    return FormValidation.error("Connection error: Contrast URL does not end with /Contrast/api.");
+                 }
+             } catch (MalformedURLException e) {
+                 return FormValidation.error("Connection error: Contrast URL is not a valid URL.");
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
+index 38f7ce8..9f7fcac 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/GlobalThresholdCondition.java
+@@ -3,9 +3,12 @@ package com.aspectsecurity.contrast.contrastjenkins;
+ import hudson.Extension;
+ import hudson.model.AbstractDescribableImpl;
+ import hudson.model.Descriptor;
++import hudson.model.Item;
+ import hudson.util.ListBoxModel;
++import jenkins.model.Jenkins;
+ import lombok.Getter;
+ import lombok.Setter;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.QueryParameter;
+ 
+@@ -63,14 +66,30 @@ public class GlobalThresholdCondition extends AbstractDescribableImpl<GlobalThre
+             return "Global Threshold Condition";
+         }
+ 
+-        public ListBoxModel doFillTeamServerProfileNameItems() {
++        public ListBoxModel doFillTeamServerProfileNameItems(@AncestorInPath Item item) {
++            if (!hasFillPermission(item)) {
++                return new ListBoxModel();
++            }
+             return VulnerabilityTrendHelper.getProfileNames();
+         }
+ 
+-        public ListBoxModel doFillThresholdVulnTypeItems(
++        public ListBoxModel doFillThresholdVulnTypeItems(@AncestorInPath Item item,
+                 @QueryParameter("teamServerProfileName") final String teamServerProfileName) throws IOException {
++            if (!hasFillPermission(item)) {
++                return new ListBoxModel();
++            }
+             return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+         }
++
++        private static boolean hasFillPermission(Item item) {
++            boolean allowed = item == null
++                    ? Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)
++                    : item.hasPermission(Item.CONFIGURE);
++            if (!allowed) {
++                throw new RuntimeException("access denied");
++            }
++            return true;
++        }
+     }
+ 
+     public List<String> getVulnerabilityStatuses() {
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ThresholdCondition.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ThresholdCondition.java
+index 577c530..c52b024 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ThresholdCondition.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/ThresholdCondition.java
+@@ -7,15 +7,18 @@ import hudson.Extension;
+ import hudson.RelativePath;
+ import hudson.model.AbstractDescribableImpl;
+ import hudson.model.Descriptor;
++import hudson.model.Item;
+ import hudson.util.ComboBoxModel;
+ import hudson.util.FormValidation;
+ import hudson.util.ListBoxModel;
+ import jenkins.model.Jenkins;
+ import lombok.Getter;
+ import lombok.Setter;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.DataBoundSetter;
+ import org.kohsuke.stapler.QueryParameter;
++import org.kohsuke.stapler.interceptor.RequirePOST;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -276,7 +279,10 @@ public class ThresholdCondition extends AbstractDescribableImpl<ThresholdConditi
+          * @param value This parameter receives the value that the user has typed.
+          * @return Indicates the outcome of the validation. This is sent to the browser.
+          */
+-        public FormValidation doCheckApplicationId(@QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName, @QueryParameter String value) {
++        public FormValidation doCheckApplicationId(@AncestorInPath Item item, @QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName, @QueryParameter String value) {
++            if (!hasFillPermission(item)) {
++                return FormValidation.ok();
++            }
+             if (VulnerabilityTrendHelper.appExistsInProfile(teamServerProfileName, value)) {
+                 TeamServerProfile profile = VulnerabilityTrendHelper.getProfile(teamServerProfileName);
+                 ContrastSDK contrastSDK = VulnerabilityTrendHelper.createSDK(profile.getUsername(), profile.getServiceKey(), profile.getApiKey(), profile.getTeamServerUrl());
+@@ -303,7 +309,11 @@ public class ThresholdCondition extends AbstractDescribableImpl<ThresholdConditi
+          *
+          * @return ComboBoxModel filled with application ids.
+          */
+-        public ComboBoxModel doFillApplicationIdItems(@QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName) {
++        @RequirePOST
++        public ComboBoxModel doFillApplicationIdItems(@AncestorInPath Item item, @QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName) {
++            if (!hasFillPermission(item)) {
++                return new ComboBoxModel();
++            }
+ 
+             // Refresh apps every ${appsRefreshIntervalMinutes} minutes before filling in the combobox
+             if (lastAppsRefresh == null || (Calendar.getInstance().getTimeInMillis() - lastAppsRefresh.getTimeInMillis()) / 60000 >= appsRefreshIntervalMinutes) {
+@@ -337,10 +347,23 @@ public class ThresholdCondition extends AbstractDescribableImpl<ThresholdConditi
+          *
+          * @return ListBoxModel filled with vulnerability types.
+          */
+-        public ListBoxModel doFillThresholdVulnTypeItems(@QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName) throws IOException {
++        public ListBoxModel doFillThresholdVulnTypeItems(@AncestorInPath Item item, @QueryParameter("teamServerProfileName") @RelativePath("..") final String teamServerProfileName) throws IOException {
++            if (!hasFillPermission(item)) {
++                return new ListBoxModel();
++            }
+             return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+         }
+ 
++        private static boolean hasFillPermission(Item item) {
++            boolean allowed = item == null
++                    ? Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)
++                    : item.hasPermission(Item.CONFIGURE);
++            if (!allowed) {
++                throw new RuntimeException("access denied");
++            }
++            return true;
++        }
++
+         /**
+          * Fills the Threshold Severity select drop down with severities for the configured application.
+          *
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendRecorder.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendRecorder.java
+index 7818a2b..ec42924 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendRecorder.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendRecorder.java
+@@ -16,6 +16,7 @@ import hudson.model.AbstractBuild;
+ import hudson.model.AbstractProject;
+ import hudson.model.Action;
+ import hudson.model.BuildListener;
++import hudson.model.Item;
+ import hudson.model.Result;
+ import hudson.tasks.BuildStepDescriptor;
+ import hudson.tasks.BuildStepMonitor;
+@@ -27,6 +28,7 @@ import lombok.Getter;
+ import lombok.Setter;
+ import net.sf.json.JSONArray;
+ import net.sf.json.JSONObject;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.StaplerRequest;
+ import org.kohsuke.stapler.bind.JavaScriptMethod;
+@@ -440,15 +442,31 @@ public class VulnerabilityTrendRecorder extends Recorder {
+         }
+ 
+         @JavaScriptMethod
+-        public boolean isAllowGlobalThresholdConditionsOverride(String teamServerProfileName) {
++        public boolean isAllowGlobalThresholdConditionsOverride(@AncestorInPath Item item, String teamServerProfileName) {
++            if (!hasFillPermission(item)) {
++                return false;
++            }
+             return VulnerabilityTrendHelper.getProfile(teamServerProfileName).isAllowGlobalThresholdConditionsOverride();
+         }
+ 
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillTeamServerProfileNameItems() {
++        public ListBoxModel doFillTeamServerProfileNameItems(@AncestorInPath Item item) {
++            if (!hasFillPermission(item)) {
++                return new ListBoxModel();
++            }
+             return VulnerabilityTrendHelper.getProfileNames();
+         }
+ 
++        private static boolean hasFillPermission(Item item) {
++            boolean allowed = item == null
++                    ? Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)
++                    : item.hasPermission(Item.CONFIGURE);
++            if (!allowed) {
++                throw new RuntimeException("access denied");
++            }
++            return true;
++        }
++
+         /**
+          * Allows this builder to be available for all classes.
+          *
+diff --git a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
+index a5b0e7a..5e9e858 100644
+--- a/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
++++ b/src/main/java/com/aspectsecurity/contrast/contrastjenkins/VulnerabilityTrendStep.java
+@@ -24,6 +24,7 @@ import org.jenkinsci.plugins.workflow.steps.AbstractStepImpl;
+ import org.jenkinsci.plugins.workflow.steps.AbstractSynchronousStepExecution;
+ import org.jenkinsci.plugins.workflow.steps.Step;
+ import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
++import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+ import org.kohsuke.stapler.DataBoundSetter;
+ import org.kohsuke.stapler.QueryParameter;
+@@ -219,8 +220,8 @@ public class VulnerabilityTrendStep extends AbstractStepImpl {
+         }
+ 
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillProfileItems() {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
++        public ListBoxModel doFillProfileItems(@AncestorInPath Item item) {
++            if (!hasFillPermission(item)) {
+                 return new ListBoxModel();
+             }
+             return VulnerabilityTrendHelper.getProfileNames();
+@@ -231,21 +232,31 @@ public class VulnerabilityTrendStep extends AbstractStepImpl {
+          *
+          * @return ListBoxModel filled with application ids.
+          */
+-        public ListBoxModel doFillApplicationIdItems(@QueryParameter("profile") final String teamServerProfileName) throws IOException {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
++        public ListBoxModel doFillApplicationIdItems(@AncestorInPath Item item, @QueryParameter("profile") final String teamServerProfileName) throws IOException {
++            if (!hasFillPermission(item)) {
+                 return new ListBoxModel();
+             }
+             return VulnerabilityTrendHelper.getApplicationIds(teamServerProfileName);
+         }
+ 
+         @SuppressWarnings("unused")
+-        public ListBoxModel doFillRuleItems(@QueryParameter("profile") final String teamServerProfileName) {
+-            if (!Jenkins.getActiveInstance().hasPermission(Item.CONFIGURE)) {
++        public ListBoxModel doFillRuleItems(@AncestorInPath Item item, @QueryParameter("profile") final String teamServerProfileName) {
++            if (!hasFillPermission(item)) {
+                 return new ListBoxModel();
+             }
+             return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+         }
+ 
++        private static boolean hasFillPermission(Item item) {
++            boolean allowed = item == null
++                    ? Jenkins.getActiveInstance().hasPermission(Jenkins.ADMINISTER)
++                    : item.hasPermission(Item.CONFIGURE);
++            if (!allowed) {
++                throw new RuntimeException("access denied");
++            }
++            return true;
++        }
++
+         /**
+          * Validates the configured application id by checking it against the selected profile.
+          *
+@@ -253,8 +264,12 @@ public class VulnerabilityTrendStep extends AbstractStepImpl {
+          * @param value                 The value that the user has typed.
+          * @return Indicates the outcome of the validation. This is sent to the browser.
+          */
+-        public FormValidation doCheckApplicationId(@QueryParameter("profile") final String teamServerProfileName,
++        public FormValidation doCheckApplicationId(@AncestorInPath Item item,
++                                                   @QueryParameter("profile") final String teamServerProfileName,
+                                                    @QueryParameter String value) {
++            if (!hasFillPermission(item)) {
++                return FormValidation.ok();
++            }
+             if (VulnerabilityTrendHelper.appExistsInProfile(teamServerProfileName, value)) {
+                 TeamServerProfile profile = VulnerabilityTrendHelper.getProfile(teamServerProfileName);
+                 ContrastSDK contrastSDK = VulnerabilityTrendHelper.createSDK(profile.getUsername(), profile.getServiceKey(),

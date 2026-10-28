@@ -1,0 +1,99 @@
+diff --git a/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java b/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java
+index b6aaefc50..6368dcec7 100755
+--- a/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java
++++ b/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java
+@@ -38,6 +38,7 @@ import com.izforge.izpack.installer.data.UninstallData;
+ import com.izforge.izpack.installer.event.InstallerListeners;
+ import com.izforge.izpack.installer.unpacker.*;
+ import com.izforge.izpack.util.Housekeeper;
++import com.izforge.izpack.util.IoHelper;
+ import com.izforge.izpack.util.PlatformModelMatcher;
+ import com.izforge.izpack.util.os.FileQueue;
+ import org.apache.commons.io.IOUtils;
+@@ -156,6 +157,39 @@ public class MultiVolumeUnpacker extends UnpackerBase
+         }
+     }
+ 
++    /**
++     * Unpacks a pack file.
++     * <p/>
++     * Multi-volume entries are written directly from the volume stream; the per-file progress
++     * notifications used by the single-volume unpacker are reported at volume level instead.
++     *
++     * @param packFile        the pack file
++     * @param packInputStream the pack file input stream
++     * @param fileNo          the pack file number
++     * @param pack            the pack that the pack file comes from
++     * @param queue           the file queue, or {@code null} if queuing is not supported
++     * @throws IOException for any I/O error
++     */
++    @Override
++    protected void unpack(PackFile packFile, InputStream packInputStream, int fileNo, Pack pack, FileQueue queue)
++            throws IOException
++    {
++        String path = IoHelper.translatePath(packFile.getTargetPath(), getInstallData().getVariables());
++        File target = new File(path);
++        File dir = packFile.isDirectory() ? target : target.getParentFile();
++
++        createDirectory(dir, packFile, pack);
++        getUninstallData().addFile(path, pack.isUninstall());
++
++        if (packFile.isDirectory())
++        {
++            return;
++        }
++
++        handleOverrideRename(packFile, target);
++        extract(packFile, target, packInputStream, pack, queue);
++    }
++
+     /**
+      * Creates an unpacker to unpack a pack file.
+      *
+diff --git a/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java b/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java
+index 0b1c9ba11..fcb9da40b 100755
+--- a/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java
++++ b/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java
+@@ -31,6 +31,7 @@ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.util.Map;
+ import java.util.logging.Logger;
+ 
+ 
+@@ -82,6 +83,8 @@ public class LooseFileUnpacker extends FileUnpacker
+         // Since this is very likely to fail and does not conform to the documentation prefer using relative
+         // path's
+ 
++        Map additionals = file.getAdditionals();
++        final String installTarget = additionals == null ? null : (String) additionals.get("installTarget");
+         File resolvedFile = file.getFile();
+         if (!resolvedFile.exists())
+         {
+@@ -105,7 +108,24 @@ public class LooseFileUnpacker extends FileUnpacker
+                                     file.osConstraints(), file.override(), file.overrideRenameTo(),
+                                     file.blockable(), file.getAdditionals());
+ 
+-                copy(file, stream, target);
++                // A loose entry may be relocated at install time, relative to its target directory
++                // or to an absolute location.
++                File destination = target;
++                if (installTarget != null && !installTarget.isEmpty())
++                {
++                    destination = new File(installTarget);
++                    if (!destination.isAbsolute())
++                    {
++                        destination = new File(target.getParentFile(), installTarget);
++                    }
++                    File parent = destination.getParentFile();
++                    if (parent != null && !parent.exists())
++                    {
++                        parent.mkdirs();
++                    }
++                }
++
++                copy(file, stream, destination);
+             }
+             catch (IOException e)
+             {

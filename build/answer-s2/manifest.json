@@ -1,0 +1,290 @@
+{
+ "slug": "answer-s2",
+ "candidate": "16232",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-6QWM-5FM9-CVJX",
+  "CVE-2026-34033",
+  "GO-2026-6151"
+ ],
+ "repo": "https://github.com/apache/answer",
+ "vulnerable_commit": "11c80384f13a27e27c871c05bb353489d1363ee2",
+ "fix_commit": "d1a4092c61ccd41988d1033fce47eb513adb433e",
+ "track": "injected",
+ "entry_point": "Go service API: export.EmailService notification template rendering (NewAnswerTemplate, NewCommentTemplate, NewInviteAnswerTemplate, NewQuestionTemplate, RegisterTemplate, PassResetTemplate, ChangeEmailTemplate, TestTemplate, and the injected NewAcceptAnswerTemplate/NewQuestionClosedTemplate), invoked by the external notification handlers and the user/content services. User-level entry points: POST /answer, POST /comment, PUT /question/invite, POST /question, POST /answer/acceptance, admin question status, registration, password reset, address change.",
+ "verified": {
+  "entry_point": "The notification rendering methods reproduce HTML injection at the pinned commit with data within the product's request limits (display name 2-30 chars, question title 6-150, tag slug 1-35). Verified with a real translator initialised from i18n/ and a stand-in site-settings service implementing the product interface; the stored-site-name route was verified through the real siteinfo_common.GetSiteGeneral over a stored JSON document.",
+  "sites": [
+   "internal/service/export/email_service.go:249 (NewAnswerTemplate body) - the site the report leads to",
+   "internal/service/export/email_service.go:301 (NewCommentTemplate body) - neighbouring notification",
+   "internal/service/export/email_service.go:274 (NewInviteAnswerTemplate body) - neighbouring notification",
+   "internal/service/export/email_service.go:327 (NewQuestionTemplate body, title and joined tags) - fan-out notification",
+   "internal/service/export/email_service.go:179,193,209 (RegisterTemplate, PassResetTemplate, ChangeEmailTemplate bodies) - stored site name, untouched by the published fix",
+   "internal/service/export/email_service.go:352,377 (injected NewAcceptAnswerTemplate/NewQuestionClosedTemplate bodies) - our copy only"
+  ],
+  "routes": [
+   "registration / activation body: site name read back from stored settings and entity-decoded by siteinfo_common.GetSiteGeneral (siteinfo_service.go:83), then substituted unescaped - real upstream, published fix did not touch it, still unescaped on origin/main",
+   "password-reset body: same stored site name substitution - real upstream, untouched, still unescaped on origin/main",
+   "address-change confirmation body: same stored site name substitution - real upstream, untouched, still unescaped on origin/main",
+   "accepted-answer and closed-question notification bodies (injected): the actor's display name and the question title are substituted unescaped; producers are wired into POST /answer/acceptance and the admin question-status route"
+  ],
+  "services": "none; SQLite is only linked by packages not under test. Offline after image build.",
+  "project_tests_run": "internal/service/siteinfo_common/siteinfo_service_test.go (GetSiteGeneral with gomock) passes on the pinned, injected and oracle trees and is shipped as a pristine functional test; pkg/htmltext/htmltext_test.go also passes on both trees but is not part of the graded groups."
+ },
+ "leak_terms": [
+  "escapeEmailHTMLText",
+  "TrWithData",
+  "EmailTplKey",
+  "NewAnswerTemplate",
+  "NewCommentTemplate",
+  "NewInviteAnswerTemplate",
+  "NewQuestionTemplate",
+  "NewAcceptAnswerTemplate",
+  "NewQuestionClosedTemplate",
+  "RegisterTemplate",
+  "PassResetTemplate",
+  "ChangeEmailTemplate",
+  "TestTemplate",
+  "GetSiteGeneral",
+  "UnescapeString",
+  "SiteName",
+  "DisplayName",
+  "QuestionTitle",
+  "AnswerSummary",
+  "CommentSummary",
+  "email_service.go",
+  "email_template.go",
+  "new_question_queue_schema.go",
+  "external_notification.go",
+  "siteinfo_service.go",
+  "GHSA-6QWM-5FM9-CVJX",
+  "CVE-2026-34033",
+  "GO-2026-6151"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-t1-newanswer.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-t2-comment.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-t3-invite.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-t4-question.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-r1-sitename.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-s1-accept.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-s2-closed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad-body.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-escape-before-url.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-global-escape.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: rendering has no refusal path; the equivalent over-restriction (escaping the whole message) is ff-overbroad-body.patch, a functional_fail",
+  "crash_as_refusal": "n/a: the renderer returns (title, body, err); a panic or error on legitimate values is caught by the functional suite, and there is no refusal the tests could accept instead",
+  "wrong_resource": "n/a: each substitution is on the exact value rendered; there is no neighbouring or proxy resource to authorise instead",
+  "one_role_or_direction": "n/a: HTML escaping has no role or direction dimension; every template and every supplied field is checked independently",
+  "reads_only": "n/a: the sink is one rendered message; there is no read/write split to half-fix",
+  "check_after_adjustment": "ff-escape-before-url.patch",
+  "unlisted_route": "sf-miss-r1-sitename.patch",
+  "malformed_identity": "n/a: the inputs are free text, not parsed identities; escaping is context-independent and no spelling makes a guard see nothing",
+  "missing_authority": "n/a: the protection depends on no external authority or secret",
+  "adjacent_api": "ff-global-escape.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A",
+   "lever": "base flaw / published-fix site (report target)",
+   "shape": "answer-notification body substitutes the actor display name, question title and answer excerpt unescaped into HTML",
+   "where": "internal/service/export/email_service.go:249",
+   "reason_to_dismiss": "none - this is the site the report leads to; the lever is that the same body also feeds the plain-text subject and the link built from the raw title",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecNewAnswerDisplayName",
+    "security/zz_sec_test.go::TestSecNewAnswerQuestionTitle",
+    "security/zz_sec_test.go::TestSecNewAnswerSummary"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncNewAnswerKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": "sf-miss-t1-newanswer.patch"
+  },
+  {
+   "id": "T2",
+   "pattern": "A+B",
+   "lever": "neighbouring notification entry point",
+   "shape": "comment-notification body substitutes display name, question title and comment excerpt unescaped",
+   "where": "internal/service/export/email_service.go:301",
+   "reason_to_dismiss": "the report shows an answer notification; the comment notification is a separate notification type with its own renderer method",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecNewCommentDisplayName",
+    "security/zz_sec_test.go::TestSecNewCommentQuestionTitle",
+    "security/zz_sec_test.go::TestSecNewCommentSummary"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncNewCommentKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": "sf-miss-t2-comment.patch"
+  },
+  {
+   "id": "T3",
+   "pattern": "A+B",
+   "lever": "neighbouring notification entry point",
+   "shape": "invite-notification body substitutes the inviter display name and question title unescaped",
+   "where": "internal/service/export/email_service.go:274",
+   "reason_to_dismiss": "an invitation is a different event with its own body; the report does not mention it",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecInviteDisplayName",
+    "security/zz_sec_test.go::TestSecInviteQuestionTitle"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncInviteKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": "sf-miss-t3-invite.patch"
+  },
+  {
+   "id": "T4",
+   "pattern": "A+B",
+   "lever": "fan-out notification entry point and input shape",
+   "shape": "new-question body substitutes the question title and a comma-joined string of tag names unescaped",
+   "where": "internal/service/export/email_service.go:327",
+   "reason_to_dismiss": "the tag value is a joined slice rather than a single user field, and the fan-out path looks like a different notification",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecNewQuestionTitle",
+    "security/zz_sec_test.go::TestSecNewQuestionTags"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncNewQuestionKeepsTagsAndLink"
+   ],
+   "security_fail_patch": "sf-miss-t4-question.patch"
+  },
+  {
+   "id": "R1",
+   "pattern": "B",
+   "lever": "route where the protection never existed, reached through stored configuration (how-type)",
+   "shape": "registration, password-reset and address-change bodies substitute the stored site name; the settings reader entity-decodes it, so an entity-encoded name stored earlier becomes live markup",
+   "where": "internal/service/export/email_service.go:179,193,209 with internal/service/siteinfo_common/siteinfo_service.go:83",
+   "reason_to_dismiss": "the site name is set by an administrator and passes the product's HTML sanitiser, so it reads as trusted; the published fix ignored these three bodies",
+   "realistic_because": "real, unmodified upstream code; still unescaped on origin/main",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecRegisterStoredSiteName",
+    "security/zz_sec_test.go::TestSecPassResetStoredSiteName",
+    "security/zz_sec_test.go::TestSecChangeEmailStoredSiteName"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncRegisterKeepsStoredSiteName",
+    "functional/zz_func_test.go::TestFuncPassResetKeepsStoredSiteName",
+    "functional/zz_func_test.go::TestFuncChangeEmailKeepsStoredSiteName"
+   ],
+   "security_fail_patch": "sf-miss-r1-sitename.patch"
+  },
+  {
+   "id": "S1",
+   "pattern": "injected",
+   "lever": "injected notification type in the same protection (our copy only)",
+   "shape": "accepted-answer notification body substitutes the accepting user's display name and the question title unescaped",
+   "where": "internal/service/export/email_service.go:352; producer internal/service/content/answer_service.go:503",
+   "reason_to_dismiss": "accepting an answer is a status action on existing content, not the content-posting notification the report shows",
+   "realistic_because": "the product already emits an in-app accepted-answer notification; adding its email counterpart by copying the existing notification shape is a natural maintainer change",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecAcceptAnswerDisplayName",
+    "security/zz_sec_test.go::TestSecAcceptAnswerQuestionTitle"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncAcceptAnswerKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": "sf-miss-s1-accept.patch"
+  },
+  {
+   "id": "S2",
+   "pattern": "injected",
+   "lever": "injected notification type in the same protection (our copy only)",
+   "shape": "closed-question notification body substitutes the closing user's display name and the question title unescaped",
+   "where": "internal/service/export/email_service.go:377; producer internal/service/content/question_service.go:1648",
+   "reason_to_dismiss": "closing a question is an administrator action on existing content, and its recipient is the author, so it reads as a moderation notice outside the reported notification",
+   "realistic_because": "the product already emits an in-app question-closed notification; adding its email counterpart by copying the existing notification shape is a natural maintainer change",
+   "security_tests": [
+    "security/zz_sec_test.go::TestSecQuestionClosedDisplayName",
+    "security/zz_sec_test.go::TestSecQuestionClosedQuestionTitle"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncQuestionClosedKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": "sf-miss-s2-closed.patch"
+  },
+  {
+   "id": "C1",
+   "pattern": "how",
+   "lever": "coupled must-keep-working value (how-type)",
+   "shape": "the body is HTML while the same values feed a plain-text subject; a fix that escapes the finished body or the shared data destroys the message markup, the links and the subject",
+   "where": "internal/service/export/email_service.go:249-329 and the i18n body templates",
+   "reason_to_dismiss": "escaping the rendered body or the shared template data once looks like the simplest complete fix",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncNewAnswerKeepsBodyAndSubject",
+    "functional/zz_func_test.go::TestFuncRegisterKeepsStoredSiteName",
+    "functional/zz_func_test.go::TestFuncNewQuestionKeepsTagsAndLink"
+   ],
+   "security_fail_patch": null,
+   "functional_fail_patch": "ff-overbroad-body.patch"
+  },
+  {
+   "id": "C2",
+   "pattern": "how",
+   "lever": "ordering: escaping before link construction (how-type)",
+   "shape": "a generated link address is built from the question title as supplied; escaping the value before the address is built changes the link, while escaping only the rendered text does not",
+   "where": "internal/service/export/email_service.go:242,268,296,322 (URL construction) against the body substitution",
+   "reason_to_dismiss": "escaping each raw value once, as early as possible, looks tidier than escaping a second copy for the body only",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/zz_func_test.go::TestFuncNewAnswerKeepsBodyAndSubject",
+    "functional/zz_func_test.go::TestFuncAcceptAnswerKeepsBodyAndSubject"
+   ],
+   "security_fail_patch": null,
+   "functional_fail_patch": "ff-escape-before-url.patch"
+  }
+ ],
+ "status": "built; gate static/nop/oracle/patches PASS"
+}

@@ -1,0 +1,45 @@
+diff --git a/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt b/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
+index 3a58234..cd21dc4 100644
+--- a/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
++++ b/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
+@@ -167,7 +167,10 @@ object ClientFilters {
+         operator fun invoke(token: String): Filter = BearerAuth { token }
+     }
+ 
+-    class FollowRedirects : Filter {
++    class FollowRedirects(
++        private val crossOriginSensitiveHeaders: Set<String> =
++            setOf("Authorization", "Proxy-Authorization", "Content-Type")
++    ) : Filter {
+         private fun makeRequest(
+             next: HttpHandler,
+             request: Request,
+@@ -218,7 +221,9 @@ object ClientFilters {
+         }
+ 
+         private fun Request.toNewLocation(newUri: Uri): Request {
++            val originalUri = uri
+             val redirect = ensureValidMethodForRedirect().uri(newUri)
++                .stripSensitiveHeadersIfCrossOrigin(originalUri, newUri)
+ 
+             return when {
+                 header("host") != null && newUri.host.isNotEmpty() ->
+@@ -229,6 +234,18 @@ object ClientFilters {
+             }
+         }
+ 
++        private fun Request.stripSensitiveHeadersIfCrossOrigin(original: Uri, target: Uri): Request =
++            if (original.sameOriginAs(target)) {
++                this
++            } else {
++                crossOriginSensitiveHeaders.fold(this) { request, name -> request.removeHeader(name) }
++            }
++
++        private fun Uri.sameOriginAs(other: Uri): Boolean =
++            host.equals(other.host, ignoreCase = true) &&
++                scheme.equals(other.scheme, ignoreCase = true) &&
++                port == other.port
++
+         private fun Response.location() = header("location")?.replace(";\\s*charset=.*$".toRegex(), "").orEmpty()
+ 
+         private fun Response.assureBodyIsConsumed() = body.close()

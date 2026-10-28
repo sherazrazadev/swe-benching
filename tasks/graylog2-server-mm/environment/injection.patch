@@ -1,0 +1,77 @@
+diff -ruN base/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java inj/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java
+--- base/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java	2026-10-28 07:08:47.742915226 +0000
++++ inj/graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java	2026-10-28 07:09:04.521567661 +0000
+@@ -342,8 +342,9 @@
+     @AuditEvent(type = EventsAuditEventTypes.EVENT_DEFINITION_UPDATE)
+     public Response update(@Parameter(name = "definitionId") @PathParam("definitionId") @NotBlank String definitionId,
+                            @Parameter(name = "schedule") @QueryParam("schedule") @DefaultValue("true") boolean schedule,
+-                           @Parameter(name = "JSON Body") EventDefinitionDto dto,
++                           @Parameter(name = "JSON Body") CreateEntityRequest<EventDefinitionDto> createEntityRequest,
+                            @Context UserContext userContext) {
++        EventDefinitionDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_DEFINITIONS_EDIT, definitionId);
+         checkEventDefinitionPermissions(dto, "update");
+         EventDefinitionDto oldDto = dbService.get(definitionId)
+@@ -367,7 +368,10 @@
+                     .build();
+         }
+         recentActivityService.update(definitionId, GRNTypes.EVENT_DEFINITION, userContext.getUser());
+-        return Response.ok().entity(eventDefinitionHandler.update(dto, schedule)).build();
++        final Response response = Response.ok().entity(eventDefinitionHandler.update(dto, schedule)).build();
++        createEntityRequest.shareRequest().ifPresent(shareRequest ->
++                entitySharesService.updateEntityShares(GRNTypes.EVENT_DEFINITION, definitionId, shareRequest, userContext.getUser()));
++        return response;
+     }
+ 
+     @DELETE
+diff -ruN base/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java inj/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java
+--- base/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java	2026-10-28 07:08:47.742964150 +0000
++++ inj/graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java	2026-10-28 07:09:04.522179776 +0000
+@@ -210,8 +210,9 @@
+     @Operation(summary = "Update existing notification")
+     @AuditEvent(type = EventsAuditEventTypes.EVENT_NOTIFICATION_UPDATE)
+     public Response update(@Parameter(name = "notificationId") @PathParam("notificationId") @NotBlank String notificationId,
+-                           @Parameter(name = "JSON Body") NotificationDto dto,
++                           @Parameter(name = "JSON Body") CreateEntityRequest<NotificationDto> createEntityRequest,
+                            @Context UserContext userContext) {
++        final NotificationDto dto = createEntityRequest.entity();
+         checkPermission(RestPermissions.EVENT_NOTIFICATIONS_EDIT, notificationId);
+         if (dbNotificationService.get(notificationId).isEmpty()) {
+             throw new NotFoundException("Notification " + notificationId + " doesn't exist");
+@@ -228,7 +229,10 @@
+         }
+ 
+         recentActivityService.update(notificationId, GRNTypes.EVENT_NOTIFICATION, userContext.getUser());
+-        return Response.ok().entity(resourceHandler.update(dto)).build();
++        final Response response = Response.ok().entity(resourceHandler.update(dto)).build();
++        createEntityRequest.shareRequest().ifPresent(shareRequest ->
++                entitySharesService.updateEntityShares(GRNTypes.EVENT_NOTIFICATION, notificationId, shareRequest, userContext.getUser()));
++        return response;
+     }
+ 
+     private void validateEmailConfiguration(NotificationDto dto, ValidationResult validationResult) {
+diff -ruN base/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java inj/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java
+--- base/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java	2026-10-28 07:08:47.743113756 +0000
++++ inj/graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java	2026-10-28 07:09:04.522381450 +0000
+@@ -389,15 +389,19 @@
+     public StreamResponse update(@Parameter(name = "streamId", required = true)
+                                  @PathParam("streamId") String streamId,
+                                  @RequestBody(required = true)
+-                                 @Valid @NotNull UpdateStreamRequest request,
++                                 @Valid @NotNull CreateEntityRequest<UpdateStreamRequest> createEntityRequest,
+                                  @Context UserContext userContext) throws NotFoundException, ValidationException {
++        final UpdateStreamRequest request = createEntityRequest.entity();
+         checkPermission(RestPermissions.STREAMS_EDIT, streamId);
+         checkNotEditableStream(streamId, "The stream cannot be edited.");
+ 
+         final Stream stream = streamService.update(streamId, request);
+ 
+         recentActivityService.update(streamId, GRNTypes.STREAM, userContext.getUser());
+-        return streamToResponse(stream);
++        final StreamResponse response = streamToResponse(stream);
++        createEntityRequest.shareRequest().ifPresent(shareRequest ->
++                entitySharesService.updateEntityShares(GRNTypes.STREAM, streamId, shareRequest, userContext.getUser()));
++        return response;
+     }
+ 
+     @DELETE

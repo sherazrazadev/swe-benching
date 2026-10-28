@@ -1,0 +1,205 @@
+{
+ "slug": "file-viewer-xss-inj",
+ "candidate": "7789",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-3753-M2X2-Q623",
+  "CVE-2026-91127"
+ ],
+ "repo": "https://github.com/flyfish-dev/file-viewer",
+ "vulnerable_commit": "772ae40de07e48134de0449997cb4924b0cde3e4",
+ "fix_commit": "ef045680f8d9830a3eee9612f7df46a734361b07",
+ "entry_point": "library API: renderMsDoc(parsed, options) with a caller-supplied AST, parseMsDocToHtml(buffer, options), mountMsDoc/createMsDocViewer on a DOM container, the module worker's 'render' message, and @file-viewer/renderer-word's renderFileViewerWordDoc(buffer, target, 'doc', context) including the export adapter it registers",
+ "track": "injected",
+ "verified": {
+  "entry_point": "At the pinned+injected tree a crafted legacy .doc whose HYPERLINK field target is a javascript: URL renders an anchor with that destination through parseMsDocToHtml/renderMsDoc, and the DOM mounts (mountMsDoc, createMsDocViewer, renderFileViewerWordDoc) insert it into the page; the Word export adapter also emits it. A caller-supplied AST reproduces the same sink for text runs, linked images, picture fallbacks, inline attachments, the trailing attachments block, table-cell links, font-family values, linked-picture targets and style names. All of this is driven through the real public entry points on a jsdom document; no browser binary is required.",
+  "sites": [
+   "packages/renderers/doc/src/render/html.ts renderTextNode/renderLink: document hyperlink target emitted as <a href> with only HTML escaping (published-fix landing point)",
+   "packages/renderers/doc/src/render/html.ts renderImageNode/renderAttachmentNode/renderAttachmentsBlock: image links, image-fallback asset hrefs (any data:/blob:), inline attachment dataUrl, trailing attachment dataUrl (published-fix far sites)",
+   "packages/renderers/doc/src/render/html.ts inlineStyleToCss/styleObjectToCss: font-family from the document font table written into style= without CSS/attribute escaping (CWE-83)",
+   "packages/renderers/doc/src/viewer.ts mountMsDoc: renderer output written with innerHTML, no DOM sanitisation (DOM mount helper; published fix adds DOMPurify)",
+   "packages/renderers/word/src/wordDoc.ts render: the Word/DOCX integration package mounts the same output with its own innerHTML and reads the externalLinkPolicy option (second mount in another package)",
+   "packages/renderers/doc/src/types.ts and index.ts: public MsDocRenderOptions.externalLinkPolicy default and exported helpers (defaults route)",
+   "INJECTED SIBLING packages/renderers/doc/src/render/html.ts renderImageNode fallback: the linked-picture target recorded in the document is emitted as an anchor target (new document-derived channel, untouched by the published fix)",
+   "INJECTED SIBLING packages/renderers/doc/src/render/html.ts renderParagraphBlock: the document style name is written raw into a data-style attribute (new attribute-injection channel, untouched by the published fix)",
+   "INJECTED SIBLING packages/renderers/word/src/wordDoc.ts export adapter: the print/export link appendix is built from the parsed document's link targets and is not passed through the renderer's destination check"
+  ],
+  "routes": [
+   "text hyperlink from a HYPERLINK field (parser.ts decodeFieldInstruction -> node.href -> renderTextNode), reached through parseMsDocToHtml and through the Word renderer with a byte-patched .doc fixture",
+   "caller-supplied pre-parsed AST passed directly to renderMsDoc or through the worker's render message (bypasses the parser entirely)",
+   "linked image and image fallback hrefs",
+   "inline attachment dataUrl plus attachment-block dataUrl (array shape)",
+   "font-family declaration injected through the style attribute",
+   "link inside a table cell (render context threaded through renderTableBlock)",
+   "DOM mount through mountMsDoc, createMsDocViewer.mount, and the Word renderer plugin's own target.innerHTML",
+   "Word renderer print/export adapter toHtml()"
+  ],
+  "injected_siblings": [
+   "packages/renderers/doc/src/render/html.ts renderImageNode fallback: linked-picture target (meta.linkedPath) used as an open link when the picture is not displayable - plausible 'open linked file' behaviour, treated as internal metadata",
+   "packages/renderers/doc/src/render/html.ts renderParagraphBlock: raw document style name written into data-style for theming/debugging - treated as an internal identifier",
+   "packages/renderers/word/src/wordDoc.ts export adapter: a printed 'Document links' appendix collected from the parsed AST - a separate print path assumed to be trusted because the mounted page is sanitised"
+  ],
+  "services": "none; offline after build",
+  "project_tests_run": "packages/renderers/doc: verify-github-171.mjs, verify-github-192.mjs, verify-github-34.mjs, verify-github-87.mjs and verify-table-spec.mjs (the project's own DOC verification scripts) run unchanged against the rebuilt dist and pass on the pinned+injected tree and on the reference fix; they are part of the functional group."
+ },
+ "leak_terms": [
+  "renderMsDoc",
+  "parseMsDocToHtml",
+  "mountMsDoc",
+  "createMsDocViewer",
+  "sanitizeMsDocLinkHref",
+  "sanitizeMsDocHtml",
+  "sanitizeAssetHref",
+  "sanitizeDownloadHref",
+  "renderTextNode",
+  "renderImageNode",
+  "renderAttachmentNode",
+  "renderParagraphBlock",
+  "collectDocumentLinks",
+  "renderDocumentLinkList",
+  "linkedPath",
+  "styleName",
+  "data-style",
+  "wordDoc",
+  "renderer-word",
+  "file-viewer/doc",
+  "HYPERLINK",
+  "INCLUDEPICTURE",
+  "DOMPurify",
+  "dompurify",
+  "msdoc",
+  "GHSA-3753-M2X2-Q623",
+  "CVE-2026-91127",
+  "html.ts",
+  "viewer.ts",
+  "types.ts",
+  "index.ts",
+  "wordDoc.ts",
+  "package.json"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-base.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-linked.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-styleattr.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-export.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "n/a: unsafe destinations are dropped from generated markup; there is no refusal response, and a crash would break the preservation checks",
+  "wrong_resource": "n/a: each guard acts on the exact document value written into its own destination; there is no neighbouring resource to authorise instead",
+  "one_role_or_direction": "n/a: rendering has no roles or directions; the levers differ by data channel and output path",
+  "reads_only": "n/a: markup generation has no read/write split; every route writes the same kind of output",
+  "check_after_adjustment": "n/a: no normalising step sits between the document value and the sink; control-whitespace stripping is part of the check itself",
+  "unlisted_route": "sf-miss-export.patch",
+  "malformed_identity": "n/a: destinations are opaque strings rather than parsed identities; the mixed-case/whitespace case is covered by a security test",
+  "missing_authority": "n/a: there is no authority or secret; external-link policy is a local render option",
+  "adjacent_api": "n/a: no shared helper has its stated behaviour changed for a sibling API; the reference fix is additive"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A",
+   "lever": "base flaw / published-fix landing point: document hyperlink target becomes an anchor destination",
+   "shape": "a HYPERLINK field (or caller-supplied AST) whose target is javascript:, mixed case, or control-whitespace obfuscated, on a text run and inside a table cell",
+   "where": "packages/renderers/doc/src/render/html.ts:199-200 (renderTextNode); parser origin packages/renderers/doc/src/msdoc/parser.ts:64-73",
+   "reason_to_dismiss": "none - this is the site the report leads to",
+   "security_tests": [
+    "security/document_markup.test.mjs::a document link with a script target is not rendered as an active link",
+    "security/document_markup.test.mjs::a mixed-case, whitespace-obfuscated script target is not rendered as an active link",
+    "security/document_markup.test.mjs::a script target is blocked even when external links are allowed",
+    "security/document_markup.test.mjs::a hyperlink inside a table cell is treated like any other document link"
+   ],
+   "coupled_functional_tests": [
+    "functional/preserved_behaviour.test.mjs::internal bookmarks stay clickable under the default policy",
+    "functional/preserved_behaviour.test.mjs::ordinary web, mail, phone and relative destinations render when external links are allowed"
+   ],
+   "security_fail_patch": "sf-miss-base.patch",
+   "realistic_because": "real published flaw at the vulnerable commit"
+  },
+  {
+   "id": "T2",
+   "pattern": "A",
+   "lever": "far site: the Word renderer package's print/export adapter builds markup from the parsed document instead of the mounted page",
+   "shape": "the export adapter's toHtml() emits a 'Document links' appendix whose hrefs come from the parsed AST link targets",
+   "where": "packages/renderers/word/src/wordDoc.ts:480-485 (export adapter toHtml); the renderer output is mounted at wordDoc.ts:478",
+   "reason_to_dismiss": "the Word/DOCX integration package looks out of scope for the legacy DOC renderer, and the export/print path is a separate presentation adapter assumed safe because the mounted page is sanitised",
+   "security_tests": [
+    "security/document_markup.test.mjs::the Word renderer does not export crafted document links as active links",
+    "security/document_markup.test.mjs::the Word renderer mounts a crafted document without active links"
+   ],
+   "coupled_functional_tests": [
+    "functional/preserved_behaviour.test.mjs::the Word renderer export keeps allowed links",
+    "functional/preserved_behaviour.test.mjs::the Word renderer keeps allowed document links clickable"
+   ],
+   "security_fail_patch": "sf-miss-export.patch",
+   "realistic_because": "INJECTED sibling written in the surrounding style of the existing Word export adapter; applied to our copy only"
+  },
+  {
+   "id": "T3",
+   "pattern": "B (injected sibling)",
+   "lever": "linked-picture target: a document records a linked picture's external location, which the image fallback offers as an open link",
+   "shape": "an image node with displayable:false and meta.linkedPath set to javascript:/file:/protocol-relative, delivered as a caller-supplied AST or as an INCLUDEPICTURE-derived asset",
+   "where": "packages/renderers/doc/src/render/html.ts:251-257 (renderImageNode fallback)",
+   "reason_to_dismiss": "linked-picture metadata is treated as internal/trusted bookkeeping, not as a user-facing hyperlink; the reported flaw is about hyperlink fields",
+   "security_tests": [
+    "security/document_markup.test.mjs::a linked-picture target from the document is not an active link"
+   ],
+   "coupled_functional_tests": [
+    "functional/preserved_behaviour.test.mjs::a linked picture with a safe web location is offered when external links are allowed"
+   ],
+   "security_fail_patch": "sf-miss-linked.patch",
+   "realistic_because": "INJECTED sibling: the parser already records meta.linkedPath for INCLUDEPICTURE fields (image-linked.doc fixture), so offering it as an open link is a natural feature; applied to our copy only"
+  },
+  {
+   "id": "T4",
+   "pattern": "B (injected sibling)",
+   "lever": "attribute injection: the document's style name is written into a data attribute without escaping",
+   "shape": "a paragraph whose styleName contains a quote and an event-handler attribute; also exercised through the mounted DOM",
+   "where": "packages/renderers/doc/src/render/html.ts:297-298 (renderParagraphBlock)",
+   "reason_to_dismiss": "style names come from the document's style table and are treated as internal identifiers for theming/debugging, not as displayed user content",
+   "security_tests": [
+    "security/document_markup.test.mjs::a document style name cannot break out of its attribute"
+   ],
+   "coupled_functional_tests": [
+    "functional/preserved_behaviour.test.mjs::ordinary font names and style names are preserved"
+   ],
+   "security_fail_patch": "sf-miss-styleattr.patch",
+   "realistic_because": "INJECTED sibling written in the surrounding style of the existing slugified style class; applied to our copy only"
+  }
+ ],
+ "status": "built; gate PASSED 2026-10-28: static, nop (0/17 security, 12/12 functional), oracle (3 runs, reward 1.0, identical), patches (7/7 as declared: four per-lever security_fail, ff-overbroad functional_fail, pass-hardening and pass-alt 1.0). blind.patch and FAIRNESS.md are written downstream."
+}

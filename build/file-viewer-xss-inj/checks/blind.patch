@@ -1,0 +1,455 @@
+diff -ruN a/packages/renderers/doc/src/index.ts b/packages/renderers/doc/src/index.ts
+--- a/packages/renderers/doc/src/index.ts	2026-10-28 07:18:08.000000000 +0000
++++ b/packages/renderers/doc/src/index.ts	2026-10-28 07:30:36.558477245 +0000
+@@ -1,5 +1,12 @@
+ export { parseMsDoc } from './msdoc/parser.js';
+ export { renderMsDoc, defaultMsDocCss } from './render/html.js';
+-export { createMsDocViewer, mountMsDoc, parseMsDocToHtml } from './viewer.js';
++export {
++  normalizeMsDocUrl,
++  sanitizeMsDocHref,
++  sanitizeMsDocDownloadHref,
++  sanitizeMsDocAssetHref,
++} from './render/safety.js';
++export type { MsDocExternalLinkPolicy } from './render/safety.js';
++export { createMsDocViewer, mountMsDoc, parseMsDocToHtml, sanitizeMsDocFragment } from './viewer.js';
+ export { MsDocWorkerClient } from './worker-client.js';
+ export type * from './types.js';
+diff -ruN a/packages/renderers/doc/src/render/html.ts b/packages/renderers/doc/src/render/html.ts
+--- a/packages/renderers/doc/src/render/html.ts	2026-10-28 07:18:17.000000000 +0000
++++ b/packages/renderers/doc/src/render/html.ts	2026-10-28 07:30:16.347495862 +0000
+@@ -1,6 +1,12 @@
+ import { escapeHtml, slugify, twipsToPx } from '../core/utils.js';
+ import { HIGHLIGHT_COLORS } from '../msdoc/constants.js';
+ import { cssTextAlign, cssUnderline, cssVerticalAlign } from '../msdoc/properties.js';
++import {
++  sanitizeMsDocAssetHref,
++  sanitizeMsDocDownloadHref,
++  sanitizeMsDocHref,
++  type MsDocExternalLinkPolicy,
++} from './safety.js';
+ import type {
+   AttachmentAsset,
+   AttachmentsBlock,
+@@ -41,10 +47,34 @@
+ function styleObjectToCss(style: CssStyleObject): string {
+   return Object.entries(style)
+     .filter(([, value]) => value != null && value !== '')
+-    .map(([key, value]) => `${key}:${value}`)
++    .map(([key, value]) => `${key}:${escapeHtml(value)}`)
+     .join(';');
+ }
+ 
++/** Quotes a document-supplied font family so it stays a single CSS string. */
++function cssQuotedString(value: unknown): string {
++  const escaped = String(value ?? '')
++    .replace(/\\/g, '\\\\')
++    .replace(/'/g, "\\'")
++    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
++  return `'${escaped}'`;
++}
++
++interface RenderContext {
++  externalLinkPolicy: MsDocExternalLinkPolicy;
++}
++
++/**
++ * Wraps already-escaped markup in a link only when the destination survived the
++ * policy check. Internal bookmarks stay in the same document; external links
++ * keep the existing new-tab hardening.
++ */
++function renderLink(content: string, href: string | null): string {
++  if (!href) return content;
++  const target = href.startsWith('#') ? '' : ' target="_blank" rel="noreferrer noopener"';
++  return `<a class="msdoc-link" href="${escapeHtml(href)}"${target}>${content}</a>`;
++}
++
+ function borderToCss(border: BorderSpec | undefined | null): string | null {
+   if (!border || border.nil) return null;
+   const borderType = border.borderType as number | undefined;
+@@ -167,7 +197,7 @@
+   if (styleState.strike || styleState.doubleStrike) style['text-decoration-line'] = `${style['text-decoration-line'] ? `${style['text-decoration-line']} ` : ''}line-through`;
+   Object.assign(style, buildUnderlineStyle(styleState.underline));
+   if (styleState.fontSizeHalfPoints) style['font-size'] = `${styleState.fontSizeHalfPoints / 2}pt`;
+-  if (styleState.fontFamily) style['font-family'] = `'${String(styleState.fontFamily).replace(/'/g, "\\'")}', sans-serif`;
++  if (styleState.fontFamily) style['font-family'] = `${cssQuotedString(styleState.fontFamily)},sans-serif`;
+   if (styleState.colorIndex && COLOR_INDEX_MAP[styleState.colorIndex]) style.color = COLOR_INDEX_MAP[styleState.colorIndex];
+   const highlightIndex = typeof styleState.highlight === 'number' ? styleState.highlight : styleState.highlight?.index;
+   if (highlightIndex && HIGHLIGHT_COLORS[highlightIndex as keyof typeof HIGHLIGHT_COLORS]) {
+@@ -190,16 +220,13 @@
+   return style;
+ }
+ 
+-function renderTextNode(node: TextInlineNode): string {
++function renderTextNode(node: TextInlineNode, context: RenderContext): string {
+   const content = escapeHtml(node.text);
+   const inlineStyle = inlineStyleToCss(node.style);
+   inlineStyle['white-space'] = 'break-spaces';
+   const style = styleObjectToCss(inlineStyle);
+   const inner = `<span${style ? ` style="${style}"` : ''}>${content}</span>`;
+-  if (node.href) {
+-    return `<a class="msdoc-link" href="${escapeHtml(node.href)}" target="_blank" rel="noreferrer noopener">${inner}</a>`;
+-  }
+-  return inner;
++  return renderLink(inner, sanitizeMsDocHref(node.href, context.externalLinkPolicy));
+ }
+ 
+ function inlineImageDisplaySizePx(asset: ImageAsset): { widthPx?: number; heightPx?: number } {
+@@ -226,14 +253,7 @@
+   return null;
+ }
+ 
+-function sanitizeAssetHref(href: string | undefined | null): string | null {
+-  const value = String(href || '').trim();
+-  if (!value) return null;
+-  if (/^(?:data:|blob:|https?:)/i.test(value)) return value;
+-  return null;
+-}
+-
+-function renderImageNode(node: Extract<InlineNode, { type: 'image' }>): string {
++function renderImageNode(node: Extract<InlineNode, { type: 'image' }>, context: RenderContext): string {
+   const src = sanitizeImageSource(node.asset.sourceUrl) || sanitizeImageSource(node.asset.dataUrl);
+   const baseStyle = inlineStyleToCss(node.style);
+   const displaySize = inlineImageDisplaySizePx(node.asset);
+@@ -247,54 +267,50 @@
+   }
+ 
+   if (!src || node.asset.displayable === false) {
+-    const fallbackHref = sanitizeAssetHref(node.asset.dataUrl) || sanitizeAssetHref(node.asset.sourceUrl);
+-    const linkedTarget = String(node.asset.meta?.linkedPath || '').trim();
+-    const openHref = fallbackHref || linkedTarget;
++    const fallbackHref = sanitizeMsDocAssetHref(node.asset.dataUrl, context.externalLinkPolicy)
++      || sanitizeMsDocAssetHref(node.asset.sourceUrl, context.externalLinkPolicy);
++    const linkedHref = sanitizeMsDocAssetHref(node.asset.meta?.linkedPath, context.externalLinkPolicy);
++    const openHref = fallbackHref || linkedHref;
+     const label = escapeHtml(String(node.asset.meta?.linkedPath || node.asset.mime || 'image'));
+     const inner = openHref
+       ? `<a class="msdoc-attachment msdoc-image-fallback" href="${escapeHtml(openHref)}" target="_blank" rel="noreferrer noopener">🖼 ${label}</a>`
+       : `<span class="msdoc-image-fallback">🖼 ${label}</span>`;
+-    if (node.href) {
+-      return `<a class="msdoc-link" href="${escapeHtml(node.href)}" target="_blank" rel="noreferrer noopener">${inner}</a>`;
+-    }
+-    return inner;
++    return renderLink(inner, sanitizeMsDocHref(node.href, context.externalLinkPolicy));
+   }
+ 
+   const img = `<img class="msdoc-image" src="${escapeHtml(src)}" alt="" style="${styleObjectToCss(baseStyle)}">`;
+-  if (node.href) {
+-    return `<a class="msdoc-link" href="${escapeHtml(node.href)}" target="_blank" rel="noreferrer noopener">${img}</a>`;
+-  }
+-  return img;
++  return renderLink(img, sanitizeMsDocHref(node.href, context.externalLinkPolicy));
+ }
+ 
+-function renderAttachmentNode(node: Extract<InlineNode, { type: 'attachment' }>): string {
++function renderAttachmentNode(node: Extract<InlineNode, { type: 'attachment' }>, context: RenderContext): string {
+   const label = escapeHtml(node.asset.name || 'embedded-file');
+-  const inner = `<a class="msdoc-attachment" href="${escapeHtml(node.asset.dataUrl)}" download="${label}">📎 ${label}</a>`;
+-  if (node.href) {
+-    return `<a class="msdoc-link" href="${escapeHtml(node.href)}" target="_blank" rel="noreferrer noopener">${inner}</a>`;
+-  }
+-  return inner;
++  const downloadHref = sanitizeMsDocDownloadHref(node.asset.dataUrl);
++  const inner = downloadHref
++    ? `<a class="msdoc-attachment" href="${escapeHtml(downloadHref)}" download="${label}">📎 ${label}</a>`
++    : `<span class="msdoc-attachment">📎 ${label}</span>`;
++  const href = sanitizeMsDocHref(node.href, context.externalLinkPolicy);
++  return href ? `<span class="msdoc-inline-group">${inner}${renderLink('↗', href)}</span>` : inner;
+ }
+ 
+-function renderInlineNodes(nodes: InlineNode[]): string {
++function renderInlineNodes(nodes: InlineNode[], context: RenderContext): string {
+   return nodes.map((node) => {
+-    if (node.type === 'text') return renderTextNode(node);
+-    if (node.type === 'image') return renderImageNode(node);
+-    if (node.type === 'attachment') return renderAttachmentNode(node);
++    if (node.type === 'text') return renderTextNode(node, context);
++    if (node.type === 'image') return renderImageNode(node, context);
++    if (node.type === 'attachment') return renderAttachmentNode(node, context);
+     if (node.type === 'lineBreak') return '<br>';
+     if (node.type === 'pageBreak') return '<span class="msdoc-page-break"></span>';
+     return '';
+   }).join('');
+ }
+ 
+-function renderParagraphBlock(block: ParagraphBlock, options: { inline?: boolean } = {}): string {
++function renderParagraphBlock(block: ParagraphBlock, context: RenderContext, options: { inline?: boolean } = {}): string {
+   const tag = options.inline ? 'div' : 'p';
+   const style = styleObjectToCss(paragraphStyleToCss(block.paraState));
+-  const body = renderInlineNodes(block.inlines || []);
++  const body = renderInlineNodes(block.inlines || [], context);
+   const empty = body || '<br>';
+   const classNames = ['msdoc-paragraph'];
+   if (block.styleName) classNames.push(`msdoc-style-${slugify(block.styleName)}`);
+-  const styleNameAttr = block.styleName ? ` data-style="${block.styleName}"` : '';
++  const styleNameAttr = block.styleName ? ` data-style="${escapeHtml(block.styleName)}"` : '';
+   return `<${tag} class="${classNames.join(' ')}"${styleNameAttr}${style ? ` style="${style}"` : ''}>${empty}</${tag}>`;
+ }
+ 
+@@ -356,7 +372,7 @@
+   return style;
+ }
+ 
+-function renderTableBlock(block: TableBlock): string {
++function renderTableBlock(block: TableBlock, context: RenderContext): string {
+   const rows = block.rows.map((row) => {
+     const rowHeight = row.state?.rowHeight ? twipsToPx(Math.abs(row.state.rowHeight)) : null;
+     const rowStyle = rowHeight ? ` style="height:${rowHeight}px"` : '';
+@@ -367,7 +383,7 @@
+         if ((cell.colspan ?? 1) > 1) attrs.push(` colspan="${cell.colspan}"`);
+         if ((cell.rowspan ?? 1) > 1) attrs.push(` rowspan="${cell.rowspan}"`);
+         const style = styleObjectToCss(cellStyle(cell));
+-        const body = cell.paragraphs.map((paragraph) => renderParagraphBlock(paragraph, { inline: true })).join('');
++        const body = cell.paragraphs.map((paragraph) => renderParagraphBlock(paragraph, context, { inline: true })).join('');
+         return `<td class="msdoc-cell"${attrs.join('')}${style ? ` style="${style}"` : ''}>${body || '<div class="msdoc-paragraph"><br></div>'}</td>`;
+       })
+       .join('');
+@@ -378,7 +394,14 @@
+ }
+ 
+ function renderAttachmentsBlock(block: AttachmentsBlock): string {
+-  const items = block.items.map((item: AttachmentAsset) => `<li><a class="msdoc-attachment" href="${escapeHtml(item.dataUrl)}" download="${escapeHtml(item.name || 'embedded-file')}">📎 ${escapeHtml(item.name || 'embedded-file')}</a></li>`).join('');
++  const items = block.items.map((item: AttachmentAsset) => {
++    const label = escapeHtml(item.name || 'embedded-file');
++    const downloadHref = sanitizeMsDocDownloadHref(item.dataUrl);
++    const content = downloadHref
++      ? `<a class="msdoc-attachment" href="${escapeHtml(downloadHref)}" download="${label}">📎 ${label}</a>`
++      : `<span class="msdoc-attachment">📎 ${label}</span>`;
++    return `<li>${content}</li>`;
++  }).join('');
+   return `<section class="msdoc-attachments"><div class="msdoc-attachments-title">Embedded attachments</div><ul>${items}</ul></section>`;
+ }
+ 
+@@ -408,9 +431,12 @@
+  */
+ export function renderMsDoc(parsed: MsDocParseResult, options: MsDocRenderOptions = {}): MsDocRenderResult {
+   const css = options.css ?? defaultMsDocCss();
++  const context: RenderContext = {
++    externalLinkPolicy: options.externalLinkPolicy ?? 'block',
++  };
+   const html = parsed.blocks.map((block) => {
+-    if (block.type === 'paragraph') return renderParagraphBlock(block);
+-    if (block.type === 'table') return renderTableBlock(block);
++    if (block.type === 'paragraph') return renderParagraphBlock(block, context);
++    if (block.type === 'table') return renderTableBlock(block, context);
+     if (block.type === 'attachments') return renderAttachmentsBlock(block);
+     return '';
+   }).join('');
+diff -ruN a/packages/renderers/doc/src/render/safety.ts b/packages/renderers/doc/src/render/safety.ts
+--- a/packages/renderers/doc/src/render/safety.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/renderers/doc/src/render/safety.ts	2026-10-28 07:29:50.197520981 +0000
+@@ -0,0 +1,88 @@
++/**
++ * Destination and escaping rules applied while the legacy DOC renderer turns a
++ * parsed document into markup. Everything in here is pure string handling so
++ * the same rules apply on the main thread and inside the module worker.
++ */
++
++export type MsDocExternalLinkPolicy = 'allow' | 'block';
++
++/** Characters a browser ignores or treats as separators inside a URL scheme. */
++const URL_NOISE = /[\u0000- \u007f-\u009f]/g;
++
++const SAFE_EXTERNAL_SCHEME = /^(?:https?|mailto|tel):/i;
++const ANY_SCHEME = /^[a-z][a-z\d+.-]*:/i;
++
++/** MIME types that a browser may execute as a document when opened directly. */
++const EXECUTABLE_DATA_MIME = new Set([
++  'text/html',
++  'text/javascript',
++  'text/ecmascript',
++  'text/xml',
++  'text/xsl',
++  'application/xhtml+xml',
++  'application/xml',
++  'application/xsl',
++  'application/javascript',
++  'application/ecmascript',
++  'image/svg+xml',
++]);
++
++const BASE64_DATA_URL = /^data:([^;,]+);base64,([a-z\d+/=\s]+)$/i;
++
++/**
++ * Removes the whitespace and control characters browsers skip while parsing a
++ * URL, so an obfuscated `JaVa\nScRiPt:` cannot slip past a scheme check.
++ */
++export function normalizeMsDocUrl(value: unknown): string {
++  return String(value ?? '').replace(URL_NOISE, '').trim();
++}
++
++/**
++ * Decides whether a document link may be emitted as an active destination.
++ * Internal bookmarks (`#...`) always survive. Everything else needs the opt-in
++ * `allow` policy and a browser-safe scheme or a relative path.
++ */
++export function sanitizeMsDocHref(
++  value: unknown,
++  policy: MsDocExternalLinkPolicy = 'block',
++): string | null {
++  const href = normalizeMsDocUrl(value);
++  if (!href) return null;
++  if (href.startsWith('#')) return href;
++  if (policy !== 'allow') return null;
++  // Protocol-relative and backslash-relative destinations leave the document.
++  if (href.startsWith('//') || href.startsWith('\\')) return null;
++  if (SAFE_EXTERNAL_SCHEME.test(href)) return href;
++  if (ANY_SCHEME.test(href)) return null;
++  return href;
++}
++
++/**
++ * Decides whether an embedded asset may be offered as a download link.
++ * Only base64 data URLs survive, and only for MIME types a browser cannot
++ * execute as a document (markup, script, XML-based formats, SVG).
++ */
++export function sanitizeMsDocDownloadHref(value: unknown): string | null {
++  const href = String(value ?? '').trim();
++  if (!href) return null;
++  const match = BASE64_DATA_URL.exec(href);
++  if (!match) return null;
++  const mime = match[1].trim().toLowerCase();
++  if (EXECUTABLE_DATA_MIME.has(mime)) return null;
++  if (mime.endsWith('+xml')) return null;
++  return href;
++}
++
++/**
++ * Destination used for an image that has to fall back to a textual open link:
++ * an ordinary downloadable asset first, then a policy-checked external link.
++ */
++export function sanitizeMsDocAssetHref(
++  value: unknown,
++  policy: MsDocExternalLinkPolicy,
++): string | null {
++  const download = sanitizeMsDocDownloadHref(value);
++  if (download) return download;
++  const link = sanitizeMsDocHref(value, policy);
++  return link && !link.startsWith('#') ? link : null;
++}
+diff -ruN a/packages/renderers/doc/src/types.ts b/packages/renderers/doc/src/types.ts
+--- a/packages/renderers/doc/src/types.ts	2026-10-28 07:18:08.000000000 +0000
++++ b/packages/renderers/doc/src/types.ts	2026-10-28 07:30:19.057493339 +0000
+@@ -676,6 +676,13 @@
+ 
+ export interface MsDocRenderOptions {
+   css?: string;
++  /**
++   * External navigation is opt-in. `"block"` (the default) keeps only
++   * destinations inside the document active; `"allow"` also keeps ordinary web,
++   * mail, telephone and relative destinations, never script-capable or
++   * local-file ones.
++   */
++  externalLinkPolicy?: 'allow' | 'block';
+ }
+ 
+ export interface MsDocMeta {
+diff -ruN a/packages/renderers/doc/src/viewer.ts b/packages/renderers/doc/src/viewer.ts
+--- a/packages/renderers/doc/src/viewer.ts	2026-10-28 07:18:08.000000000 +0000
++++ b/packages/renderers/doc/src/viewer.ts	2026-10-28 07:31:40.048245256 +0000
+@@ -1,5 +1,8 @@
++import createDOMPurify from 'dompurify';
++import type { WindowLike } from 'dompurify';
+ import { parseMsDoc } from './msdoc/parser.js';
+ import { renderMsDoc } from './render/html.js';
++import { sanitizeMsDocDownloadHref, sanitizeMsDocHref } from './render/safety.js';
+ import type {
+   MsDocParseToHtmlOptions,
+   MsDocRenderResult,
+@@ -27,9 +30,49 @@
+   throw new TypeError('Unsupported input type');
+ }
+ 
++/**
++ * Sanitizes generated markup right before it enters a live document. The
++ * renderer already applies the destination policy, but mounting is the last
++ * boundary where caller-supplied or future renderer output could become live
++ * nodes, so the fragment is normalized once more with a conservative allowlist.
++ */
++export function sanitizeMsDocFragment(html: string, targetWindow: Window): DocumentFragment {
++  const purifier = createDOMPurify(targetWindow as unknown as WindowLike);
++  const fragment = purifier.sanitize(html, {
++    RETURN_DOM_FRAGMENT: true,
++    USE_PROFILES: { html: true },
++    ADD_ATTR: ['download'],
++    // Keep embedded-file data URLs long enough to re-check them below, so that
++    // ordinary attachments stay downloadable after mounting.
++    ADD_DATA_URI_TAGS: ['a'],
++    ALLOW_DATA_ATTR: true,
++    FORBID_TAGS: ['base', 'embed', 'form', 'iframe', 'link', 'meta', 'object', 'script', 'style', 'template'],
++    FORBID_ATTR: ['action', 'formaction', 'ping', 'srcdoc'],
++  }) as unknown as DocumentFragment;
++
++  // Final destination check: the mount point accepts external navigation that
++  // the renderer already allowed, plus non-executable embedded downloads.
++  for (const anchor of Array.from(fragment.querySelectorAll('a[href]'))) {
++    const raw = anchor.getAttribute('href') || '';
++    const safe = sanitizeMsDocHref(raw, 'allow') ?? sanitizeMsDocDownloadHref(raw);
++    if (safe) anchor.setAttribute('href', safe);
++    else anchor.removeAttribute('href');
++  }
++  return fragment;
++}
++
+ export function mountMsDoc(container: HTMLElement, rendered: MsDocRenderResult): HTMLElement {
+   if (!container) throw new Error('A container element is required');
+-  container.innerHTML = `<style data-msdoc>${rendered.css}</style><div class="msdoc-root">${rendered.html}</div>`;
++  const ownerDocument = container.ownerDocument;
++  const targetWindow = ownerDocument.defaultView;
++  if (!targetWindow) throw new Error('The container must belong to a browser document');
++  const style = ownerDocument.createElement('style');
++  style.dataset.msdoc = '';
++  style.textContent = rendered.css;
++  const root = ownerDocument.createElement('div');
++  root.className = 'msdoc-root';
++  root.append(sanitizeMsDocFragment(rendered.html, targetWindow));
++  container.replaceChildren(style, root);
+   return container;
+ }
+ 
+diff -ruN a/packages/renderers/word/src/wordDoc.ts b/packages/renderers/word/src/wordDoc.ts
+--- a/packages/renderers/word/src/wordDoc.ts	2026-10-28 07:18:17.000000000 +0000
++++ b/packages/renderers/word/src/wordDoc.ts	2026-10-28 07:30:42.136472217 +0000
+@@ -1,4 +1,10 @@
+-import { defaultMsDocCss, parseMsDocToHtml, type MsDocParseResult } from '@file-viewer/doc'
++import {
++  defaultMsDocCss,
++  parseMsDocToHtml,
++  sanitizeMsDocFragment,
++  sanitizeMsDocHref,
++  type MsDocParseResult
++} from '@file-viewer/doc'
+ 
+ import {
+   applyPrintPageSize,
+@@ -469,15 +475,28 @@
+  * 渲染 doc 文件
+  */
+ export default async function render(buffer: ArrayBuffer, target: HTMLDivElement, context?: FileRenderContext): Promise<AppWrapper> {
++  const externalLinkPolicy = context?.options?.docx?.externalLinkPolicy ?? 'block'
+   const rendered = await parseMsDocToHtml(buffer, {
+     renderOptions: {
+-      css: `${defaultMsDocCss()}\n${WORD_PAGE_CSS}`
++      css: `${defaultMsDocCss()}\n${WORD_PAGE_CSS}`,
++      externalLinkPolicy
+     }
+   })
+ 
+-  target.innerHTML = `<style data-msdoc>${rendered.css}</style>${wrapAsWordPages(rendered.html)}`
++  const targetWindow = target.ownerDocument.defaultView
++  if (!targetWindow) {
++    throw new Error('The DOC target must belong to a browser document')
++  }
++  const style = target.ownerDocument.createElement('style')
++  style.dataset.msdoc = ''
++  style.textContent = rendered.css
++  const content = target.ownerDocument.createElement('div')
++  content.append(sanitizeMsDocFragment(wrapAsWordPages(rendered.html), targetWindow))
++  target.replaceChildren(style, ...Array.from(content.childNodes))
+   const disposeResponsive = makeMsDocResponsive(target)
+   const documentLinks = collectDocumentLinks(rendered.parsed)
++    .map(href => sanitizeMsDocHref(href, externalLinkPolicy))
++    .filter((href): href is string => Boolean(href))
+   context?.registerExportAdapter?.({
+     includeDocumentStyles: false,
+     getPrintMaskPages: () => Array.from(target.querySelectorAll<HTMLElement>('.msdoc-page')),

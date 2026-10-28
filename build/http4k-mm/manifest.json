@@ -1,0 +1,216 @@
+{
+ "slug": "http4k-mm",
+ "candidate": "screener-v2 entry 27402: GHSA-PR33-38XX-6R26 / CVE-2026-100725 (http4k/http4k, CWE-200)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "665b64e00c73491052d4d75e25720f6af739dada (parent of published fix 6a9b44d74342879ece808de00a66ec30e2b9da23; the fix commit is the only commit between them and it adds the regression tests, which are absent at the pinned tree)",
+  "entry_points": [
+   "library API: ClientFilters.Cookies(...) applied to an in-process HttpHandler; the default store is exercised through the public constructors (defaults, Clock, time source)",
+   "library API: Http4kWebDriver(handler) (in-process browser): get/navigate plus manage().addCookie/getCookies",
+   "library API: ClientFilters.Cookies(...).then(ClientFilters.FollowRedirects()) over an in-process HttpHandler"
+  ],
+  "sites": [
+   "core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt:20-36 (published landing: CookieStorage/BasicCookieStorage return every cookie)",
+   "core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt:257-281 (published far site: Cookies filter attaches everything, default store)",
+   "core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt:235-245 (second CookieStorage implementation, left unscoped by the published fix)",
+   "core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt:220-246 (FollowRedirects copies the whole request; injected cross-origin sensitive-header policy omits Cookie)",
+   "store side of the cookie jar (the storage's store call): the published fix accepts any Domain attribute; upstream added a domain-match check later"
+  ],
+  "routes": [
+   "reported: client cookie jar attaches every stored cookie to every request",
+   "store-side: a response sets a Domain outside the setting host's own domain and the cookie is delivered there",
+   "second implementation: Http4kWebDriver's own CookieStorage returns every stored cookie for every request URI; manage().addCookie stores no origin",
+   "uncovered + injected: a cookie attached for one origin is carried by a followed redirect to a different origin because the injected cross-origin header policy does not name Cookie"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "core/core: org.http4k.filter.ClientCookiesTest (pass at pinned + injection)",
+   "core/core: org.http4k.filter.cookie.LocalCookieTest (pass at pinned + injection)",
+   "core/testing/webdriver: org.http4k.webdriver.RedirectTest (pass at pinned + injection)"
+  ],
+  "local_runs": "nop: security 0/10 pass, functional 16/16 pass; oracle: security 10/10, functional 16/16; every checks/ patch validated locally by building the two modules and running both hidden groups (declared outcomes matched).",
+  "gate": {
+   "static": "pass",
+   "nop": "pass (security 0/10 pass, functional 16/16 pass)",
+   "oracle": "pass (3/3 runs, reward 1.0, identical results)",
+   "patches": "pass (10/10: sf-published-only 0.5, sf-core-only 0.3, sf-no-store-domain 0.8, sf-no-webdriver-scope 0.8, sf-no-redirect-strip 0.9; ff-refuse-all/exact-host/strip-all-redirects functional fail; pass-hardening 1.0; pass-alt 1.0; declared blind skipped until it exists)"
+  }
+ },
+ "leak_terms": [
+  "BasicCookieStorage",
+  "InsecureCookieStorage",
+  "DefaultCookieStorage",
+  "CookieStorage",
+  "LocalCookie",
+  "ClientFilters",
+  "FollowRedirects",
+  "Http4kWebDriver",
+  "clientCookies",
+  "cookieStorage",
+  "withLocalCookies",
+  "removeExpired",
+  "crossOriginSensitiveHeaders",
+  "sameOriginAs",
+  "resolvedOrigin",
+  "cookieMatches",
+  "GHSA-PR33-38XX-6R26",
+  "CVE-2026-100725"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "the published fix at this commit reduced to source: scoped default storage, but no store-side Domain check, the in-process browser left unscoped, and no redirect handling"
+  },
+  {
+   "patch": "sf-core-only.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: outer routes handled but the default client jar still returns every cookie"
+  },
+  {
+   "patch": "sf-no-store-domain.patch",
+   "expect": "security_fail",
+   "note": "oracle minus store-side Domain validation"
+  },
+  {
+   "patch": "sf-no-webdriver-scope.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the in-process browser's own scoping"
+  },
+  {
+   "patch": "sf-no-redirect-strip.patch",
+   "expect": "security_fail",
+   "note": "oracle minus Cookie in the cross-origin redirect policy"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "attaches no stored cookies at all"
+  },
+  {
+   "patch": "ff-exact-host.patch",
+   "expect": "functional_fail",
+   "note": "treats every cookie as host-only at the exact origin, so Domain scopes break"
+  },
+  {
+   "patch": "ff-strip-all-redirects.patch",
+   "expect": "functional_fail",
+   "note": "strips the cookie header on same-origin redirects too"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus rejecting Secure cookies stored over http and Domain attributes with a trailing dot"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "list-based cookie jar that decides scope on every read instead of a keyed map"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written later by a fresh agent from instruction.md and the repository only"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: there is no refusal response; a crash is never accepted because the tests require the request to complete and the legitimate single-origin request would fail",
+  "wrong_resource": "n/a: the thing protected is the cookie a request carries, not an authorisation object, so there is no neighbouring resource to confuse it with",
+  "one_role_or_direction": "sf-no-store-domain.patch",
+  "reads_only": "n/a: cookie attachment has no read/write verb split at this layer",
+  "check_after_adjustment": "n/a: no attacker-controlled normalisation runs before the scope decision; paths and domains are compared as supplied",
+  "unlisted_route": "sf-published-only.patch",
+  "malformed_identity": "n/a: no identity document is parsed; host matching normalises case and a leading dot before every comparison",
+  "missing_authority": "n/a: there is no authority or secret lookup; the setting origin comes from the request itself",
+  "adjacent_api": "ff-strip-all-redirects.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_core_jar_scope",
+   "pattern": "B (reported sink; input-shape coverage)",
+   "shape": "host-only vs Domain; leading dot and mixed case; suffix that only shares characters; explicit and default path; /api vs /apiv2; Secure vs http/https; same name at two origins",
+   "where": "core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt:20-36 and core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt:257-281",
+   "security_tests": [
+    "tests/security/CookieScopeSecurityTest.kt::a host only cookie is not sent to a different host",
+    "tests/security/CookieScopeSecurityTest.kt::a path scoped cookie is not sent outside its path",
+    "tests/security/CookieScopeSecurityTest.kt::a cookie without a path uses the default path of the request that set it",
+    "tests/security/CookieScopeSecurityTest.kt::a secure cookie is not sent over plain http",
+    "tests/security/CookieScopeSecurityTest.kt::cookies of the same name from two hosts stay separate"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/CookieFunctionalTest.kt::a client with relative uris round trips a cookie",
+    "tests/functional/CookieFunctionalTest.kt::a domain cookie reaches the subdomains of its domain",
+    "tests/functional/CookieFunctionalTest.kt::a path attribute matches its subtree",
+    "tests/functional/CookieFunctionalTest.kt::a cookie without a path covers its sibling resources",
+    "tests/functional/CookieFunctionalTest.kt::a secure cookie is sent over https",
+    "tests/functional/CookieFunctionalTest.kt::an expired cookie is removed and not sent",
+    "tests/functional/ClientApiFunctionalTest.kt::the default client construction round trips a cookie"
+   ],
+   "security_fail_patch": "sf-core-only.patch",
+   "realistic_because": "the reported site; this is the published vulnerability"
+  },
+  {
+   "id": "T2_store_domain",
+   "pattern": "B (route where the protection never existed; store vs retrieve)",
+   "shape": "a response names an unrelated Domain; a Domain that only shares a character suffix with the setting host",
+   "where": "the store side of the cookie jar in core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt (the published fix accepted any Domain; upstream added the domain-match check in a later commit)",
+   "security_tests": [
+    "tests/security/StoreDomainSecurityTest.kt::a response cannot place its cookie on an unrelated domain",
+    "tests/security/StoreDomainSecurityTest.kt::a domain suffix that only looks similar is not accepted"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/CookieFunctionalTest.kt::a domain cookie reaches the subdomains of its domain",
+    "tests/functional/CookieFunctionalTest.kt::each origin keeps its own cookies"
+   ],
+   "security_fail_patch": "sf-no-store-domain.patch",
+   "realistic_because": "a real gap in the published fix at this commit: retrieve-side matching looks complete, and the same check was added upstream only later"
+  },
+  {
+   "id": "T3_webdriver_second_implementation",
+   "pattern": "A (far site, second implementation)",
+   "shape": "in-process browser navigation across origins; cookies added through manage().addCookie",
+   "where": "core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt:235-245 (the fix changed only the retrieve signature there)",
+   "security_tests": [
+    "tests/security/WebDriverCookieSecurityTest.kt::the in process browser does not send a stored cookie to another origin",
+    "tests/security/WebDriverCookieSecurityTest.kt::a cookie added through the browser API is not sent to another origin"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/WebDriverFunctionalTest.kt::the browser keeps a cookie across pages on the same origin",
+    "tests/functional/WebDriverFunctionalTest.kt::the browser keeps a cookie across a same origin redirect",
+    "tests/functional/WebDriverFunctionalTest.kt::a cookie added through the browser API is visible and sent on the same origin"
+   ],
+   "security_fail_patch": "sf-no-webdriver-scope.patch",
+   "realistic_because": "real unmodified upstream code in a separate module; the published fix itself left this storage unscoped"
+  },
+  {
+   "id": "T4_redirect_forwarding",
+   "pattern": "B (uncovered route) + injected sibling",
+   "shape": "a cookie attached for one origin is carried to a different origin when a redirect is followed",
+   "where": "core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt:220-246 (FollowRedirects; the injected cross-origin sensitive-header policy names Authorization/Proxy-Authorization/Content-Type but not Cookie)",
+   "security_tests": [
+    "tests/security/RedirectCookieSecurityTest.kt::a cookie is not forwarded to a different origin when a redirect is followed"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/RedirectFunctionalTest.kt::a same origin redirect keeps the cookie",
+    "tests/functional/RedirectFunctionalTest.kt::a redirect is still followed and its response returned",
+    "tests/functional/WebDriverFunctionalTest.kt::the browser keeps a cookie across a same origin redirect"
+   ],
+   "security_fail_patch": "sf-no-redirect-strip.patch",
+   "realistic_because": "real unmodified upstream redirect code; the injected policy is ordinary maintainer code that hardens named sensitive headers and simply misses the cookie header"
+  }
+ ],
+ "status": "Frontier 1.4: static PASS, nop PASS (security 0/10, functional 16/16), oracle PASS (3/3), patches PASS (10/10); blind patch declared for the later blind pass"
+}

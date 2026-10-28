@@ -1,0 +1,265 @@
+diff --git a/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt b/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
+index cd21dc4..359c1e9 100644
+--- a/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
++++ b/core/core/src/main/kotlin/org/http4k/filter/ClientFilters.kt
+@@ -23,8 +23,8 @@ import org.http4k.core.with
+ import org.http4k.events.Events
+ import org.http4k.events.HttpEvent.Outgoing
+ import org.http4k.filter.GzipCompressionMode.Memory
+-import org.http4k.filter.cookie.BasicCookieStorage
+ import org.http4k.filter.cookie.CookieStorage
++import org.http4k.filter.cookie.DefaultCookieStorage
+ import org.http4k.filter.cookie.LocalCookie
+ import org.http4k.lens.Header.CONTENT_TYPE
+ import org.http4k.lens.StringBiDiMappings
+@@ -169,7 +169,7 @@ object ClientFilters {
+ 
+     class FollowRedirects(
+         private val crossOriginSensitiveHeaders: Set<String> =
+-            setOf("Authorization", "Proxy-Authorization", "Content-Type")
++            setOf("Authorization", "Cookie", "Proxy-Authorization", "Content-Type")
+     ) : Filter {
+         private fun makeRequest(
+             next: HttpHandler,
+@@ -273,28 +273,28 @@ object ClientFilters {
+     object Cookies {
+         operator fun invoke(
+             clock: Clock = Clock.systemDefaultZone(),
+-            storage: CookieStorage = BasicCookieStorage()
++            storage: CookieStorage = DefaultCookieStorage()
+         ) = invoke(clock::instant, storage)
+ 
+         operator fun invoke(
+             timeSource: () -> Instant,
+-            storage: CookieStorage = BasicCookieStorage()
++            storage: CookieStorage = DefaultCookieStorage()
+         ): Filter = Filter { next ->
+             { request ->
+                 val now = timeSource()
+-                removeExpired(now, storage)
+-                val response = next(request.withLocalCookies(storage))
+-                storage.store(response.cookies().map { LocalCookie(it, now) })
++                removeExpired(now, storage, request.uri)
++                val response = next(request.withLocalCookies(storage, request.uri))
++                storage.store(response.cookies().map { LocalCookie(it, now, request.uri) })
+                 response
+             }
+         }
+ 
+-        private fun Request.withLocalCookies(storage: CookieStorage) = storage.retrieve()
++        private fun Request.withLocalCookies(storage: CookieStorage, uri: Uri) = storage.retrieve(uri)
+             .map { it.cookie }
+             .fold(this) { r, cookie -> r.cookie(cookie.name, cookie.value) }
+ 
+-        private fun removeExpired(now: Instant, storage: CookieStorage) =
+-            storage.retrieve().filter { it.isExpired(now) }.forEach { storage.remove(it.cookie.name) }
++        private fun removeExpired(now: Instant, storage: CookieStorage, uri: Uri) =
++            storage.retrieve(uri).filter { it.isExpired(now) }.forEach { storage.remove(it.cookie.name) }
+     }
+ 
+     /**
+diff --git a/core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt b/core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt
+index 5d5cfc4..a2566b5 100644
+--- a/core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt
++++ b/core/core/src/main/kotlin/org/http4k/filter/cookie/clientCookies.kt
+@@ -1,11 +1,12 @@
+ package org.http4k.filter.cookie
+ 
++import org.http4k.core.Uri
+ import org.http4k.core.cookie.Cookie
+ import java.time.Duration
+ import java.time.Instant
+ import java.util.concurrent.ConcurrentHashMap
+ 
+-data class LocalCookie(val cookie: Cookie, val created: Instant) {
++data class LocalCookie(val cookie: Cookie, val created: Instant, val origin: Uri) {
+     fun isExpired(now: Instant) =
+         (cookie.maxAge
+             ?.let { maxAge -> Duration.between(created, now).seconds >= maxAge }
+@@ -20,17 +21,89 @@ data class LocalCookie(val cookie: Cookie, val created: Instant) {
+ interface CookieStorage {
+     fun store(cookies: List<LocalCookie>)
+     fun remove(name: String)
+-    fun retrieve(): List<LocalCookie>
++    fun retrieve(uri: Uri): List<LocalCookie>
+ }
+ 
+-class BasicCookieStorage : CookieStorage {
++@Deprecated(
++    message = "This storage has no domain/path/scheme scoping. Use DefaultCookieStorage instead.",
++    replaceWith = ReplaceWith("DefaultCookieStorage()", "org.http4k.filter.cookie.DefaultCookieStorage")
++)
++typealias BasicCookieStorage = InsecureCookieStorage
++
++/**
++ * A cookie jar with no domain, path or scheme scoping.
++ */
++class InsecureCookieStorage : CookieStorage {
+     private val storage = ConcurrentHashMap<String, LocalCookie>()
+ 
+     override fun store(cookies: List<LocalCookie>) = cookies.forEach { storage[it.cookie.name] = it }
+ 
+-    override fun retrieve(): List<LocalCookie> = storage.values.toList()
++    override fun retrieve(uri: Uri): List<LocalCookie> = storage.values.toList()
+ 
+     override fun remove(name: String) {
+         storage.remove(name)
+     }
+ }
++
++/**
++ * A cookie jar which scopes cookies by effective domain, path and scheme.
++ */
++class DefaultCookieStorage : CookieStorage {
++    private data class Key(val domain: String, val path: String, val name: String, val hostOnly: Boolean)
++
++    private val storage = ConcurrentHashMap<Key, LocalCookie>()
++
++    override fun store(cookies: List<LocalCookie>) {
++        for (localCookie in cookies) {
++            val cookie = localCookie.cookie
++            val originHost = localCookie.origin.host.lowercase()
++            if (cookie.secure && !localCookie.origin.scheme.equals("https", ignoreCase = true)) continue
++            val rawDomain = cookie.domain?.trim()
++            if (rawDomain != null && rawDomain.endsWith(".")) continue
++            val configuredDomain = rawDomain?.removePrefix(".")?.lowercase()
++            val (effectiveDomain, hostOnly) = if (configuredDomain.isNullOrBlank()) {
++                originHost to true
++            } else {
++                if (!domainMatchesOrigin(configuredDomain, originHost)) continue
++                configuredDomain to false
++            }
++            val effectivePath = effectivePath(cookie.path, localCookie.origin.path)
++            storage[Key(effectiveDomain, effectivePath, cookie.name, hostOnly)] = localCookie
++        }
++    }
++
++    override fun retrieve(uri: Uri): List<LocalCookie> {
++        val requestHost = uri.host.lowercase()
++        val requestPath = uri.path.ifEmpty { "/" }
++        val isSecure = uri.scheme.equals("https", ignoreCase = true)
++
++        return storage.entries.filter { (key, localCookie) ->
++            when {
++                localCookie.cookie.secure && !isSecure -> false
++                key.hostOnly -> requestHost == key.domain
++                else -> requestHost == key.domain || requestHost.endsWith(".${key.domain}")
++            } && pathMatches(requestPath, key.path)
++        }.map { it.value }
++    }
++
++    override fun remove(name: String) {
++        storage.keys.removeIf { it.name == name }
++    }
++
++    private fun domainMatchesOrigin(domain: String, originHost: String): Boolean =
++        domain == originHost || (domain.contains(".") && originHost.endsWith(".$domain"))
++
++    private fun effectivePath(cookiePath: String?, requestPath: String?): String {
++        if (!cookiePath.isNullOrBlank()) return cookiePath
++        val path = requestPath ?: "/"
++        if (!path.startsWith("/")) return "/"
++        val lastSlash = path.lastIndexOf('/')
++        return if (lastSlash == 0) "/" else path.take(lastSlash)
++    }
++
++    private fun pathMatches(requestPath: String, cookiePath: String): Boolean {
++        if (requestPath == cookiePath) return true
++        if (!requestPath.startsWith(cookiePath)) return false
++        return cookiePath.endsWith("/") || requestPath[cookiePath.length] == '/'
++    }
++}
+diff --git a/core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt b/core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt
+index ea7fd7d..59cfad8 100644
+--- a/core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt
++++ b/core/testing/webdriver/src/main/kotlin/org/http4k/webdriver/Http4kWebDriver.kt
+@@ -49,11 +49,13 @@ class Http4kWebDriver(initialHandler: HttpHandler, clock: Clock = Clock.systemDe
+     private val siteCookies = mutableMapOf<String, StoredCookie>()
+     private var latestUri: String = ""
+     private var latestHost: String? = null
++    private var latestScheme: String = "http"
+ 
+     private fun navigateTo(request: Request) {
+         val normalizedPath = request.uri(request.uri.path(normalized(request.uri.path)))
+         val host = request.uri.host + (request.uri.port?.let { ":$it" } ?: "")
+         if (host.isNotEmpty()) latestHost = host
++        if (request.uri.scheme.isNotEmpty()) latestScheme = request.uri.scheme
+         val response = handler(normalizedPath)
+         current = Page(
+             response.status,
+@@ -205,7 +207,11 @@ class Http4kWebDriver(initialHandler: HttpHandler, clock: Clock = Clock.systemDe
+         override fun addCookie(cookie: Cookie) {
+             siteCookies[cookie.name] = StoredCookie(
+                 cookie,
+-                LocalCookie(HCookie(cookie.name, cookie.value), LocalDateTime.now().toInstant(UTC))
++                LocalCookie(
++                    HCookie(cookie.name, cookie.value),
++                    LocalDateTime.now().toInstant(UTC),
++                    resolvedOrigin(Uri.of(getCurrentUrl() ?: "/"))
++                )
+             )
+         }
+ 
+@@ -234,14 +240,60 @@ class Http4kWebDriver(initialHandler: HttpHandler, clock: Clock = Clock.systemDe
+ 
+     private fun cookieStorage() = object : CookieStorage {
+         override fun store(cookies: List<LocalCookie>) {
+-            cookies.forEach { siteCookies[it.cookie.name] = it.toWebDriver() }
++            cookies.forEach {
++                siteCookies[it.cookie.name] = it.copy(origin = resolvedOrigin(it.origin)).toWebDriver()
++            }
+         }
+ 
+         override fun remove(name: String) {
+             siteCookies.remove(name)
+         }
+ 
+-        override fun retrieve(): List<LocalCookie> = siteCookies.entries.map { it.value.localCookie }
++        override fun retrieve(uri: Uri): List<LocalCookie> =
++            siteCookies.values.map { it.localCookie }.filter { cookieMatches(it, uri) }
++    }
++
++    private fun resolvedOrigin(uri: Uri): Uri {
++        if (uri.host.isNotEmpty()) return uri
++        val host = latestHost ?: return uri
++        val base = Uri.of("http://$host")
++        return uri.scheme(if (uri.scheme.isNotEmpty()) uri.scheme else latestScheme)
++            .host(base.host)
++            .port(base.port)
++    }
++
++    private fun cookieMatches(localCookie: LocalCookie, uri: Uri): Boolean {
++        val request = resolvedOrigin(uri)
++        val origin = resolvedOrigin(localCookie.origin)
++        val cookie = localCookie.cookie
++        if (cookie.secure && !request.scheme.equals("https", ignoreCase = true)) return false
++
++        val configuredDomain = cookie.domain?.trim()?.removePrefix(".")?.lowercase()
++        val hostOnly = configuredDomain.isNullOrBlank()
++        val cookieHost = configuredDomain ?: origin.host.lowercase()
++        val requestHost = request.host.lowercase()
++        val domainMatches = if (hostOnly) {
++            requestHost == cookieHost
++        } else {
++            requestHost == cookieHost || requestHost.endsWith(".$cookieHost")
++        }
++        if (!domainMatches) return false
++
++        return pathMatches(request.path.ifEmpty { "/" }, effectivePath(cookie.path, origin.path))
++    }
++
++    private fun effectivePath(cookiePath: String?, requestPath: String?): String {
++        if (!cookiePath.isNullOrBlank()) return cookiePath
++        val path = requestPath ?: "/"
++        if (!path.startsWith("/")) return "/"
++        val lastSlash = path.lastIndexOf('/')
++        return if (lastSlash == 0) "/" else path.take(lastSlash)
++    }
++
++    private fun pathMatches(requestPath: String, cookiePath: String): Boolean {
++        if (requestPath == cookiePath) return true
++        if (!requestPath.startsWith(cookiePath)) return false
++        return cookiePath.endsWith("/") || requestPath[cookiePath.length] == '/'
+     }
+ 
+     private data class StoredCookie(val cookie: Cookie, val localCookie: LocalCookie)

@@ -1,0 +1,221 @@
+diff -ruN pristine/izpack-api/src/main/java/com/izforge/izpack/api/data/InstallTargetValidator.java app/izpack-api/src/main/java/com/izforge/izpack/api/data/InstallTargetValidator.java
+--- a/izpack-api/src/main/java/com/izforge/izpack/api/data/InstallTargetValidator.java	1970-01-01 00:00:00.000000000 +0000
++++ b/izpack-api/src/main/java/com/izforge/izpack/api/data/InstallTargetValidator.java	2026-10-28 07:51:06.360780303 +0000
+@@ -0,0 +1,88 @@
++/*
++ * IzPack - Copyright 2001-2012 Julien Ponge, All Rights Reserved.
++ *
++ * http://izpack.org/
++ * http://izpack.codehaus.org/
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.izforge.izpack.api.data;
++
++import java.io.IOException;
++
++/**
++ * Guards the target locations that an installer takes from its pack metadata.
++ * <p/>
++ * A location is refused when it contains a parent-directory segment ({@code ".."}). Both
++ * {@code '/'} and {@code '\'} are treated as segment separators, so the rule holds whichever
++ * spelling a location uses and whichever platform the installer runs on. Absolute locations
++ * without a parent-directory segment are legitimate, including ones that point outside the
++ * installation directory.
++ *
++ * @author IzPack
++ */
++public final class InstallTargetValidator
++{
++    private InstallTargetValidator()
++    {
++        // static utility
++    }
++
++    /**
++     * Determines if a path contains a parent-directory segment.
++     *
++     * @param path the path to examine; {@code null} is treated as safe
++     * @return {@code true} if any segment of the path is exactly {@code ".."}
++     */
++    public static boolean hasParentSegment(String path)
++    {
++        if (path == null)
++        {
++            return false;
++        }
++        int length = path.length();
++        int segmentStart = 0;
++        for (int i = 0; i <= length; i++)
++        {
++            boolean atEnd = (i == length);
++            char character = atEnd ? '/' : path.charAt(i);
++            if (atEnd || character == '/' || character == '\\')
++            {
++                if (i - segmentStart == 2
++                        && path.charAt(segmentStart) == '.'
++                        && path.charAt(segmentStart + 1) == '.')
++                {
++                    return true;
++                }
++                segmentStart = i + 1;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Refuses a target location that contains a parent-directory segment.
++     *
++     * @param target the location to check
++     * @param what   a short description of the location, used in the error message
++     * @throws IOException if the location contains a parent-directory segment
++     */
++    public static void validate(String target, String what) throws IOException
++    {
++        if (hasParentSegment(target))
++        {
++            throw new IOException("Installer " + what + " must not contain a parent-directory segment: " + target);
++        }
++    }
++}
+diff -ruN pristine/izpack-api/src/main/java/com/izforge/izpack/api/data/PackFile.java app/izpack-api/src/main/java/com/izforge/izpack/api/data/PackFile.java
+--- a/izpack-api/src/main/java/com/izforge/izpack/api/data/PackFile.java	2026-10-28 07:24:39.000000000 +0000
++++ b/izpack-api/src/main/java/com/izforge/izpack/api/data/PackFile.java	2026-10-28 07:51:09.252784916 +0000
+@@ -160,10 +160,11 @@
+      * @param override           what to do when the file already exists
+      * @param additionals        additional attributes
+      * @throws FileNotFoundException if the specified file does not exist.
++     * @throws IOException           if the target contains a parent-directory segment.
+      */
+     public PackFile(File src, String relativeSourcePath, String target, List<OsModel> osList, OverrideType override,
+                     String overrideRenameTo, Blockable blockable, Map additionals, Map<String, String> pack200Properties)
+-            throws FileNotFoundException
++            throws IOException
+     {
+         instanceId = nextInstanceId.getAndIncrement();
+         if (!src.exists()) // allows cleaner client co
+@@ -171,6 +172,10 @@
+             throw new FileNotFoundException("No such file: " + src);
+         }
+ 
++        // The target is data supplied by whoever authored the description; never accept a
++        // location that climbs out of its directory, whichever separator spells the segment.
++        InstallTargetValidator.validate(target, "target path");
++
+         if ('/' != File.separatorChar)
+         {
+             target = target.replace(File.separatorChar, '/');
+diff -ruN pristine/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java app/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java
+--- a/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java	2026-10-28 07:24:42.000000000 +0000
++++ b/izpack-installer/src/main/java/com/izforge/izpack/installer/multiunpacker/MultiVolumeUnpacker.java	2026-10-28 07:51:20.778797537 +0000
+@@ -175,6 +175,7 @@
+             throws IOException
+     {
+         String path = IoHelper.translatePath(packFile.getTargetPath(), getInstallData().getVariables());
++        validateTargetPath(path);
+         File target = new File(path);
+         File dir = packFile.isDirectory() ? target : target.getParentFile();
+ 
+diff -ruN pristine/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java app/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java
+--- a/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java	2026-10-28 07:24:42.000000000 +0000
++++ b/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/LooseFileUnpacker.java	2026-10-28 07:51:24.955802099 +0000
+@@ -21,6 +21,7 @@
+ 
+ package com.izforge.izpack.installer.unpacker;
+ 
++import com.izforge.izpack.api.data.InstallTargetValidator;
+ import com.izforge.izpack.api.data.Pack;
+ import com.izforge.izpack.api.data.PackFile;
+ import com.izforge.izpack.api.exception.InstallerException;
+@@ -85,6 +86,17 @@
+ 
+         Map additionals = file.getAdditionals();
+         final String installTarget = additionals == null ? null : (String) additionals.get("installTarget");
++
++        // A relocation carried by the pack metadata may not climb out of its directory.
++        try
++        {
++            InstallTargetValidator.validate(installTarget, "relocated target");
++        }
++        catch (IOException e)
++        {
++            throw new InstallerException(e.getMessage(), e);
++        }
++
+         File resolvedFile = file.getFile();
+         if (!resolvedFile.exists())
+         {
+diff -ruN pristine/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/UnpackerBase.java app/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/UnpackerBase.java
+--- a/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/UnpackerBase.java	2026-10-28 07:24:39.000000000 +0000
++++ b/izpack-installer/src/main/java/com/izforge/izpack/installer/unpacker/UnpackerBase.java	2026-10-28 07:51:18.462795140 +0000
+@@ -24,6 +24,7 @@
+ 
+ import com.izforge.izpack.api.data.ExecutableFile;
+ import com.izforge.izpack.api.data.InstallData;
++import com.izforge.izpack.api.data.InstallTargetValidator;
+ import com.izforge.izpack.api.data.OverrideType;
+ import com.izforge.izpack.api.data.Pack;
+ import com.izforge.izpack.api.data.PackCompression;
+@@ -621,6 +622,7 @@
+ 
+         // translate & build the path
+         String path = IoHelper.translatePath(targetPath, variables);
++        validateTargetPath(path);
+         File target = new File(path);
+         File dir = target;
+         if (!packFile.isDirectory())
+@@ -659,6 +661,23 @@
+     }
+ 
+     /**
++     * Refuses a target location carried by compiled installer metadata when it contains a
++     * parent-directory segment.
++     *
++     * @param target the target location, after configured values have been substituted into it
++     * @throws InstallerException if the location contains a parent-directory segment
++     */
++    protected void validateTargetPath(String target)
++    {
++        if (InstallTargetValidator.hasParentSegment(target))
++        {
++            String message = "Refusing target location with a parent-directory segment: " + target;
++            logger.severe(message);
++            throw new InstallerException(message);
++        }
++    }
++
++    /**
+      * Extracts a pack file.
+      *
+      * @param packFile        the pack file
+@@ -1331,6 +1350,9 @@
+             if (newFileNameArr != null)
+             {
+                 String newFileName = newFileNameArr[0];
++                // The rename destination is metadata too: refuse one that climbs out before
++                // deleting or moving anything.
++                validateTargetPath(newFileName);
+                 File newPathFile = new File(file.getParent(), newFileName);
+                 if (newPathFile.exists())
+                 {
+@@ -1366,6 +1388,8 @@
+             if (!parsableFile.hasCondition() || isConditionTrue(parsableFile.getCondition()))
+             {
+                 String path = IoHelper.translatePath(parsableFile.getPath(), variables);
++                // The file to rewrite is chosen by metadata; refuse it before any rewrite.
++                validateTargetPath(path);
+                 File file = new File(path);
+                 if (file.exists() && file.isFile())
+                 {

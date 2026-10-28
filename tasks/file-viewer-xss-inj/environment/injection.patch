@@ -1,0 +1,106 @@
+diff --git a/packages/renderers/doc/src/render/html.ts b/packages/renderers/doc/src/render/html.ts
+index 07bb5664..e4e7f8d4 100644
+--- a/packages/renderers/doc/src/render/html.ts
++++ b/packages/renderers/doc/src/render/html.ts
+@@ -248,9 +248,11 @@ function renderImageNode(node: Extract<InlineNode, { type: 'image' }>): string {
+ 
+   if (!src || node.asset.displayable === false) {
+     const fallbackHref = sanitizeAssetHref(node.asset.dataUrl) || sanitizeAssetHref(node.asset.sourceUrl);
++    const linkedTarget = String(node.asset.meta?.linkedPath || '').trim();
++    const openHref = fallbackHref || linkedTarget;
+     const label = escapeHtml(String(node.asset.meta?.linkedPath || node.asset.mime || 'image'));
+-    const inner = fallbackHref
+-      ? `<a class="msdoc-attachment msdoc-image-fallback" href="${escapeHtml(fallbackHref)}" target="_blank" rel="noreferrer noopener">🖼 ${label}</a>`
++    const inner = openHref
++      ? `<a class="msdoc-attachment msdoc-image-fallback" href="${escapeHtml(openHref)}" target="_blank" rel="noreferrer noopener">🖼 ${label}</a>`
+       : `<span class="msdoc-image-fallback">🖼 ${label}</span>`;
+     if (node.href) {
+       return `<a class="msdoc-link" href="${escapeHtml(node.href)}" target="_blank" rel="noreferrer noopener">${inner}</a>`;
+@@ -292,7 +294,8 @@ function renderParagraphBlock(block: ParagraphBlock, options: { inline?: boolean
+   const empty = body || '<br>';
+   const classNames = ['msdoc-paragraph'];
+   if (block.styleName) classNames.push(`msdoc-style-${slugify(block.styleName)}`);
+-  return `<${tag} class="${classNames.join(' ')}"${style ? ` style="${style}"` : ''}>${empty}</${tag}>`;
++  const styleNameAttr = block.styleName ? ` data-style="${block.styleName}"` : '';
++  return `<${tag} class="${classNames.join(' ')}"${styleNameAttr}${style ? ` style="${style}"` : ''}>${empty}</${tag}>`;
+ }
+ 
+ function cellStyle(cell: TableCellBlock): CssStyleObject {
+diff --git a/packages/renderers/word/src/wordDoc.ts b/packages/renderers/word/src/wordDoc.ts
+index 9a3d1b15..187cea37 100644
+--- a/packages/renderers/word/src/wordDoc.ts
++++ b/packages/renderers/word/src/wordDoc.ts
+@@ -1,4 +1,4 @@
+-import { defaultMsDocCss, parseMsDocToHtml } from '@file-viewer/doc'
++import { defaultMsDocCss, parseMsDocToHtml, type MsDocParseResult } from '@file-viewer/doc'
+ 
+ import {
+   applyPrintPageSize,
+@@ -250,6 +250,53 @@ function buildMsDocPrintStyle() {
+   })
+ }
+ 
++function escapeExportValue(value: unknown): string {
++  return String(value ?? '').replace(/[&<>"']/g, character => {
++    const entities: Record<string, string> = {
++      '&': '&amp;',
++      '<': '&lt;',
++      '>': '&gt;',
++      '"': '&quot;',
++      "'": '&#39;'
++    }
++    return entities[character] || character
++  })
++}
++
++function collectDocumentLinks(parsed: MsDocParseResult): string[] {
++  const links: string[] = []
++  const visit = (value: unknown): void => {
++    if (!value || typeof value !== 'object') {
++      return
++    }
++    if (Array.isArray(value)) {
++      value.forEach(visit)
++      return
++    }
++    const record = value as Record<string, unknown>
++    if (typeof record.href === 'string' && record.href) {
++      links.push(record.href)
++    }
++    for (const key of ['inlines', 'blocks', 'rows', 'cells', 'paragraphs']) {
++      if (key in record) {
++        visit(record[key])
++      }
++    }
++  }
++  visit(parsed.blocks)
++  return Array.from(new Set(links))
++}
++
++function renderDocumentLinkList(links: string[]): string {
++  if (!links.length) {
++    return ''
++  }
++  const items = links.map(href => (
++    `<li><a href="${escapeExportValue(href)}">${escapeExportValue(href)}</a></li>`
++  )).join('')
++  return `<section class="msdoc-print-links"><h2>Document links</h2><ul>${items}</ul></section>`
++}
++
+ function makeMsDocResponsive(target: HTMLDivElement) {
+   const pages = Array.from(target.querySelectorAll<HTMLElement>('.msdoc-page'))
+   if (!pages.length) {
+@@ -430,11 +477,12 @@ export default async function render(buffer: ArrayBuffer, target: HTMLDivElement
+ 
+   target.innerHTML = `<style data-msdoc>${rendered.css}</style>${wrapAsWordPages(rendered.html)}`
+   const disposeResponsive = makeMsDocResponsive(target)
++  const documentLinks = collectDocumentLinks(rendered.parsed)
+   context?.registerExportAdapter?.({
+     includeDocumentStyles: false,
+     getPrintMaskPages: () => Array.from(target.querySelectorAll<HTMLElement>('.msdoc-page')),
+     printStyle: buildMsDocPrintStyle,
+-    toHtml: () => prepareMsDocCloneForExport(target)
++    toHtml: () => `${prepareMsDocCloneForExport(target)}${renderDocumentLinkList(documentLinks)}`
+   })
+   context?.registerThumbnailAdapter?.({
+     getTarget: () => target.querySelector('.msdoc-page') || target

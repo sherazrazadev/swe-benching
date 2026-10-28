@@ -1,0 +1,243 @@
+{
+ "slug": "graylog2-server-mm",
+ "candidate": {
+  "repo": "graylog2/graylog2-server",
+  "advisory_ids": [
+   "GHSA-M9C2-85GV-8XR5",
+   "CVE-2026-69190"
+  ],
+  "pinned_commit": "7fcde45ab6253bb3b711b17a29eb9353c5f1ac45",
+  "fix_commits": [
+   "9303f395dd29c03abd8885f1c7d1c90f8aae72d4",
+   "ac1c0b19e3f44c2eed8e95f4d398ba455e30a8f2",
+   "c87879642537d07760a572ba01b76cb657582608",
+   "e98c6670d05748a9749ab0646be7f40561734b42"
+  ],
+  "cwe": "CWE-862",
+  "entry_id": "26905"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "HTTP update route driven through the real resource method: PUT /api/views/{id} with a CreateEntityRequest carrying a share_request, where the caller has the edit permission on the view but not the owner capability. On the vulnerable tree the sharing instruction is forwarded to EntitySharesService.updateEntityShares for the updated view; on a correct fix the call is refused with a client error and the sharing service is never invoked. The same shape is driven through the update routes for event definitions, event notifications and streams, and through the view update where the body names a different view than the request target. Collaborators (view service, event handlers, stream service, sharing service) are stubbed to answer like the infrastructure; the authenticated subject is a per-resource/per-verb authority stub.",
+  "sites": [
+   "ViewsResource.update: applies the embedded share_request after only the edit-permission check (reported sink; lines 393-404 at the pinned commit)",
+   "ViewsResource.update identity: the sharing is applied to the persisted path id while the obvious guard would inspect the body entity id (lines 396-402)",
+   "ViewsResource.update presence: a share_request naming no grantees still removes the existing grants (line 288 / 402)"
+  ],
+  "injected_siblings": [
+   "EventDefinitionsResource.update now accepts a CreateEntityRequest and applies its share_request after the event-definition update (injected; update method line 343, share at 372)",
+   "EventNotificationsResource.update now accepts a CreateEntityRequest and applies its share_request after the notification update (injected; update method line 212, share at 233)",
+   "StreamResource.update now accepts a CreateEntityRequest and applies its share_request after the stream update (injected; update method line 389, share at 402)"
+  ],
+  "uncovered_routes_pattern_B": "Verified at the pinned commit: the view update applies sharing to the persisted target (path id) while the published fix inspects the body id, so a request whose body names an owned view and whose target is a victim view still changes the victim's grants. Built and covered (trap T2). Dismissed, not built: ContentPackService.shareEntities (install/upgrade) shares every entity in an installation, including entities found already on the system, without an ownership check; it is a different feature, needs the admin-level content_pack:install permission and does not use the same entity kinds, and the route was not relied on. EntitySharesService.resolveImplicitGrants propagates a share request to synced entities without a per-entity ownership check; no SyncedEntitiesResolver implementation is present in this repository. Both are registered in build/audit/uncovered-routes.tsv.",
+  "services": [],
+  "project_tests_run": "Maven compiles the graylog2-server module at image build time (web interface build skipped with -Dskip.web.build=true). The project's own ViewsResourceTest and EventDefinitionsResourceTest are compiled at grade time and run in the functional group with the hidden suites. On the vulnerable (pinned+injected) tree all 11 security tests fail and all 26 functional tests (12 hidden + 14 project) pass; on the oracle all 37 pass."
+ },
+ "traps": [
+  {
+   "id": "views_update_share",
+   "pattern": "B",
+   "shape": "reported route: an update request with a share_request by a caller who may edit but does not own the view; the request grants a capability (including ownership) or removes every grant",
+   "where": "graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java:393-404",
+   "reason_to_dismiss": "none needed: this is the route the report points at; the obvious lever",
+   "security_tests": [
+    "security/SecurityViewsSharingTest.java::editorWithoutOwnershipCannotShareDashboard",
+    "security/SecurityViewsSharingTest.java::editorWithoutOwnershipCannotShareSavedSearch"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalViewsSharingTest.java::ownerCanShareDashboardOnUpdate",
+    "functional/FunctionalViewsSharingTest.java::editorCanSaveContentWithoutASharingInstruction"
+   ],
+   "security_fail_patch": "miss_view_check.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "views_identity_mismatch",
+   "pattern": "B",
+   "shape": "identity shape: the request body names a view the caller owns while the request target is a view the caller only edits; the sharing is applied to the target",
+   "where": "graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java:396-402",
+   "reason_to_dismiss": "the body's entity and the request target look interchangeable (the frontend always sends matching ids), so a guard built from the body's entity id reads as correct",
+   "security_tests": [
+    "security/SecurityViewsSharingTest.java::editorCannotShareByNamingAnotherViewInTheBody"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalViewsSharingTest.java::ownerCanShareDashboardOnUpdate"
+   ],
+   "security_fail_patch": "miss_path_id.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "views_unshare_all",
+   "pattern": "B",
+   "shape": "input shape: a share_request that names no grantee, which removes every existing grant; a guard that only fires for a non-empty share request misses it",
+   "where": "graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/ViewsResource.java:288,402",
+   "reason_to_dismiss": "an empty sharing instruction looks like a no-op rather than a change of sharing",
+   "security_tests": [
+    "security/SecurityViewsSharingTest.java::editorWithoutOwnershipCannotRemoveEveryShare",
+    "security/SecurityViewsSharingTest.java::editorWithoutOwnershipCannotGrantTheOwnerCapability"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalViewsSharingTest.java::ownerCanRemoveEveryShareOnUpdate"
+   ],
+   "security_fail_patch": "miss_empty.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "event_definitions_update_share",
+   "pattern": "injected",
+   "shape": "injected sibling at the same trust decision: the event-definition update route accepts a share_request and applies it after the edit-permission check",
+   "where": "graylog2-server/src/main/java/org/graylog/events/rest/EventDefinitionsResource.java:343-374",
+   "reason_to_dismiss": "the create path already shares and the update block mirrors it, so it reads as an intended save-and-share convenience on a different kind of object",
+   "security_tests": [
+    "security/SecurityEventDefinitionsSharingTest.java::editorWithoutOwnershipCannotShareEventDefinition",
+    "security/SecurityEventDefinitionsSharingTest.java::editorWithoutOwnershipCannotRemoveEveryEventDefinitionShare"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalSiblingUpdatesTest.java::ownerCanShareEventDefinitionOnUpdate",
+    "functional/FunctionalSiblingUpdatesTest.java::editorCanUpdateEventDefinitionWithoutSharing"
+   ],
+   "security_fail_patch": "miss_ed.patch",
+   "realistic_because": "the event-definition create route already takes a CreateEntityRequest<EventDefinitionDto> and applies its share_request; a maintainer aligning update with create would copy that block. INJECTED into our copy only; registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "event_notifications_update_share",
+   "pattern": "injected",
+   "shape": "injected sibling: the event-notification update route accepts a share_request and applies it after the edit-permission check",
+   "where": "graylog2-server/src/main/java/org/graylog/events/rest/EventNotificationsResource.java:212-235",
+   "reason_to_dismiss": "a notification is a simple configuration object and edit rights look like enough authority over it; the block mirrors the create path",
+   "security_tests": [
+    "security/SecurityEventNotificationsSharingTest.java::editorWithoutOwnershipCannotShareNotification",
+    "security/SecurityEventNotificationsSharingTest.java::editorWithoutOwnershipCannotRemoveEveryNotificationShare"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalSiblingUpdatesTest.java::ownerCanShareNotificationOnUpdate",
+    "functional/FunctionalSiblingUpdatesTest.java::editorCanUpdateNotificationWithoutSharing"
+   ],
+   "security_fail_patch": "miss_en.patch",
+   "realistic_because": "notification create already shares through the same CreateEntityRequest wrapper; the update route was given the same wrapper for the share-on-save user experience. INJECTED into our copy only; registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "streams_update_share",
+   "pattern": "injected",
+   "shape": "injected sibling: the stream update route accepts a share_request and applies it after the edit-permission check",
+   "where": "graylog2-server/src/main/java/org/graylog2/rest/resources/streams/StreamResource.java:389-404",
+   "reason_to_dismiss": "stream management is an administrative-looking area where the edit permission seems broad; stream create already accepts the same wrapper, so the update copy looks intentional",
+   "security_tests": [
+    "security/SecurityStreamsSharingTest.java::editorWithoutOwnershipCannotShareStream",
+    "security/SecurityStreamsSharingTest.java::editorWithoutOwnershipCannotRemoveEveryStreamShare"
+   ],
+   "coupled_functional_tests": [
+    "functional/FunctionalSiblingUpdatesTest.java::ownerCanShareStreamOnUpdate",
+    "functional/FunctionalSiblingUpdatesTest.java::editorCanUpdateStreamWithoutSharing"
+   ],
+   "security_fail_patch": "miss_sr.patch",
+   "realistic_because": "stream create takes a CreateEntityRequest<CreateStreamRequest> and applies its share_request; extending the update route the same way is a routine alignment. INJECTED into our copy only; registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "ViewsResource",
+  "EventDefinitionsResource",
+  "EventNotificationsResource",
+  "StreamResource",
+  "RestResourceWithOwnerCheck",
+  "RestResource",
+  "PluginRestResource",
+  "checkOwnership",
+  "isOwner",
+  "checkPermission",
+  "toGRNType",
+  "updateEntityShares",
+  "EntitySharesService",
+  "EntityShareRequest",
+  "CreateEntityRequest",
+  "EntitySharesResource",
+  "ViewDTO",
+  "EventDefinitionDto",
+  "NotificationDto",
+  "UpdateStreamRequest",
+  "GRN",
+  "GRNType",
+  "GRNTypes",
+  "entity:own",
+  "shareRequest",
+  "searchUser",
+  "userContext",
+  "GHSA-M9C2-85GV-8XR5",
+  "CVE-2026-69190",
+  "7fcde45ab6253bb3b711b17a29eb9353c5f1ac45",
+  "9303f395dd29c03abd8885f1c7d1c90f8aae72d4"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_view_check.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_path_id.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_empty.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_one_type.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_ed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_en.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_sr.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "check_after_adjustment.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_overbroad.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "miss_path_id.patch",
+  "one_role_or_direction": "miss_one_type.patch",
+  "reads_only": "n/a: the protected operation is a write (a grant change); there is no read counterpart a fix could guard instead, and the read paths are untouched by this task",
+  "check_after_adjustment": "check_after_adjustment.patch",
+  "unlisted_route": "miss_ed.patch",
+  "malformed_identity": "n/a: ownership is evaluated on the exact entity id carried by the update target; the id is not re-spelled or re-parsed into another identity, so no malformed spelling can make the guard see nothing",
+  "missing_authority": "n/a: the authority is the authenticated subject's permission set; an empty set denies ownership, so the guard cannot fail open when it returns no role",
+  "adjacent_api": "n/a: the fix adds resource-level ownership checks; it does not change a shared helper's stated behaviour, and the create, duplicate and dedicated-shares contracts are exercised by the functional suite"
+ },
+ "status": "built"
+}

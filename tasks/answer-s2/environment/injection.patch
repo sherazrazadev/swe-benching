@@ -1,0 +1,417 @@
+diff --git a/i18n/en_US.yaml b/i18n/en_US.yaml
+index 9a0d198b..4e858ddf 100644
+--- a/i18n/en_US.yaml
++++ b/i18n/en_US.yaml
+@@ -508,6 +508,16 @@ backend:
+         other: "[{{.SiteName}}] New question: {{.QuestionTitle}}"
+       body:
+         other: "<a href='{{.QuestionUrl}}'>{{.QuestionTitle}}</a><br>\n<small>{{.Tags}}</small><br><br>\n\n--<br>\nNote: This is an automatic system email, please do not reply to this message as your response will not be seen.<br><br>\n\n<small><a href='{{.UnsubscribeUrl}}'>Unsubscribe</a></small>"
++    accept_answer:
++      title:
++        other: "[{{.SiteName}}] {{.DisplayName}} accepted an answer you wrote"
++      body:
++        other: "<a href='{{.AnswerUrl}}'>{{.QuestionTitle}}</a><br><br>\n\n{{.DisplayName}} accepted your answer.<br><br>\n\n--<br>\nNote: This is an automatic system email, please do not reply to this message as your response will not be seen.<br><br>\n\n<small><a href='{{.UnsubscribeUrl}}'>Unsubscribe</a></small>"
++    question_closed:
++      title:
++        other: "[{{.SiteName}}] {{.DisplayName}} closed your question"
++      body:
++        other: "<a href='{{.QuestionUrl}}'>{{.QuestionTitle}}</a><br><br>\n\n{{.DisplayName}} closed this question.<br><br>\n\n--<br>\nNote: This is an automatic system email, please do not reply to this message as your response will not be seen.<br><br>\n\n<small><a href='{{.UnsubscribeUrl}}'>Unsubscribe</a></small>"
+     pass_reset:
+       title:
+         other: "[{{.SiteName }}] Password reset"
+diff --git a/internal/base/constant/email_tpl_key.go b/internal/base/constant/email_tpl_key.go
+index 2a06783f..19f4a8b6 100644
+--- a/internal/base/constant/email_tpl_key.go
++++ b/internal/base/constant/email_tpl_key.go
+@@ -43,4 +43,10 @@ const (
+ 
+ 	EmailTplKeyNewQuestionTitle = "email_tpl.new_question.title"
+ 	EmailTplKeyNewQuestionBody  = "email_tpl.new_question.body"
++
++	EmailTplKeyAcceptAnswerTitle = "email_tpl.accept_answer.title"
++	EmailTplKeyAcceptAnswerBody  = "email_tpl.accept_answer.body"
++
++	EmailTplKeyQuestionClosedTitle = "email_tpl.question_closed.title"
++	EmailTplKeyQuestionClosedBody  = "email_tpl.question_closed.body"
+ )
+diff --git a/internal/schema/email_template.go b/internal/schema/email_template.go
+index d7e4b929..07435ff2 100644
+--- a/internal/schema/email_template.go
++++ b/internal/schema/email_template.go
+@@ -143,3 +143,34 @@ type NewQuestionTemplateData struct {
+ 	Tags           string
+ 	UnsubscribeUrl string
+ }
++
++type NewAcceptAnswerTemplateRawData struct {
++	QuestionTitle   string
++	QuestionID      string
++	AnswerID        string
++	DisplayName     string
++	UnsubscribeCode string
++}
++
++type NewAcceptAnswerTemplateData struct {
++	SiteName       string
++	DisplayName    string
++	QuestionTitle  string
++	AnswerUrl      string
++	UnsubscribeUrl string
++}
++
++type NewQuestionClosedTemplateRawData struct {
++	QuestionTitle   string
++	QuestionID      string
++	DisplayName     string
++	UnsubscribeCode string
++}
++
++type NewQuestionClosedTemplateData struct {
++	SiteName       string
++	DisplayName    string
++	QuestionTitle  string
++	QuestionUrl    string
++	UnsubscribeUrl string
++}
+diff --git a/internal/schema/new_question_queue_schema.go b/internal/schema/new_question_queue_schema.go
+index 5faeabb2..1b1eec54 100644
+--- a/internal/schema/new_question_queue_schema.go
++++ b/internal/schema/new_question_queue_schema.go
+@@ -29,10 +29,12 @@ type ExternalNotificationMsg struct {
+ 	ReceiverEmail  string `json:"receiver_email"`
+ 	ReceiverLang   string `json:"receiver_lang"`
+ 
+-	NewAnswerTemplateRawData       *NewAnswerTemplateRawData       `json:"new_answer_template_raw_data,omitempty"`
+-	NewInviteAnswerTemplateRawData *NewInviteAnswerTemplateRawData `json:"new_invite_answer_template_raw_data,omitempty"`
+-	NewCommentTemplateRawData      *NewCommentTemplateRawData      `json:"new_comment_template_raw_data,omitempty"`
+-	NewQuestionTemplateRawData     *NewQuestionTemplateRawData     `json:"new_question_template_raw_data,omitempty"`
++	NewAnswerTemplateRawData         *NewAnswerTemplateRawData         `json:"new_answer_template_raw_data,omitempty"`
++	NewInviteAnswerTemplateRawData   *NewInviteAnswerTemplateRawData   `json:"new_invite_answer_template_raw_data,omitempty"`
++	NewCommentTemplateRawData        *NewCommentTemplateRawData        `json:"new_comment_template_raw_data,omitempty"`
++	NewQuestionTemplateRawData       *NewQuestionTemplateRawData       `json:"new_question_template_raw_data,omitempty"`
++	NewAcceptAnswerTemplateRawData   *NewAcceptAnswerTemplateRawData   `json:"new_accept_answer_template_raw_data,omitempty"`
++	NewQuestionClosedTemplateRawData *NewQuestionClosedTemplateRawData `json:"new_question_closed_template_raw_data,omitempty"`
+ }
+ 
+ func CreateNewQuestionNotificationMsg(
+diff --git a/internal/service/content/answer_service.go b/internal/service/content/answer_service.go
+index 50975d2d..3f5d4138 100644
+--- a/internal/service/content/answer_service.go
++++ b/internal/service/content/answer_service.go
+@@ -488,6 +488,29 @@ func (as *AnswerService) AcceptAnswer(ctx context.Context, req *schema.AcceptAns
+ 			QID(questionInfo.ID, questionInfo.UserID).AID(acceptedAnswerInfo.ID, acceptedAnswerInfo.UserID))
+ 	}
+ 
++	// Notify the author of the accepted answer by email.
++	if acceptedAnswerInfo != nil && acceptedAnswerInfo.UserID != req.UserID {
++		receiverUserInfo, exist, err := as.userRepo.GetByUserID(ctx, acceptedAnswerInfo.UserID)
++		if err == nil && exist && receiverUserInfo.Status == entity.UserStatusAvailable {
++			displayName := ""
++			if operatorInfo, ok, e := as.userCommon.GetUserBasicInfoByID(ctx, req.UserID); e == nil && ok && operatorInfo != nil {
++				displayName = operatorInfo.DisplayName
++			}
++			as.externalNotificationQueueService.Send(ctx, &schema.ExternalNotificationMsg{
++				ReceiverUserID: receiverUserInfo.ID,
++				ReceiverEmail:  receiverUserInfo.EMail,
++				ReceiverLang:   receiverUserInfo.Language,
++				NewAcceptAnswerTemplateRawData: &schema.NewAcceptAnswerTemplateRawData{
++					QuestionTitle:   questionInfo.Title,
++					QuestionID:      questionInfo.ID,
++					AnswerID:        acceptedAnswerInfo.ID,
++					DisplayName:     displayName,
++					UnsubscribeCode: token.GenerateToken(),
++				},
++			})
++		}
++	}
++
+ 	as.updateAnswerRank(ctx, req.UserID, questionInfo, acceptedAnswerInfo, oldAnswerInfo)
+ 	return nil
+ }
+diff --git a/internal/service/content/question_service.go b/internal/service/content/question_service.go
+index 8c8da1fd..b4c82c99 100644
+--- a/internal/service/content/question_service.go
++++ b/internal/service/content/question_service.go
+@@ -1632,6 +1632,28 @@ func (qs *QuestionService) AdminSetQuestionStatus(ctx context.Context, req *sche
+ 		msg.ObjectType = constant.QuestionObjectType
+ 		qs.notificationQueueService.Send(ctx, msg)
+ 	}
++
++	// Notify the question author by email when the question is closed.
++	if setStatus == entity.QuestionStatusClosed && questionInfo.UserID != req.UserID {
++		receiverUserInfo, exist, err := qs.userRepo.GetByUserID(ctx, questionInfo.UserID)
++		if err == nil && exist && receiverUserInfo.Status == entity.UserStatusAvailable {
++			displayName := ""
++			if operatorInfo, ok, e := qs.userCommon.GetUserBasicInfoByID(ctx, req.UserID); e == nil && ok && operatorInfo != nil {
++				displayName = operatorInfo.DisplayName
++			}
++			qs.externalNotificationQueueService.Send(ctx, &schema.ExternalNotificationMsg{
++				ReceiverUserID: receiverUserInfo.ID,
++				ReceiverEmail:  receiverUserInfo.EMail,
++				ReceiverLang:   receiverUserInfo.Language,
++				NewQuestionClosedTemplateRawData: &schema.NewQuestionClosedTemplateRawData{
++					QuestionTitle:   questionInfo.Title,
++					QuestionID:      questionInfo.ID,
++					DisplayName:     displayName,
++					UnsubscribeCode: token.GenerateToken(),
++				},
++			})
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/service/export/email_service.go b/internal/service/export/email_service.go
+index ddf31b34..07e7e4b3 100644
+--- a/internal/service/export/email_service.go
++++ b/internal/service/export/email_service.go
+@@ -328,6 +328,56 @@ func (es *EmailService) NewQuestionTemplate(ctx context.Context, raw *schema.New
+ 	return title, body, nil
+ }
+ 
++// NewAcceptAnswerTemplate new answer accepted template
++func (es *EmailService) NewAcceptAnswerTemplate(ctx context.Context, raw *schema.NewAcceptAnswerTemplateRawData) (
++	title, body string, err error) {
++	siteInfo, err := es.siteInfoService.GetSiteGeneral(ctx)
++	if err != nil {
++		return
++	}
++	seoInfo, err := es.siteInfoService.GetSiteSeo(ctx)
++	if err != nil {
++		return
++	}
++	templateData := &schema.NewAcceptAnswerTemplateData{
++		SiteName:       siteInfo.Name,
++		DisplayName:    raw.DisplayName,
++		QuestionTitle:  raw.QuestionTitle,
++		AnswerUrl:      display.AnswerURL(seoInfo.Permalink, siteInfo.SiteUrl, raw.QuestionID, raw.QuestionTitle, raw.AnswerID),
++		UnsubscribeUrl: fmt.Sprintf("%s/users/unsubscribe?code=%s", siteInfo.SiteUrl, raw.UnsubscribeCode),
++	}
++
++	lang := handler.GetLangByCtx(ctx)
++	title = translator.TrWithData(lang, constant.EmailTplKeyAcceptAnswerTitle, templateData)
++	body = translator.TrWithData(lang, constant.EmailTplKeyAcceptAnswerBody, templateData)
++	return title, body, nil
++}
++
++// NewQuestionClosedTemplate new question closed template
++func (es *EmailService) NewQuestionClosedTemplate(ctx context.Context, raw *schema.NewQuestionClosedTemplateRawData) (
++	title, body string, err error) {
++	siteInfo, err := es.siteInfoService.GetSiteGeneral(ctx)
++	if err != nil {
++		return
++	}
++	seoInfo, err := es.siteInfoService.GetSiteSeo(ctx)
++	if err != nil {
++		return
++	}
++	templateData := &schema.NewQuestionClosedTemplateData{
++		SiteName:       siteInfo.Name,
++		DisplayName:    raw.DisplayName,
++		QuestionTitle:  raw.QuestionTitle,
++		QuestionUrl:    display.QuestionURL(seoInfo.Permalink, siteInfo.SiteUrl, raw.QuestionID, raw.QuestionTitle),
++		UnsubscribeUrl: fmt.Sprintf("%s/users/unsubscribe?code=%s", siteInfo.SiteUrl, raw.UnsubscribeCode),
++	}
++
++	lang := handler.GetLangByCtx(ctx)
++	title = translator.TrWithData(lang, constant.EmailTplKeyQuestionClosedTitle, templateData)
++	body = translator.TrWithData(lang, constant.EmailTplKeyQuestionClosedBody, templateData)
++	return title, body, nil
++}
++
+ func (es *EmailService) GetEmailConfig(ctx context.Context) (ec *EmailConfig, err error) {
+ 	emailConf, err := es.configService.GetStringValue(ctx, constant.EmailConfigKey)
+ 	if err != nil {
+diff --git a/internal/service/notification/external_notification.go b/internal/service/notification/external_notification.go
+index 425a8c2b..553aaa0e 100644
+--- a/internal/service/notification/external_notification.go
++++ b/internal/service/notification/external_notification.go
+@@ -92,6 +92,12 @@ func (ns *ExternalNotificationService) Handler(ctx context.Context, msg *schema.
+ 	if msg.NewInviteAnswerTemplateRawData != nil {
+ 		return ns.handleInviteAnswerNotification(ctx, msg)
+ 	}
++	if msg.NewAcceptAnswerTemplateRawData != nil {
++		return ns.handleNewAcceptAnswerNotification(ctx, msg)
++	}
++	if msg.NewQuestionClosedTemplateRawData != nil {
++		return ns.handleNewQuestionClosedNotification(ctx, msg)
++	}
+ 	log.Errorf("unknown notification message: %+v", msg)
+ 	return nil
+ }
+diff --git a/internal/service/notification/new_accept_answer_notification.go b/internal/service/notification/new_accept_answer_notification.go
+new file mode 100644
+index 00000000..04b7d092
+--- /dev/null
++++ b/internal/service/notification/new_accept_answer_notification.go
+@@ -0,0 +1,82 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package notification
++
++import (
++	"context"
++	"time"
++
++	"github.com/apache/answer/internal/base/constant"
++	"github.com/apache/answer/internal/schema"
++	"github.com/segmentfault/pacman/i18n"
++	"github.com/segmentfault/pacman/log"
++)
++
++func (ns *ExternalNotificationService) handleNewAcceptAnswerNotification(ctx context.Context,
++	msg *schema.ExternalNotificationMsg) error {
++	log.Debugf("try to send accepted answer notification %+v", msg)
++
++	notificationConfig, exist, err := ns.userNotificationConfigRepo.GetByUserIDAndSource(ctx, msg.ReceiverUserID, constant.InboxSource)
++	if err != nil {
++		return err
++	}
++	if !exist {
++		return nil
++	}
++	channels := schema.NewNotificationChannelsFormJson(notificationConfig.Channels)
++	for _, channel := range channels {
++		if !channel.Enable {
++			continue
++		}
++		if channel.Key == constant.EmailChannel {
++			ns.sendNewAcceptAnswerNotificationEmail(
++				ctx, msg.ReceiverUserID, msg.ReceiverEmail, msg.ReceiverLang, msg.NewAcceptAnswerTemplateRawData)
++		}
++	}
++	return nil
++}
++
++func (ns *ExternalNotificationService) sendNewAcceptAnswerNotificationEmail(ctx context.Context,
++	userID, email, lang string, rawData *schema.NewAcceptAnswerTemplateRawData) {
++	if unavailable := ns.checkUserStatusBeforeNotification(ctx, userID); unavailable {
++		return
++	}
++	codeContent := &schema.EmailCodeContent{
++		SourceType: schema.UnsubscribeSourceType,
++		NotificationSources: []constant.NotificationSource{
++			constant.InboxSource,
++		},
++		Email:                    email,
++		UserID:                   userID,
++		SkipValidationLatestCode: true,
++	}
++
++	if len(lang) > 0 {
++		ctx = context.WithValue(ctx, constant.AcceptLanguageContextKey, i18n.Language(lang))
++	}
++	title, body, err := ns.emailService.NewAcceptAnswerTemplate(ctx, rawData)
++	if err != nil {
++		log.Error(err)
++		return
++	}
++
++	ns.emailService.SendAndSaveCodeWithTime(
++		ctx, userID, email, title, body, rawData.UnsubscribeCode, codeContent.ToJSONString(), 1*24*time.Hour)
++}
+diff --git a/internal/service/notification/new_question_closed_notification.go b/internal/service/notification/new_question_closed_notification.go
+new file mode 100644
+index 00000000..3a60e6f2
+--- /dev/null
++++ b/internal/service/notification/new_question_closed_notification.go
+@@ -0,0 +1,82 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package notification
++
++import (
++	"context"
++	"time"
++
++	"github.com/apache/answer/internal/base/constant"
++	"github.com/apache/answer/internal/schema"
++	"github.com/segmentfault/pacman/i18n"
++	"github.com/segmentfault/pacman/log"
++)
++
++func (ns *ExternalNotificationService) handleNewQuestionClosedNotification(ctx context.Context,
++	msg *schema.ExternalNotificationMsg) error {
++	log.Debugf("try to send question closed notification %+v", msg)
++
++	notificationConfig, exist, err := ns.userNotificationConfigRepo.GetByUserIDAndSource(ctx, msg.ReceiverUserID, constant.InboxSource)
++	if err != nil {
++		return err
++	}
++	if !exist {
++		return nil
++	}
++	channels := schema.NewNotificationChannelsFormJson(notificationConfig.Channels)
++	for _, channel := range channels {
++		if !channel.Enable {
++			continue
++		}
++		if channel.Key == constant.EmailChannel {
++			ns.sendNewQuestionClosedNotificationEmail(
++				ctx, msg.ReceiverUserID, msg.ReceiverEmail, msg.ReceiverLang, msg.NewQuestionClosedTemplateRawData)
++		}
++	}
++	return nil
++}
++
++func (ns *ExternalNotificationService) sendNewQuestionClosedNotificationEmail(ctx context.Context,
++	userID, email, lang string, rawData *schema.NewQuestionClosedTemplateRawData) {
++	if unavailable := ns.checkUserStatusBeforeNotification(ctx, userID); unavailable {
++		return
++	}
++	codeContent := &schema.EmailCodeContent{
++		SourceType: schema.UnsubscribeSourceType,
++		NotificationSources: []constant.NotificationSource{
++			constant.InboxSource,
++		},
++		Email:                    email,
++		UserID:                   userID,
++		SkipValidationLatestCode: true,
++	}
++
++	if len(lang) > 0 {
++		ctx = context.WithValue(ctx, constant.AcceptLanguageContextKey, i18n.Language(lang))
++	}
++	title, body, err := ns.emailService.NewQuestionClosedTemplate(ctx, rawData)
++	if err != nil {
++		log.Error(err)
++		return
++	}
++
++	ns.emailService.SendAndSaveCodeWithTime(
++		ctx, userID, email, title, body, rawData.UnsubscribeCode, codeContent.ToJSONString(), 1*24*time.Hour)
++}
