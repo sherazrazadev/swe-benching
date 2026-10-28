@@ -4,7 +4,7 @@ Started 2026-10-28T03:37Z. [run 40627768818](https://github.com/sherazrazadev/sw
 
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
-| `fast-jwt-s2` | sound | 0.7097 | 1 | **REJECTED** |
+| `fast-jwt-s2` | sound | 1 | 0.871 | **REJECTED** |
 | `reachy-mini-s2` | sound | 1 | 1 | **REJECTED** |
 | `inference-s2` | sound | 1 | 1 | **REJECTED** |
 | `schema-org-s2` | sound | 1 | 1 | **REJECTED** |
