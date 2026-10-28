@@ -1,0 +1,168 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+index d7782017..26e3132a 100644
+--- a/contrib/auto-render/auto-render.ts
++++ b/contrib/auto-render/auto-render.ts
+@@ -127,9 +127,14 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
+-
+-    Object.assign(optionsCopy, options);
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null);
++    if (options) {
++        for (const key of Object.keys(options)) {
++            (optionsCopy as Record<string, unknown>)[key] =
++                (options as unknown as Record<string, unknown>)[key];
++        }
++    }
+ 
+     // default options
+     optionsCopy.delimiters = optionsCopy.delimiters || [
+@@ -148,7 +153,7 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff --git a/src/Namespace.ts b/src/Namespace.ts
+index 0053695a..dfabd08b 100644
+--- a/src/Namespace.ts
++++ b/src/Namespace.ts
+@@ -79,11 +79,12 @@ export default class Namespace<Value> {
+      * `if (namespace.has(...))`.
+      */
+     get(name: string): Value | undefined {
+-        if (Object.prototype.hasOwnProperty.call(this.current, name)) {
+-            return this.current[name];
+-        } else {
+-            return this.builtins[name];
++        const current = Object.getOwnPropertyDescriptor(this.current, name);
++        if (current) {
++            return current.value;
+         }
++        const builtin = Object.getOwnPropertyDescriptor(this.builtins, name);
++        return builtin ? builtin.value : undefined;
+     }
+ 
+     /**
+@@ -111,7 +112,9 @@ export default class Namespace<Value> {
+             // value is the correct one.
+             const top = this.undefStack[this.undefStack.length - 1];
+             if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++                const current =
++                    Object.getOwnPropertyDescriptor(this.current, name);
++                top[name] = current ? current.value : undefined;
+             }
+         }
+         if (value == null) {
+diff --git a/src/Settings.ts b/src/Settings.ts
+index 1793cbf2..0e40c614 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -334,8 +334,9 @@ function getDefaultValue<K extends keyof SettingsOptions>(
+     schema: SchemaEntry<K>,
+ ): Settings[K];
+ function getDefaultValue(schema: SchemaEntry<keyof SettingsOptions>): DefaultValue {
+-    if (schema.default !== undefined) {
+-        return schema.default;
++    const own = Object.getOwnPropertyDescriptor(schema, "default");
++    if (own && own.value !== undefined) {
++        return own.value;
+     }
+     const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+     return getImplicitDefault(type);
+@@ -347,10 +348,13 @@ function applySetting<K extends keyof SettingsOptions>(
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const option = Object.getOwnPropertyDescriptor(options, prop);
++    const optionValue = option ? option.value : undefined;
++    const adjuster = Object.getOwnPropertyDescriptor(schema, "processor");
++    const processor = adjuster ? adjuster.value : undefined;
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+@@ -395,9 +399,10 @@ export default class Settings {
+         // into the boolean function the rest of the library expects.
+         if (this.trust !== null && typeof this.trust === "object") {
+             const protocols = this.trust as TrustMap;
++            const allowed = new Map(Object.entries(protocols));
+             this.trust = (context) => {
+                 const protocol = (context as {protocol?: string}).protocol;
+-                return protocol != null && Boolean(protocols[protocol]);
++                return protocol != null && allowed.get(protocol) === true;
+             };
+         }
+     }
+@@ -479,15 +484,18 @@ export default class Settings {
+      * get added by this function (changing the specified object).
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
++        const has = Object.prototype.hasOwnProperty;
++        let decided: AnyTrustContext = context;
++        if ("url" in context && has.call(context, "url") && context.url &&
++            (!has.call(context, "protocol") || !context.protocol)) {
+             const protocol = protocolFromUrl(context.url);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            decided = {...context, protocol} as AnyTrustContext;
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(decided)
+             : this.trust;
+         return Boolean(trust);
+     }
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index 69ccae00..d59242a6 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -9,15 +9,15 @@ import type {AnyTrustContext} from "../Settings";
+ 
+ // Attributes that only annotate an element and cannot run code, so they can be
+ // set without enabling trust for the active HTML commands.
+-const SAFE_ATTRIBUTES: Record<string, boolean> = {
+-    "title": true,
+-    "role": true,
+-    "lang": true,
+-    "dir": true,
+-    "aria-label": true,
+-    "aria-hidden": true,
+-    "aria-describedby": true,
+-};
++const SAFE_ATTRIBUTES = new Set<string>([
++    "title",
++    "role",
++    "lang",
++    "dir",
++    "aria-label",
++    "aria-hidden",
++    "aria-describedby",
++]);
+ 
+ defineFunction({
+     type: "html",
+@@ -107,7 +107,7 @@ defineFunction({
+                 const name = value.slice(0, firstEquals).trim();
+                 const attrValue = value.slice(firstEquals + 1);
+                 attributes[name] = attrValue;
+-                presentational = SAFE_ATTRIBUTES[name];
++                presentational = SAFE_ATTRIBUTES.has(name);
+                 trustContext = {
+                     command: "\\htmlAttr",
+                     name,

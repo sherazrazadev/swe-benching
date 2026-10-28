@@ -1,0 +1,179 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+--- a/contrib/auto-render/auto-render.ts	2026-10-28 00:22:21.000000000 +0000
++++ b/contrib/auto-render/auto-render.ts	2026-10-28 00:39:16.714636655 +0000
+@@ -127,9 +127,18 @@
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null) as Partial<RenderMathInElementOptionsCopy>;
+ 
+-    Object.assign(optionsCopy, options);
++    if (options != null) {
++        // Take only the caller's own entries. The prototype-free copy also
++        // keeps the reads below from finding an inherited value when the
++        // caller omitted an option.
++        for (const key of Object.keys(options)) {
++            (optionsCopy as Record<string, unknown>)[key] =
++                (options as unknown as Record<string, unknown>)[key];
++        }
++    }
+ 
+     // default options
+     optionsCopy.delimiters = optionsCopy.delimiters || [
+@@ -148,7 +157,7 @@
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff --git a/src/Namespace.ts b/src/Namespace.ts
+--- a/src/Namespace.ts	2026-10-28 00:22:21.000000000 +0000
++++ b/src/Namespace.ts	2026-10-28 00:39:14.532736821 +0000
+@@ -8,6 +8,9 @@
+ 
+ import ParseError from "./ParseError";
+ 
++const hasOwn = (target: object, key: string): boolean =>
++    Object.prototype.hasOwnProperty.call(target, key);
++
+ export default class Namespace<Value> {
+     current: Record<string, Value>;
+     builtins: Record<string, Value>;
+@@ -79,10 +82,12 @@
+      * `if (namespace.has(...))`.
+      */
+     get(name: string): Value | undefined {
+-        if (Object.prototype.hasOwnProperty.call(this.current, name)) {
++        if (hasOwn(this.current, name)) {
+             return this.current[name];
+-        } else {
++        } else if (hasOwn(this.builtins, name)) {
+             return this.builtins[name];
++        } else {
++            return undefined;
+         }
+     }
+ 
+@@ -110,8 +115,12 @@
+             // unless an undo is already in place, in which case that older
+             // value is the correct one.
+             const top = this.undefStack[this.undefStack.length - 1];
+-            if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++            if (top && !hasOwn(top, name)) {
++                // Record the current value only when this namespace actually
++                // defines it; an inherited value is not a definition.
++                top[name] = hasOwn(this.current, name)
++                    ? this.current[name]
++                    : undefined;
+             }
+         }
+         if (value == null) {
+diff --git a/src/Settings.ts b/src/Settings.ts
+--- a/src/Settings.ts	2026-10-28 00:22:23.000000000 +0000
++++ b/src/Settings.ts	2026-10-28 00:40:09.924186426 +0000
+@@ -330,11 +330,19 @@
+     }
+ }
+ 
++/**
++ * Whether `target` carries `key` among its own properties. Options, schema
++ * entries and trust contexts are plain objects, so a value reachable only
++ * through `Object.prototype` is not one of their entries.
++ */
++const hasOwn = (target: object, key: PropertyKey): boolean =>
++    Object.prototype.hasOwnProperty.call(target, key);
++
+ function getDefaultValue<K extends keyof SettingsOptions>(
+     schema: SchemaEntry<K>,
+ ): Settings[K];
+ function getDefaultValue(schema: SchemaEntry<keyof SettingsOptions>): DefaultValue {
+-    if (schema.default !== undefined) {
++    if (hasOwn(schema, "default") && schema.default !== undefined) {
+         return schema.default;
+     }
+     const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+@@ -347,10 +355,11 @@
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const optionValue = hasOwn(options, prop) ? options[prop] : undefined;
++    const processor = hasOwn(schema, "processor") ? schema.processor : undefined;
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+@@ -397,7 +406,8 @@
+             const protocols = this.trust as TrustMap;
+             this.trust = (context) => {
+                 const protocol = (context as {protocol?: string}).protocol;
+-                return protocol != null && Boolean(protocols[protocol]);
++                return protocol != null && hasOwn(protocols, protocol) &&
++                    Boolean(protocols[protocol]);
+             };
+         }
+     }
+@@ -479,15 +489,26 @@
+      * get added by this function (changing the specified object).
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
+-            const protocol = protocolFromUrl(context.url);
++        const fields = context as unknown as {url?: string; protocol?: string};
++        // Derive the protocol from the context's own URL only, and only when
++        // the context does not already carry a truthy protocol of its own.
++        if (hasOwn(fields, "url") && fields.url &&
++            !(hasOwn(fields, "protocol") && fields.protocol)) {
++            const protocol = protocolFromUrl(fields.url);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            fields.protocol = protocol;
++        }
++        // Ask the trust function about a view holding only the context's own
++        // fields. Otherwise a field reachable only through the shared
++        // prototype would still be visible to a caller's trust function.
++        const decision: Record<string, unknown> = Object.create(null);
++        for (const key of Object.keys(context)) {
++            decision[key] = (context as unknown as Record<string, unknown>)[key];
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(decision as unknown as AnyTrustContext)
+             : this.trust;
+         return Boolean(trust);
+     }
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+--- a/src/functions/html.ts	2026-10-28 00:22:23.000000000 +0000
++++ b/src/functions/html.ts	2026-10-28 00:39:17.429603813 +0000
+@@ -7,6 +7,9 @@
+ import * as mml from "../buildMathML";
+ import type {AnyTrustContext} from "../Settings";
+ 
++const hasOwn = (target: object, key: string): boolean =>
++    Object.prototype.hasOwnProperty.call(target, key);
++
+ // Attributes that only annotate an element and cannot run code, so they can be
+ // set without enabling trust for the active HTML commands.
+ const SAFE_ATTRIBUTES: Record<string, boolean> = {
+@@ -107,7 +110,8 @@
+                 const name = value.slice(0, firstEquals).trim();
+                 const attrValue = value.slice(firstEquals + 1);
+                 attributes[name] = attrValue;
+-                presentational = SAFE_ATTRIBUTES[name];
++                presentational = hasOwn(SAFE_ATTRIBUTES, name) &&
++                    SAFE_ATTRIBUTES[name];
+                 trustContext = {
+                     command: "\\htmlAttr",
+                     name,

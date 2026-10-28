@@ -1,0 +1,123 @@
+diff --git a/src/Settings.ts b/src/Settings.ts
+index da3c505a..1793cbf2 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -47,9 +47,16 @@ export type TrustContextTypes = {
+         command: "\\htmlData";
+         attributes: Record<string, string>;
+     };
++    "\\htmlAttr": {
++        command: "\\htmlAttr";
++        name: string;
++        value: string;
++    };
+ };
+ export type AnyTrustContext = TrustContextTypes[keyof TrustContextTypes];
+ export type TrustFunction = (context: AnyTrustContext) => boolean | null | undefined;
++/** Maps a value reported in a trust context to whether it may be used. */
++export type TrustMap = Record<string, boolean>;
+ export type SettingsOptions = Partial<Settings>;
+ 
+ type EnumType<T extends string = string> = {
+@@ -266,8 +273,9 @@ export const SETTINGS_SCHEMA: Schema = {
+         cliDefault: false,
+     },
+     trust: {
+-        type: ["boolean", "function"],
+-        description: "Trust the input, enabling all HTML features such as \\url.",
++        type: ["boolean", "function", "object"],
++        description: "Trust the input, enabling all HTML features such as \\url. " +
++            "May also be an object mapping a URL protocol to whether it is allowed.",
+         cli: "-T, --trust",
+     },
+     maxSize: {
+@@ -368,7 +376,7 @@ export default class Settings {
+     minRuleThickness!: number;
+     colorIsTextColor!: boolean;
+     strict!: boolean | "ignore" | "warn" | "error" | StrictFunction;
+-    trust!: boolean | TrustFunction;
++    trust!: boolean | TrustFunction | TrustMap;
+     maxSize!: number;
+     maxExpand!: number;
+     globalGroup!: boolean;
+@@ -383,6 +391,15 @@ export default class Settings {
+                 applySetting(this, prop, options, schema);
+             }
+         }
++        // A trust map lets the caller allow particular URL protocols; turn it
++        // into the boolean function the rest of the library expects.
++        if (this.trust !== null && typeof this.trust === "object") {
++            const protocols = this.trust as TrustMap;
++            this.trust = (context) => {
++                const protocol = (context as {protocol?: string}).protocol;
++                return protocol != null && Boolean(protocols[protocol]);
++            };
++        }
+     }
+ 
+     /**
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index 360a8894..69ccae00 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -7,9 +7,21 @@ import * as html from "../buildHTML";
+ import * as mml from "../buildMathML";
+ import type {AnyTrustContext} from "../Settings";
+ 
++// Attributes that only annotate an element and cannot run code, so they can be
++// set without enabling trust for the active HTML commands.
++const SAFE_ATTRIBUTES: Record<string, boolean> = {
++    "title": true,
++    "role": true,
++    "lang": true,
++    "dir": true,
++    "aria-label": true,
++    "aria-hidden": true,
++    "aria-describedby": true,
++};
++
+ defineFunction({
+     type: "html",
+-    names: ["\\htmlClass", "\\htmlId", "\\htmlStyle", "\\htmlData"],
++    names: ["\\htmlClass", "\\htmlId", "\\htmlStyle", "\\htmlData", "\\htmlAttr"],
+     numArgs: 2,
+     argTypes: ["raw", "original"],
+     allowedInText: true,
+@@ -25,6 +37,7 @@ defineFunction({
+ 
+         let trustContext: AnyTrustContext;
+         const attributes: Record<string, string> = {};
++        let presentational = false;
+ 
+         switch (funcName) {
+             case "\\htmlClass":
+@@ -85,11 +98,28 @@ defineFunction({
+                 };
+                 break;
+             }
++            case "\\htmlAttr": {
++                const firstEquals = value.indexOf("=");
++                if (firstEquals < 0) {
++                    throw new ParseError(`\\htmlAttr key/value '${value}'` +
++                        ` missing equals sign`);
++                }
++                const name = value.slice(0, firstEquals).trim();
++                const attrValue = value.slice(firstEquals + 1);
++                attributes[name] = attrValue;
++                presentational = SAFE_ATTRIBUTES[name];
++                trustContext = {
++                    command: "\\htmlAttr",
++                    name,
++                    value: attrValue,
++                };
++                break;
++            }
+             default:
+                 throw new Error("Unrecognized html command");
+         }
+ 
+-        if (!parser.settings.isTrusted(trustContext)) {
++        if (!presentational && !parser.settings.isTrusted(trustContext)) {
+             return parser.formatUnsupportedCmd(funcName);
+         }
+         return {
