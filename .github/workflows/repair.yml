@@ -4,13 +4,16 @@ name: repair
 #           reading FAIRNESS.md and AUDIT-FINDINGS.md), full re-gate (common/gate/gate_one_ds.sh), then fresh trials of
 #           both models (the old runs saw the old task; they stay in build/<slug>/round<N>/). One repair per task.
 #   rerun   a model has fewer than 3 trustworthy failing runs: extra runs of that model, merged with the earlier ones.
+#   harden  a task the models solved or nearly solved: the upgrade step (pipelines/sibling/upgrade/run_upgrade.sh,
+#           DeepSeek: one general property in the instruction, >=1 how-type lever, coverage tests) and its own gate,
+#           then fresh trials of both models as a new task version (old runs kept in build/<slug>/pre-harden/).
 # Then collect (branch runs/<this run>) and verdict.yml again, which records ACCEPTED / REJECTED or comes back here.
 on:
   workflow_dispatch:
     inputs:
       slug: { description: "task slug", required: true }
       run: { description: "run id whose branch runs/<id> holds the task, its trials, fairness and audits", required: true }
-      mode: { description: "repair or rerun", type: choice, options: [repair, rerun], default: repair }
+      mode: { description: "repair or rerun", type: choice, options: [repair, rerun, harden], default: repair }
       models: { description: "trial models", default: "deepseek,mimo" }
       first_run: { description: "number of the first new run (rerun: after the existing ones)", default: "1" }
       runs: { description: "runs per model", default: "3" }
@@ -29,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: main }
       - uses: ./.github/actions/setup-runner
-        if: inputs.mode == 'repair'
+        if: inputs.mode != 'rerun'
         with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}", gate_slots: "${{ inputs.gate_slots }}" }
       - name: Task from branch runs/<run>
         run: |
@@ -59,6 +62,23 @@ jobs:
           echo "$SLUG re-gate after the repair: $m" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$m" = .unsound ] && echo "re-gate after the repair: unsound" > /tmp/why
           [ "$m" = .sound ] || [ "$m" = .unsound ] || { echo "::error::re-gate did not finish ($m): infrastructure, not the task. Dispatch repair.yml again."; exit 1; }
+      - name: Harden (upgrade) and gate
+        if: inputs.mode == 'harden'
+        timeout-minutes: 340
+        run: |
+          B=build/$SLUG
+          export UPGRADE_TIMEOUT=10800
+          rc=0; bash common/launch/drive.sh deepseek bash pipelines/sibling/upgrade/run_upgrade.sh "$SLUG" || rc=$?
+          echo "$SLUG harden: exit $rc, $(cat "$B/upgrade_status.txt" 2>/dev/null)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # 0 upgraded + sound; 4 upgraded but its gate failed (the task is rejected); 1/3: not done or no change, task restored
+          [ $rc = 4 ] && { echo "re-gate after the hardening: unsound" > /tmp/why; exit 0; }
+          [ $rc = 0 ] || { echo "::error::upgrade did not finish or changed nothing (exit $rc); task restored. Dispatch again."; exit 1; }
+          # a new task version: the old trials, fairness, audits and repair round judged the old one
+          mkdir -p "$B/pre-harden"
+          for f in trial_detail_*.json runs_*.log evidence FAIRNESS.md* fairness_* AUDIT-FINDINGS.md audits HUMAN-DECISION.md round* repair_round.txt; do
+            for x in "$B"/$f; do [ -e "$x" ] && mv "$x" "$B/pre-harden/"; done
+          done
+          [ -f "$B/.sound" ] || { echo "::error::upgraded but no .sound marker"; exit 1; }
       - name: Pack
         id: p
         if: always()
@@ -81,9 +101,9 @@ jobs:
     uses: ./.github/workflows/trial.yml
     with:
       slugs: ${{ inputs.slug }}
-      models: ${{ inputs.mode == 'repair' && 'deepseek,mimo' || inputs.models }}
-      runs: ${{ inputs.mode == 'repair' && '3' || inputs.runs }}
-      first_run: ${{ inputs.mode == 'repair' && '1' || inputs.first_run }}
+      models: ${{ inputs.mode != 'rerun' && 'deepseek,mimo' || inputs.models }}
+      runs: ${{ inputs.mode != 'rerun' && '3' || inputs.runs }}
+      first_run: ${{ inputs.mode != 'rerun' && '1' || inputs.first_run }}
       build_run: ${{ github.run_id }}
       collect: false
     secrets: inherit

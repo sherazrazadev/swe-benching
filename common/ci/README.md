@@ -29,6 +29,7 @@ accepted tasks, `batch-NN.md`, `tasks.tsv`). Leave `slugs` empty to take the nex
 | REPAIR | fairness NOT_READY or an audit found a fault | `repair` workflow: fairfix (reads `FAIRNESS.md` + `AUDIT-FINDINGS.md`), full re-gate, 3 fresh runs per model, then `verdict` again |
 | RERUN | a model has fewer than 3 trustworthy failing runs (e.g. provider refusal) | `repair` workflow, mode rerun: extra runs of that model (up to 6 in all), then `verdict` again |
 | pending | an audit or the fairness review is missing | nothing; run the audits, then dispatch `verdict` again |
+| (harden) | dispatched by hand for a solved or nearly solved task | `repair` workflow, mode harden: upgrade step (one general property, a how-type lever, coverage), its gate, 3 fresh runs per model, then `verdict` |
 
 An open "human review" question in the fairness review does not stop a task: the audits of the actual runs answer it.
 The audits need Claude Opus: secret `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. Without one, run them locally
