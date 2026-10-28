@@ -4,4 +4,4 @@ Started 2026-10-28T00:04Z. [run 40606332971](https://github.com/sherazrazadev/sw
 
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
-| `katex-s2` | sound | 0.9091 0.9091 0.8636 | 0.6364 0.9091 1 | **REJECTED** |
+| `katex-s2` | sound | 1 | 0.9091 | **REJECTED** |
