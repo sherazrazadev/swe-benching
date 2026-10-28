@@ -9,4 +9,4 @@ Started 2026-10-27T22:22Z. [run 40594259349](https://github.com/sherazrazadev/sw
 | `snipe-it-s2` | sound | 1 | 1 | **REJECTED** |
 | `sublinear-time-solver-s2` | sound | 1 | 1 | **REJECTED** |
 | `katex-s2` | sound | - | - | **incomplete** |
-| `go-git-s2` | sound | 0 0.9167 1 | 0.9167 0.9167 0.9167 | **REJECTED** |
+| `go-git-s2` | sound | 1 | 1 | **REJECTED** |
