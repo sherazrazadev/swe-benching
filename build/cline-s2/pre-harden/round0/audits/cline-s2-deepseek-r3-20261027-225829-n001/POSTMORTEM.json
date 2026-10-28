@@ -1,0 +1,46 @@
+{
+ "trial": "cline-s2__6Cg4e6H",
+ "task": "cline-s2",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-27T23:39:55+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-28T01:00:16+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.875 = 14/16 security tests; all 71 functional tests pass. Both failures are in security/dashboard_socket.test.ts and come from one deliberate design choice in the model's dashboard origin policy: isAllowedDashboardOrigin returns true for ANY loopback hostname regardless of port or scheme (changes.patch:698-699 `if (isLoopbackHostname(originHostname)) return true;`). So the /browser upgrade accepts Origin http://127.0.0.1:9999 (another port) and https://127.0.0.1:<port> (another scheme). The instruction's security property refuses any origin 'not an address the deployment is configured to serve' (instruction.md:19-21); the dashboard serves only http://127.0.0.1:<port>, so both origins should be refused. The reference fix does exact-origin matching (fix.patch:209-227, 268-269) and passes. There is some tension with the preservation bullet 'a connection from the product's own local front end must still be accepted when that front end is served from a different local port' (instruction.md:32-33): the model applied it to the dashboard (cline-hub has a Vite dev server, transcript.md:115). But that bullet is exercised only on the desktop sidecar (functional/sidecar_trusted_connections.test.ts:15-20, origin localhost:3125), and even on the model's reading it would not require accepting every loopback port and every scheme. The scheme failure has no instruction-based excuse at all. Passing tests checked (dashboard_http_command, dashboard_shared_address, live_socket, sidecar) assert a 4xx and no '\"ok\":true' against real spawned servers and are not lenient. No contamination: the agent never read the hidden tests or fetched upstream, and graded cleanly with no tool calls inside the grading window.",
+  "items": [
+   {
+    "test": "security/dashboard_socket.test.ts::dashboard browser socket > refuses an upgrade from the right machine on another port",
+    "outcome": "fail",
+    "model_behaviour": "Dashboard origin check accepts any loopback hostname on any port (changes.patch:698-699, comment at :715 'Local front ends can be served from another port on the same machine'). Origin http://127.0.0.1:9999 is accepted, so the upgrade is not refused with a 4xx. The model's own unit test asserts this acceptance (changes.patch:83-84, 155-159).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security/dashboard_socket.test.ts::dashboard browser socket > refuses an upgrade that uses another scheme",
+    "outcome": "fail",
+    "model_behaviour": "Same loopback short-circuit ignores scheme, so Origin https://127.0.0.1:<dashboard port> is accepted for /browser. For non-loopback public hosts the model does enforce scheme (changes.patch:703) but exempts loopback. No preservation clause asks for a different scheme to be accepted.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows only repo exploration, edits, local typecheck and tests, and smoke tests against servers the agent built itself. The agent never accessed evidence/tests or any hidden test path, and there was no web or advisory lookup. No netguard.log was present. run.json shows tool_calls_during_grading: [] and agent_events_after_end: 0.",
+  "evidence": [
+   "grading/results.json:13-14 \u2014 the two failing dashboard_socket tests; reward 0.875, all functional pass",
+   "tests/security/dashboard_socket.test.ts:45-59 \u2014 origins http://127.0.0.1:9999 and https://127.0.0.1:${port}, expects 4xx",
+   "final-code/changes.patch:692-717 \u2014 isAllowedDashboardOrigin: `if (isLoopbackHostname(originHostname)) return true;`",
+   "final-code/changes.patch:808-813 \u2014 /browser gated only by isAllowedDashboardOrigin",
+   "instruction.md:19-21 \u2014 'A request whose origin is not an address the deployment is configured to serve ... must be refused'",
+   "instruction.md:32-33 \u2014 preservation bullet for a local front end on a different local port (ambiguity source)",
+   "tests/functional/sidecar_trusted_connections.test.ts:15-20 \u2014 the only test of the cross-port bullet is on the sidecar",
+   "solution/fix.patch:209-227,260-273 \u2014 reference allows the exact publicUrl origin plus loopback origins on the same port and scheme only",
+   "transcript.md:474-481 \u2014 the model's summary says it chose to accept 'local front ends on other local ports'",
+   "run.json timing \u2014 grading window 23:35:00-23:39:38, no agent tool calls inside it"
+  ],
+  "recommended_action": "Accept the 0.875 as a fair measure (model-failed on origin strictness for loopback). Optionally, tighten the instruction so the cross-port preservation bullet names the desktop app sidecar explicitly. That would remove the residual ambiguity that led this model to exempt all loopback ports on the dashboard."
+ }
+}

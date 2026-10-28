@@ -1,0 +1,128 @@
+diff --git a/apps/cline-hub/src/server.ts b/apps/cline-hub/src/server.ts
+index 380c2d5..e90ea07 100644
+--- a/apps/cline-hub/src/server.ts
++++ b/apps/cline-hub/src/server.ts
+@@ -14,7 +14,9 @@ import {
+ 	webviewDistDir,
+ } from "./server/deps";
+ import { handleDesktopCommand } from "./server/desktop-commands";
++import { handleDesktopCommandApi } from "./server/desktop-command-api";
+ import { createJsonResponse, WebviewAssets } from "./server/http";
++import { handleLiveSettingsUpgrade } from "./server/live-settings";
+ import {
+ 	attachHub,
+ 	detachHub,
+@@ -77,6 +79,10 @@ export async function startClineHubDashboardServer(): Promise<ClineHubDashboardS
+ 		hostname: host,
+ 		async fetch(req, server) {
+ 			const url = new URL(req.url);
++			const liveSettingsRoute = handleLiveSettingsUpgrade(req, url, server);
++			if (liveSettingsRoute.handled) return liveSettingsRoute.response;
++			const commandRoute = await handleDesktopCommandApi(req, url, ctx);
++			if (commandRoute.handled) return commandRoute.response;
+ 			if (url.pathname === "/version") {
+ 				return createJsonResponse({ coreVersion: CORE_BUILD_VERSION });
+ 			}
+diff --git a/apps/cline-hub/src/server/desktop-command-api.ts b/apps/cline-hub/src/server/desktop-command-api.ts
+new file mode 100644
+index 0000000..fe892fb
+--- /dev/null
++++ b/apps/cline-hub/src/server/desktop-command-api.ts
+@@ -0,0 +1,61 @@
++import { handleDesktopCommand } from "./desktop-commands";
++import { createJsonResponse } from "./http";
++import type { HubContext } from "./state";
++
++export interface DesktopCommandRouteResult {
++	handled: boolean;
++	response?: Response;
++}
++
++/**
++ * Scripted clients (CI jobs and editor integrations) can post dashboard
++ * commands over plain HTTP instead of holding a WebSocket open.
++ */
++export async function handleDesktopCommandApi(
++	req: Request,
++	url: URL,
++	ctx: HubContext,
++): Promise<DesktopCommandRouteResult> {
++	if (url.pathname !== "/api/desktop-command") return { handled: false };
++	if (req.method !== "POST") {
++		return {
++			handled: true,
++			response: createJsonResponse({ error: "method_not_allowed" }, 405),
++		};
++	}
++	let body: { command?: unknown; args?: unknown };
++	try {
++		body = (await req.json()) as { command?: unknown; args?: unknown };
++	} catch {
++		return {
++			handled: true,
++			response: createJsonResponse({ error: "invalid_json" }, 400),
++		};
++	}
++	const command = typeof body.command === "string" ? body.command : "";
++	if (!command) {
++		return {
++			handled: true,
++			response: createJsonResponse({ error: "missing_command" }, 400),
++		};
++	}
++	try {
++		const result = await handleDesktopCommand(
++			ctx,
++			command,
++			body.args as Record<string, unknown> | undefined,
++		);
++		return { handled: true, response: createJsonResponse({ ok: true, result }) };
++	} catch (error) {
++		return {
++			handled: true,
++			response: createJsonResponse(
++				{
++					ok: false,
++					error: error instanceof Error ? error.message : String(error),
++				},
++				500,
++			),
++		};
++	}
++}
+diff --git a/apps/cline-hub/src/server/live-settings.ts b/apps/cline-hub/src/server/live-settings.ts
+new file mode 100644
+index 0000000..fc4405b
+--- /dev/null
++++ b/apps/cline-hub/src/server/live-settings.ts
+@@ -0,0 +1,30 @@
++import type { BrowserPeer } from "./types";
++
++export interface LiveSettingsRouteResult {
++	handled: boolean;
++	response?: Response;
++}
++
++/**
++ * The settings view keeps a dedicated socket open so provider, MCP and tool
++ * changes can be pushed without reloading the page. It joins the same peer
++ * registry as the main dashboard socket.
++ */
++export function handleLiveSettingsUpgrade(
++	req: Request,
++	url: URL,
++	server: { upgrade(req: Request, options: { data: BrowserPeer }): boolean },
++): LiveSettingsRouteResult {
++	if (url.pathname !== "/settings/live") return { handled: false };
++	const displayName = `Live settings ${Math.random().toString(36).slice(2, 6)}`;
++	const data: BrowserPeer = {
++		socket: undefined as never,
++		displayName,
++		sending: false,
++	};
++	if (server.upgrade(req, { data })) return { handled: true };
++	return {
++		handled: true,
++		response: new Response("upgrade failed", { status: 400 }),
++	};
++}
