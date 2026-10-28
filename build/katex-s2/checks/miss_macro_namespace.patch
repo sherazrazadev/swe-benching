@@ -1,0 +1,91 @@
+diff --git a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+index d7782017..a8970d92 100644
+--- a/contrib/auto-render/auto-render.ts
++++ b/contrib/auto-render/auto-render.ts
+@@ -127,7 +127,8 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null);
+ 
+     Object.assign(optionsCopy, options);
+ 
+@@ -148,7 +149,7 @@ const renderMathInElement = function(elem: HTMLElement, options?: RenderMathInEl
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff --git a/src/Settings.ts b/src/Settings.ts
+index 1793cbf2..9b790bc6 100644
+--- a/src/Settings.ts
++++ b/src/Settings.ts
+@@ -334,7 +334,8 @@ function getDefaultValue<K extends keyof SettingsOptions>(
+     schema: SchemaEntry<K>,
+ ): Settings[K];
+ function getDefaultValue(schema: SchemaEntry<keyof SettingsOptions>): DefaultValue {
+-    if (schema.default !== undefined) {
++    if (Object.prototype.hasOwnProperty.call(schema, "default") &&
++        schema.default !== undefined) {
+         return schema.default;
+     }
+     const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+@@ -347,10 +348,13 @@ function applySetting<K extends keyof SettingsOptions>(
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const optionValue = Object.prototype.hasOwnProperty.call(options, prop)
++        ? options[prop] : undefined;
++    const processor = Object.prototype.hasOwnProperty.call(schema, "processor")
++        ? schema.processor : undefined;
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+@@ -397,7 +401,9 @@ export default class Settings {
+             const protocols = this.trust as TrustMap;
+             this.trust = (context) => {
+                 const protocol = (context as {protocol?: string}).protocol;
+-                return protocol != null && Boolean(protocols[protocol]);
++                return protocol != null &&
++                    Object.prototype.hasOwnProperty.call(protocols, protocol) &&
++                    Boolean(protocols[protocol]);
+             };
+         }
+     }
+@@ -479,7 +485,10 @@ export default class Settings {
+      * get added by this function (changing the specified object).
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
++        const own = (key: string) =>
++            Object.prototype.hasOwnProperty.call(context, key);
++        if ("url" in context && own("url") && context.url &&
++            (!own("protocol") || !context.protocol)) {
+             const protocol = protocolFromUrl(context.url);
+             if (protocol == null) {
+                 return false;
+diff --git a/src/functions/html.ts b/src/functions/html.ts
+index 69ccae00..79fd31b3 100644
+--- a/src/functions/html.ts
++++ b/src/functions/html.ts
+@@ -107,7 +107,8 @@ defineFunction({
+                 const name = value.slice(0, firstEquals).trim();
+                 const attrValue = value.slice(firstEquals + 1);
+                 attributes[name] = attrValue;
+-                presentational = SAFE_ATTRIBUTES[name];
++                presentational = Object.prototype.hasOwnProperty.call(
++                    SAFE_ATTRIBUTES, name) && SAFE_ATTRIBUTES[name];
+                 trustContext = {
+                     command: "\\htmlAttr",
+                     name,
