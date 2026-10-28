@@ -67,10 +67,15 @@ def pack(kind, slug, out, model=None, run=None):
     keys = [os.environ[k].encode() for k in ("DEEPSEEK_API_KEY", "MIMO_API_KEY") if len(os.environ.get(k, "")) > 8]
     stage, jstage = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
     n = 0
-    for p in newer_files(ROOT, mark):
+    files = set(newer_files(ROOT, mark))
+    if kind == "build":   # the whole task, also files the builder copied with old dates (katex-s2: gate fingerprint went STALE)
+        for d in (ROOT / "tasks" / slug, ROOT / "build" / slug):
+            files |= {p for p in d.rglob("*") if p.is_file() and not ({".git", "node_modules", "__pycache__"} & set(p.parts))
+                      and p.stat().st_size <= MAX_FILE} if d.is_dir() else set()
+    for p in files:
         dst = stage / "repo" / p.relative_to(ROOT)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, dst)
+        shutil.copy2(p, dst)   # follows symlinks: the content, as the gate read it
         n += 1
     jobs_root, prefix = (TB / "gate-jobs", f"{slug}-") if kind == "build" else (TB / "jobs", f"{slug}-{model}-r{run}-")
     m = 0
