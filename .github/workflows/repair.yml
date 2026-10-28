@@ -7,13 +7,15 @@ name: repair
 #   harden  a task the models solved or nearly solved: the upgrade step (pipelines/sibling/upgrade/run_upgrade.sh,
 #           DeepSeek: one general property in the instruction, >=1 how-type lever, coverage tests) and its own gate,
 #           then fresh trials of both models as a new task version (old runs kept in build/<slug>/pre-harden/).
+#   stack   round 2 on a near-miss (one model already fails it): pipelines/sibling/upgrade/run_trapstack.sh adds 2-3 real
+#           traps of the other model's kind (common/builder/BRIEF-trap-stack.md), full re-gate, then fresh trials.
 # Then collect (branch runs/<this run>) and verdict.yml again, which records ACCEPTED / REJECTED or comes back here.
 on:
   workflow_dispatch:
     inputs:
       slug: { description: "task slug", required: true }
       run: { description: "run id whose branch runs/<id> holds the task, its trials, fairness and audits", required: true }
-      mode: { description: "repair or rerun", type: choice, options: [repair, rerun, harden], default: repair }
+      mode: { description: "repair or rerun", type: choice, options: [repair, rerun, harden, stack], default: repair }
       models: { description: "trial models", default: "deepseek,mimo" }
       first_run: { description: "number of the first new run (rerun: after the existing ones)", default: "1" }
       runs: { description: "runs per model", default: "3" }
@@ -62,16 +64,17 @@ jobs:
           echo "$SLUG re-gate after the repair: $m" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$m" = .unsound ] && echo "re-gate after the repair: unsound" > /tmp/why
           [ "$m" = .sound ] || [ "$m" = .unsound ] || { echo "::error::re-gate did not finish ($m): infrastructure, not the task. Dispatch repair.yml again."; exit 1; }
-      - name: Harden (upgrade) and gate
-        if: inputs.mode == 'harden'
+      - name: Harden (upgrade) or stack traps, and gate
+        if: inputs.mode == 'harden' || inputs.mode == 'stack'
         timeout-minutes: 340
         run: |
           B=build/$SLUG
-          export UPGRADE_TIMEOUT=10800
-          rc=0; bash common/launch/drive.sh deepseek bash pipelines/sibling/upgrade/run_upgrade.sh "$SLUG" || rc=$?
-          echo "$SLUG harden: exit $rc, $(cat "$B/upgrade_status.txt" 2>/dev/null)" | tee -a "$GITHUB_STEP_SUMMARY"
+          export UPGRADE_TIMEOUT=10800 TRAPSTACK_TIMEOUT=10800
+          if [ "${{ inputs.mode }}" = stack ]; then sc=run_trapstack.sh; sf=trapstack_status.txt; else sc=run_upgrade.sh; sf=upgrade_status.txt; fi
+          rc=0; bash common/launch/drive.sh deepseek bash pipelines/sibling/upgrade/$sc "$SLUG" || rc=$?
+          echo "$SLUG ${{ inputs.mode }}: exit $rc, $(cat "$B/$sf" 2>/dev/null)" | tee -a "$GITHUB_STEP_SUMMARY"
           # 0 upgraded + sound; 4 upgraded but its gate failed (the task is rejected); 1/3: not done or no change, task restored
-          [ $rc = 4 ] && { echo "re-gate after the hardening: unsound" > /tmp/why; exit 0; }
+          [ $rc = 4 ] && { echo "re-gate after the ${{ inputs.mode }}: unsound" > /tmp/why; exit 0; }
           [ $rc = 0 ] || { echo "::error::upgrade did not finish or changed nothing (exit $rc); task restored. Dispatch again."; exit 1; }
           # a new task version: the old trials, fairness, audits and repair round judged the old one
           mkdir -p "$B/pre-harden"

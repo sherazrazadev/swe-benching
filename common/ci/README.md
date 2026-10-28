@@ -25,11 +25,12 @@ accepted tasks, `batch-NN.md`, `tasks.tsv`). Leave `slugs` empty to take the nex
 | Result | When | What happens |
 |---|---|---|
 | ACCEPTED | fairness READY and every failing run audited, none finding a test or instruction fault | recorded |
-| REJECTED | a model solved it; or still unfair after one repair; or the repaired task is unsound | recorded |
+| REJECTED | a model solved it; or still unfair after two repairs; or the repaired task is unsound | recorded |
 | REPAIR | fairness NOT_READY or an audit found a fault | `repair` workflow: fairfix (reads `FAIRNESS.md` + `AUDIT-FINDINGS.md`), full re-gate, 3 fresh runs per model, then `verdict` again |
 | RERUN | a model has fewer than 3 trustworthy failing runs (e.g. provider refusal) | `repair` workflow, mode rerun: extra runs of that model (up to 6 in all), then `verdict` again |
 | pending | an audit or the fairness review is missing | nothing; run the audits, then dispatch `verdict` again |
 | (harden) | dispatched by hand for a solved or nearly solved task | `repair` workflow, mode harden: upgrade step (one general property, a how-type lever, coverage), its gate, 3 fresh runs per model, then `verdict` |
+| (stack) | dispatched by hand for a near-miss one model already fails 3/3 | `repair` workflow, mode stack: `pipelines/sibling/upgrade/run_trapstack.sh` adds 2-3 real traps of the other model's kind (common/builder/BRIEF-trap-stack.md; reads build/<slug>/ROUND1-MISSES.md), full re-gate, 3 fresh runs per model, then `verdict` |
 
 An open "human review" question in the fairness review does not stop a task: the audits of the actual runs answer it.
 The audits need Claude Opus: secret `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. Without one, run them locally

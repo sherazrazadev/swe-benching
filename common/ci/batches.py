@@ -52,7 +52,7 @@ COLS = ["slug", "batch", "run", "utc", "status", "gate", "deepseek", "mimo", "cw
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 MODELS = ("deepseek", "mimo")
 MAX_RUNS = 6          # runs per model before a task that cannot get 3 trustworthy failing runs is rejected
-MAX_REPAIRS = 1       # repair rounds before a task that is still unfair is rejected
+MAX_REPAIRS = 2       # repair rounds before a task that is still unfair is rejected (2 since 2026-10-28)
 MARKERS = {".sound": "sound", ".unsound": "unsound", ".gate_error": "gate error", ".listing_fail": "listing fail"}
 
 
