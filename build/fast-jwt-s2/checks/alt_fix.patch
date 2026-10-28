@@ -1,0 +1,162 @@
+diff --git a/src/certchain.js b/src/certchain.js
+index c71a36d..a5b6af0 100644
+--- a/src/certchain.js
++++ b/src/certchain.js
+@@ -2,7 +2,6 @@
+ 
+ const { createPublicKey } = require('node:crypto')
+ 
+-const { hsAlgorithms } = require('./crypto')
+ const { TokenError } = require('./error')
+ 
+ // A certificate chain is a list of PEM-encoded X.509 certificates. The leaf
+@@ -29,13 +28,13 @@ function createCertificateChainVerifier(createVerifier, options) {
+       importable = false
+     }
+ 
+-    if (importable || rest.algorithms) {
+-      return createVerifier(base)
++    if (!importable) {
++      // A value that is not an importable certificate must never be downgraded to a
++      // shared secret: the certificate text is public, so anyone could forge with it.
++      throw new TokenError(TokenError.codes.invalidKey, 'The configured certificate could not be imported.')
+     }
+ 
+-    // A deployment that has not finished migrating may keep a shared secret in
+-    // the same configuration field, so keep honouring it for HMAC tokens.
+-    return createVerifier({ ...base, algorithms: hsAlgorithms })
++    return createVerifier(base)
+   })
+ 
+   return function verifyWithCertificateChain(token, callback) {
+diff --git a/src/crypto.js b/src/crypto.js
+index 0ab7adc..2b7d515 100644
+--- a/src/crypto.js
++++ b/src/crypto.js
+@@ -71,8 +71,15 @@ function cacheSet(cache, key, value, error) {
+   return value || error
+ }
+ 
++function normalizeKeyMaterial(key) {
++  const trimmed = key.trim()
++  const begin = trimmed.indexOf('-----BEGIN')
++
++  return begin > 0 ? trimmed.slice(begin) : trimmed
++}
++
+ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+-  const trimmedKey = key.trim()
++  const trimmedKey = normalizeKeyMaterial(key)
+ 
+   if (hsAlgorithms.includes(providedAlgorithm)) {
+     // the key string might look like a public/private key, but it should be used as a raw string
+@@ -86,6 +93,9 @@ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+   const pemData = trimmedKey.match(privateKeyPemMatcher)
+ 
+   if (!pemData) {
++    if (trimmedKey.startsWith('-----BEGIN')) {
++      throw new TokenError(TokenError.codes.invalidKey, 'Unsupported PEM private key.')
++    }
+     return 'HS256'
+   }
+ 
+@@ -131,7 +141,7 @@ function performDetectPrivateKeyAlgorithm(key, providedAlgorithm) {
+ }
+ 
+ function performDetectPublicKeyAlgorithms(key) {
+-  const trimmedKey = key.trim()
++  const trimmedKey = normalizeKeyMaterial(key)
+   const publicKeyPemMatch = trimmedKey.match(publicKeyPemMatcher)
+ 
+   if (trimmedKey.match(privateKeyPemMatcher)) {
+@@ -140,6 +150,9 @@ function performDetectPublicKeyAlgorithms(key) {
+     // pkcs1 format - Can only be RSA key
+     return rsaAlgorithms
+   } else if (!publicKeyPemMatch && !trimmedKey.includes(publicKeyX509CertMatcher)) {
++    if (trimmedKey.startsWith('-----BEGIN')) {
++      throw new TokenError(TokenError.codes.invalidKey, 'Unsupported PEM public key.')
++    }
+     // Not a PEM, assume a plain secret
+     return hsAlgorithms
+   }
+@@ -183,8 +196,12 @@ function detectPrivateKeyAlgorithm(key, providedAlgorithm) {
+     throw new TokenError(TokenError.codes.invalidKey, 'The private key must be a string or a buffer.')
+   }
+ 
++  // The caller's explicit HS* choice is an option of this operation, not a property of
++  // the key, so keep the verdicts it produces apart from the detected ones.
++  const cacheKey = hsAlgorithms.includes(providedAlgorithm) ? `hs\u0000${key}` : key
++
+   // Check cache first
+-  const [cached, error] = privateKeysCache.get(key) || []
++  const [cached, error] = privateKeysCache.get(cacheKey) || []
+ 
+   if (cached) {
+     return cached
+@@ -197,13 +214,13 @@ function detectPrivateKeyAlgorithm(key, providedAlgorithm) {
+     const detectedAlgorithm = performDetectPrivateKeyAlgorithm(key, providedAlgorithm)
+ 
+     if (detectedAlgorithm === 'ENCRYPTED') {
+-      return cacheSet(privateKeysCache, key, providedAlgorithm)
++      return cacheSet(privateKeysCache, cacheKey, providedAlgorithm)
+     }
+-    return cacheSet(privateKeysCache, key, detectedAlgorithm)
++    return cacheSet(privateKeysCache, cacheKey, detectedAlgorithm)
+   } catch (e) {
+     throw cacheSet(
+       privateKeysCache,
+-      key,
++      cacheKey,
+       null,
+       TokenError.wrap(e, TokenError.codes.invalidKey, 'Unsupported PEM private key.')
+     )
+diff --git a/src/keyring.js b/src/keyring.js
+index a388fa1..c69783d 100644
+--- a/src/keyring.js
++++ b/src/keyring.js
+@@ -1,21 +1,10 @@
+ 'use strict'
+ 
+-const { hsAlgorithms } = require('./crypto')
+ const { TokenError } = require('./error')
+ 
+-const pemBlockMatcher = /^-----BEGIN [A-Z0-9 ]+-----/
+-
+ // A key ring holds more than one verification key so tokens signed with a key
+ // that is being rotated out are still accepted. An entry is either the PEM
+ // block of a public key or certificate, or the value of a shared secret.
+-function isPemEntry(value) {
+-  if (typeof value !== 'string') {
+-    return false
+-  }
+-
+-  return pemBlockMatcher.test(value.trim())
+-}
+-
+ function createKeyRingVerifier(createVerifier, options) {
+   const { keyRing, ...rest } = options
+ 
+@@ -27,14 +16,9 @@ function createKeyRingVerifier(createVerifier, options) {
+       )
+     }
+ 
+-    const base = { ...rest, key: entry }
+-
+-    if (isPemEntry(entry) || rest.algorithms) {
+-      return createVerifier(base)
+-    }
+-
+-    // A value that is not a PEM block is a shared secret, so only the HMAC algorithms apply.
+-    return createVerifier({ ...base, algorithms: hsAlgorithms })
++    // Whether an entry is a shared secret or an asymmetric key is decided by the
++    // key detection shared with the single-key verifier, never by the entry's spelling.
++    return createVerifier({ ...rest, key: entry })
+   })
+ 
+   return function verifyWithKeyRing(token, callback) {
+@@ -60,4 +44,4 @@ function createKeyRingVerifier(createVerifier, options) {
+   }
+ }
+ 
+-module.exports = { createKeyRingVerifier, isPemEntry }
++module.exports = { createKeyRingVerifier }
