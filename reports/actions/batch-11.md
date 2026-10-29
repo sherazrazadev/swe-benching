@@ -9,4 +9,4 @@ Started 2026-10-28T14:57Z. [run 40711090816](https://github.com/sherazrazadev/sw
 | `nginxui-origin-inj` | sound | 1 | 1 | **REJECTED** |
 | `praisonai-authn-inj` | sound | 0 1 0 | 0 1 0 | **REJECTED** |
 | `tilt-s2` | sound | 1 | 1 | **REJECTED** |
-| `wakaru-mm` | sound | 0.6667 0.6667 0.6667 | 0 0.6667 1 | **REJECTED** |
+| `wakaru-mm` | sound | 1 | 1 | **REJECTED** |
