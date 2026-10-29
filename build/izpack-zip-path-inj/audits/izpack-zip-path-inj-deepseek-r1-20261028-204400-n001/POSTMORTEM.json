@@ -1,0 +1,95 @@
+{
+ "trial": "izpack-zip-path-inj__mjMoVeZ",
+ "task": "izpack-zip-path-inj",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-28T21:01:50+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T00:57:12+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "test-fault",
+  "confidence": "high",
+  "summary": "The model did fail the task. It never guarded the uninstaller output/log locations (UninstallDataWriter) or the configuration-step file locations (ConfigFileTask/SingleXmlFileMergeTask), and those 6 security failures are its own misses. The reported number (0.4667 = 7/15) is still wrong, though. Two security tests show 'error', not 'fail': LooseRelocationSecurityTest and OverrideRenameSecurityTest. Both build their malicious metadata through the public PackInfo.addFile/PackFile constructor, passing a traversing installTarget or overrideRenameTo. The model hardened that constructor to refuse '..' in installTarget and overrideRenameTo as well as in targetPath, which the instruction supports ('however the value is carried'; 'a traversing target must be refused' at the public file-entry interface). So the test throws InvalidTargetPathException during setup, before the installer runs. The model also added install-time guards for both routes: validateTargetPath checks overrideRenameTo and installTarget, handleOverrideRename checks the mapped name, and LooseFileUnpacker checks installTarget. Those guards would have blocked both attacks if the tests had injected the values the way InstallerFixture.target() injects targetPath. A fair grader would give 9/15 = 0.6. The pass/fail direction (not solved) can be trusted; the reported number cannot.",
+  "items": [
+   {
+    "test": "com.izforge.izpack.installer.bench.security.LooseRelocationSecurityTest::relocatedEntryDoesNotEscapeInstallDirectory",
+    "outcome": "fail",
+    "model_behaviour": "Graded 'error'. The PackFile constructor (changes.patch:81-87) refuses installTarget '../escape/loose.txt', so the test's own setup call pack.addFile(..., additionals, ...) throws before fixture.unpacker().run(). The model also guards this route at install time: UnpackerBase.validateTargetPath checks additionals installTarget (changes.patch:393-402), and LooseFileUnpacker checks it again (changes.patch:507-510).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.OverrideRenameSecurityTest::existingFileOutsideInstallDirectoryIsNotTouched",
+    "outcome": "fail",
+    "model_behaviour": "Graded 'error'. The PackFile constructor refuses overrideRenameTo '../escape/' (changes.patch:76-80), so pack.addFile(...) throws during test setup. At install time, validateTargetPath refuses a traversing overrideRenameTo (changes.patch:386-391), and handleOverrideRename refuses a traversing mapped name before any delete or rename (changes.patch:433-437). Neither path is reached because the setup throws first. The oracle validates only targetPath in the constructor, so the test passes under the oracle only by accident of that design choice.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.UninstallerOutputSecurityTest::uninstallerDirectoryDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "UninstallDataWriter is not modified. The model read it (transcript.md:190) and grepped getUninstallerPath (transcript.md:114, 277) but added no check, so the translated uninstaller path '${INSTALL_PATH}/../escape' is mkdirs'd and written to.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.UninstallerOutputSecurityTest::uninstallerFileNameDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "No check on the uninstaller name ('../../escape/evil.jar') joined to the uninstaller directory; UninstallDataWriter is unchanged.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.InstallLogSecurityTest::logFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "The install-log location in UninstallDataWriter is not validated after translation, so a log path containing '..' is written outside the install directory.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.InstallLogSecurityTest::derivedLogFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "The 'default' log path derived from a traversing uninstaller path is not validated; UninstallDataWriter is unchanged.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::configurationFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "ConfigFileTask/SingleOptionFileTask in izpack-util are not modified, so a toFile containing '..' gets its parent directories created and the file written. The instruction's invariant covers every metadata location 'whichever installation step would use it'. This is a far-site trap, but it is a fair one.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::patchFileOutsideIsNotDeleted",
+    "outcome": "fail",
+    "model_behaviour": "No validation of oldFile in ConfigFileTask, so with cleanup=true a patch file reached via '..' is removed or changed. The instruction explicitly lists 'delete'.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows no reads of hidden test paths (no '/tests/' or 'bench/security' access) and no network fetch of the upstream fix or advisory. The 'github' hits are only the repo's own .github directory and a local ~/.m2 path. No netguard.log is present. run.json shows no agent tool calls during the grading window (tool_calls_during_grading: []).",
+  "evidence": [
+   "grading/results.json:9 LooseRelocationSecurityTest -> \"error\"; :11 OverrideRenameSecurityTest -> \"error\" (score.py:37-38: <error> means an exception, not an assertion failure)",
+   "tests/security/.../LooseRelocationSecurityTest.java:33-36 builds the attack via pack.addFile(..., additionals{installTarget:'../escape/loose.txt'}, ...) instead of injecting it post-construction",
+   "tests/security/.../OverrideRenameSecurityTest.java:34-35 builds the attack via pack.addFile(..., overrideRenameTo='../escape/', ...)",
+   "tests/support/.../InstallerFixture.java:118-124 injects targetPath by reflection for the target tests, but no equivalent exists for installTarget or overrideRenameTo",
+   "final-code/changes.patch:71-87 PackFile constructor refuses '..' in target, overrideRenameTo and installTarget",
+   "final-code/changes.patch:378-403 install-time validateTargetPath covers the translated target, overrideRenameTo and installTarget; :433-437 handleOverrideRename check; :507-510 LooseFileUnpacker check",
+   "instruction.md:25-32 'however the value is carried'; 'a traversing target must be refused there too' (public file-entry interface)",
+   "solution/fix.patch:27 the oracle validates only targetPath in the PackFile constructor, so these two tests pass only under that narrower API design",
+   "solution/fix.patch:104-115, 1499-1552 the oracle guards UninstallDataWriter and the ConfigFileTask/SingleXmlFileMergeTask locations; changes.patch touches neither",
+   "transcript.md:190 the model read UninstallDataWriter.java but did not patch it",
+   "Reward arithmetic: 7/15 = 0.4667 reported; with the two setup errors credited, 9/15 = 0.6"
+  ],
+  "recommended_action": "Rescore this trial as 0.6 (9/15 security, 23/23 functional) and record it as model-failed for the 6 genuine misses (uninstaller output, install log, config tasks). Fix LooseRelocationSecurityTest and OverrideRenameSecurityTest so they build the PackFile with benign values and then inject installTarget/overrideRenameTo by reflection (as InstallerFixture.target() does for targetPath), or treat a refusal at addFile as a pass. As written, they penalise fixes that harden the public file-entry API more broadly than the oracle. Re-check other trials of this task whose fixes validate those fields in the PackFile constructor."
+ }
+}

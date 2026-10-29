@@ -1,0 +1,78 @@
+{
+ "trial": "izpack-zip-path-inj__MsDe8N6",
+ "task": "izpack-zip-path-inj",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-29T00:22:06+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T00:57:12+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.6 = 9/15 security tests passed, all 31 functional tests passed (score.py:59-64). The model hardened pack-file targets (raw and after variable substitution), override-rename, loose installTarget, multi-volume, parsables, executables and the PackFile/PackInfo creation API, and all of those security tests pass. The 6 failing tests cover other carriers that the model never touched: the uninstaller output dir/file name and install-log location written by UninstallDataWriter (Info.uninstallerPath/uninstallerName, InstallerFrame.logfilePath variable), and the configuration-file task's toFile/oldFile (ConfigFileTask). The instruction puts these in scope: 'No location value ... taken from an installer's packaged metadata may be used to create, write, move, rename, rewrite or delete anything ... however the value is carried, whichever installation step would use it', and also says 'Fix the problem and its close variants'. The transcript shows the model grepped for uninstallerPath (transcript.md:100-102), then moved on without guarding it. The reference fix guards exactly these sites (fix.patch:89-140 UninstallDataWriter, 1484-1519 ConfigFileTask), so a fix that is correct and complete passes them. No contamination and no infra problems were found. Confidence is medium, not high, because grading stdout is empty, and because the ConfigTask tests drive SingleOptionFileTask directly with File objects, which is one step removed from 'packaged metadata'. Even so, both reasonably fall under the stated invariant.",
+  "items": [
+   {
+    "test": "com.izforge.izpack.installer.bench.security.UninstallerOutputSecurityTest::uninstallerDirectoryDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "No change to UninstallDataWriter. Info.uninstallerPath '${INSTALL_PATH}/../escape' is translated, then mkdirs/written unchecked. The model saw getUninstallerPath usages (transcript.md:100-102) but did not guard them.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.UninstallerOutputSecurityTest::uninstallerFileNameDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "Info.uninstallerName '../../escape/evil.jar' is not validated, so the jar is written outside the install dir.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.InstallLogSecurityTest::logFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "The install-log path from variable InstallerFrame.logfilePath ('${INSTALL_PATH}/../escape/install.log') is not checked in UninstallDataWriter. The model's patch has no log-path handling.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.InstallLogSecurityTest::derivedLogFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "The 'default' log location is derived from the traversing uninstallerPath. It is unguarded, the same root cause as above.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::configurationFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "ConfigFileTask/SingleOptionFileTask is untouched, so a toFile with '..' is created outside the install dir. The instruction covers 'write ... rewrite' via any installation step. The test calls the task directly rather than through the installer listener, which adds a small amount of ambiguity.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::patchFileOutsideIsNotDeleted",
+    "outcome": "fail",
+    "model_behaviour": "A traversing oldFile with cleanup=true deletes or changes a file outside the install dir. ConfigFileTask was not hardened. The instruction explicitly lists 'delete'.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows only local workspace exploration and offline mvn builds (transcript.md:109-112, 189). There is no access to hidden tests and no internet fetch of the upstream fix. No netguard.log is present.",
+  "evidence": [
+   "evidence/grading/results.json:3-17 \u2014 6 security fails, all in ConfigTask/InstallLog/UninstallerOutput; all functional tests pass",
+   "evidence/tests/score.py:59-64 \u2014 reward = sec_ok/len(sec) when all functional tests pass (9/15 = 0.6)",
+   "evidence/instruction.md:25-29 \u2014 'however the value is carried, whichever installation step would use it' and 'create, write, move, rename, rewrite or delete'",
+   "evidence/instruction.md:44 \u2014 'Fix the problem and its close variants'",
+   "evidence/final-code/changes.patch \u2014 touches FileUtil, PackFile, PackInfo, UnpackerBase, MultiVolumeUnpacker, LooseFileUnpacker, ScriptParser only; no UninstallDataWriter or ConfigFileTask",
+   "evidence/transcript.md:100-102 \u2014 model grepped uninstallerPath usages, then did not act on them",
+   "evidence/solution/fix.patch:89-140 \u2014 reference validates logfile, uninstaller dir, name and jar path in UninstallDataWriter",
+   "evidence/solution/fix.patch:1484-1519 \u2014 reference validates toFile/oldFile/newFile in ConfigFileTask.checkAttributes",
+   "evidence/run.json:12-20 \u2014 no tool calls during the grading window; exception_info null",
+   "evidence/grading/test-stdout.tail.txt \u2014 empty (minor: no raw log to confirm failure messages)"
+  ],
+  "recommended_action": "Accept the 0.6 reward as a genuine partial solve: the model covered the unpacker paths but missed the uninstaller/log writer and config-task carriers. Optionally keep the grading stdout tail so future audits can confirm failure causes."
+ }
+}
