@@ -1,0 +1,33 @@
+# Post-run audit: plugins-s4__htfJz72
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.0.
+
+**Trustworthy:** False  **Attribution:** unclear  **Confidence:** medium
+
+The graded workspace is the unmodified vulnerable tree. HARVEST.json says files_changed=0, and changes.patch and changed_files.tsv are empty. All 7 security tests fail and all 15 functional and project tests pass, which matches the task's own nop baseline exactly (build-notes: 'nop: security 0/7 ... functional 15/15'). For the code that was graded, reward 0.0 is the correct number. The tests look fair: the oracle scores 7/7 and 10/10, several alternative correct patches (pass_alt, pass_pod_only, blind) score 1.0, detection is checked by comparing a bad request with a benign twin, and the catalogue naming is derivable from the instruction ('the container list's own key in place of the regular list's key'). There is no contamination. What I cannot establish from this folder is WHY the agent produced nothing. transcript.md is only about 35 tool calls of exploration (reading fields.go, extract.go and the rules, grepping for ephemeral and init references). It ends right after a tool result, mid-investigation ('Let me search for any Kubernetes API type definitions...'), with no final message and no edit attempt. agent_end is 18:41:04, about 76 minutes into a 7200 s budget, so it did not time out. exception_info is null. That pattern fits the model quietly ending its turn (model-failed), but it fits equally well a provider error, crash or context-limit abort inside the Claude Code process (harness-or-infra). The full transcript (agent/claude-code.txt) that would settle this could not be read: permission was denied in this audit session. Until its tail is checked, I can't safely blame the model for the 0.0.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| TestSecPrivilegedInitContainerReported | fail | genuine-fail | True | True |
+| TestSecPrivilegedEphemeralContainerReported | fail | genuine-fail | True | True |
+| TestSecRootUserInInitContainerReported | fail | genuine-fail | True | True |
+| TestSecPrivilegeEscalationInInitContainerReported | fail | genuine-fail | True | True |
+| TestSecFieldCatalogueCoversEveryContainerList | fail | genuine-fail | True | True |
+| TestSecInitContainerValuesExtracted | fail | genuine-fail | True | True |
+| TestSecEphemeralContainerValuesExtracted | fail | genuine-fail | True | True |
+
+**Lookup or leak:** None seen. The transcript shows only local repository exploration (find, grep, reading k8saudit sources and rules, go build/test of the existing package). There was no network access, no attempt to reach /tests or hidden test files, and no upstream lookup. No netguard.log is present. No tool calls fell inside the grading window (run.json timing.tool_calls_during_grading = []).
+
+**Evidence:**
+- evidence/final-code/HARVEST.json:7 "files_changed": 0; changes.patch and changed_files.tsv are empty
+- evidence/grading/results.json:2-10 all 7 TestSec* fail; :11-27 all 15 functional/project tests pass; reward 0.0
+- evidence/build-notes.md:165-166 nop gate: security 0/7, functional 15/15, identical to this trial
+- evidence/build-notes.md:150,157-160 oracle and alternative correct patches (pass_alt, pass_pod_only, blind) score 7/7 + 10/10, so the tests accept more than one layer
+- evidence/tests/support/zz_support_test.go:342-356 detection is checked by comparing bad and benign requests (no exact rule name or output required)
+- evidence/instruction.md:19-21 catalogue naming contract ('container list's own key in place of the regular list's key') supports the initContainers/ephemeralContainers field names
+- evidence/solution/fix.patch:437,455,463-465,479 the reference fix updates the privileged, root and escalation rules and adds an ephemeral-attachment rule, consistent with 'cover the whole shipped detection'
+- evidence/transcript.md:70-72 the transcript ends on a tool result mid-exploration, with no final agent message and no Edit/Write call
+- evidence/run.json:13-19 agent_end 18:41:04, about 76 minutes into the 7200 s timeout (task.toml:51); exception_info null; no tool calls during grading
+- evidence/grading/test-stdout.tail.txt is empty (no grader stdout to check for setup errors); the results file itself is complete
+
+**Recommended action:** Read the tail of /home/runner/.tb-graders/cwe/jobs/plugins-s4-mimo-r1-20261029-172514-n001/plugins-s4__htfJz72/agent/claude-code.txt (this auditor was denied permission). If it shows a normal model end_turn or result with no error, reclassify as model-failed, trustworthy=true, high confidence: the grader and tests are fair and the model submitted nothing. If it shows an API or provider error, refusal, context-limit abort or process crash, classify as harness-or-infra and rerun the trial. Either way, don't count this 0.0 as evidence that the task is unfair.
