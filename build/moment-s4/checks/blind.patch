@@ -1,0 +1,169 @@
+diff -ruN a/src/lib/locale/compat.js b/src/lib/locale/compat.js
+--- a/src/lib/locale/compat.js	2026-10-29 11:48:45.000000000 +0000
++++ b/src/lib/locale/compat.js	2026-10-29 12:01:10.318337865 +0000
+@@ -1,3 +1,5 @@
++import { isCanonicalLocaleIdentifier } from './module-name';
++
+ // Locale files that older releases published under a different spelling.
+ // Loading the module here keeps those spellings working for server-side
+ // callers without shipping every locale in the entry bundle.
+@@ -12,11 +14,16 @@
+ export function loadLegacyLocale(name) {
+     var fileName;
+ 
+-    if (typeof name !== 'string') {
++    // This loader owns a require of its own, so it repeats the same rule as the
++    // main loader: only a canonical bundled identifier may name a module.
++    if (!isCanonicalLocaleIdentifier(name)) {
+         return null;
+     }
+ 
+     fileName = legacyLocaleNames[name] || name;
++    if (!isCanonicalLocaleIdentifier(fileName)) {
++        return null;
++    }
+     if (loadedLegacyNames[fileName]) {
+         return fileName;
+     }
+diff -ruN a/src/lib/locale/legacy.js b/src/lib/locale/legacy.js
+--- a/src/lib/locale/legacy.js	2026-10-29 11:48:45.000000000 +0000
++++ b/src/lib/locale/legacy.js	2026-10-29 12:01:12.906807493 +0000
+@@ -1,10 +1,14 @@
++import { isCanonicalLocaleIdentifier } from './module-name';
++
+ // moment.lang()/moment.langData() predate the locale API. They load the
+ // locale file themselves because older projects called them before any
+ // locale had been registered.
+ var loadedLangNames = {};
+ 
+ export function loadLangLocale(name) {
+-    if (!name || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) {
++    // This loader keeps its own require, so it applies the same rule as the
++    // main one: only a canonical bundled identifier may name a module.
++    if (!isCanonicalLocaleIdentifier(name)) {
+         return undefined;
+     }
+ 
+diff -ruN a/src/lib/locale/locales.js b/src/lib/locale/locales.js
+--- a/src/lib/locale/locales.js	2026-10-29 11:48:45.000000000 +0000
++++ b/src/lib/locale/locales.js	2026-10-29 12:01:05.489646916 +0000
+@@ -7,6 +7,7 @@
+ 
+ import { baseConfig } from './base-config';
+ import { loadLegacyLocale } from './compat';
++import { isCanonicalLocaleIdentifier } from './module-name';
+ 
+ // internal storage for locale config files
+ var locales = {},
+@@ -25,7 +26,7 @@
+ }
+ 
+ function normalizeLocale(key) {
+-    return key ? key.toLowerCase().replace('_', '-') : key;
++    return typeof key === 'string' ? key.toLowerCase().replace('_', '-') : key;
+ }
+ 
+ // pick the locale from the array
+@@ -39,9 +40,17 @@
+         split;
+ 
+     while (i < names.length) {
++        // Only string identifiers name a locale; anything else selects nothing.
++        if (typeof names[i] !== 'string') {
++            i += 1;
++            continue;
++        }
+         split = normalizeLocale(names[i]).split('-');
+         j = split.length;
+-        next = normalizeLocale(names[i + 1]);
++        next =
++            typeof names[i + 1] === 'string'
++                ? normalizeLocale(names[i + 1])
++                : null;
+         next = next ? next.split('-') : null;
+         while (j > 0) {
+             locale = loadLocale(split.slice(0, j).join('-'));
+@@ -63,35 +72,41 @@
+     return globalLocale;
+ }
+ 
+-function isLocaleNameSane(name) {
+-    // Prevent names that look like filesystem paths, i.e contain '/' or '\'
+-    // Ensure name is available and function returns boolean
+-    return !!(name && name.match('^[^/\\\\]*$'));
+-}
+-
+ function loadLocale(name) {
+     var oldLocale = null,
+-        aliasedRequire;
++        aliasedRequire,
++        normalizedName;
++
++    // A locale registered under an exact name (custom locales included) is
++    // resolved from the in-memory registry, never from the filesystem.
++    if (typeof name === 'string' && locales[name] !== undefined) {
++        return locales[name];
++    }
++
++    // Only a canonical identifier of a bundled locale may name a module. A
++    // value of any other type or spelling selects nothing.
++    normalizedName = normalizeLocale(name);
++    if (!isCanonicalLocaleIdentifier(normalizedName)) {
++        return undefined;
++    }
++    if (locales[normalizedName] !== undefined) {
++        return locales[normalizedName];
++    }
++
+     // TODO: Find a better way to register and load all the locales in Node
+-    if (
+-        locales[name] === undefined &&
+-        typeof module !== 'undefined' &&
+-        module &&
+-        module.exports &&
+-        isLocaleNameSane(name)
+-    ) {
++    if (typeof module !== 'undefined' && module && module.exports) {
+         try {
+             oldLocale = globalLocale._abbr;
+             aliasedRequire = require;
+-            aliasedRequire('./locale/' + name);
++            aliasedRequire('./locale/' + normalizedName);
+             getSetGlobalLocale(oldLocale);
+         } catch (e) {
+             // mark as not found to avoid repeating expensive file require call causing high CPU
+             // when trying to find en-US, en_US, en-us for every format call
+-            locales[name] = null; // null means not found
++            locales[normalizedName] = null; // null means not found
+         }
+     }
+-    return locales[name];
++    return locales[normalizedName];
+ }
+ 
+ // This function will load locale and then set the global locale.  If
+@@ -234,6 +249,11 @@
+     }
+ 
+     if (!isArray(key)) {
++        // A value that is not a string identifier cannot name a locale; treat
++        // it exactly like an unknown name.
++        if (typeof key !== 'string') {
++            return globalLocale;
++        }
+         //short-circuit everything else
+         locale = loadLocale(key);
+         if (locale) {
+diff -ruN a/src/lib/locale/module-name.js b/src/lib/locale/module-name.js
+--- a/src/lib/locale/module-name.js	1970-01-01 00:00:00.000000000 +0000
++++ b/src/lib/locale/module-name.js	2026-10-29 12:00:52.428364595 +0000
+@@ -0,0 +1,9 @@
++// Locale identifiers are data, never module paths. The library may only ever
++// load one of the locale modules it ships, so the only strings allowed to reach
++// a locale require are canonical bundled identifiers: lower-case ASCII letters
++// and digits in single-hyphen-separated groups. Everything else is unknown.
++var canonicalLocaleIdentifier = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
++
++export function isCanonicalLocaleIdentifier(name) {
++    return typeof name === 'string' && canonicalLocaleIdentifier.test(name);
++}

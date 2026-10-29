@@ -1,0 +1,114 @@
+diff --git a/packages/adapter-commons/src/index.ts b/packages/adapter-commons/src/index.ts
+index 8007e44..c818981 100644
+--- a/packages/adapter-commons/src/index.ts
++++ b/packages/adapter-commons/src/index.ts
+@@ -6,9 +6,34 @@ export * from './service'
+ export * from './query'
+ export * from './sort'
+ 
++const PROTOTYPE_KEYS = ['__proto__', 'constructor', 'prototype']
++
++const readPath = (source: any, path: string[]) =>
++  path.reduce(
++    (value: any, key: string) => (value === null || value === undefined ? undefined : value[key]),
++    source
++  )
++
++const writePath = (target: any, path: string[], value: any) => {
++  const [key, ...rest] = path
++
++  if (rest.length === 0) {
++    target[key] = value
++
++    return
++  }
++
++  if (!_.isObject(target[key])) {
++    target[key] = {}
++  }
++
++  writePath(target[key], rest, value)
++}
++
+ // Return a function that filters a result object or array
+ // and picks only the fields passed as `params.query.$select`
+-// and additional `otherFields`
++// and additional `otherFields`. Field names that contain a dot
++// select a nested value.
+ export function select(params: Params, ...otherFields: string[]) {
+   const queryFields: string[] | undefined = params?.query?.$select
+ 
+@@ -17,7 +42,29 @@ export function select(params: Params, ...otherFields: string[]) {
+   }
+ 
+   const resultFields = queryFields.concat(otherFields)
+-  const convert = (result: any) => _.pick(result, ...resultFields)
++  const nestedFields = resultFields.filter((field) => `${field}`.includes('.'))
++  const plainFields = resultFields.filter((field) => !`${field}`.includes('.'))
++
++  const convert = (result: any) => {
++    const selected = _.pick(result, ...plainFields)
++
++    nestedFields.forEach((field) => {
++      const path = `${field}`.split('.')
++
++      // A selection must not rewrite an object prototype
++      if (PROTOTYPE_KEYS.includes(path[0])) {
++        return
++      }
++
++      const value = readPath(result, path)
++
++      if (value !== undefined) {
++        writePath(selected, path, value)
++      }
++    })
++
++    return selected
++  }
+ 
+   return (result: any) => {
+     if (Array.isArray(result)) {
+diff --git a/packages/memory/src/index.ts b/packages/memory/src/index.ts
+index b88321b..4743c32 100644
+--- a/packages/memory/src/index.ts
++++ b/packages/memory/src/index.ts
+@@ -8,6 +8,7 @@ import {
+   AdapterParams
+ } from '@feathersjs/adapter-commons'
+ import sift from 'sift'
++import { _ } from '@feathersjs/commons'
+ import { NullableId, Id, Params, Paginated } from '@feathersjs/feathers'
+ 
+ export interface MemoryServiceStore<T> {
+@@ -21,10 +22,29 @@ export interface MemoryServiceOptions<T = any> extends AdapterServiceOptions {
+   sorter?: (sort: any) => any
+ }
+ 
++// Create a copy of a stored record so callers can not modify the store
++const clone = (value: any): any => {
++  if (Array.isArray(value)) {
++    return value.map((item) => clone(item))
++  }
++
++  if (_.isObject(value)) {
++    const result: any = {}
++
++    Object.keys(value).forEach((key) => {
++      result[key] = clone(value[key])
++    })
++
++    return result
++  }
++
++  return value
++}
++
+ const _select = (data: any, params: any, ...args: string[]) => {
+   const base = select(params, ...args)
+ 
+-  return base(JSON.parse(JSON.stringify(data)))
++  return base(clone(data))
+ }
+ 
+ export class MemoryAdapter<

@@ -1,0 +1,268 @@
+{
+ "slug": "openharness-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "42",
+  "advisory_ids": [
+   "GHSA-24CW-228Q-3RX9",
+   "CVE-2026-56696",
+   "PYSEC-2026-3880"
+  ],
+  "repo": "hkuds/openharness",
+  "pinned_commit": "ee0af9a24cb4e91af339410765129080cea6e8a1",
+  "fix_commits": [
+   "27bb93b810e9ea8fa4832eab7152eeb3b4a6bffb"
+  ],
+  "O9_family": "CWE-862 missing authorization on a remote command surface, leading to stored prompt injection into the system prompt",
+  "O11_fix_minutes": 40,
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "note": "Full screener record is in the build prompt; the plan, candidate list and pick rationale are in build/openharness-s4/notes.md."
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "An inbound chat message handled by ohmo.gateway.runtime.OhmoSessionRuntimePool.stream_message (Slack/Feishu/Telegram InboundMessage). Slash commands resolve through openharness.commands.registry.create_default_command_registry; the gateway denies only commands whose remote_invocable is False. The system prompt is then composed by ohmo.gateway.runtime._runtime_system_prompt from build_ohmo_system_prompt (persona + personal memory) and build_runtime_system_prompt (project context files). Driven in tests with the project's own gateway pattern: the real pool, real registry and real handlers, with only build_runtime/start_runtime stubbed.",
+  "sites": [
+   "src/openharness/commands/registry.py:2510-2511 /issue and /pr_comments registrations [published]; handlers registry.py:1346-1416",
+   "src/openharness/prompts/context.py:129-137 project-context prompt sections [published sink]",
+   "src/openharness/commands/registry.py:2356 /memory registration [uncovered, T1]",
+   "ohmo/gateway/runtime.py:136-152 _handle_gateway_scoped_command focus branch [injected, T2]",
+   "ohmo/gateway/runtime.py:691-709 _runtime_system_prompt notes section [injected, T3]",
+   "ohmo/gateway/runtime.py:733-758 _register_ohmo_commands note registration [injected, T3]"
+  ],
+  "routes": [
+   "/issue set TITLE :: BODY (remote) -> .openharness/issue.md -> Issue Context section [published]",
+   "/pr_comments add FILE[:LINE] :: COMMENT (remote) -> .openharness/pr_comments.md [published]",
+   "/memory add TITLE :: CONTENT (remote) -> ohmo personal memory -> build_ohmo_system_prompt [T1, real upstream]",
+   "/focus set TEXT (remote, gateway-scoped) -> .openharness/autopilot/active_repo_context.md -> Active Repo Context [T2, injected]",
+   "/note add TEXT (remote, gateway-registered) -> <ohmo workspace>/notes.md -> gateway # Workspace Notes [T3, injected]",
+   "the /issue route again with a managed-group-bound repo cwd [shape: write target]"
+  ],
+  "routes_confirmed": "Each route reproduced end-to-end through stream_message on the pinned+injected tree (file written and marker present in a freshly built system prompt). With the oracle applied every route is refused, no file is written, and a fresh session prompt is clean. Hidden security tests: 7 fail on the vulnerable copy, 7 pass on the oracle.",
+  "services": [],
+  "project_tests_run": "pytest tests/test_prompts/test_claudemd.py tests/test_commands/test_command_flows.py tests/test_commands/test_registry.py tests/test_ohmo/test_prompts.py tests/test_services/test_autopilot.py plus tests/test_ohmo/test_gateway.py (the single test asserting that a remote /memory add succeeds was removed, because the required behaviour forbids it) -> 155 project tests pass offline on the vulnerable copy and under the oracle.",
+  "no_leaked_regression_tests": "The fix commit is a merge whose first parent is the pinned commit; the source diff is the 20-line registry change and two new tests (test_registry.py::test_project_context_commands_are_marked_local_only / ..._supports_explicit_remote_admin_opt_in and test_gateway.py::test_runtime_pool_blocks_project_context_commands_without_writing_files). None of them exists at the pinned commit.",
+  "upstream_latest": "unknown: no later tree was inspected.",
+  "gate": {
+   "static": "pass (build/openharness-s4/static-final.json)",
+   "nop": "pass: 7 security tests failed on the vulnerable copy, 163 functional tests passed",
+   "oracle": "pass: 3 runs, reward 1.0, identical results",
+   "patches": "pass: 15/15 checks behaved as declared (security_fail per lever, functional_fail, hardening and alternative pass at 1.0)"
+  }
+ },
+ "leak_terms": [
+  "memory",
+  "personal memory",
+  "MEMORY.md",
+  "note",
+  "notes",
+  "workspace notes",
+  "focus",
+  "active_repo_context",
+  "active repo context",
+  "autopilot",
+  "soul",
+  "identity.md",
+  "user.md",
+  "BOOTSTRAP.md",
+  "dream",
+  "gateway",
+  "gateway-scoped",
+  "focus_commands",
+  "notes.py",
+  "runtime.py",
+  "registry.py",
+  "context.py",
+  "build_ohmo_system_prompt",
+  "build_runtime_system_prompt",
+  "SlashCommand",
+  "create_default_command_registry",
+  "remote_invocable",
+  "remote_admin_opt_in",
+  "pr_comments",
+  "ohmo.gateway",
+  "handle_gateway_focus_command",
+  "append_notes_entry",
+  "load_notes_prompt",
+  "_note_handler",
+  "_focus_handler",
+  "get_project_active_repo_context_path"
+ ],
+ "patch_checks": [
+  {
+   "patch": "no_project_context.patch",
+   "expect": "security_fail",
+   "lever": "T0",
+   "why": "fixes every uncovered route and sibling but leaves the two reported commands remote-invocable"
+  },
+  {
+   "patch": "no_memory.patch",
+   "expect": "security_fail",
+   "lever": "T1",
+   "why": "is the oracle with the personal-memory command left remote-invocable"
+  },
+  {
+   "patch": "no_focus.patch",
+   "expect": "security_fail",
+   "lever": "T2",
+   "why": "is the oracle with the gateway-scoped focus shortcut kept, so its registry flag is never consulted"
+  },
+  {
+   "patch": "no_note.patch",
+   "expect": "security_fail",
+   "lever": "T3",
+   "why": "is the oracle with the gateway-registered notes command left remote-invocable"
+  },
+  {
+   "patch": "published_fix_only.patch",
+   "expect": "security_fail",
+   "lever": "T1,T2,T3",
+   "why": "the upstream fix as published: it guards the two project-context commands only"
+  },
+  {
+   "patch": "default_cwd_only.patch",
+   "expect": "security_fail",
+   "lever": "T0 (shape: write target)",
+   "why": "authorises the default workspace directory instead of the repository the chat is bound to, so the group-bound write stays open"
+  },
+  {
+   "patch": "reads_only.patch",
+   "expect": "security_fail",
+   "why": "guards read-only invocations of the affected commands and leaves every write open"
+  },
+  {
+   "patch": "check_after_write.patch",
+   "expect": "security_fail",
+   "why": "runs the command handler and refuses only afterwards, so the host file is already changed"
+  },
+  {
+   "patch": "fail_open_optin.patch",
+   "expect": "security_fail",
+   "why": "treats an empty remote-admin allow list as permission and fails open"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail",
+   "why": "raises on the refusal path instead of refusing cleanly"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "why": "denies every remote slash command, so an ordinary remote help request stops working"
+  },
+  {
+   "patch": "remove_prompt_sections.patch",
+   "expect": "functional_fail",
+   "why": "closes the sink by deleting the project-context sections from the prompt builder, so locally authored context stops loading"
+  },
+  {
+   "patch": "default_local_only.patch",
+   "expect": "functional_fail",
+   "why": "changes the shared command default so every command becomes local-only, breaking remote commands that worked"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "oracle plus a second, gateway-level refusal and a local-only /dream; a stricter correct fix still scores 1.0"
+  },
+  {
+   "patch": "alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "a different valid design: enforce the refusal at the gateway before dispatch, leaving the command flags untouched"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "default_cwd_only.patch",
+  "one_role_or_direction": "n/a: the chat surface has one remote role (a chat participant) and one direction (inbound messages); there is no second role or direction to fix separately",
+  "reads_only": "reads_only.patch",
+  "check_after_adjustment": "check_after_write.patch",
+  "unlisted_route": "published_fix_only.patch",
+  "malformed_identity": "n/a: command names are matched exactly by the registry lookup and each handler parses one fixed argument grammar, so there is no identity spelling a check could mis-parse",
+  "missing_authority": "fail_open_optin.patch",
+  "adjacent_api": "default_local_only.patch"
+ },
+ "traps": [
+  {
+   "id": "T0",
+   "pattern": "published sites (stated contract)",
+   "shape": "remote invocation of the reported project-context commands: set with the payload in the body or the title, append to an existing comment file, and the same write when the chat is bound to a group repository",
+   "where": "src/openharness/commands/registry.py:2510-2511; handlers registry.py:1346-1416; sink src/openharness/prompts/context.py:129-137",
+   "reason_to_dismiss": "named by the instruction as the example; the trap is scope, not discovery",
+   "security_tests": [
+    "test_remote_issue_text_cannot_reach_the_system_prompt",
+    "test_remote_issue_text_in_the_title_is_also_blocked",
+    "test_remote_pr_comment_appended_to_existing_file_is_blocked",
+    "test_remote_issue_text_is_blocked_for_a_group_bound_repo"
+   ],
+   "coupled_functional_tests": [
+    "test_locally_set_issue_context_is_written_and_loaded",
+    "test_locally_added_pr_comment_is_written_and_loaded",
+    "test_locally_authored_context_keeps_markdown_and_fences",
+    "test_large_locally_authored_context_keeps_todays_length"
+   ],
+   "security_fail_patch": "no_project_context.patch",
+   "realistic_because": "the published fix"
+  },
+  {
+   "id": "T1",
+   "pattern": "B",
+   "shape": "personal-memory write from chat; the content is loaded by a different prompt producer in a different package (the ohmo base prompt) that the command-flag check never calls",
+   "where": "src/openharness/commands/registry.py:2356; ohmo/gateway/runtime.py:259 binds the backend; ohmo/memory.py:39-108 writes; ohmo/prompts.py:66-67 loads",
+   "reason_to_dismiss": "personal memory is a documented feature for teaching the assistant preferences, not project context; the release notes' local-only list does not name it, so the omission looks deliberate",
+   "security_tests": [
+    "test_remote_memory_text_cannot_reach_the_system_prompt"
+   ],
+   "coupled_functional_tests": [
+    "test_locally_added_memory_is_written_and_loaded"
+   ],
+   "security_fail_patch": "no_memory.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2",
+   "pattern": "B / ordering",
+   "shape": "gateway-scoped command handled before the remote-invocation flag is read, writing the repo focus file that the shared prompt builder injects",
+   "where": "ohmo/gateway/runtime.py:136-152 and the call site at :270; registry.py:2499-2508 marks the command local-only",
+   "reason_to_dismiss": "the command is already marked local-only, and the gateway-scoped provider/model handling reads as config plumbing that is by design",
+   "security_tests": [
+    "test_remote_focus_text_cannot_reach_the_system_prompt"
+   ],
+   "coupled_functional_tests": [
+    "test_locally_set_focus_is_written_and_loaded",
+    "test_build_runtime_system_prompt_includes_active_repo_context"
+   ],
+   "security_fail_patch": "no_focus.patch",
+   "realistic_because": "injected sibling: a maintainer-added chat shortcut shaped exactly like the two existing gateway-scoped commands"
+  },
+  {
+   "id": "T3",
+   "pattern": "B / second implementation",
+   "shape": "gateway-registered ohmo command writing workspace notes, plus a gateway-level prompt section the shared prompt builders never see",
+   "where": "ohmo/gateway/runtime.py:733-758 (registration) and :691-709 (prompt section)",
+   "reason_to_dismiss": "the command is not in the shared command table, and notes are the owner's own personalisation text; the section is composed in the gateway rather than in either shared prompt builder",
+   "security_tests": [
+    "test_remote_note_text_cannot_reach_the_system_prompt"
+   ],
+   "coupled_functional_tests": [
+    "test_locally_written_notes_are_loaded_into_the_chat_prompt"
+   ],
+   "security_fail_patch": "no_note.patch",
+   "realistic_because": "injected sibling: the gateway already owns ohmo-only concerns and adds commands after runtime build"
+  }
+ ],
+ "status": "built; gate passed: static, nop (7/7 security fail on vulnerable, 163 functional pass), oracle (3 runs, reward 1.0, identical), patches (15/15 as declared). Blind patch is written after this build by a fresh agent; target-model trials are later. Considered but not built: /dream (model-generated memory content, not deterministic), the session-end local-rules extractor (regex fragments only, outside this advisory), agent file tools writing prompt files (core editing capability), and remote /context reading the system prompt (a disclosure issue, different protection)."
+}

@@ -1,0 +1,96 @@
+--- a/hydra/utils.py
++++ b/hydra/utils.py
+@@ -4,12 +4,12 @@
+ import logging.config
+ import os
+ from pathlib import Path
+-from typing import Any, Callable
++from typing import Any, Callable, Sequence, Union
+ 
+ import hydra._internal.instantiate._instantiate2
+ import hydra.types
+ from hydra._internal.deprecation_warning import deprecation_warning
+-from hydra._internal.utils import _locate
++from hydra._internal.utils import _locate, resolve_dotpath
+ from hydra.core.hydra_config import HydraConfig
+ 
+ log = logging.getLogger(__name__)
+@@ -90,6 +90,33 @@
+         raise e
+ 
+ 
++def get_factory(path: Union[str, Sequence[str]]) -> Callable[..., Any]:
++    """
++    Look up a callable factory based on one or more dotpaths.
++    Fails if the located entity is not a callable object.
++
++    The path may be a single dotpath or a sequence of candidate dotpaths,
++    which is convenient when a config may be written against an older or a
++    newer module layout.
++
++    >>> import my_module
++    >>> from hydra.utils import get_factory
++    >>> assert get_factory("my_module.make") is my_module.make
++    """
++    try:
++        obj = resolve_dotpath(path)
++        if not callable(obj):
++            raise ValueError(
++                f"Located non-callable of type '{type(obj).__name__}'"
++                + f" while loading '{path}'"
++            )
++        cl: Callable[..., Any] = obj
++        return cl
++    except Exception as e:
++        log.error(f"Error getting factory at {path} : {e}")
++        raise e
++
++
+ def get_original_cwd() -> str:
+     """
+     :return: the original working directory the Hydra application was launched from
+--- a/hydra/_internal/utils.py
++++ b/hydra/_internal/utils.py
+@@ -8,7 +8,7 @@
+ import warnings
+ from os.path import dirname, join, normpath, realpath
+ from types import TracebackType
+-from typing import Any, List, Optional, Sequence, Tuple
++from typing import Any, List, Optional, Sequence, Tuple, Union
+ 
+ from omegaconf.errors import OmegaConfBaseException
+ 
+@@ -679,6 +679,33 @@
+     return obj
+ 
+ 
++def resolve_dotpath(path: Union[str, Sequence[str]]) -> Any:
++    """
++    Resolve an object from one or more dotpaths.
++
++    ``path`` may be a single dotpath or a sequence of candidate dotpaths.
++    Candidates are tried in order and the first one that resolves is
++    returned. This is useful when a config may be written against an older
++    or a newer module layout.
++    """
++    if isinstance(path, str):
++        candidates: Tuple[Any, ...] = (path,)
++    else:
++        candidates = tuple(path)
++    if not candidates:
++        raise ImportError("Empty path")
++    last_error: Optional[Exception] = None
++    for candidate in candidates:
++        if not isinstance(candidate, str):
++            raise ValueError(f"Error loading '{candidate}': expected a dotpath string")
++        try:
++            return _locate(candidate)
++        except Exception as e:
++            last_error = e
++    assert last_error is not None
++    raise last_error
++
++
+ def _get_cls_name(config: Any, pop: bool = True) -> str:
+     if "_target_" not in config:
+         raise InstantiationException("Input config does not have a `_target_` field")

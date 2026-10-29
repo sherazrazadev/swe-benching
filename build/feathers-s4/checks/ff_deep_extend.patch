@@ -1,0 +1,152 @@
+diff --git a/packages/adapter-commons/src/index.ts b/packages/adapter-commons/src/index.ts
+index c818981..750d671 100644
+--- a/packages/adapter-commons/src/index.ts
++++ b/packages/adapter-commons/src/index.ts
+@@ -51,8 +51,8 @@ export function select(params: Params, ...otherFields: string[]) {
+     nestedFields.forEach((field) => {
+       const path = `${field}`.split('.')
+ 
+-      // A selection must not rewrite an object prototype
+-      if (PROTOTYPE_KEYS.includes(path[0])) {
++      // A selection must not rewrite an object prototype at any depth
++      if (path.some((segment) => PROTOTYPE_KEYS.includes(segment))) {
+         return
+       }
+ 
+diff --git a/packages/adapter-commons/src/query.ts b/packages/adapter-commons/src/query.ts
+index 1dc31ff..95d4375 100644
+--- a/packages/adapter-commons/src/query.ts
++++ b/packages/adapter-commons/src/query.ts
+@@ -7,12 +7,19 @@ const parse = (value: any) => (typeof value !== 'undefined' ? parseInt(value, 10
+ 
+ const isPlainObject = (value: any) => _.isObject(value) && value.constructor === {}.constructor
+ 
++const isPrototypeKey = (key: string) =>
++  key === '__proto__' || key === 'constructor' || key === 'prototype'
++
+ const validateQueryProperty = (query: any, operators: string[] = []): Query => {
+   if (!isPlainObject(query)) {
+     return query
+   }
+ 
+   for (const key of Object.keys(query)) {
++    if (isPrototypeKey(key)) {
++      continue
++    }
++
+     if (key.startsWith('$') && !operators.includes(key)) {
+       throw new BadRequest(`Invalid query parameter ${key}`, query)
+     }
+@@ -24,9 +31,17 @@ const validateQueryProperty = (query: any, operators: string[] = []): Query => {
+     }
+   }
+ 
+-  return {
++  const result: any = {
+     ...query
+   }
++
++  Object.keys(result).forEach((key) => {
++    if (isPrototypeKey(key)) {
++      delete result[key]
++    }
++  })
++
++  return result
+ }
+ 
+ const getFilters = (query: Query, settings: FilterQueryOptions) => {
+@@ -37,7 +52,7 @@ const getFilters = (query: Query, settings: FilterQueryOptions) => {
+       const queryValue = query[key]
+       const filter = settings.filters[key]
+ 
+-      if (filter) {
++      if (filter && !isPrototypeKey(key)) {
+         const value = typeof filter === 'function' ? filter(queryValue, settings) : queryValue
+ 
+         if (value !== undefined) {
+@@ -55,6 +70,10 @@ const getQuery = (query: Query, settings: FilterQueryOptions) => {
+   const keys = Object.keys(query).concat(Object.getOwnPropertySymbols(query) as any as string[])
+ 
+   return keys.reduce((result, key) => {
++    if (typeof key === 'string' && isPrototypeKey(key)) {
++      return result
++    }
++
+     if (typeof key === 'string' && key.startsWith('$')) {
+       if (settings.filters[key] === undefined) {
+         throw new BadRequest(`Invalid filter value ${key}`)
+@@ -98,7 +117,9 @@ export const FILTERS: FilterSettings = {
+ 
+     return Object.keys(sort).reduce(
+       (result, key) => {
+-        result[key] = typeof sort[key] === 'object' ? sort[key] : parse(sort[key])
++        if (!isPrototypeKey(key)) {
++          result[key] = typeof sort[key] === 'object' ? sort[key] : parse(sort[key])
++        }
+ 
+         return result
+       },
+diff --git a/packages/commons/src/index.ts b/packages/commons/src/index.ts
+index 9455252..8424c80 100644
+--- a/packages/commons/src/index.ts
++++ b/packages/commons/src/index.ts
+@@ -5,6 +5,10 @@ export function stripSlashes(name: string) {
+ 
+ export type KeyValueCallback<T> = (value: any, key: string) => T
+ 
++// Keys that name a prototype and must never be used as ordinary property names
++const isPrototypeKey = (key: string) =>
++  key === '__proto__' || key === 'constructor' || key === 'prototype'
++
+ // A set of lodash-y utility functions that use ES6
+ export const _ = {
+   each(obj: any, callback: KeyValueCallback<void>) {
+@@ -52,7 +56,11 @@ export const _ = {
+   },
+ 
+   extend(first: any, ...rest: any[]) {
+-    return Object.assign(first, ...rest)
++    rest.forEach((source) => {
++      _.merge(first, source)
++    })
++
++    return first
+   },
+ 
+   omit(obj: any, ...keys: string[]) {
+@@ -63,7 +71,7 @@ export const _ = {
+ 
+   pick(source: any, ...keys: string[]) {
+     return keys.reduce((result: { [key: string]: any }, key) => {
+-      if (source[key] !== undefined) {
++      if (!isPrototypeKey(key) && source[key] !== undefined) {
+         result[key] = source[key]
+       }
+ 
+@@ -75,6 +83,10 @@ export const _ = {
+   merge(target: any, source: any) {
+     if (_.isObject(target) && _.isObject(source)) {
+       Object.keys(source).forEach((key) => {
++        if (isPrototypeKey(key)) {
++          return
++        }
++
+         if (_.isObject(source[key])) {
+           if (!target[key]) {
+             Object.assign(target, { [key]: {} })
+diff --git a/packages/memory/src/index.ts b/packages/memory/src/index.ts
+index 4743c32..6410056 100644
+--- a/packages/memory/src/index.ts
++++ b/packages/memory/src/index.ts
+@@ -32,7 +32,9 @@ const clone = (value: any): any => {
+     const result: any = {}
+ 
+     Object.keys(value).forEach((key) => {
+-      result[key] = clone(value[key])
++      if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype') {
++        result[key] = clone(value[key])
++      }
+     })
+ 
+     return result

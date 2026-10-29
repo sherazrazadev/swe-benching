@@ -1,0 +1,443 @@
+diff -ruN a/hydra/_internal/instantiate/_instantiate2.py b/hydra/_internal/instantiate/_instantiate2.py
+--- a/hydra/_internal/instantiate/_instantiate2.py	2026-10-29 11:46:49.000000000 +0000
++++ b/hydra/_internal/instantiate/_instantiate2.py	2026-10-29 12:06:05.448073152 +0000
+@@ -336,8 +336,18 @@
+     args: Tuple[Any, ...],
+     kwargs: Dict[str, Any],
+     full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
+ ) -> Any:
+-    """Call target (type) with args and kwargs."""
++    """Call target (type) with args and kwargs.
++
++    The target name was authorized before we got here, but a selector target
++    (a dotpath helper, an attribute-access primitive or a deferral primitive)
++    turns config data into *another* callable that never faced that decision.
++    Every such call goes through :func:`_mediate_selection_call`, which puts
++    the same policy decision on the value the config asks for; a deferred
++    selector carries the gate with it so the decision cannot be postponed past
++    the point where the value is used.
++    """
+     try:
+         args, kwargs = _extract_pos_args(args, kwargs)
+     except Exception as e:
+@@ -347,10 +357,33 @@
+         )
+         raise InstantiationException(_with_full_key(msg, full_key)) from e
+ 
++    selection_kind = _selection_kind(_target_)
++    if selection_kind is not None:
++        _authorize_selection_inputs(
++            selection_kind, args, kwargs, full_key, target_whitelist
++        )
++
+     try:
+         if _partial_:
+-            return functools.partial(_target_, *args, **kwargs)
+-        return _target_(*args, **kwargs)
++            if selection_kind is None:
++                # The deferred callable is the target itself, which the policy
++                # already authorized.
++                return functools.partial(_target_, *args, **kwargs)
++            return functools.partial(
++                _mediated_call,
++                _kind=selection_kind,
++                _target=_target_,
++                _args=tuple(args),
++                _kwargs=dict(kwargs),
++                _full_key=full_key,
++                _whitelist=target_whitelist,
++            )
++        if selection_kind == _KIND_DEFERRAL:
++            result = _build_deferred_value(
++                _target_, args, kwargs, full_key, target_whitelist
++            )
++        else:
++            result = _target_(*args, **kwargs)
+     except Exception as e:
+         if _partial_:
+             msg = (
+@@ -361,6 +394,18 @@
+             msg = f"Error in call to target '{_convert_target_to_string(_target_)}':\n{repr(e)}"
+         raise InstantiationException(_with_full_key(msg, full_key)) from e
+ 
++    # Policy refusals are raised outside the call handler: they are not errors
++    # reported by the target, and re-wrapping them would bury the reason.
++    if selection_kind is None:
++        # A plain target may still hand back a callable chosen by config data
++        # (a factory, a wrapper). It is not trusted just because the target was.
++        _authorize_produced_callable(result, full_key, target_whitelist)
++    else:
++        _authorize_selection_outcome(
++            selection_kind, args, kwargs, result, full_key, target_whitelist
++        )
++    return result
++
+ 
+ def _convert_target_to_string(t: Any) -> Any:
+     if callable(t) and hasattr(t, "__qualname__"):
+@@ -538,6 +583,353 @@
+         )
+ 
+ 
++# --- mediation of config-selected callables --------------------------------
++#
++# Authorizing a target name answers "may instantiate call this?". It says
++# nothing about a callable the config reaches *through* an allowed target: a
++# dotpath helper, an attribute-access primitive and a deferral primitive all
++# turn config data into another callable after the target decision was made.
++# The helpers below put the same policy decision on the value that comes back,
++# at the moment it is produced -- and, when the config deferred the selection,
++# at the moment the deferred value is used.
++
++_KIND_DOTPATH = "dotpath"
++_KIND_ATTRIBUTE = "attribute"
++_KIND_DEFERRAL = "deferral"
++
++# Slot wrappers carry no ``__module__``/``__qualname__`` of their own, so their
++# identity is pinned here. Keyed by ``id`` of live module-level objects.
++_IDENTITY_OVERRIDES = {
++    id(object.__getattribute__): "builtins.object.__getattribute__",
++    id(type.__getattribute__): "builtins.type.__getattribute__",
++}
++
++_SELECTION_HELPERS: Optional[Tuple[Tuple[Any, str], ...]] = None
++
++_PUBLIC_SELECTION_HELPER_NAMES = (
++    "get_class",
++    "get_factory",
++    "get_method",
++    "get_object",
++)
++
++
++def _selection_helpers() -> Tuple[Tuple[Any, str], ...]:
++    """Every target that selects another object from config data.
++
++    Membership is by callable identity, so plain aliases (``get_static_method``
++    is ``get_method``) and re-exports are recognized without extra entries.
++    The public helpers are imported lazily: this module is imported by
++    ``hydra.utils`` itself.
++    """
++    global _SELECTION_HELPERS
++    if _SELECTION_HELPERS is not None:
++        return _SELECTION_HELPERS
++
++    from hydra._internal import utils as internal_utils
++
++    helpers: List[Tuple[Any, str]] = [
++        (_locate, _KIND_DOTPATH),
++        (internal_utils.resolve_dotpath, _KIND_DOTPATH),
++        (getattr, _KIND_ATTRIBUTE),
++        (object.__getattribute__, _KIND_ATTRIBUTE),
++        (type.__getattribute__, _KIND_ATTRIBUTE),
++    ]
++    complete = True
++    try:
++        from hydra import utils as public_utils
++    except ImportError:  # pragma: no cover - public facade unavailable
++        complete = False
++    else:
++        for name in _PUBLIC_SELECTION_HELPER_NAMES:
++            helper = getattr(public_utils, name, None)
++            if helper is None:  # pragma: no cover - partially initialized module
++                complete = False
++                continue
++            helpers.append((helper, _KIND_DOTPATH))
++
++    if complete:
++        _SELECTION_HELPERS = tuple(helpers)
++    return tuple(helpers)
++
++
++def _selection_kind(target: Any) -> Optional[str]:
++    """Classify a target by how it can turn config data into another object."""
++    for helper, kind in _selection_helpers():
++        if target is helper:
++            return kind
++    if isinstance(target, type) and issubclass(target, functools.partial):
++        return _KIND_DEFERRAL
++    return None
++
++
++def _security_identity(value: Any) -> str:
++    """Canonical policy name of the callable a value ultimately defers to.
++
++    ``functools.partial`` is unwrapped because the policy applies to what would
++    be called, not to the wrapper holding it.
++    """
++    seen: set[int] = set()
++    while isinstance(value, functools.partial) and id(value) not in seen:
++        seen.add(id(value))
++        value = value.func
++    override = _IDENTITY_OVERRIDES.get(id(value))
++    if override is not None:
++        return override
++    return _get_os_alias_target(_get_resolved_target_name_for_check(value))
++
++
++def _selection_argument(
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    position: int,
++    names: Tuple[str, ...],
++) -> Any:
++    """The config-supplied value a selector will act on."""
++    if len(args) > position:
++        return args[position]
++    for name in names:
++        if name in kwargs:
++            return kwargs[name]
++    return None
++
++
++def _dotpath_candidates(value: Any) -> List[str]:
++    """Every dotpath a selection helper might consume from one config value."""
++    if isinstance(value, str):
++        return [value]
++    if (
++        isinstance(value, (list, tuple))
++        or OmegaConf.is_list(value)
++        or OmegaConf.is_tuple(value)
++    ):
++        return [item for item in value if isinstance(item, str)]
++    return []
++
++
++def _authorize_selection_inputs(
++    kind: str,
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Authorize config-supplied dotpaths before a helper can resolve them.
++
++    The name is authorized even when the helper would not resolve it today: a
++    candidate that is refused stays refused, and no import happens for it.
++    """
++    if target_whitelist is UNSAFE_ALLOW_ALL_TARGETS or kind != _KIND_DOTPATH:
++        return
++    path = _selection_argument(args, kwargs, 0, ("path",))
++    for candidate in _dotpath_candidates(path):
++        _authorize_target_name(candidate, candidate, full_key, target_whitelist)
++
++
++def _authorize_dotpath_result(
++    candidates: List[str],
++    result: Callable[..., Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Re-authorize a resolved value by its canonical identity.
++
++    A dotpath can name a callable that lives in another module (``logging.os``
++    is ``os``), so the string that was authorized is not the identity that
++    matters. An exact allowlist entry for the string stays authoritative for
++    exactly that string, as it does for ``_target_`` itself.
++    """
++    resolved_name = _security_identity(result)
++    if not candidates:
++        _authorize_target_name(resolved_name, resolved_name, full_key, target_whitelist)
++        return
++    path = candidates[0]
++    for candidate in candidates:
++        if candidate == resolved_name:
++            path = candidate
++            break
++    if resolved_name != path and _requires_resolved_authorization(
++        path, target_whitelist
++    ):
++        _authorize_target_name(resolved_name, path, full_key, target_whitelist)
++
++
++def _authorize_selection_result(
++    kind: str,
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    result: Any,
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Authorize the callable a selector produced from config data."""
++    if target_whitelist is UNSAFE_ALLOW_ALL_TARGETS or not callable(result):
++        # Non-callable results are ordinary data and keep flowing unchanged.
++        return
++    if kind == _KIND_DOTPATH:
++        path = _selection_argument(args, kwargs, 0, ("path",))
++        _authorize_dotpath_result(
++            _dotpath_candidates(path), result, full_key, target_whitelist
++        )
++    else:
++        resolved_name = _security_identity(result)
++        _authorize_target_name(
++            resolved_name, resolved_name, full_key, target_whitelist
++        )
++
++
++def _authorize_deferred_callables(
++    value: Any, full_key: str, target_whitelist: NormalizedTargetWhitelist
++) -> None:
++    """Authorize the callable a deferred value will use, and bound callables.
++
++    A partial that is itself a selector carries the gate instead (see
++    :func:`_build_deferred_value`), so it is skipped here.
++    """
++    if target_whitelist is UNSAFE_ALLOW_ALL_TARGETS:
++        return
++    if not isinstance(value, functools.partial):
++        resolved_name = _security_identity(value)
++        _authorize_target_name(
++            resolved_name, resolved_name, full_key, target_whitelist
++        )
++        return
++    pending: List[Any] = [value]
++    seen: set[int] = set()
++    while pending:
++        current = pending.pop()
++        if id(current) in seen:
++            continue
++        seen.add(id(current))
++        deferred = isinstance(current, functools.partial)
++        func = current.func if deferred else current
++        if func is _mediated_call or _selection_kind(func) is not None:
++            # A deferred selector carries its own gate: it checks the value it
++            # selects when it is used, so it is not decided here.
++            continue
++        resolved_name = _security_identity(func)
++        _authorize_target_name(
++            resolved_name, resolved_name, full_key, target_whitelist
++        )
++        if deferred:
++            for bound in (*current.args, *current.keywords.values()):
++                if callable(bound):
++                    pending.append(bound)
++
++
++def _build_deferred_value(
++    target: Callable[..., Any],
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> Any:
++    """Build the value a deferral target returns, with the gate attached.
++
++    When the config defers a *selection* (``functools.partial(get_object,
++    "os.remove")``) the selection has not happened yet, so the decision is
++    deferred with it: the returned value re-runs the same gate when it is used
++    and refuses there instead of yielding the refused callable.
++    """
++    if not args:
++        # No callable to defer; let the target report the usual error.
++        return target(*args, **kwargs)
++    func = args[0]
++    deferred_args = args[1:]
++    inner_kind = _selection_kind(func) if callable(func) else None
++    if inner_kind is not None:
++        gate = functools.partial(
++            _mediated_call,
++            _kind=inner_kind,
++            _target=func,
++            _args=(),
++            _kwargs={},
++            _full_key=full_key,
++            _whitelist=target_whitelist,
++        )
++        return functools.partial(gate, *deferred_args, **kwargs)
++    return target(func, *deferred_args, **kwargs)
++
++
++def _authorize_selection_outcome(
++    kind: str,
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    result: Any,
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Authorize what a selector target produced (or deferred)."""
++    if kind == _KIND_DEFERRAL:
++        _authorize_deferred_callables(result, full_key, target_whitelist)
++    else:
++        _authorize_selection_result(
++            kind, args, kwargs, result, full_key, target_whitelist
++        )
++
++
++def _mediate_selection_call(
++    kind: str,
++    target: Callable[..., Any],
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> Any:
++    """Call a selector target and authorize what it selected.
++
++    This is the body of a deferred selector: it runs when the value built for
++    ``_partial_: true`` (or by ``functools.partial``) is used.
++    """
++    _authorize_selection_inputs(kind, args, kwargs, full_key, target_whitelist)
++    if kind == _KIND_DEFERRAL:
++        result = _build_deferred_value(
++            target, args, kwargs, full_key, target_whitelist
++        )
++    else:
++        result = target(*args, **kwargs)
++    _authorize_selection_outcome(
++        kind, args, kwargs, result, full_key, target_whitelist
++    )
++    return result
++
++
++def _mediated_call(
++    *extra_args: Any,
++    _kind: str,
++    _target: Callable[..., Any],
++    _args: Tuple[Any, ...],
++    _kwargs: Dict[str, Any],
++    _full_key: str,
++    _whitelist: NormalizedTargetWhitelist,
++    **extra_kwargs: Any,
++) -> Any:
++    """Deferred form of :func:`_mediate_selection_call`."""
++    return _mediate_selection_call(
++        _kind,
++        _target,
++        tuple(_args) + tuple(extra_args),
++        {**_kwargs, **extra_kwargs},
++        _full_key,
++        _whitelist,
++    )
++
++
++def _authorize_produced_callable(
++    result: Any, full_key: str, target_whitelist: NormalizedTargetWhitelist
++) -> None:
++    """Authorize a callable returned by a target that is not a selector.
++
++    A whitelisted target is trusted code, but a callable it returns is still a
++    callable the config asked instantiation to hand over, so it faces the same
++    decision. Non-callable results are untouched.
++    """
++    if target_whitelist is UNSAFE_ALLOW_ALL_TARGETS or not callable(result):
++        return
++    resolved_name = _security_identity(result)
++    _authorize_target_name(resolved_name, resolved_name, full_key, target_whitelist)
++
++
+ def _resolve_target(
+     target: Union[str, type, Callable[..., Any]],
+     full_key: str,
+@@ -1222,7 +1614,9 @@
+                     )
+                     kwargs[key] = _convert_node(value, convert)
+ 
+-            return _call_target(_target_, partial, args, kwargs, full_key)
++            return _call_target(
++                _target_, partial, args, kwargs, full_key, target_whitelist
++            )
+         else:
+             object_type = node._metadata.object_type
+             if isinstance(overrides, DictConfig):

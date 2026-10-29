@@ -1,0 +1,255 @@
+{
+ "slug": "hydra-s4",
+ "candidate": "screener-v2 entry 5510: GHSA-RQX7-P7VV-W7HR / CVE-2026-106442 (hydra-ecosystem/hydra, CWE-184, incomplete target denylist leading to code execution through config-selected callables)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "bd5f094a501b9e1783de90d58760531497f53f5e (parent of published fix f462811117b5ecfd2ed652ed52d6b4e3771bd943; the 1.3 backport 2c82bbb3f39603b336cb852461739fdf7a38798a is the same hardening on the other branch and was not used)",
+  "entry_points": [
+   "library API: hydra.utils.instantiate(config) (alias hydra.utils.call())",
+   "library API: hydra._internal.instantiate._instantiate2.instantiate_node() reached from instantiate() for nested configs"
+  ],
+  "sites": [
+   "hydra/_internal/instantiate/_instantiate2.py:333-362 (pinned _call_target returns the target result unchecked)",
+   "hydra/_internal/instantiate/_instantiate2.py:383-397 (pinned _get_resolved_target_name_for_check)",
+   "hydra/_internal/instantiate/_instantiate2.py:508-585 (pinned _authorize_target_name / _resolve_target; policy data and matcher unchanged by the fix)",
+   "hydra/utils.py:27-90 + injected get_factory (dotpath helpers)",
+   "hydra/_internal/utils.py:628-680 (_locate) + injected resolve_dotpath"
+  ],
+  "routes": [
+   "a dotpath helper used as _target_ returns the refused callable (get_object, get_method, _locate, get_factory, resolve_dotpath)",
+   "builtins.getattr over a config-obtained module returns the refused callable",
+   "builtins.object.__getattribute__ / builtins.type.__getattribute__ return the refused attribute (legacy policy; open in the published fix too)",
+   "functools.partial as _target_ returns a partial wrapping the refused callable",
+   "_partial_: true on an attribute-access primitive or a dotpath helper binds the selection after the policy decision (legacy policy; open in the published fix too)",
+   "the allowlist path: a permitted helper selecting a non-permitted callable",
+   "injected sequence shape: resolve_dotpath/get_factory given a list of candidate dotpaths"
+  ],
+  "services": [],
+  "project_tests_run": "tests/instantiate (576 tests: test_instantiate.py, test_helpers.py, test_positional*.py) passes on the pinned+injected tree and under the reference fix; a pristine copy is restored at grade time"
+ },
+ "leak_terms": [
+  "get_method",
+  "_locate",
+  "resolve_dotpath",
+  "get_factory",
+  "__getattribute__",
+  "getattr",
+  "functools.partial",
+  "_instantiate2",
+  "_call_target",
+  "_authorize_target_name",
+  "_resolve_target",
+  "DEFAULT_BLOCKLISTED_MODULES",
+  "DISCOVERY_TARGETS",
+  "CALLABLE_RESULT_TARGETS",
+  "UNCONTROLLED_EXECUTION_TARGETS",
+  "target_whitelist",
+  "whitelist",
+  "blocklist"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-result.patch",
+   "expect": "security_fail",
+   "note": "the reported route (and partial-target wrapping) left unmediated: attribute access returns the refused callable"
+  },
+  {
+   "patch": "sf-no-getattribute.patch",
+   "expect": "security_fail",
+   "note": "attribute-access primitives are not treated as callable producers; the selected attribute escapes"
+  },
+  {
+   "patch": "sf-no-partial.patch",
+   "expect": "security_fail",
+   "note": "deferred selection is not refused: _partial_: true binds the callable after the policy decision"
+  },
+  {
+   "patch": "sf-no-discovery.patch",
+   "expect": "security_fail",
+   "note": "the dotpath argument of a lookup helper is not authorized; the selected callable escapes"
+  },
+  {
+   "patch": "sf-no-sibling.patch",
+   "expect": "security_fail",
+   "note": "the fix covers the upstream helper names but not the two helpers this project also ships"
+  },
+  {
+   "patch": "sf-no-sequence.patch",
+   "expect": "security_fail",
+   "note": "a sequence of candidate dotpaths is not parsed by a string-only path check"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "note": "over-strict resolved-identity recheck breaks exact allowlist entries for re-exported targets"
+  },
+  {
+   "patch": "ff-refuse-callable.patch",
+   "expect": "functional_fail",
+   "note": "refuses every callable result regardless of policy, breaking benign lookups and attribute access"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a general legacy-policy authorization of any callable result"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "note": "second valid design: no dotpath-name gating; every callable result is authorized and deferred selectors are resolved eagerly"
+  },
+  {
+   "patch": "blind-fix.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "produced after the build by a fresh agent that saw only instruction.md and the repository"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-callable.patch",
+  "crash_as_refusal": "n/a: refusal is an ordinary in-process exception; a process-aborting crash produces no test result, which never scores a pass",
+  "wrong_resource": "n/a: the protected object is the callable itself, asserted by identity; there is no neighbouring or proxy resource a check could authorize instead",
+  "one_role_or_direction": "n/a: the policy is not role- or direction-scoped; one decision applies to every call",
+  "reads_only": "n/a: instantiation is a single produce direction; there are no read and write verbs to split",
+  "check_after_adjustment": "sf-no-partial.patch",
+  "unlisted_route": "sf-no-sibling.patch",
+  "malformed_identity": "sf-no-sequence.patch",
+  "missing_authority": "n/a: there is no external authority lookup that could fail open; the decision is local to the shipped policy and the caller's allowlist",
+  "adjacent_api": "n/a: the reference and the alternative leave the trusted lookup helpers' own direct behaviour unchanged, so no sibling API contract is co-opted"
+ },
+ "traps": [
+  {
+   "id": "T1_attribute_access_primitive",
+   "pattern": "B (route where the protection never existed; how-type)",
+   "shape": "attribute-access primitives return the selected attribute; the policy authorizes the target name, never the callable the target produces",
+   "where": "hydra/_internal/instantiate/_instantiate2.py:333-362 (pinned; the result is returned unchecked)",
+   "security_tests": [
+    "security.test_produced_callables.ProducedCallableCases::test_object_attribute_access_returns_refused_callable",
+    "security.test_produced_callables.ProducedCallableCases::test_type_attribute_access_returns_refused_callable",
+    "security.test_deferred_selection.DeferredSelectionCases::test_deferred_object_attribute_access_is_refused",
+    "security.test_deferred_selection.DeferredSelectionCases::test_deferred_type_attribute_access_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_object_attribute_access_returns_non_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_object_attribute_access_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_type_attribute_access_returns_allowed_callable"
+   ],
+   "security_fail_patch": "sf-no-getattribute.patch",
+   "realistic_because": "real, unmodified upstream code: these primitives are absent from the shipped policy and the published fix leaves them available on the default policy"
+  },
+  {
+   "id": "T2_deferred_selection",
+   "pattern": "B (uncovered route; how-type)",
+   "shape": "_partial_: true returns before any result mediation, so the effective callable is bound after the policy decision",
+   "where": "hydra/_internal/instantiate/_instantiate2.py:350-353 (pinned partial early return)",
+   "security_tests": [
+    "security.test_deferred_selection.DeferredSelectionCases::test_deferred_attribute_selection_is_refused",
+    "security.test_deferred_selection.DeferredSelectionCases::test_deferred_lookup_is_refused",
+    "security.test_allowlist_policy.AllowlistPolicyCases::test_allowlisted_deferred_selection_still_checks_the_callable"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_partial_flag_on_allowed_target_calls",
+    "functional.test_preserved_behaviour.AllowlistKeepsItsMeaning::test_allowlisted_partial_flag_returns_a_callable"
+   ],
+   "security_fail_patch": "sf-no-partial.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix refuses deferred selection only under an allowlist and leaves the default policy open"
+  },
+  {
+   "id": "T3_produced_callable",
+   "pattern": "B (reported family)",
+   "shape": "a target returns, or wraps into a partial, a callable selected by config data; the call handler returns it without a policy decision",
+   "where": "hydra/_internal/instantiate/_instantiate2.py:333-362",
+   "security_tests": [
+    "security.test_produced_callables.ProducedCallableCases::test_attribute_lookup_returns_refused_callable",
+    "security.test_produced_callables.ProducedCallableCases::test_partial_target_wraps_resolved_refused_callable",
+    "security.test_produced_callables.ProducedCallableCases::test_partial_target_wraps_looked_up_refused_callable"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_attribute_lookup_returns_non_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_attribute_lookup_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_partial_target_of_allowed_callable_calls"
+   ],
+   "security_fail_patch": "sf-no-result.patch",
+   "realistic_because": "real, unmodified upstream code; the report's example is one instance of this family"
+  },
+  {
+   "id": "T4_dotpath_helper_selection",
+   "pattern": "B (pattern A second entry point; how-type)",
+   "shape": "documented dotpath helpers resolve a config-supplied name and hand the result back; the name is data, so the target-name check never sees it",
+   "where": "hydra/utils.py:27-90 and hydra/_internal/utils.py:628-680 with the call handler at _instantiate2.py:333-362",
+   "security_tests": [
+    "security.test_produced_callables.ProducedCallableCases::test_object_lookup_returns_refused_callable",
+    "security.test_produced_callables.ProducedCallableCases::test_method_lookup_returns_refused_callable",
+    "security.test_produced_callables.ProducedCallableCases::test_internal_resolver_returns_refused_callable",
+    "security.test_allowlist_policy.AllowlistPolicyCases::test_allowlisted_lookup_still_checks_selected_value",
+    "security.test_allowlist_policy.AllowlistPolicyCases::test_allowlisted_method_lookup_still_checks_selected_value"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_lookup_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_lookup_returns_plain_object",
+    "functional.test_preserved_behaviour.AllowlistKeepsItsMeaning::test_allowlisted_lookup_returns_allowed_callable"
+   ],
+   "security_fail_patch": "sf-no-discovery.patch",
+   "realistic_because": "real, unmodified upstream code: the helpers are documented trusted-code lookup APIs and are reachable as _target_"
+  },
+  {
+   "id": "T5_injected_dotpath_helpers",
+   "pattern": "injected sibling (where-type + how-type)",
+   "shape": "two ordinary dotpath helpers ship beside the documented ones: a public factory lookup and an internal resolver; neither is part of the version of the policy the project started from",
+   "where": "hydra/utils.py get_factory and hydra/_internal/utils.py resolve_dotpath (injected; the published fix never touches these files)",
+   "security_tests": [
+    "security.test_injected_helpers.InjectedHelperCases::test_factory_helper_returns_refused_callable",
+    "security.test_injected_helpers.InjectedHelperCases::test_factory_helper_returns_refused_callable_under_allowlist",
+    "security.test_injected_helpers.InjectedHelperCases::test_fallback_resolver_returns_refused_callable"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_factory_helper_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_fallback_resolver_uses_first_resolving_candidate"
+   ],
+   "security_fail_patch": "sf-no-sibling.patch",
+   "realistic_because": "a config framework that already ships three near-identical dotpath helpers plausibly gains a factory lookup and a fallback resolver; both call the same low-level locator and do no policy work"
+  },
+  {
+   "id": "T6_sequence_of_candidates",
+   "pattern": "injected sibling (how-type: shape a plausible check mishandles)",
+   "shape": "the injected resolver accepts one dotpath or a sequence of candidate dotpaths; a check that only accepts a string sees no name at all",
+   "where": "hydra/_internal/utils.py resolve_dotpath (injected)",
+   "security_tests": [
+    "security.test_injected_helpers.InjectedHelperCases::test_fallback_resolver_sequence_returns_refused_callable",
+    "security.test_injected_helpers.InjectedHelperCases::test_factory_helper_sequence_returns_refused_callable"
+   ],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_fallback_resolver_uses_first_resolving_candidate"
+   ],
+   "security_fail_patch": "sf-no-sequence.patch",
+   "realistic_because": "fallback candidate lists are an ordinary compatibility convenience; the helper's own signature and docstring show the sequence form"
+  },
+  {
+   "id": "T7_coupled_allowlist_and_benign_values",
+   "pattern": "coupled must-keep-working (over-hardening)",
+   "shape": "an exact allowlist entry for a re-exported target must keep binding even though the canonical module differs, and benign attribute access/lookup results must keep flowing, so an over-broad fix fails",
+   "where": "hydra/_internal/instantiate/_instantiate2.py:481-505 (pinned exact-entry exemption)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional.test_preserved_behaviour.AllowlistKeepsItsMeaning::test_exact_entry_binds_reexported_target",
+    "functional.test_preserved_behaviour.AllowlistKeepsItsMeaning::test_wildcard_entry_binds_package_member",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_attribute_lookup_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowedValuesKeepWorking::test_lookup_returns_allowed_callable",
+    "functional.test_preserved_behaviour.AllowlistKeepsItsMeaning::test_explicit_opt_out_disables_checks"
+   ],
+   "security_fail_patch": "ff-overbroad.patch",
+   "realistic_because": "the exact-entry exemption exists at the pinned commit and the project's own instantiate tests pin it (test_whitelist_allows_exact_reexported_target)"
+  }
+ ],
+ "status": "built; gate static/nop/oracle/patches ALL PASS on 2026-10-29 (nop: 21/21 security tests fail, 596/596 functional+project pass; oracle: 3x reward 1.0, identical; patches: 10/10 as declared, both pass variants 1.0); blind-fix.patch and FAIRNESS.md are produced downstream"
+}

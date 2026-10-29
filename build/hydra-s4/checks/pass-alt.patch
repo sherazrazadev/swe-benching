@@ -1,0 +1,210 @@
+--- a/hydra/_internal/instantiate/_instantiate2.py
++++ b/hydra/_internal/instantiate/_instantiate2.py
+@@ -94,6 +94,36 @@
+     "os.spawn",
+ )
+ 
++# Targets that resolve another object from a config-controlled dotpath. The
++# selected path is an authorization boundary: the helper returns, and the
++# config later uses, an object the policy never saw.
++DISCOVERY_TARGETS = {
++    "hydra._internal.utils._locate",
++    # Second resolver next to _locate; its candidates are dotpaths too.
++    "hydra._internal.utils.resolve_dotpath",
++    "hydra.utils.get_class",
++    "hydra.utils.get_method",
++    # get_static_method is an alias of get_method; every alias of a discovery
++    # helper resolves to its own canonical name, so list it explicitly.
++    "hydra.utils.get_static_method",
++    "hydra.utils.get_object",
++    "hydra.utils.get_factory",
++}
++
++# Targets that may return (or bind into a deferred value) a callable chosen by
++# config data. Non-callable results remain ordinary values; a callable result
++# must independently satisfy the active target policy.
++CALLABLE_RESULT_TARGETS = {
++    "builtins.getattr",
++    "builtins.object.__getattribute__",
++    "builtins.type.__getattribute__",
++    "functools.partial",
++}
++
++# Selection into a deferred value is checked when the value is built, never
++# later: after the call returns, the effective callable is out of reach.
++DEFERRED_SELECTION_TARGETS = DISCOVERY_TARGETS | CALLABLE_RESULT_TARGETS
++
+ 
+ class _UnsafeAllowAllTargets:
+     def __repr__(self) -> str:
+@@ -336,6 +366,7 @@
+     args: Tuple[Any, ...],
+     kwargs: Dict[str, Any],
+     full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
+ ) -> Any:
+     """Call target (type) with args and kwargs."""
+     try:
+@@ -347,10 +378,23 @@
+         )
+         raise InstantiationException(_with_full_key(msg, full_key)) from e
+ 
++    resolved_target_name = _get_resolved_target_name_for_check(_target_)
++    if (
++        _partial_
++        and resolved_target_name in DEFERRED_SELECTION_TARGETS
++        and target_whitelist is not UNSAFE_ALLOW_ALL_TARGETS
++    ):
++        selected = _target_(*args, **kwargs)
++        if callable(selected):
++            _authorize_callable_result(
++                selected, resolved_target_name, full_key, target_whitelist
++            )
++
++    discovery_path = None
+     try:
+         if _partial_:
+             return functools.partial(_target_, *args, **kwargs)
+-        return _target_(*args, **kwargs)
++        result = _target_(*args, **kwargs)
+     except Exception as e:
+         if _partial_:
+             msg = (
+@@ -360,6 +404,12 @@
+         else:
+             msg = f"Error in call to target '{_convert_target_to_string(_target_)}':\n{repr(e)}"
+         raise InstantiationException(_with_full_key(msg, full_key)) from e
++
++    if callable(result):
++        _authorize_callable_result(
++            result, resolved_target_name, full_key, target_whitelist
++        )
++    return result
+ 
+ 
+ def _convert_target_to_string(t: Any) -> Any:
+@@ -384,16 +434,26 @@
+     """Return the security identity of a resolved callable.
+ 
+     Bound ``__call__`` attributes must be authorized as the callable they wrap,
+-    not as a generic method or method-wrapper. Unwrap recursively because
+-    repeated ``.__call__`` traversal creates another bound wrapper each time.
++    not as a generic method or method-wrapper. ``functools.partial`` objects
++    must be authorized as the callable they defer. Repeated traversal creates
++    another wrapper each time, so unwrap recursively.
+     """
+     seen: set[int] = set()
+-    while id(target) not in seen and getattr(target, "__name__", None) == "__call__":
++    while id(target) not in seen:
+         seen.add(id(target))
+-        owner = getattr(target, "__self__", None)
+-        if owner is None or not callable(owner):
+-            break
+-        target = owner
++        if getattr(target, "__name__", None) == "__call__":
++            owner = getattr(target, "__self__", None)
++            if owner is not None and callable(owner):
++                target = owner
++                continue
++        if isinstance(target, functools.partial):
++            target = target.func
++            continue
++        break
++    if target is object.__getattribute__:
++        return "builtins.object.__getattribute__"
++    if target is type.__getattribute__:
++        return "builtins.type.__getattribute__"
+     return _get_target_name_for_check(target)
+ 
+ 
+@@ -536,6 +596,79 @@
+                 _not_whitelisted_message(target_name, resolved_from), full_key
+             )
+         )
++
++
++def _discovery_path_candidates(path: Any) -> List[str]:
++    """Every dotpath a discovery helper might consume from one config value."""
++    if isinstance(path, str):
++        return [path]
++    if isinstance(path, (list, tuple)):
++        return [candidate for candidate in path if isinstance(candidate, str)]
++    if OmegaConf.is_list(path) or OmegaConf.is_tuple(path):
++        return [candidate for candidate in path if isinstance(candidate, str)]
++    return []
++
++
++def _authorize_discovery_path(
++    target: Callable[..., Any],
++    args: Tuple[Any, ...],
++    kwargs: Dict[str, Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> Optional[List[str]]:
++    """Authorize every dotpath a discovery helper may consume.
++
++    A helper may take one dotpath or a sequence of candidate dotpaths, so the
++    value is normalized first and every candidate is authorized before the
++    helper can try it.
++    """
++    target_name = _get_resolved_target_name_for_check(target)
++    if target_name not in DISCOVERY_TARGETS:
++        return None
++    path = args[0] if args else kwargs.get("path")
++    candidates = _discovery_path_candidates(path)
++    for candidate in candidates:
++        _authorize_target_name(candidate, candidate, full_key, target_whitelist)
++    return candidates
++
++
++def _authorize_discovered_value(
++    candidates: List[str],
++    result: Callable[..., Any],
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Recheck a discovered callable by its canonical security identity."""
++    resolved_name = _get_os_alias_target(_get_resolved_target_name_for_check(result))
++    selected = candidates[0] if candidates else resolved_name
++    for candidate in candidates:
++        if candidate == resolved_name:
++            selected = candidate
++            break
++    _reject_dotpath_result(selected, resolved_name, full_key, target_whitelist)
++
++
++def _reject_dotpath_result(
++    path: str,
++    resolved_name: str,
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    if resolved_name != path and _requires_resolved_authorization(
++        path, target_whitelist
++    ):
++        _authorize_target_name(resolved_name, path, full_key, target_whitelist)
++
++
++def _authorize_callable_result(
++    result: Callable[..., Any],
++    resolved_from: str,
++    full_key: str,
++    target_whitelist: NormalizedTargetWhitelist,
++) -> None:
++    """Authorize a callable selected as another target's runtime result."""
++    resolved_name = _get_os_alias_target(_get_resolved_target_name_for_check(result))
++    _authorize_target_name(resolved_name, resolved_from, full_key, target_whitelist)
+ 
+ 
+ def _resolve_target(
+@@ -1222,7 +1355,9 @@
+                     )
+                     kwargs[key] = _convert_node(value, convert)
+ 
+-            return _call_target(_target_, partial, args, kwargs, full_key)
++            return _call_target(
++                _target_, partial, args, kwargs, full_key, target_whitelist
++            )
+         else:
+             object_type = node._metadata.object_type
+             if isinstance(overrides, DictConfig):

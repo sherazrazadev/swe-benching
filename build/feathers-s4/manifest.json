@@ -1,0 +1,235 @@
+{
+ "slug": "feathers-s4",
+ "candidate": {
+  "repo": "feathersjs/feathers",
+  "advisory_ids": [
+   "GHSA-28XV-PH75-77WH",
+   "CVE-2026-54335"
+  ],
+  "cwe": "CWE-1321",
+  "pinned_commit": "3c3da6d688e62a1f832f549d3271c80ce3a47b01",
+  "fix_commits": [
+   "28b3c03c63bdbff53115fdaa46c56980e7942acc"
+  ],
+  "track": "injected",
+  "entry_id": "7443"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "Public library APIs and the services built on them: @feathersjs/commons `_.merge`/`_.extend`/`_.omit`/`_.pick`; @feathersjs/adapter-commons `select` (the $select projection every adapter applies) and `filterQuery`; the memory adapter's record reads through the Feathers service API (MemoryService.create/get/find). No internal helper is called directly by a test.",
+  "sites": [
+   "packages/commons/src/index.ts:75-89 (`_.merge`: source key used as a property name, recursion reaches Object.prototype; `__proto__: null` reaches the assignment branch)",
+   "packages/commons/src/index.ts:54-72 (`_.extend` Object.assign copy, `_.omit` built through it, `_.pick` reduce key copy)",
+   "packages/adapter-commons/src/query.ts:21-23 and 57-67 (request query keys written as property names; `$sort` key copy at 101)",
+   "packages/adapter-commons/src/index.ts:37-76 (injected nested $select projection; guard inspects only the first path segment)",
+   "packages/memory/src/index.ts:25-45 (injected record deep copy used by every service read; writes each source key into a fresh object)"
+  ],
+  "routes": [
+   "T1: public object merge of a JSON body with an own `__proto__` object at top level or at depth, and with a non-object `__proto__` value that replaces the target's prototype",
+   "T2: public extend/omit/pick copies of a JSON object with an own `__proto__` field; flat $select projection naming that field through the adapter helper",
+   "T3: request query keys, nested query values and $sort specifications whose field name is a prototype key",
+   "T4: dotted $select entries (`profile.__proto__`, `profile.__proto__.marker`) which split into path segments before each part becomes a property name",
+   "T5: records created with an own `__proto__` field and read back through the service with no projection"
+  ],
+  "services": [],
+  "project_tests_run": "packages/commons (20), packages/adapter-commons (72) and packages/memory (149) mocha suites pass on the pinned+injected tree and on the oracle. Hidden suites: 14 security tests fail on pinned+injected and pass on the oracle; 19 functional tests pass on both. Verified locally with the same mocha/ts-node runner and config the verifier uses."
+ },
+ "leak_terms": [
+  "_.merge",
+  "_.extend",
+  "_.omit",
+  "_.pick",
+  "filterQuery",
+  "getQuery",
+  "validateQueryProperty",
+  "select",
+  "$select",
+  "writePath",
+  "readPath",
+  "clone",
+  "adapter-commons",
+  "commons",
+  "memory",
+  "index.ts",
+  "query.ts",
+  "isPrototypeKey"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_merge.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "sf_miss_copy.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "sf_miss_query.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "sf_miss_nested_select.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "sf_miss_clone.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "upstream_fix_only.patch",
+   "expect": "security_fail",
+   "kind": "security_fail"
+  },
+  {
+   "patch": "ff_shallow_merge.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "ff_deep_extend.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_correct_fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: the suites accept any refusal only when no prototype was installed; a crash that leaves state unchanged is a valid refusal here, and an over-broad crash is caught by ff_refuse_all.patch as functional_fail",
+  "wrong_resource": "n/a: there is no authorization decision or proxy resource in this task",
+  "one_role_or_direction": "n/a: no roles, peers or directions; every helper and route handles the same inputs uniformly",
+  "reads_only": "n/a: the flaw is in how data becomes object state, not in a read/write permission",
+  "check_after_adjustment": "sf_miss_nested_select.patch",
+  "unlisted_route": "upstream_fix_only.patch",
+  "malformed_identity": "n/a: prototype keys are compared on the parsed string, so JSON escapes resolve to the same key; there is no parser mismatch to exploit",
+  "missing_authority": "n/a: no authority, secret or role lookup exists on these paths",
+  "adjacent_api": "ff_deep_extend.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "the reported sink: an own `__proto__` key from JSON is used as a property name by the recursive merge, so the recursion reaches the shared prototype; a non-object `__proto__` value instead replaces the prototype of the object being merged into",
+   "where": "packages/commons/src/index.ts:75-89",
+   "security_tests": [
+    "security/merge.test.ts::does not install a top-level prototype field on every object",
+    "security/merge.test.ts::does not install a nested prototype field on every object",
+    "security/merge.test.ts::does not replace the prototype of the object it merges into"
+   ],
+   "coupled_functional_tests": [
+    "functional/merge.test.ts::combines nested objects in place and returns the target",
+    "functional/merge.test.ts::adds new nested objects",
+    "functional/merge.test.ts::passes non-object arguments through unchanged",
+    "functional/merge.test.ts::keeps array and null values as values",
+    "functional/merge.test.ts::completes when ordinary data uses a name that looks like a prototype key"
+   ],
+   "security_fail_patch": "sf_miss_merge.patch",
+   "realistic_because": "the published advisory's own site; the merge is real unmodified upstream code at the pinned commit"
+  },
+  {
+   "id": "T2",
+   "type": "both",
+   "origin": "uncovered_upstream",
+   "shape": "the sibling copy helpers in the same public utility object have no key discipline: Object.assign/reduce copy a source's own `__proto__` into the object they build, which changes that object's prototype; the adapter's flat projection reaches the same sink through `pick`",
+   "where": "packages/commons/src/index.ts:54-72",
+   "security_tests": [
+    "security/copy.test.ts::extend does not adopt a prototype field from a source",
+    "security/copy.test.ts::omit does not adopt a prototype field from its source",
+    "security/copy.test.ts::pick does not adopt a prototype field it selects",
+    "security/copy.test.ts::flat projection does not adopt a prototype field"
+   ],
+   "coupled_functional_tests": [
+    "functional/copy.test.ts::extend copies own fields into the first object",
+    "functional/copy.test.ts::extend copies nested values by reference instead of merging them",
+    "functional/copy.test.ts::omit and pick keep ordinary fields",
+    "functional/copy.test.ts::flat projection returns only the requested fields",
+    "functional/copy.test.ts::projection maps over arrays"
+   ],
+   "security_fail_patch": "sf_miss_copy.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix never touches these helpers, and they only ever change the prototype of the object they return, which a solver can dismiss as different from the advisory's global effect"
+  },
+  {
+   "id": "T3",
+   "type": "both",
+   "origin": "uncovered_upstream",
+   "shape": "request query keys, nested query values and `$sort` field names are written back as property names with no key discipline, so a sanitized query object or sort specification inherits fields chosen by the caller",
+   "where": "packages/adapter-commons/src/query.ts:21-23,57-67,101",
+   "security_tests": [
+    "security/query.test.ts::a query does not inherit a prototype field from its own keys",
+    "security/query.test.ts::a sort specification does not gain a prototype field"
+   ],
+   "coupled_functional_tests": [
+    "functional/service.test.ts::splits filters from ordinary query fields",
+    "functional/service.test.ts::stringifies a selected field list",
+    "functional/service.test.ts::rejects an unknown special parameter"
+   ],
+   "security_fail_patch": "sf_miss_query.patch",
+   "realistic_because": "real, unmodified upstream code in a different package; the published fix never touches it, and it reads as query parsing rather than object merging"
+  },
+  {
+   "id": "T4",
+   "type": "both",
+   "origin": "injected_sibling",
+   "shape": "nested (dotted) projection support splits a field name on the separator and uses each part as a property name; the guard beside it inspects only the first part, so a prototype key in a later position still reaches a prototype, and a later segment can reach the shared one",
+   "where": "packages/adapter-commons/src/index.ts:37-76 (injected; guard at 55)",
+   "security_tests": [
+    "security/nested_select.test.ts::does not set the prototype of a nested selected object",
+    "security/nested_select.test.ts::does not write a shared prototype through a nested path"
+   ],
+   "coupled_functional_tests": [
+    "functional/copy.test.ts::nested projection returns only the requested nested fields",
+    "functional/copy.test.ts::nested projection ignores paths that do not exist",
+    "functional/copy.test.ts::flat projection returns only the requested fields"
+   ],
+   "security_fail_patch": "sf_miss_nested_select.patch",
+   "realistic_because": "injected sibling a maintainer could plausibly have written: dotted $select is a natural extension, the guard reads as protection, and the published fix never touches this package"
+  },
+  {
+   "id": "T5",
+   "type": "both",
+   "origin": "injected_sibling",
+   "shape": "the adapter deep-copies every record it returns by writing each source key into a fresh object; an own `__proto__` field on a stored record therefore changes the prototype of the copy before any projection runs, so reads without a projection are affected too",
+   "where": "packages/memory/src/index.ts:25-45 (injected)",
+   "security_tests": [
+    "security/clone.test.ts::a fetched record does not inherit a prototype field",
+    "security/clone.test.ts::records listed by a service do not inherit a prototype field",
+    "security/clone.test.ts::a projected record does not inherit a prototype field"
+   ],
+   "coupled_functional_tests": [
+    "functional/service.test.ts::stores and returns ordinary records",
+    "functional/service.test.ts::returns nested record data unchanged",
+    "functional/service.test.ts::projects flat fields for a fetched record"
+   ],
+   "security_fail_patch": "sf_miss_clone.patch",
+   "realistic_because": "injected sibling a maintainer could plausibly have written: a hand-written deep copy replaces the JSON round-trip at the adapter's read boundary; it is a producer the projection check never calls, and the published fix never touches this package"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle 3/3, patches)"
+}

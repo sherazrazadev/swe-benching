@@ -1,0 +1,281 @@
+diff --git a/ohmo/gateway/focus_commands.py b/ohmo/gateway/focus_commands.py
+new file mode 100644
+index 0000000..7b14c9e
+--- /dev/null
++++ b/ohmo/gateway/focus_commands.py
+@@ -0,0 +1,32 @@
++"""ohmo gateway-scoped focus command.
++
++Lets a chat set the repo focus without rebuilding the runtime, the same way the
++gateway-scoped provider and model commands work.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from openharness.config.paths import get_project_active_repo_context_path
++
++
++def handle_gateway_focus_command(args: str, *, cwd: str | Path) -> tuple[str, bool]:
++    """Handle ``/focus`` against the repository bound to the current ohmo chat."""
++    path = get_project_active_repo_context_path(cwd)
++    tokens = args.split(maxsplit=1)
++    action = tokens[0] if tokens else "show"
++    rest = tokens[1] if len(tokens) == 2 else ""
++    if action == "show":
++        if not path.exists():
++            return f"No active repo context. File path: {path}", False
++        return path.read_text(encoding="utf-8"), False
++    if action == "set" and rest.strip():
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(f"# Active Repo Context\n\n{rest.strip()}\n", encoding="utf-8")
++        return f"Saved active repo context to {path}", False
++    if action == "clear":
++        if path.exists():
++            path.unlink()
++        return "Cleared active repo context.", False
++    return "Usage: /focus [show|set TEXT|clear]", False
+diff --git a/ohmo/gateway/notes.py b/ohmo/gateway/notes.py
+new file mode 100644
+index 0000000..f5d7534
+--- /dev/null
++++ b/ohmo/gateway/notes.py
+@@ -0,0 +1,36 @@
++"""Workspace notes shown to the assistant in ohmo chat sessions."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from ohmo.workspace import get_notes_path
++
++
++def load_notes_prompt(workspace: str | Path | None = None) -> str | None:
++    """Return the workspace notes markdown, or ``None`` when there are none."""
++    path = get_notes_path(workspace)
++    if not path.exists():
++        return None
++    content = path.read_text(encoding="utf-8", errors="replace").strip()
++    return content or None
++
++
++def append_notes_entry(workspace: str | Path | None, text: str) -> Path:
++    """Append one note line to the workspace notes file."""
++    path = get_notes_path(workspace)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    existing = path.read_text(encoding="utf-8") if path.exists() else ""
++    if existing and not existing.endswith("\n"):
++        existing += "\n"
++    path.write_text(existing + f"- {text.strip()}\n", encoding="utf-8")
++    return path
++
++
++def clear_notes(workspace: str | Path | None = None) -> bool:
++    """Remove the workspace notes file; return whether it existed."""
++    path = get_notes_path(workspace)
++    if path.exists():
++        path.unlink()
++        return True
++    return False
+diff --git a/ohmo/gateway/runtime.py b/ohmo/gateway/runtime.py
+index dd07002..5ac5f28 100644
+--- a/ohmo/gateway/runtime.py
++++ b/ohmo/gateway/runtime.py
+@@ -33,7 +33,9 @@ from openharness.prompts import build_runtime_system_prompt
+ from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
+ 
+ from ohmo.gateway.config import load_gateway_config
++from ohmo.gateway.focus_commands import handle_gateway_focus_command
+ from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
++from ohmo.gateway.notes import append_notes_entry, clear_notes, load_notes_prompt
+ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+ from ohmo.group_registry import load_managed_group_record, normalize_cwd
+ from ohmo.memory import create_memory_command_backend
+@@ -131,12 +133,16 @@ class OhmoSessionRuntimePool:
+         }
+         return command.name.lower() in allowed
+ 
+-    def _handle_gateway_scoped_command(self, command_name: str, args: str) -> tuple[str, bool] | None:
++    def _handle_gateway_scoped_command(
++        self, command_name: str, args: str, *, cwd: str | Path | None = None
++    ) -> tuple[str, bool] | None:
+         lowered = command_name.lower()
+         if lowered == "provider":
+             result = handle_gateway_provider_command(args, workspace=self._workspace)
+         elif lowered == "model":
+             result = handle_gateway_model_command(args, workspace=self._workspace)
++        elif lowered == "focus":
++            result = handle_gateway_focus_command(args, cwd=cwd or self._cwd)
+         else:
+             return None
+         if result[1]:
+@@ -205,6 +211,7 @@ class OhmoSessionRuntimePool:
+         if snapshot and snapshot.get("session_id"):
+             bundle.session_id = str(snapshot["session_id"])
+         self._register_gateway_tools(bundle)
++        self._register_ohmo_commands(bundle)
+         await start_runtime(bundle)
+         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, latest_user_prompt))
+         logger.info(
+@@ -260,7 +267,9 @@ class OhmoSessionRuntimePool:
+         if parsed is not None and not message.media:
+             command, args = parsed
+             command_name = str(getattr(command, "name", "") or "")
+-            gateway_result = self._handle_gateway_scoped_command(command_name, args)
++            gateway_result = self._handle_gateway_scoped_command(
++                command_name, args, cwd=getattr(bundle, "cwd", self._cwd)
++            )
+             if gateway_result is not None:
+                 message_text, refresh_runtime = gateway_result
+                 result = CommandResult(message=message_text, refresh_runtime=refresh_runtime)
+@@ -667,6 +676,7 @@ class OhmoSessionRuntimePool:
+         )
+         refreshed.session_id = prior_session_id
+         self._register_gateway_tools(refreshed)
++        self._register_ohmo_commands(refreshed)
+         await start_runtime(refreshed)
+         refreshed.engine.set_system_prompt(self._runtime_system_prompt(refreshed, latest_user_prompt))
+         self._bundles[session_key] = refreshed
+@@ -681,18 +691,24 @@ class OhmoSessionRuntimePool:
+     def _runtime_system_prompt(self, bundle: RuntimeBundle, latest_user_prompt: str | None) -> str:
+         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
+         if not hasattr(bundle, "current_settings"):
+-            return build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
+-        settings = bundle.current_settings()
+-        if not hasattr(settings, "system_prompt"):
+-            return build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
+-        return build_runtime_system_prompt(
+-            settings,
+-            cwd=bundle_cwd,
+-            latest_user_prompt=latest_user_prompt,
+-            extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
+-            extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
+-            include_project_memory=False,
+-        )
++            prompt = build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
++        else:
++            settings = bundle.current_settings()
++            if not hasattr(settings, "system_prompt"):
++                prompt = build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
++            else:
++                prompt = build_runtime_system_prompt(
++                    settings,
++                    cwd=bundle_cwd,
++                    latest_user_prompt=latest_user_prompt,
++                    extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
++                    extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
++                    include_project_memory=False,
++                )
++        notes = load_notes_prompt(self._workspace)
++        if notes:
++            prompt = f"{prompt}\n\n# Workspace Notes\n\n{notes}"
++        return prompt
+ 
+     def _cwd_for_message(self, message: InboundMessage) -> str:
+         record = load_managed_group_record(
+@@ -714,6 +730,33 @@ class OhmoSessionRuntimePool:
+             return self._cwd
+         return normalized
+ 
++    def _register_ohmo_commands(self, bundle: RuntimeBundle) -> None:
++        commands = getattr(bundle, "commands", None)
++        if commands is None or not hasattr(commands, "register"):
++            return
++        from openharness.commands.registry import SlashCommand
++
++        async def _note_handler(args: str, context: CommandContext) -> CommandResult:
++            del context
++            tokens = args.split(maxsplit=1)
++            action = tokens[0] if tokens else "list"
++            rest = tokens[1] if len(tokens) == 2 else ""
++            if action == "list":
++                notes = load_notes_prompt(self._workspace)
++                return CommandResult(message=notes or "No workspace notes.")
++            if action == "add" and rest.strip():
++                path = append_notes_entry(self._workspace, rest)
++                return CommandResult(message=f"Added workspace note to {path}")
++            if action == "clear":
++                clear_notes(self._workspace)
++                return CommandResult(message="Cleared workspace notes.")
++            return CommandResult(message="Usage: /note [list|add TEXT|clear]")
++
++        existing = getattr(commands, "_commands", None)
++        if isinstance(existing, dict) and existing.get("note") is not None:
++            return
++        commands.register(SlashCommand("note", "Show, add or clear ohmo workspace notes", _note_handler))
++
+     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
+         self._unregister_group_tool(bundle)
+ 
+diff --git a/ohmo/workspace.py b/ohmo/workspace.py
+index 20bfe00..308765f 100644
+--- a/ohmo/workspace.py
++++ b/ohmo/workspace.py
+@@ -191,6 +191,10 @@ def get_bootstrap_path(workspace: str | Path | None = None) -> Path:
+     return get_workspace_root(workspace) / "BOOTSTRAP.md"
+ 
+ 
++def get_notes_path(workspace: str | Path | None = None) -> Path:
++    return get_workspace_root(workspace) / "notes.md"
++
++
+ def get_memory_dir(workspace: str | Path | None = None) -> Path:
+     return get_workspace_root(workspace) / "memory"
+ 
+diff --git a/src/openharness/commands/registry.py b/src/openharness/commands/registry.py
+index 9a69ad8..ea656f3 100644
+--- a/src/openharness/commands/registry.py
++++ b/src/openharness/commands/registry.py
+@@ -21,6 +21,7 @@ from openharness.config.paths import (
+     get_config_dir,
+     get_data_dir,
+     get_feedback_log_path,
++    get_project_active_repo_context_path,
+     get_project_config_dir,
+     get_project_issue_file,
+     get_project_pr_comments_file,
+@@ -1366,6 +1367,27 @@ def create_default_command_registry(
+             return CommandResult(message="No issue context to clear.")
+         return CommandResult(message="Usage: /issue [show|set TITLE :: BODY|clear]")
+ 
++    async def _focus_handler(args: str, context: CommandContext) -> CommandResult:
++        path = get_project_active_repo_context_path(context.cwd)
++        tokens = args.split(maxsplit=1)
++        action = tokens[0] if tokens else "show"
++        rest = tokens[1] if len(tokens) == 2 else ""
++        if action == "show":
++            if not path.exists():
++                return CommandResult(message=f"No active repo context. File path: {path}")
++            return CommandResult(message=path.read_text(encoding="utf-8"))
++        if action == "set" and rest.strip():
++            content = f"# Active Repo Context\n\n{rest.strip()}\n"
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(content, encoding="utf-8")
++            return CommandResult(message=f"Saved active repo context to {path}")
++        if action == "clear":
++            if path.exists():
++                path.unlink()
++                return CommandResult(message="Cleared active repo context.")
++            return CommandResult(message="No active repo context to clear.")
++        return CommandResult(message="Usage: /focus [show|set TEXT|clear]")
++
+     async def _pr_comments_handler(args: str, context: CommandContext) -> CommandResult:
+         path = get_project_pr_comments_file(context.cwd)
+         tokens = args.split(maxsplit=1)
+@@ -2476,6 +2498,15 @@ def create_default_command_registry(
+             remote_admin_opt_in=True,
+         )
+     )
++    registry.register(
++        SlashCommand(
++            "focus",
++            "Show or update the active repo context",
++            _focus_handler,
++            remote_invocable=False,
++            remote_admin_opt_in=True,
++        )
++    )
+     registry.register(SlashCommand("issue", "Show or update project issue context", _issue_handler))
+     registry.register(SlashCommand("pr_comments", "Show or update project PR comments context", _pr_comments_handler))
+     registry.register(SlashCommand("privacy-settings", "Show local privacy and storage settings", _privacy_settings_handler))

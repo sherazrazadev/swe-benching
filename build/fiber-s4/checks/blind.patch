@@ -1,0 +1,111 @@
+diff -ruN a/middleware/proxy/clientaddress.go b/middleware/proxy/clientaddress.go
+--- a/middleware/proxy/clientaddress.go	1970-01-01 00:00:00.000000000 +0000
++++ b/middleware/proxy/clientaddress.go	2026-10-29 12:01:58.743161394 +0000
+@@ -0,0 +1,20 @@
++package proxy
++
++import "github.com/valyala/fasthttp"
++
++// clientAddressHeader carries the address of the client as this middleware
++// observed it on the connection. The proxy owns this header on every request it
++// forwards: the upstream can rely on it naming the peer.
++const clientAddressHeader = "X-Real-IP"
++
++// claimClientAddress makes ip the single value of the client-address header in
++// h and discards every value that was stored there before.
++//
++// RequestHeader.Set only replaces the first stored value for a key, so a caller
++// that supplies the header on several lines would leave its remaining lines in
++// place and have them forwarded alongside the observed address. Deleting the
++// key first removes all of them.
++func claimClientAddress(h *fasthttp.RequestHeader, ip string) {
++	h.Del(clientAddressHeader)
++	h.Set(clientAddressHeader, ip)
++}
+diff -ruN a/middleware/proxy/forwardedfor.go b/middleware/proxy/forwardedfor.go
+--- a/middleware/proxy/forwardedfor.go	2026-10-29 11:46:33.000000000 +0000
++++ b/middleware/proxy/forwardedfor.go	2026-10-29 12:02:18.541298616 +0000
+@@ -1,22 +1,16 @@
+ package proxy
+ 
+ import (
+-	"strings"
+-
+ 	"github.com/gofiber/fiber/v3"
+ 	"github.com/valyala/fasthttp"
+ )
+ 
+ // ForwardedForForward forwards the request to addr, reporting the client
+-// address carried by the request's forwarding chain so an upstream that logs
+-// or filters on that address keeps seeing the original client.
++// address this middleware observed on the connection. The forwarding chain is
++// caller-controlled and is deliberately not used as the source of that address.
+ func ForwardedForForward(addr string, clients ...*fasthttp.Client) fiber.Handler {
+ 	return func(c fiber.Ctx) error {
+-		ip := c.IP()
+-		if chain := c.Get(fiber.HeaderXForwardedFor); chain != "" {
+-			ip = strings.TrimSpace(strings.Split(chain, ",")[0])
+-		}
+-		c.Request().Header.Set("X-Real-IP", ip)
++		claimClientAddress(&c.Request().Header, c.IP())
+ 		return Do(c, addr+c.OriginalURL(), clients...)
+ 	}
+ }
+diff -ruN a/middleware/proxy/prefix.go b/middleware/proxy/prefix.go
+--- a/middleware/proxy/prefix.go	2026-10-29 11:46:33.000000000 +0000
++++ b/middleware/proxy/prefix.go	2026-10-29 12:02:14.953292114 +0000
+@@ -26,10 +26,11 @@
+ 		}
+ 
+ 		req := &fasthttp.Request{}
+-		// The address learned from this connection wins over anything the
+-		// client put in the same header.
+-		req.Header.Set("X-Real-IP", c.IP())
++		// Copy the caller's request first: CopyTo resets the destination header
++		// map, so the address observed on this connection must be written after
++		// the copy to win over a value the caller supplied.
+ 		c.Request().Header.CopyTo(&req.Header)
++		claimClientAddress(&req.Header, c.IP())
+ 		req.Header.SetMethod(c.Method())
+ 		req.Header.Del(fiber.HeaderConnection)
+ 		req.SetBody(c.Body())
+diff -ruN a/middleware/proxy/proxy.go b/middleware/proxy/proxy.go
+--- a/middleware/proxy/proxy.go	2026-10-29 11:46:30.000000000 +0000
++++ b/middleware/proxy/proxy.go	2026-10-29 12:02:12.379290743 +0000
+@@ -74,6 +74,11 @@
+ 			req.Header.Del(fiber.HeaderConnection)
+ 		}
+ 
++		// Report the address this connection observed. This runs before the
++		// application's request hook so a value the application sets there
++		// remains authoritative.
++		claimClientAddress(&req.Header, c.IP())
++
+ 		// Modify request
+ 		if cfg.ModifyRequest != nil {
+ 			if err := cfg.ModifyRequest(c); err != nil {
+@@ -137,6 +142,7 @@
+ // This method will return a fiber.Handler
+ func Forward(addr string, clients ...*fasthttp.Client) fiber.Handler {
+ 	return func(c fiber.Ctx) error {
++		claimClientAddress(&c.Request().Header, c.IP())
+ 		return Do(c, addr, clients...)
+ 	}
+ }
+@@ -240,6 +246,7 @@
+ 	return func(c fiber.Ctx) error {
+ 		host := utils.UnsafeString(c.Request().Host())
+ 		if host == hostname {
++			claimClientAddress(&c.Request().Header, c.IP())
+ 			return Do(c, addr+c.OriginalURL(), clients...)
+ 		}
+ 		return nil
+@@ -279,7 +286,7 @@
+ 		if !strings.HasPrefix(server, "http") {
+ 			server = "http://" + server
+ 		}
+-		c.Request().Header.Add("X-Real-IP", c.IP())
++		claimClientAddress(&c.Request().Header, c.IP())
+ 		return Do(c, server+c.OriginalURL(), clients...)
+ 	}
+ }

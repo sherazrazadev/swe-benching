@@ -1,0 +1,135 @@
+diff --git a/src/lib/locale/compat.js b/src/lib/locale/compat.js
+new file mode 100644
+index 00000000..011c9a3d
+--- /dev/null
++++ b/src/lib/locale/compat.js
+@@ -0,0 +1,31 @@
++// Locale files that older releases published under a different spelling.
++// Loading the module here keeps those spellings working for server-side
++// callers without shipping every locale in the entry bundle.
++var legacyLocaleNames = {
++        'zh-hans': 'zh-cn',
++        'zh-hant': 'zh-tw',
++        'nb-no': 'nb',
++        'nn-no': 'nn',
++    },
++    loadedLegacyNames = {};
++
++export function loadLegacyLocale(name) {
++    var fileName;
++
++    if (typeof name !== 'string') {
++        return null;
++    }
++
++    fileName = legacyLocaleNames[name] || name;
++    if (loadedLegacyNames[fileName]) {
++        return fileName;
++    }
++
++    try {
++        require('./locale/' + fileName);
++        loadedLegacyNames[fileName] = true;
++        return fileName;
++    } catch (e) {
++        return null;
++    }
++}
+diff --git a/src/lib/locale/legacy.js b/src/lib/locale/legacy.js
+new file mode 100644
+index 00000000..46d5232d
+--- /dev/null
++++ b/src/lib/locale/legacy.js
+@@ -0,0 +1,21 @@
++// moment.lang()/moment.langData() predate the locale API. They load the
++// locale file themselves because older projects called them before any
++// locale had been registered.
++var loadedLangNames = {};
++
++export function loadLangLocale(name) {
++    if (!name || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) {
++        return undefined;
++    }
++
++    if (loadedLangNames[name] === undefined) {
++        try {
++            require('./locale/' + name);
++            loadedLangNames[name] = true;
++        } catch (e) {
++            loadedLangNames[name] = false;
++        }
++    }
++
++    return loadedLangNames[name] ? name : undefined;
++}
+diff --git a/src/lib/locale/locale.js b/src/lib/locale/locale.js
+index 522e36dd..18c07c64 100644
+--- a/src/lib/locale/locale.js
++++ b/src/lib/locale/locale.js
+@@ -32,14 +32,29 @@ export {
+ 
+ import { deprecate } from '../utils/deprecate';
+ import { hooks } from '../utils/hooks';
++import { loadLangLocale } from './legacy';
++
++function langWithLocaleLoad(key, values) {
++    if (key) {
++        loadLangLocale(key);
++    }
++    return getSetGlobalLocale(key, values);
++}
++
++function langDataWithLocaleLoad(key) {
++    if (key) {
++        loadLangLocale(key);
++    }
++    return getLocale(key);
++}
+ 
+ hooks.lang = deprecate(
+     'moment.lang is deprecated. Use moment.locale instead.',
+-    getSetGlobalLocale
++    langWithLocaleLoad
+ );
+ hooks.langData = deprecate(
+     'moment.langData is deprecated. Use moment.localeData instead.',
+-    getLocale
++    langDataWithLocaleLoad
+ );
+ 
+ import './en';
+diff --git a/src/lib/locale/locales.js b/src/lib/locale/locales.js
+index 721594a2..51eb7e20 100644
+--- a/src/lib/locale/locales.js
++++ b/src/lib/locale/locales.js
+@@ -6,6 +6,7 @@ import { Locale } from './constructor';
+ import keys from '../utils/keys';
+ 
+ import { baseConfig } from './base-config';
++import { loadLegacyLocale } from './compat';
+ 
+ // internal storage for locale config files
+ var locales = {},
+@@ -222,7 +223,7 @@ export function updateLocale(name, config) {
+ 
+ // returns locale data
+ export function getLocale(key) {
+-    var locale;
++    var locale, legacyName;
+ 
+     if (key && key._locale && key._locale._abbr) {
+         key = key._locale._abbr;
+@@ -238,6 +239,13 @@ export function getLocale(key) {
+         if (locale) {
+             return locale;
+         }
++        legacyName = loadLegacyLocale(key);
++        if (legacyName !== null) {
++            locale = loadLocale(legacyName);
++            if (locale) {
++                return locale;
++            }
++        }
+         key = [key];
+     }
+ 

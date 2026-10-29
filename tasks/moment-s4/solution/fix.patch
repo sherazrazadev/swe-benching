@@ -1,0 +1,117 @@
+diff --git a/src/lib/locale/compat.js b/src/lib/locale/compat.js
+index 011c9a3d..be61bb13 100644
+--- a/src/lib/locale/compat.js
++++ b/src/lib/locale/compat.js
+@@ -17,6 +17,10 @@ export function loadLegacyLocale(name) {
+     }
+ 
+     fileName = legacyLocaleNames[name] || name;
++    // Only a canonical locale module name may be appended to the require path.
++    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(fileName)) {
++        return null;
++    }
+     if (loadedLegacyNames[fileName]) {
+         return fileName;
+     }
+diff --git a/src/lib/locale/legacy.js b/src/lib/locale/legacy.js
+index 46d5232d..eed4a6d2 100644
+--- a/src/lib/locale/legacy.js
++++ b/src/lib/locale/legacy.js
+@@ -4,7 +4,12 @@
+ var loadedLangNames = {};
+ 
+ export function loadLangLocale(name) {
+-    if (!name || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) {
++    if (
++        !name ||
++        typeof name !== 'string' ||
++        name.indexOf('/') !== -1 ||
++        name.indexOf('\\') !== -1
++    ) {
+         return undefined;
+     }
+ 
+diff --git a/src/lib/locale/locales.js b/src/lib/locale/locales.js
+index 51eb7e20..04b1af30 100644
+--- a/src/lib/locale/locales.js
++++ b/src/lib/locale/locales.js
+@@ -64,34 +64,44 @@ function chooseLocale(names) {
+ }
+ 
+ function isLocaleNameSane(name) {
+-    // Prevent names that look like filesystem paths, i.e contain '/' or '\'
+-    // Ensure name is available and function returns boolean
+-    return !!(name && name.match('^[^/\\\\]*$'));
++    // Only canonical locale module names are safe to append to the require path.
++    return typeof name === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name);
+ }
+ 
+ function loadLocale(name) {
+     var oldLocale = null,
+-        aliasedRequire;
++        aliasedRequire,
++        normalizedName;
++
++    // Preserve exact custom locale names before trying the canonical built-in name.
++    if (locales[name] !== undefined) {
++        return locales[name];
++    }
++
++    normalizedName = normalizeLocale(name);
++    if (locales[normalizedName] !== undefined) {
++        return locales[normalizedName];
++    }
++
+     // TODO: Find a better way to register and load all the locales in Node
+     if (
+-        locales[name] === undefined &&
+         typeof module !== 'undefined' &&
+         module &&
+         module.exports &&
+-        isLocaleNameSane(name)
++        isLocaleNameSane(normalizedName)
+     ) {
+         try {
+             oldLocale = globalLocale._abbr;
+             aliasedRequire = require;
+-            aliasedRequire('./locale/' + name);
++            aliasedRequire('./locale/' + normalizedName);
+             getSetGlobalLocale(oldLocale);
+         } catch (e) {
+             // mark as not found to avoid repeating expensive file require call causing high CPU
+             // when trying to find en-US, en_US, en-us for every format call
+-            locales[name] = null; // null means not found
++            locales[normalizedName] = null; // null means not found
+         }
+     }
+-    return locales[name];
++    return locales[normalizedName];
+ }
+ 
+ // This function will load locale and then set the global locale.  If
+@@ -177,17 +187,20 @@ export function defineLocale(name, config) {
+ }
+ 
+ export function updateLocale(name, config) {
+-    if (config != null) {
+-        var locale,
+-            tmpLocale,
+-            parentConfig = baseConfig;
++    var locale,
++        tmpLocale = loadLocale(name),
++        parentConfig = baseConfig;
+ 
++    if (tmpLocale != null) {
++        name = tmpLocale._abbr;
++    }
++
++    if (config != null) {
+         if (locales[name] != null && locales[name].parentLocale != null) {
+             // Update existing child locale in-place to avoid memory-leaks
+             locales[name].set(mergeConfigs(locales[name]._config, config));
+         } else {
+             // MERGE
+-            tmpLocale = loadLocale(name);
+             if (tmpLocale != null) {
+                 parentConfig = tmpLocale._config;
+             }

@@ -1,0 +1,79 @@
+diff --git a/ohmo/gateway/runtime.py b/ohmo/gateway/runtime.py
+index 5ac5f28..39cc1d7 100644
+--- a/ohmo/gateway/runtime.py
++++ b/ohmo/gateway/runtime.py
+@@ -33,7 +33,6 @@ from openharness.prompts import build_runtime_system_prompt
+ from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
+ 
+ from ohmo.gateway.config import load_gateway_config
+-from ohmo.gateway.focus_commands import handle_gateway_focus_command
+ from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
+ from ohmo.gateway.notes import append_notes_entry, clear_notes, load_notes_prompt
+ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+@@ -141,8 +140,6 @@ class OhmoSessionRuntimePool:
+             result = handle_gateway_provider_command(args, workspace=self._workspace)
+         elif lowered == "model":
+             result = handle_gateway_model_command(args, workspace=self._workspace)
+-        elif lowered == "focus":
+-            result = handle_gateway_focus_command(args, cwd=cwd or self._cwd)
+         else:
+             return None
+         if result[1]:
+@@ -267,6 +264,19 @@ class OhmoSessionRuntimePool:
+         if parsed is not None and not message.media:
+             command, args = parsed
+             command_name = str(getattr(command, "name", "") or "")
++            if command_name in {"issue", "pr_comments"} and str(Path(getattr(bundle, "cwd", self._cwd)).resolve()) == str(Path(self._cwd).resolve()):
++                result = CommandResult(
++                    message=f"/{command_name} is only available in the local OpenHarness UI."
++                )
++                async for update in self._stream_command_result(
++                    bundle=bundle,
++                    message=message,
++                    session_key=session_key,
++                    user_prompt=user_prompt,
++                    result=result,
++                ):
++                    yield update
++                return
+             gateway_result = self._handle_gateway_scoped_command(
+                 command_name, args, cwd=getattr(bundle, "cwd", self._cwd)
+             )
+@@ -755,7 +765,15 @@ class OhmoSessionRuntimePool:
+         existing = getattr(commands, "_commands", None)
+         if isinstance(existing, dict) and existing.get("note") is not None:
+             return
+-        commands.register(SlashCommand("note", "Show, add or clear ohmo workspace notes", _note_handler))
++        commands.register(
++            SlashCommand(
++                "note",
++                "Show, add or clear ohmo workspace notes",
++                _note_handler,
++                remote_invocable=False,
++                remote_admin_opt_in=True,
++            )
++        )
+ 
+     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
+         self._unregister_group_tool(bundle)
+diff --git a/src/openharness/commands/registry.py b/src/openharness/commands/registry.py
+index ea656f3..24ec4ee 100644
+--- a/src/openharness/commands/registry.py
++++ b/src/openharness/commands/registry.py
+@@ -2353,7 +2353,15 @@ def create_default_command_registry(
+     registry.register(SlashCommand("usage", "Show usage and token estimates", _usage_handler))
+     registry.register(SlashCommand("stats", "Show session statistics", _stats_handler))
+     registry.register(SlashCommand("dream", "Consolidate memory", _dream_handler))
+-    registry.register(SlashCommand("memory", "Inspect and manage project memory", _memory_handler))
++    registry.register(
++        SlashCommand(
++            "memory",
++            "Inspect and manage project memory",
++            _memory_handler,
++            remote_invocable=False,
++            remote_admin_opt_in=True,
++        )
++    )
+     registry.register(SlashCommand("hooks", "Show configured hooks", _hooks_handler))
+     registry.register(SlashCommand("resume", "Restore the latest saved session", _resume_handler))
+     registry.register(SlashCommand("session", "Inspect the current session storage", _session_handler))

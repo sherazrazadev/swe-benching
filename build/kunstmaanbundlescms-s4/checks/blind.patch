@@ -1,0 +1,298 @@
+--- a/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php	2026-10-29 11:43:38.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php	2026-10-29 12:08:06.551874733 +0000
+@@ -56,7 +56,7 @@
+                 $handler = $this->mediaManager->getHandler($media);
+                 if ($media->isDeleted() && $media->getLocation() === 'local' && $handler instanceof FileHandler) {
+                     $oldFileUrl = $media->getUrl();
+-                    $newFileName = ($original ? $media->getOriginalFilename() : uniqid() . '.' . pathinfo($oldFileUrl, PATHINFO_EXTENSION));
++                    $newFileName = ($original ? $handler->getStoredFilename((string) $media->getOriginalFilename()) : uniqid() . '.' . pathinfo($oldFileUrl, PATHINFO_EXTENSION));
+                     $newFileUrl = \dirname($oldFileUrl) . '/' . $newFileName;
+                     $fileRenameQueue[] = [$oldFileUrl, $newFileUrl, $handler];
+                     $media->setUrl($newFileUrl);
+@@ -75,10 +75,12 @@
+ 
+         foreach ($fileRenameQueue as $row) {
+             [$oldFileUrl, $newFileUrl, $handler] = $row;
+-            $handler->fileSystem->rename(
+-                preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $oldFileUrl),
+-                preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $newFileUrl)
+-            );
++            $oldFileKey = preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $oldFileUrl);
++            $newFileKey = preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $newFileUrl);
++            if ($oldFileKey === $newFileKey) {
++                continue;
++            }
++            $handler->fileSystem->rename($oldFileKey, $newFileKey);
+             $output->writeln('Renamed <info>' . $oldFileUrl . '</info> to <info>' . basename($newFileUrl) . '</info>');
+         }
+ 
+--- a/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php	2026-10-29 11:43:38.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php	2026-10-29 12:08:08.987885837 +0000
+@@ -2,6 +2,7 @@
+ 
+ namespace Kunstmaan\MediaBundle\DependencyInjection;
+ 
++use Kunstmaan\MediaBundle\Helper\File\StoredFilenamePolicy;
+ use Symfony\Component\Config\Definition\Builder\TreeBuilder;
+ use Symfony\Component\Config\Definition\ConfigurationInterface;
+ 
+@@ -32,7 +33,8 @@
+                 ->end()
+                 ->booleanNode('enable_pdf_preview')->defaultFalse()->end()
+                 ->arrayNode('blacklisted_extensions')
+-                    ->defaultValue(['php', 'htaccess'])
++                    ->info('Files with one of these extensions are stored as .txt. Server-executable extensions are impossible to store regardless of this setting.')
++                    ->defaultValue(StoredFilenamePolicy::EXECUTABLE_EXTENSIONS)
+                     ->prototype('scalar')->end()
+                 ->end()
+                 ->scalarNode('web_root')
+--- a/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php	2026-10-29 11:43:38.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php	2026-10-29 12:08:00.140817881 +0000
+@@ -42,6 +42,21 @@
+     private $blacklistedExtensions = [];
+ 
+     /**
++     * When not empty, the only extensions that are kept. Empty means every extension that is not
++     * blacklisted is kept.
++     *
++     * @var array
++     */
++    private $allowedExtensions = [];
++
++    /**
++     * Built from the extensions above the first time a stored name is needed.
++     *
++     * @var StoredFilenamePolicy|null
++     */
++    private $storedFilenamePolicy;
++
++    /**
+      * @var SlugifierInterface
+      */
+     private $slugifier;
+@@ -59,6 +74,7 @@
+     public function setSlugifier(SlugifierInterface $slugifier)
+     {
+         $this->slugifier = $slugifier;
++        $this->storedFilenamePolicy = null;
+     }
+ 
+     /**
+@@ -67,6 +83,16 @@
+     public function setBlacklistedExtensions(array $blacklistedExtensions)
+     {
+         $this->blacklistedExtensions = $blacklistedExtensions;
++        $this->storedFilenamePolicy = null;
++    }
++
++    /**
++     * Inject the allowed extensions, when empty only the blacklist is applied.
++     */
++    public function setAllowedExtensions(array $allowedExtensions)
++    {
++        $this->allowedExtensions = $allowedExtensions;
++        $this->storedFilenamePolicy = null;
+     }
+ 
+     /**
+@@ -278,26 +304,37 @@
+ 
+     private function getFilePath(Media $media): string
+     {
+-        $filename = $media->getOriginalFilename();
+-        $filename = str_replace(['/', '\\', '%'], '', $filename);
+-
+-        if (!empty($this->blacklistedExtensions)) {
+-            $filename = preg_replace('/\.(' . implode('|', $this->blacklistedExtensions) . ')$/', '.txt', $filename);
+-        }
+-
+-        $parts = pathinfo($filename);
+-        $filename = $this->slugifier->slugify($parts['filename']);
+-        if (\array_key_exists('extension', $parts)) {
+-            $filename .= '.' . strtolower($parts['extension']);
+-        }
+-
+         return sprintf(
+             '%s/%s',
+             $media->getUuid(),
+-            $filename
++            $this->getStoredFilename((string) $media->getOriginalFilename())
+         );
+     }
+ 
++    /**
++     * The name a media file is stored under, without the folder.
++     *
++     * Public so that maintenance code which moves or copies media files applies the same rule as
++     * the upload that stored them.
++     */
++    public function getStoredFilename(string $originalFilename): string
++    {
++        return $this->getStoredFilenamePolicy()->storedName($originalFilename);
++    }
++
++    private function getStoredFilenamePolicy(): StoredFilenamePolicy
++    {
++        if (null === $this->storedFilenamePolicy) {
++            $this->storedFilenamePolicy = new StoredFilenamePolicy(
++                $this->slugifier,
++                $this->blacklistedExtensions,
++                $this->allowedExtensions
++            );
++        }
++
++        return $this->storedFilenamePolicy;
++    }
++
+     private function getFileFolderPath(Media $media): string
+     {
+         $uuid = (string) $media->getUuid();
+--- a/src/Kunstmaan/MediaBundle/Helper/File/PdfHandler.php	2026-10-29 11:43:41.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/Helper/File/PdfHandler.php	2026-10-29 12:08:03.272821297 +0000
+@@ -60,9 +60,9 @@
+     public function getOriginalFile(Media $media)
+     {
+         // The preview transformer detects the document type from the file name, so keep the
+-        // document under the name it was uploaded with.
++        // document under the name it is stored under.
+         if ($media->getContent() instanceof File && null !== $media->getOriginalFilename()) {
+-            return $this->fileSystem->get($media->getUuid() . '/' . $media->getOriginalFilename(), true);
++            return $this->fileSystem->get($media->getUuid() . '/' . $this->getStoredFilename((string) $media->getOriginalFilename()), true);
+         }
+ 
+         return parent::getOriginalFile($media);
+--- a/src/Kunstmaan/MediaBundle/Helper/File/StoredFilenamePolicy.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/Helper/File/StoredFilenamePolicy.php	2026-10-29 12:07:51.224961657 +0000
+@@ -0,0 +1,117 @@
++<?php
++
++namespace Kunstmaan\MediaBundle\Helper\File;
++
++use Kunstmaan\UtilitiesBundle\Helper\SlugifierInterface;
++
++/**
++ * Turns the name a file was uploaded with into the name it is stored under in the public upload
++ * directory.
++ *
++ * The web server picks what to execute from the extension of the file on disk, so the stored
++ * name always lowercases the extension and never keeps one that a server may execute - whether
++ * the uploaded name wrote it in upper case, mixed case, or in a project that narrowed the
++ * configured blacklist.
++ */
++final class StoredFilenamePolicy
++{
++    /**
++     * Stored instead of an extension that must not be kept.
++     */
++    public const FALLBACK_EXTENSION = 'txt';
++
++    /**
++     * Extensions of files a web server may execute or hand to an interpreter.
++     *
++     * This list is part of the protection and not only of the default configuration: a project
++     * may add extensions to the blacklist, it cannot remove any of these.
++     */
++    public const EXECUTABLE_EXTENSIONS = [
++        'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8',
++        'phps', 'phpt', 'pht', 'phtm', 'phtml', 'phar', 'inc',
++        'htaccess', 'htpasswd', 'htgroup',
++        'shtml', 'shtm', 'stm', 'cgi', 'fcgi',
++        'pl', 'pm', 'py', 'rb', 'sh', 'bash', 'csh', 'ksh',
++        'asp', 'aspx', 'ashx', 'asmx', 'ascx', 'asax', 'config',
++        'jsp', 'jspx', 'jspf', 'cfm', 'cfml', 'cfc',
++    ];
++
++    /**
++     * @var SlugifierInterface
++     */
++    private $slugifier;
++
++    /**
++     * @var string[]
++     */
++    private $deniedExtensions;
++
++    /**
++     * @var string[]
++     */
++    private $allowedExtensions;
++
++    /**
++     * @param string[] $configuredBlacklist extensions the project additionally refuses
++     * @param string[] $configuredAllowlist when not empty, the only extensions that may be kept
++     */
++    public function __construct(SlugifierInterface $slugifier, array $configuredBlacklist = [], array $configuredAllowlist = [])
++    {
++        $this->slugifier = $slugifier;
++        $this->deniedExtensions = self::normalize(array_merge(self::EXECUTABLE_EXTENSIONS, $configuredBlacklist));
++        $this->allowedExtensions = self::normalize($configuredAllowlist);
++    }
++
++    /**
++     * The name a file is stored under. It never carries an executable extension.
++     */
++    public function storedName(string $uploadedName): string
++    {
++        $filename = str_replace(['/', '\\', '%', "\0"], '', $uploadedName);
++
++        $parts = pathinfo($filename);
++        $basename = $this->slugifier->slugify($parts['filename'] ?? '');
++        $extension = strtolower($parts['extension'] ?? '');
++
++        if ('' === $extension) {
++            return $basename;
++        }
++
++        if (!$this->isKept($extension)) {
++            $extension = self::FALLBACK_EXTENSION;
++        }
++
++        return '' === $basename ? $extension : $basename . '.' . $extension;
++    }
++
++    private function isKept(string $extension): bool
++    {
++        if (\in_array($extension, $this->deniedExtensions, true)) {
++            return false;
++        }
++
++        if ([] === $this->allowedExtensions) {
++            return true;
++        }
++
++        return \in_array($extension, $this->allowedExtensions, true);
++    }
++
++    /**
++     * @param string[] $extensions
++     *
++     * @return string[]
++     */
++    private static function normalize(array $extensions): array
++    {
++        $normalized = [];
++        foreach ($extensions as $extension) {
++            $extension = strtolower(ltrim(trim((string) $extension), '.'));
++            if ('' !== $extension) {
++                $normalized[$extension] = true;
++            }
++        }
++
++        return array_keys($normalized);
++    }
++}
+--- a/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php	2026-10-29 11:43:41.000000000 +0000
++++ b/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php	2026-10-29 12:08:02.510820467 +0000
+@@ -60,10 +60,9 @@
+         parent::saveMedia($media);
+ 
+         // The crop editor reads the uploaded image back at its original resolution, so keep a
+-        // copy of it next to the stored file under the name it was uploaded with, unless the
+-        // stored file already has that name.
++        // copy of it next to the stored file under the name it is stored under.
+         $content = $media->getContent();
+-        $key = $media->getUuid() . '/' . $media->getOriginalFilename();
++        $key = $media->getUuid() . '/' . $this->getStoredFilename((string) $media->getOriginalFilename());
+         if ($content instanceof File && false !== $content->getRealPath() && !$this->fileSystem->has($key)) {
+             $this->fileSystem->write($key, file_get_contents($content->getRealPath()));
+         }

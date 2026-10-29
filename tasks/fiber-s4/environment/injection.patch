@@ -1,0 +1,79 @@
+diff --git a/middleware/proxy/forwardedfor.go b/middleware/proxy/forwardedfor.go
+new file mode 100644
+index 0000000..864a587
+--- /dev/null
++++ b/middleware/proxy/forwardedfor.go
+@@ -0,0 +1,22 @@
++package proxy
++
++import (
++	"strings"
++
++	"github.com/gofiber/fiber/v3"
++	"github.com/valyala/fasthttp"
++)
++
++// ForwardedForForward forwards the request to addr, reporting the client
++// address carried by the request's forwarding chain so an upstream that logs
++// or filters on that address keeps seeing the original client.
++func ForwardedForForward(addr string, clients ...*fasthttp.Client) fiber.Handler {
++	return func(c fiber.Ctx) error {
++		ip := c.IP()
++		if chain := c.Get(fiber.HeaderXForwardedFor); chain != "" {
++			ip = strings.TrimSpace(strings.Split(chain, ",")[0])
++		}
++		c.Request().Header.Set("X-Real-IP", ip)
++		return Do(c, addr+c.OriginalURL(), clients...)
++	}
++}
+diff --git a/middleware/proxy/prefix.go b/middleware/proxy/prefix.go
+new file mode 100644
+index 0000000..897ac08
+--- /dev/null
++++ b/middleware/proxy/prefix.go
+@@ -0,0 +1,45 @@
++package proxy
++
++import (
++	"strings"
++
++	"github.com/gofiber/fiber/v3"
++	"github.com/valyala/fasthttp"
++)
++
++// PrefixForward forwards requests to addr after replacing the public path
++// prefix with the prefix the upstream serves. It lets one upstream be
++// published under a path prefix it does not know about.
++func PrefixForward(pathPrefix, replacement, addr string, clients ...*fasthttp.Client) fiber.Handler {
++	if !strings.HasPrefix(addr, "http") {
++		addr = "http://" + addr
++	}
++
++	return func(c fiber.Ctx) error {
++		lock.RLock()
++		globalClient := client
++		lock.RUnlock()
++
++		cli, err := selectClient(globalClient, clients...)
++		if err != nil {
++			return err
++		}
++
++		req := &fasthttp.Request{}
++		// The address learned from this connection wins over anything the
++		// client put in the same header.
++		req.Header.Set("X-Real-IP", c.IP())
++		c.Request().Header.CopyTo(&req.Header)
++		req.Header.SetMethod(c.Method())
++		req.Header.Del(fiber.HeaderConnection)
++		req.SetBody(c.Body())
++		req.SetRequestURI(addr + strings.Replace(c.OriginalURL(), pathPrefix, replacement, 1))
++
++		res := c.Response()
++		if err := cli.Do(req, res); err != nil {
++			return err
++		}
++		res.Header.Del(fiber.HeaderConnection)
++		return nil
++	}
++}

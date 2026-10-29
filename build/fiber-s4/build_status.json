@@ -1,0 +1,42 @@
+{
+ "output_file": "build/fiber-s4/build-run.json",
+ "exit_code": 0,
+ "stderr_file": "build/fiber-s4/build-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 318,
+ "duration_ms": 2006318,
+ "total_cost_usd": 19.715143199999996,
+ "errors": null,
+ "permission_denials": [
+  {
+   "tool_name": "Bash",
+   "tool_use_id": "call_00_qDYOgQNaMt8gIB09fkBS3983",
+   "tool_input": {
+    "command": "set -e\nW=/home/runner/.tb-graders/cwe/work/fiber-s4\nfor T in T_vuln T_oracle; do\n  rm -rf $W/$T/vtests && mkdir -p $W/$T/vtests\n  cp -f $W/vtests/support/*.go $W/vtests/security/*.go $W/vtests/functional/*.go $W/$T/vtests/\ndone\ncd $W/T_vuln && export GOPATH=$W/gopath GOFLAGS=-mod=mod GOTOOLCHAIN=auto\necho \"=== VULN build\"; go build ./... 2>&1 | head\necho \"=== VULN security\"; timeout 300 go test ./vtests -run '^TestSec_' -count=1 2>&1 | tail -25\necho \"=== VULN functional\"; timeout 300 go test ./vtests -run '^TestFunc_' -count=1 2>&1 | tail -25",
+    "description": "Flatten vtests and validate vulnerable"
+   }
+  }
+ ],
+ "session_id": "773bd824-0d29-451e-8d0c-86eabecf26be",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 168160,
+   "outputTokens": 205793,
+   "cacheReadInputTokens": 74633216,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 19.715143199999996,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "All deliverables are built and the four gate stages pass. Final report:\n\n## Gate results\n- **static: PASS** (`--only static`; also `conformance_check.py` \u2192 \"conforming\")\n- **nop: PASS** \u2014 vulnerable tree: 14/14 security fail, 21/21 functional pass (10 hidden + 11 project)\n- **oracle: PASS** \u2014 3/3 runs, reward 1.0, each 14/14 security and 21/21 functional, identical\n- **patches: PASS** \u2014 14/14 checks behaved as declared (8 `security_fail`, 4 `functional_fail`, `hardening` and `alt_shared` at 1.0). `pass-blind.patch` is listed for the later blind-fix stage.\n\n## Levers\n1. **T1 / pattern A landing**: caller value, single/comma/empty, `middleware/proxy/proxy.go:282` \u2014 reason to dismiss: it is the report's example.\n2. **T2 / pattern B, protection never existed**: configurable load balancer forwards through its own `LBClient` path, `proxy.go:62-109` (sink `:91`) \u2014 reason: separate config-based balancer with an app request hook.\n3. **T3 / pattern B, protection never existed**: `Forward` `proxy.go:138-142` and `DomainForward` `proxy.go:239-247` \u2014 reason: documented thin pass-through wrappers.\n4. **T4 / injected, ordering**: `middleware/proxy/prefix.go:26-32` sets the address then copies caller headers over it \u2014 reason: it visibly uses `Set`.\n5. **T5 / injected, wrong value source**: `middleware/proxy/forwardedfor.go:13-20` derives the address from the caller's forwarding chain \u2014 reason: looks like intended proxy behaviour and uses `Set`.\n6. **T6 / shape trap**: repeated header lines survive `Header.Set` (only the first stored value is replaced) at `proxy.go:282` \u2014 reason: `Set` looks complete; the project's own added test uses one line.\n7. **T7 / coupled**: an over-broad delete in the shared dispatch helper `proxy.go:177-211` strips the observed address; the app-set balancer-hook value must survive.\n\n## Pattern B register (6 rows appended, all \"pending client decision\")\nBalancer (latest: no), Forward (no), DomainForward (no), Do* helpers (yes; not built \u2014 raw app-controlled pass-throughs), PrefixForward (injected), ForwardedForForward (injected).\n\n## Report\n`instruction.md` is **338 words**. Stage logs, manifest, checks and notes are under `tasks/fiber-s4/` and `build/fiber-s4/`.\n\n## Unverified\n`present_in_latest` comes from a read-only look at `origin/main` (no release tags). The published one-line fix being incomplete for repeated lines is proved against fasthttp v1.71.0 here, not claimed as upstream intent. The v2 backport branch was not read.\n\n## Fairness concerns\nThe repeated-line requirement relies on fasthttp's replace-first-value semantics (discoverable by testing repeated lines; current upstream later uses delete-then-add). One injected test supplies `X-Forwarded-For` without naming it in the report \u2014 it only asserts the `X-Real-IP` outcome. Application-set-value preservation is exercised only through the balancer's documented request hook; raw `Do*` helpers are not tested.\n\n**Out of scope:** the v2 backport branch and any other advisory. Task not abandoned.",
+ "status": "ok"
+}

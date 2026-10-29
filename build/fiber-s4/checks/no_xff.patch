@@ -1,0 +1,69 @@
+diff --git a/middleware/proxy/prefix.go b/middleware/proxy/prefix.go
+index 897ac08..a49c1bb 100644
+--- a/middleware/proxy/prefix.go
++++ b/middleware/proxy/prefix.go
+@@ -26,10 +26,10 @@ func PrefixForward(pathPrefix, replacement, addr string, clients ...*fasthttp.Cl
+ 		}
+ 
+ 		req := &fasthttp.Request{}
++		c.Request().Header.CopyTo(&req.Header)
+ 		// The address learned from this connection wins over anything the
+ 		// client put in the same header.
+-		req.Header.Set("X-Real-IP", c.IP())
+-		c.Request().Header.CopyTo(&req.Header)
++		setClientAddress(&req.Header, c.IP())
+ 		req.Header.SetMethod(c.Method())
+ 		req.Header.Del(fiber.HeaderConnection)
+ 		req.SetBody(c.Body())
+diff --git a/middleware/proxy/proxy.go b/middleware/proxy/proxy.go
+index 2883ff5..3263889 100644
+--- a/middleware/proxy/proxy.go
++++ b/middleware/proxy/proxy.go
+@@ -74,6 +74,8 @@ func Balancer(config ...Config) fiber.Handler {
+ 			req.Header.Del(fiber.HeaderConnection)
+ 		}
+ 
++		setClientAddress(&req.Header, c.IP())
++
+ 		// Modify request
+ 		if cfg.ModifyRequest != nil {
+ 			if err := cfg.ModifyRequest(c); err != nil {
+@@ -119,6 +121,13 @@ var (
+ 	errNilGlobalProxyClient   = errors.New("proxy: global client is nil, set a non-nil client with proxy.WithClient")
+ )
+ 
++// setClientAddress makes the address observed on this connection the only value
++// of the client-address header, removing every value the client supplied.
++func setClientAddress(header *fasthttp.RequestHeader, ip string) {
++	header.Del("X-Real-IP")
++	header.Set("X-Real-IP", ip)
++}
++
+ var lock sync.RWMutex
+ 
+ // WithClient sets the global proxy client.
+@@ -137,6 +146,7 @@ func WithClient(cli *fasthttp.Client) {
+ // This method will return a fiber.Handler
+ func Forward(addr string, clients ...*fasthttp.Client) fiber.Handler {
+ 	return func(c fiber.Ctx) error {
++		setClientAddress(&c.Request().Header, c.IP())
+ 		return Do(c, addr, clients...)
+ 	}
+ }
+@@ -240,6 +250,7 @@ func DomainForward(hostname, addr string, clients ...*fasthttp.Client) fiber.Han
+ 	return func(c fiber.Ctx) error {
+ 		host := utils.UnsafeString(c.Request().Host())
+ 		if host == hostname {
++			setClientAddress(&c.Request().Header, c.IP())
+ 			return Do(c, addr+c.OriginalURL(), clients...)
+ 		}
+ 		return nil
+@@ -279,7 +290,7 @@ func BalancerForward(servers []string, clients ...*fasthttp.Client) fiber.Handle
+ 		if !strings.HasPrefix(server, "http") {
+ 			server = "http://" + server
+ 		}
+-		c.Request().Header.Add("X-Real-IP", c.IP())
++		setClientAddress(&c.Request().Header, c.IP())
+ 		return Do(c, server+c.OriginalURL(), clients...)
+ 	}
+ }

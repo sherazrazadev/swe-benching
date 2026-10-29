@@ -1,0 +1,283 @@
+{
+ "slug": "fiber-s4",
+ "candidate": "screener-v2 entry 17615: GHSA-GCFQ-8GQF-4876 / CVE-2026-45045 / GO-2026-5887 (gofiber/fiber), client-IP / header trust spoofing (CWE-290)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "40c0a5279ab14791974c34467ec3c57de5a36c8c (first parent of merge 1403cc82; the fix branch adds the only regression test, so the pinned tree does not contain it)",
+  "fix_commits": [
+   "1403cc8292da3220e9316960b4030cc722a0f396 (v3 merge: BalancerForward Header.Add -> Header.Set, docs, regression test)",
+   "33c9501288ab47a429c8b5e701493f0c3c0af37d (v2 backport merge; the v2 branch is not part of the pinned tree and was not read)"
+  ],
+  "entry_points": [
+   "Go handler proxy.BalancerForward([]string{upstream}) mounted with app.Use / app.Get; driven in-process with app.Test over a loopback upstream",
+   "Go handler proxy.Balancer(proxy.Config{Servers: []string{upstream}}) mounted with app.Use",
+   "Go handler proxy.Forward(upstream) mounted with app.Use",
+   "Go handler proxy.DomainForward(host, upstream) mounted with app.Use",
+   "injected Go handler proxy.PrefixForward(prefix, replacement, upstream) mounted with app.Use",
+   "injected Go handler proxy.ForwardedForForward(upstream) mounted with app.Use"
+  ],
+  "sites": [
+   "middleware/proxy/proxy.go:282 (landing, published fix: Header.Add -> Header.Set)",
+   "middleware/proxy/proxy.go:91 and 62-109 (configurable balancer forwards through fasthttp.LBClient.Do: own dispatch path, never writes the header)",
+   "middleware/proxy/proxy.go:138-142 (single-target forwarder: never writes the header)",
+   "middleware/proxy/proxy.go:239-247 (host-matched forwarder: never writes the header)",
+   "middleware/proxy/prefix.go:26-32 (injected: header set before Header.CopyTo, which resets dst and restores the caller's value)",
+   "middleware/proxy/forwardedfor.go:13-20 (injected: address taken from the caller-supplied X-Forwarded-For chain)"
+  ],
+  "routes": [
+   "Balancer: real, unmodified upstream code; forwards via LBClient.Do, unlike every Do-based path (confirmed on the pinned copy)",
+   "Forward: real, unmodified upstream code; forwards to the fixed target (confirmed on the pinned copy)",
+   "DomainForward: real, unmodified upstream code; forwards when Host matches (confirmed on the pinned copy)",
+   "Do/DoRedirects/DoDeadline/DoTimeout: real, unmodified upstream code; left as application-controlled pass-through helpers, consistently with current upstream, and NOT tested",
+   "PrefixForward: injected sibling (confirmed on the injected copy)",
+   "ForwardedForForward: injected sibling (confirmed on the injected copy)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "go test ./middleware/proxy (whole package at pinned commit, 3.7s, pass)",
+   "graded subset: Test_Proxy, Test_Proxy_Balancer_Forward_Local, Test_Proxy_Domain_Forward_Local, Test_Proxy_Forward, Test_Proxy_Forward_Local_Client, Test_Proxy_Forward_Global_Client, Test_Proxy_Modify_Request, Test_Proxy_Modify_Response, Test_Proxy_Immutable, Test_Proxy_KeepConnectionHeader, Test_Proxy_DropConnectionHeader (11 pass on vulnerable and oracle)"
+  ],
+  "local_runs": "Host Go 1.25.0 against the pinned tree: vulnerable 0/14 security pass, 10/10 functional pass, 11/11 project pass; oracle 14/14, 10/10, 11/11. All 14 checks/ variants applied to a fresh injected tree and run: security_fail variants leave functional and project passing; refuse_all/crash/del_doaction/overwrite_hook fail functional as declared; hardening and alt_shared pass everything. Docker/Harbor runs are the gate stages below."
+ },
+ "leak_terms": [
+  "BalancerForward",
+  "Balancer",
+  "Forward",
+  "DomainForward",
+  "PrefixForward",
+  "ForwardedForForward",
+  "doAction",
+  "selectClient",
+  "ModifyRequest",
+  "ModifyResponse",
+  "ProxyHeader",
+  "TrustProxy",
+  "X-Forwarded-For",
+  "X-Forwarded",
+  "LBClient",
+  "proxy.go",
+  "prefix.go",
+  "forwardedfor.go",
+  "middleware/proxy",
+  "Header.Add",
+  "Header.Set",
+  "PeekAll"
+ ],
+ "patch_checks": [
+  {
+   "patch": "published_only.patch",
+   "expect": "security_fail",
+   "note": "published upstream fix only (BalancerForward Add -> Set): misses the balancer path, both single-target forwarders, both injected helpers, and the repeated-header-line form"
+  },
+  {
+   "patch": "set_only.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: Set the observed address everywhere without deleting existing values; repeated header lines survive (Set replaces only the first arg)"
+  },
+  {
+   "patch": "single_value_only.patch",
+   "expect": "security_fail",
+   "note": "shape fix: replace only when the existing value parses as one address; a comma-joined list is left in place"
+  },
+  {
+   "patch": "no_balancer.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the configurable balancer path (its own LBClient dispatch)"
+  },
+  {
+   "patch": "no_forwarders.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the single-target and host-matched forwarders"
+  },
+  {
+   "patch": "no_prefix.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the injected prefix-forwarding helper (header replaced before the header copy)"
+  },
+  {
+   "patch": "no_xff.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the injected forwarding-chain helper (address still taken from the caller's chain)"
+  },
+  {
+   "patch": "no_landing.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the report's landing path (keeps the append)"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses any request that carries the header instead of serving it with the observed address"
+  },
+  {
+   "patch": "crash.patch",
+   "expect": "functional_fail",
+   "note": "returns HTTP 500 for a request that carries the header instead of serving it"
+  },
+  {
+   "patch": "del_doaction.patch",
+   "expect": "functional_fail",
+   "note": "over-broad shared-helper fix: deletes the client-address header in the common dispatch helper, stripping the address every forwarding handler just set"
+  },
+  {
+   "patch": "overwrite_hook.patch",
+   "expect": "functional_fail",
+   "note": "sanitises after the application's request hook, discarding the value the application set"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus removal of the competing forwarding headers (X-Forwarded-For, Forwarded) on every forwarding path"
+  },
+  {
+   "patch": "alt_shared.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "a second valid design: delete-and-set in the shared dispatch helper (covering every Do-based path) plus the balancer and the prefix helper"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written by the independent blind-fix stage after this build; not present at build time"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash.patch",
+  "wrong_resource": "n/a: there is a single protected value (the client-address header on the forwarded request); no neighbouring or proxy resource is authorised or touched",
+  "one_role_or_direction": "n/a: every caller and every forwarding path is protected identically; there is no role, peer or request/response asymmetry",
+  "reads_only": "n/a: the flaw is on the outbound forwarded request only; there is no read/write pair to guard",
+  "check_after_adjustment": "no_prefix.patch",
+  "unlisted_route": "published_only.patch",
+  "malformed_identity": "single_value_only.patch",
+  "missing_authority": "n/a: the protected value is the connection peer address; there is no authority, role or secret lookup that could fail open",
+  "adjacent_api": "del_doaction.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_landing_append",
+   "pattern": "A (landing, published)",
+   "shape": "caller supplies the client-address header once, as a comma list, or with an empty value",
+   "where": "middleware/proxy/proxy.go:282",
+   "security_tests": [
+    "security/sec_balancerforward_test.go::TestSec_BalancerForward_SingleValue",
+    "security/sec_balancerforward_test.go::TestSec_BalancerForward_CommaSeparatedList",
+    "security/sec_balancerforward_test.go::TestSec_BalancerForward_EmptyValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_BalancerForward_ForwardsRequestAndResponse",
+    "functional/func_forwarding_test.go::TestFunc_BalancerForward_DeliversObservedAddress"
+   ],
+   "security_fail_patch": "no_landing.patch",
+   "realistic_because": "the reported site; published upstream fix"
+  },
+  {
+   "id": "T2_balancer_path",
+   "pattern": "B (route where the protection never existed)",
+   "shape": "caller supplies the client-address header; the configurable balancer forwards through its own load-balancing client and never establishes the header",
+   "where": "middleware/proxy/proxy.go:62-109 (forward at :91)",
+   "security_tests": [
+    "security/sec_balancer_test.go::TestSec_Balancer_SingleValue",
+    "security/sec_balancer_test.go::TestSec_Balancer_CommaSeparatedList",
+    "security/sec_balancer_test.go::TestSec_Balancer_EmptyValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_Balancer_ForwardsRequestAndResponse",
+    "functional/func_forwarding_test.go::TestFunc_Balancer_ApplicationReportedValueIsAuthoritative"
+   ],
+   "security_fail_patch": "no_balancer.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: separate config-based load balancer that exposes an application request hook, so apps are assumed to manage the header themselves"
+  },
+  {
+   "id": "T3_single_target_forwarders",
+   "pattern": "B (routes where the protection never existed)",
+   "shape": "caller supplies the client-address header; the single-target and host-matched forwarders pass the client request through without establishing the header",
+   "where": "middleware/proxy/proxy.go:138-142 and 239-247",
+   "security_tests": [
+    "security/sec_forward_test.go::TestSec_Forward_SingleValue",
+    "security/sec_domainforward_test.go::TestSec_DomainForward_SingleValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_Forward_ForwardsRequestAndResponse",
+    "functional/func_forwarding_test.go::TestFunc_DomainForward_MatchingHostForwards",
+    "functional/func_forwarding_test.go::TestFunc_DomainForward_OtherHostNotForwarded"
+   ],
+   "security_fail_patch": "no_forwarders.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: documented as thin request-forwarding wrappers, so they read as raw pass-throughs rather than as paths that vouch for an identity"
+  },
+  {
+   "id": "T4_prefix_copy_ordering",
+   "pattern": "injected sibling (ordering / wrong moment)",
+   "shape": "caller supplies the client-address header; the helper sets the observed address and then copies the caller's headers over it, so the caller's value returns",
+   "where": "middleware/proxy/prefix.go:26-32",
+   "security_tests": [
+    "security/sec_injected_test.go::TestSec_PrefixForward_SingleValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_PrefixForward_RewritesPathAndKeepsRequest"
+   ],
+   "security_fail_patch": "no_prefix.patch",
+   "realistic_because": "a path-prefix forwarder that builds its own outbound request is a natural companion to the existing forwarders; it visibly sets the header with Set, so a reader who greps for the reported append pattern concludes it is already correct, while the later header copy restores the caller's value"
+  },
+  {
+   "id": "T5_forwarding_chain_source",
+   "pattern": "injected sibling (wrong value source / producer)",
+   "shape": "caller supplies a forwarding chain header alongside the client-address header; the helper takes the client address from the caller's chain instead of the connection",
+   "where": "middleware/proxy/forwardedfor.go:13-20",
+   "security_tests": [
+    "security/sec_injected_test.go::TestSec_ForwardedForForward_ClientChainNotTrusted"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_ForwardedForForward_ForwardsWithoutChain"
+   ],
+   "security_fail_patch": "no_xff.patch",
+   "realistic_because": "reporting the original client from a forwarding chain is a familiar reverse-proxy convenience, so it reads as intended behaviour; it uses Set, so the reported append defect does not appear to apply, and the value is caller-controlled rather than connection-derived"
+  },
+  {
+   "id": "T6_repeated_header_lines",
+   "pattern": "shape trap (input form a plausible check mishandles)",
+   "shape": "caller supplies the client-address header as two separate header lines; replacing a header value replaces only the first stored value, so the second line survives",
+   "where": "middleware/proxy/proxy.go:282 (and every path once fixed by Set alone)",
+   "security_tests": [
+    "security/sec_balancerforward_test.go::TestSec_BalancerForward_RepeatedHeaderLines",
+    "security/sec_balancer_test.go::TestSec_Balancer_RepeatedHeaderLines",
+    "security/sec_forward_test.go::TestSec_Forward_RepeatedHeaderLines",
+    "security/sec_domainforward_test.go::TestSec_DomainForward_RepeatedHeaderLines"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_BalancerForward_DeliversObservedAddress",
+    "functional/func_forwarding_test.go::TestFunc_Balancer_ForwardsRequestAndResponse"
+   ],
+   "security_fail_patch": "set_only.patch",
+   "realistic_because": "the published one-line fix and the obvious replacement both use a single set call, which looks complete; repeated lines are ordinary HTTP and are not covered by the project's own regression test"
+  },
+  {
+   "id": "T7_coupled_observed_address",
+   "pattern": "coupled must-keep-working value",
+   "shape": "a request with no caller-supplied value must still reach the upstream carrying the address the proxy observed; an over-broad delete removes it",
+   "where": "middleware/proxy/proxy.go:177-211 (shared dispatch) next to the forwarding handlers",
+   "security_tests": [
+    "security/sec_balancerforward_test.go::TestSec_BalancerForward_SingleValue",
+    "security/sec_balancer_test.go::TestSec_Balancer_SingleValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_forwarding_test.go::TestFunc_BalancerForward_DeliversObservedAddress",
+    "functional/func_forwarding_test.go::TestFunc_Balancer_ApplicationReportedValueIsAuthoritative"
+   ],
+   "security_fail_patch": "del_doaction.patch",
+   "realistic_because": "deleting the caller's header in the shared dispatch helper is the smallest-looking fix and is the over-hardening a careful model reaches for; it is declared functional_fail because it also strips the address from requests that carry none, which the functional control catches"
+  }
+ ],
+ "status": "static PASS; nop PASS (14/14 security fail, 21/21 functional pass); oracle PASS (3/3 reward 1.0); patches PASS (14/14 checks as declared). pass-blind.patch is pending the separate blind-fix stage."
+}

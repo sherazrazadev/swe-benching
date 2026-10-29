@@ -1,0 +1,178 @@
+diff --git a/packages/adapter-commons/src/index.ts b/packages/adapter-commons/src/index.ts
+index c818981..70b2110 100644
+--- a/packages/adapter-commons/src/index.ts
++++ b/packages/adapter-commons/src/index.ts
+@@ -8,6 +8,26 @@ export * from './sort'
+ 
+ const PROTOTYPE_KEYS = ['__proto__', 'constructor', 'prototype']
+ 
++const clean = (value: any): any => {
++  if (Array.isArray(value)) {
++    return value.map((item) => clean(item))
++  }
++
++  if (_.isObject(value)) {
++    const result: any = {}
++
++    Object.keys(value).forEach((key) => {
++      if (!PROTOTYPE_KEYS.includes(key)) {
++        result[key] = clean(value[key])
++      }
++    })
++
++    return result
++  }
++
++  return value
++}
++
+ const readPath = (source: any, path: string[]) =>
+   path.reduce(
+     (value: any, key: string) => (value === null || value === undefined ? undefined : value[key]),
+@@ -46,17 +66,13 @@ export function select(params: Params, ...otherFields: string[]) {
+   const plainFields = resultFields.filter((field) => !`${field}`.includes('.'))
+ 
+   const convert = (result: any) => {
+-    const selected = _.pick(result, ...plainFields)
++    const source = clean(result)
++    const selected = _.pick(source, ...plainFields)
+ 
+     nestedFields.forEach((field) => {
+       const path = `${field}`.split('.')
+ 
+-      // A selection must not rewrite an object prototype
+-      if (PROTOTYPE_KEYS.includes(path[0])) {
+-        return
+-      }
+-
+-      const value = readPath(result, path)
++      const value = readPath(source, path)
+ 
+       if (value !== undefined) {
+         writePath(selected, path, value)
+diff --git a/packages/adapter-commons/src/query.ts b/packages/adapter-commons/src/query.ts
+index 1dc31ff..6ec0ac2 100644
+--- a/packages/adapter-commons/src/query.ts
++++ b/packages/adapter-commons/src/query.ts
+@@ -7,6 +7,27 @@ const parse = (value: any) => (typeof value !== 'undefined' ? parseInt(value, 10
+ 
+ const isPlainObject = (value: any) => _.isObject(value) && value.constructor === {}.constructor
+ 
++const isPrototypeKey = (key: string) =>
++  key === '__proto__' || key === 'constructor' || key === 'prototype'
++
++const withoutPrototypeKeys = (value: any): any => {
++  if (!isPlainObject(value)) {
++    return value
++  }
++
++  const result: any = { ...value }
++
++  Object.keys(result).forEach((key) => {
++    if (isPrototypeKey(key)) {
++      delete result[key]
++    } else {
++      result[key] = withoutPrototypeKeys(result[key])
++    }
++  })
++
++  return result
++}
++
+ const validateQueryProperty = (query: any, operators: string[] = []): Query => {
+   if (!isPlainObject(query)) {
+     return query
+@@ -141,7 +162,7 @@ export const FILTERS: FilterSettings = {
+  * and `filters` which contains the converted values for each filter.
+  */
+ export function filterQuery(_query: Query, options: FilterQueryOptions = {}) {
+-  const query = _query || {}
++  const query = withoutPrototypeKeys(_query || {})
+   const settings = {
+     ...options,
+     filters: {
+diff --git a/packages/commons/src/index.ts b/packages/commons/src/index.ts
+index 9455252..5e6df48 100644
+--- a/packages/commons/src/index.ts
++++ b/packages/commons/src/index.ts
+@@ -5,6 +5,26 @@ export function stripSlashes(name: string) {
+ 
+ export type KeyValueCallback<T> = (value: any, key: string) => T
+ 
++const isPrototypeKey = (key: string) =>
++  key === '__proto__' || key === 'constructor' || key === 'prototype'
++
++// Return a shallow copy of an object without any key that names a prototype
++const withoutPrototypeKeys = <T>(value: T): T => {
++  if (value === null || value === undefined || typeof value !== 'object') {
++    return value
++  }
++
++  const copy: any = Array.isArray(value) ? [...(value as any)] : { ...(value as any) }
++
++  Object.keys(copy).forEach((key) => {
++    if (isPrototypeKey(key)) {
++      delete copy[key]
++    }
++  })
++
++  return copy
++}
++
+ // A set of lodash-y utility functions that use ES6
+ export const _ = {
+   each(obj: any, callback: KeyValueCallback<void>) {
+@@ -52,7 +72,13 @@ export const _ = {
+   },
+ 
+   extend(first: any, ...rest: any[]) {
+-    return Object.assign(first, ...rest)
++    rest.forEach((source) => {
++      if (source !== null && source !== undefined) {
++        Object.assign(first, withoutPrototypeKeys(source))
++      }
++    })
++
++    return first
+   },
+ 
+   omit(obj: any, ...keys: string[]) {
+@@ -62,7 +88,9 @@ export const _ = {
+   },
+ 
+   pick(source: any, ...keys: string[]) {
+-    return keys.reduce((result: { [key: string]: any }, key) => {
++    return keys
++      .filter((key) => !isPrototypeKey(key))
++      .reduce((result: { [key: string]: any }, key) => {
+       if (source[key] !== undefined) {
+         result[key] = source[key]
+       }
+@@ -73,6 +101,8 @@ export const _ = {
+ 
+   // Recursively merge the source object into the target object
+   merge(target: any, source: any) {
++    source = withoutPrototypeKeys(source)
++
+     if (_.isObject(target) && _.isObject(source)) {
+       Object.keys(source).forEach((key) => {
+         if (_.isObject(source[key])) {
+diff --git a/packages/memory/src/index.ts b/packages/memory/src/index.ts
+index 4743c32..bd0b0dc 100644
+--- a/packages/memory/src/index.ts
++++ b/packages/memory/src/index.ts
+@@ -31,9 +31,11 @@ const clone = (value: any): any => {
+   if (_.isObject(value)) {
+     const result: any = {}
+ 
+-    Object.keys(value).forEach((key) => {
+-      result[key] = clone(value[key])
+-    })
++    Object.keys(value)
++      .filter((key) => key !== '__proto__' && key !== 'constructor' && key !== 'prototype')
++      .forEach((key) => {
++        result[key] = clone(value[key])
++      })
+ 
+     return result
+   }

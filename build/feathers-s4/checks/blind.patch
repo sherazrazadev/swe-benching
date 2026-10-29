@@ -1,0 +1,217 @@
+diff -ruN a/packages/adapter-commons/src/index.ts b/packages/adapter-commons/src/index.ts
+--- a/packages/adapter-commons/src/index.ts	2026-10-29 12:09:42.000000000 +0000
++++ b/packages/adapter-commons/src/index.ts	2026-10-29 13:04:40.849960909 +0000
+@@ -1,4 +1,4 @@
+-import { _ } from '@feathersjs/commons'
++import { _, isPrototypeKey } from '@feathersjs/commons'
+ import { Params } from '@feathersjs/feathers'
+ 
+ export * from './declarations'
+@@ -6,8 +6,6 @@
+ export * from './query'
+ export * from './sort'
+ 
+-const PROTOTYPE_KEYS = ['__proto__', 'constructor', 'prototype']
+-
+ const readPath = (source: any, path: string[]) =>
+   path.reduce(
+     (value: any, key: string) => (value === null || value === undefined ? undefined : value[key]),
+@@ -51,8 +49,8 @@
+     nestedFields.forEach((field) => {
+       const path = `${field}`.split('.')
+ 
+-      // A selection must not rewrite an object prototype
+-      if (PROTOTYPE_KEYS.includes(path[0])) {
++      // A selection must not rewrite an object prototype through any segment
++      if (path.some(isPrototypeKey)) {
+         return
+       }
+ 
+diff -ruN a/packages/adapter-commons/src/query.ts b/packages/adapter-commons/src/query.ts
+--- a/packages/adapter-commons/src/query.ts	2026-10-29 12:09:39.000000000 +0000
++++ b/packages/adapter-commons/src/query.ts	2026-10-29 13:04:45.589964130 +0000
+@@ -1,4 +1,4 @@
+-import { _ } from '@feathersjs/commons'
++import { _, isPrototypeKey } from '@feathersjs/commons'
+ import { BadRequest } from '@feathersjs/errors'
+ import { Query } from '@feathersjs/feathers'
+ import { FilterQueryOptions, FilterSettings, PaginationParams } from './declarations'
+@@ -7,26 +7,39 @@
+ 
+ const isPlainObject = (value: any) => _.isObject(value) && value.constructor === {}.constructor
+ 
++// Own enumerable symbols, the part of an object that object spread carries over
++const ownSymbols = (value: any) =>
++  Object.getOwnPropertySymbols(value).filter((symbol) =>
++    Object.prototype.propertyIsEnumerable.call(value, symbol)
++  )
++
+ const validateQueryProperty = (query: any, operators: string[] = []): Query => {
+   if (!isPlainObject(query)) {
+     return query
+   }
+ 
++  const result: any = {}
++
+   for (const key of Object.keys(query)) {
++    // A caller supplied name must not become a prototype key
++    if (isPrototypeKey(key)) {
++      continue
++    }
++
+     if (key.startsWith('$') && !operators.includes(key)) {
+       throw new BadRequest(`Invalid query parameter ${key}`, query)
+     }
+ 
+     const value = query[key]
+ 
+-    if (isPlainObject(value)) {
+-      query[key] = validateQueryProperty(value, operators)
+-    }
++    result[key] = isPlainObject(value) ? validateQueryProperty(value, operators) : value
+   }
+ 
+-  return {
+-    ...query
+-  }
++  ownSymbols(query).forEach((symbol) => {
++    result[symbol] = query[symbol]
++  })
++
++  return result
+ }
+ 
+ const getFilters = (query: Query, settings: FilterQueryOptions) => {
+@@ -37,7 +50,7 @@
+       const queryValue = query[key]
+       const filter = settings.filters[key]
+ 
+-      if (filter) {
++      if (filter && !isPrototypeKey(key)) {
+         const value = typeof filter === 'function' ? filter(queryValue, settings) : queryValue
+ 
+         if (value !== undefined) {
+@@ -55,6 +68,11 @@
+   const keys = Object.keys(query).concat(Object.getOwnPropertySymbols(query) as any as string[])
+ 
+   return keys.reduce((result, key) => {
++    // A query field name decided by the caller must not act as a prototype key
++    if (isPrototypeKey(key)) {
++      return result
++    }
++
+     if (typeof key === 'string' && key.startsWith('$')) {
+       if (settings.filters[key] === undefined) {
+         throw new BadRequest(`Invalid filter value ${key}`)
+@@ -98,7 +116,9 @@
+ 
+     return Object.keys(sort).reduce(
+       (result, key) => {
+-        result[key] = typeof sort[key] === 'object' ? sort[key] : parse(sort[key])
++        if (!isPrototypeKey(key)) {
++          result[key] = typeof sort[key] === 'object' ? sort[key] : parse(sort[key])
++        }
+ 
+         return result
+       },
+diff -ruN a/packages/commons/src/index.ts b/packages/commons/src/index.ts
+--- a/packages/commons/src/index.ts	2026-10-29 12:09:40.000000000 +0000
++++ b/packages/commons/src/index.ts	2026-10-29 13:04:37.014955672 +0000
+@@ -5,6 +5,44 @@
+ 
+ export type KeyValueCallback<T> = (value: any, key: string) => T
+ 
++// Property names that address (or name) an object's prototype chain instead of
++// carrying ordinary data. They are never honoured as data keys.
++const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
++
++/**
++ * Whether `key` names a prototype and therefore must not be treated as an
++ * ordinary property name.
++ */
++export function isPrototypeKey(key: PropertyKey) {
++  return typeof key === 'string' && PROTOTYPE_KEYS.has(key)
++}
++
++// A plain copy of the own enumerable fields of `source` with prototype keys
++// left out. `null` and `undefined` stay as they are so Object.assign keeps
++// ignoring them.
++const dataFieldsOf = (source: any) => {
++  if (source === null || source === undefined) {
++    return source
++  }
++
++  const origin = Object(source)
++  const fields: any = {}
++
++  Object.keys(origin).forEach((key) => {
++    if (!isPrototypeKey(key)) {
++      fields[key] = origin[key]
++    }
++  })
++
++  Object.getOwnPropertySymbols(origin).forEach((symbol) => {
++    if (Object.prototype.propertyIsEnumerable.call(origin, symbol)) {
++      fields[symbol] = origin[symbol]
++    }
++  })
++
++  return fields
++}
++
+ // A set of lodash-y utility functions that use ES6
+ export const _ = {
+   each(obj: any, callback: KeyValueCallback<void>) {
+@@ -52,7 +90,7 @@
+   },
+ 
+   extend(first: any, ...rest: any[]) {
+-    return Object.assign(first, ...rest)
++    return Object.assign(first, ...rest.map(dataFieldsOf))
+   },
+ 
+   omit(obj: any, ...keys: string[]) {
+@@ -63,7 +101,7 @@
+ 
+   pick(source: any, ...keys: string[]) {
+     return keys.reduce((result: { [key: string]: any }, key) => {
+-      if (source[key] !== undefined) {
++      if (!isPrototypeKey(key) && source[key] !== undefined) {
+         result[key] = source[key]
+       }
+ 
+@@ -75,6 +113,10 @@
+   merge(target: any, source: any) {
+     if (_.isObject(target) && _.isObject(source)) {
+       Object.keys(source).forEach((key) => {
++        if (isPrototypeKey(key)) {
++          return
++        }
++
+         if (_.isObject(source[key])) {
+           if (!target[key]) {
+             Object.assign(target, { [key]: {} })
+diff -ruN a/packages/memory/src/index.ts b/packages/memory/src/index.ts
+--- a/packages/memory/src/index.ts	2026-10-29 12:09:42.000000000 +0000
++++ b/packages/memory/src/index.ts	2026-10-29 13:04:52.175967547 +0000
+@@ -8,7 +8,7 @@
+   AdapterParams
+ } from '@feathersjs/adapter-commons'
+ import sift from 'sift'
+-import { _ } from '@feathersjs/commons'
++import { _, isPrototypeKey } from '@feathersjs/commons'
+ import { NullableId, Id, Params, Paginated } from '@feathersjs/feathers'
+ 
+ export interface MemoryServiceStore<T> {
+@@ -32,7 +32,10 @@
+     const result: any = {}
+ 
+     Object.keys(value).forEach((key) => {
+-      result[key] = clone(value[key])
++      // A stored record must not be able to choose the copy's prototype
++      if (!isPrototypeKey(key)) {
++        result[key] = clone(value[key])
++      }
+     })
+ 
+     return result

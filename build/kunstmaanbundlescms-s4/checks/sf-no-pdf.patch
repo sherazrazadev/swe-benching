@@ -1,0 +1,196 @@
+diff --git a/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php b/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php
+index ab6be5e..804b4fa 100644
+--- a/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php
++++ b/src/Kunstmaan/MediaBundle/Command/RenameSoftDeletedCommand.php
+@@ -56,7 +56,7 @@ final class RenameSoftDeletedCommand extends Command
+                 $handler = $this->mediaManager->getHandler($media);
+                 if ($media->isDeleted() && $media->getLocation() === 'local' && $handler instanceof FileHandler) {
+                     $oldFileUrl = $media->getUrl();
+-                    $newFileName = ($original ? $media->getOriginalFilename() : uniqid() . '.' . pathinfo($oldFileUrl, PATHINFO_EXTENSION));
++                    $newFileName = ($original ? $handler->getStoredFilename((string) $media->getOriginalFilename()) : uniqid() . '.' . pathinfo($oldFileUrl, PATHINFO_EXTENSION));
+                     $newFileUrl = \dirname($oldFileUrl) . '/' . $newFileName;
+                     $fileRenameQueue[] = [$oldFileUrl, $newFileUrl, $handler];
+                     $media->setUrl($newFileUrl);
+@@ -75,10 +75,12 @@ final class RenameSoftDeletedCommand extends Command
+ 
+         foreach ($fileRenameQueue as $row) {
+             [$oldFileUrl, $newFileUrl, $handler] = $row;
+-            $handler->fileSystem->rename(
+-                preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $oldFileUrl),
+-                preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $newFileUrl)
+-            );
++            $oldFileKey = preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $oldFileUrl);
++            $newFileKey = preg_replace('~^' . preg_quote($handler->mediaPath, '~') . '~', '/', $newFileUrl);
++            if ($oldFileKey === $newFileKey) {
++                continue;
++            }
++            $handler->fileSystem->rename($oldFileKey, $newFileKey);
+             $output->writeln('Renamed <info>' . $oldFileUrl . '</info> to <info>' . basename($newFileUrl) . '</info>');
+         }
+ 
+diff --git a/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php b/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php
+index dd0c95a..fdedbdb 100644
+--- a/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php
++++ b/src/Kunstmaan/MediaBundle/DependencyInjection/Configuration.php
+@@ -32,7 +32,19 @@ class Configuration implements ConfigurationInterface
+                 ->end()
+                 ->booleanNode('enable_pdf_preview')->defaultFalse()->end()
+                 ->arrayNode('blacklisted_extensions')
+-                    ->defaultValue(['php', 'htaccess'])
++                    ->info('Files with one of these extensions are stored as .txt. Matched case-insensitively.')
++                    ->defaultValue([
++                        'php', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8',
++                        'phps', 'phpt', 'pht', 'phtm', 'phtml', 'phar', 'inc',
++                        'htaccess', 'htpasswd', 'htgroup',
++                        'shtml', 'shtm', 'cgi', 'pl', 'py', 'rb', 'sh',
++                        'asp', 'aspx', 'ashx', 'asmx', 'ascx', 'jsp', 'jspx', 'cfm', 'cfml',
++                    ])
++                    ->prototype('scalar')->end()
++                ->end()
++                ->arrayNode('allowed_extensions')
++                    ->info('Optional strict allow-list of media extensions. When empty (default) only the blacklist is applied.')
++                    ->defaultValue([])
+                     ->prototype('scalar')->end()
+                 ->end()
+                 ->scalarNode('web_root')
+diff --git a/src/Kunstmaan/MediaBundle/DependencyInjection/KunstmaanMediaExtension.php b/src/Kunstmaan/MediaBundle/DependencyInjection/KunstmaanMediaExtension.php
+index c1945eb..ad1d96e 100644
+--- a/src/Kunstmaan/MediaBundle/DependencyInjection/KunstmaanMediaExtension.php
++++ b/src/Kunstmaan/MediaBundle/DependencyInjection/KunstmaanMediaExtension.php
+@@ -32,6 +32,7 @@ class KunstmaanMediaExtension extends Extension implements PrependExtensionInter
+         $container->setParameter('kunstmaan_media.remote_video', $config['remote_video']);
+         $container->setParameter('kunstmaan_media.enable_pdf_preview', $config['enable_pdf_preview']);
+         $container->setParameter('kunstmaan_media.blacklisted_extensions', $config['blacklisted_extensions']);
++        $container->setParameter('kunstmaan_media.allowed_extensions', $config['allowed_extensions']);
+         $container->setParameter('kunstmaan_media.web_root', $config['web_root']);
+         $container->setParameter('kunstmaan_media.full_media_path', $config['web_root'] . '%kunstmaan_media.media_path%');
+         $container->setParameter('kunstmaan_media.cropping_views', $config['cropping_views']);
+diff --git a/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php b/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php
+index 5b45e5c..3c295b1 100644
+--- a/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php
++++ b/src/Kunstmaan/MediaBundle/Helper/File/FileHandler.php
+@@ -41,6 +41,14 @@ class FileHandler extends AbstractMediaHandler
+      */
+     private $blacklistedExtensions = [];
+ 
++    /**
++     * When not empty this acts as a strict allow list, files with an extension that is not in
++     * this list will be converted to txt.
++     *
++     * @var array
++     */
++    private $allowedExtensions = [];
++
+     /**
+      * @var SlugifierInterface
+      */
+@@ -69,6 +77,14 @@ class FileHandler extends AbstractMediaHandler
+         $this->blacklistedExtensions = $blacklistedExtensions;
+     }
+ 
++    /**
++     * Inject the allowed extensions, when empty only the blacklist is applied.
++     */
++    public function setAllowedExtensions(array $allowedExtensions)
++    {
++        $this->allowedExtensions = $allowedExtensions;
++    }
++
+     /**
+      * Inject the path used in media urls.
+      *
+@@ -278,24 +294,48 @@ class FileHandler extends AbstractMediaHandler
+ 
+     private function getFilePath(Media $media): string
+     {
+-        $filename = $media->getOriginalFilename();
+-        $filename = str_replace(['/', '\\', '%'], '', $filename);
++        return sprintf('%s/%s', $media->getUuid(), $this->getStoredFilename((string) $media->getOriginalFilename()));
++    }
+ 
+-        if (!empty($this->blacklistedExtensions)) {
+-            $filename = preg_replace('/\.(' . implode('|', $this->blacklistedExtensions) . ')$/', '.txt', $filename);
+-        }
++    /**
++     * Build the file name a media file is stored under. Public so that maintenance operations
++     * that move or copy media files follow the same rule.
++     */
++    public function getStoredFilename(string $originalFilename): string
++    {
++        $filename = str_replace(['/', '\\', '%'], '', $originalFilename);
+ 
+         $parts = pathinfo($filename);
+-        $filename = $this->slugifier->slugify($parts['filename']);
+-        if (\array_key_exists('extension', $parts)) {
+-            $filename .= '.' . strtolower($parts['extension']);
++        $basename = $this->slugifier->slugify($parts['filename']);
++
++        if (!\array_key_exists('extension', $parts) || '' === $parts['extension']) {
++            return $basename;
++        }
++
++        // The file is always stored with a lowercased extension, so the check must use the
++        // same lowercased value.
++        $extension = strtolower($parts['extension']);
++        if (!$this->isAllowedExtension($extension)) {
++            $extension = 'txt';
++        }
++
++        return $basename . '.' . $extension;
++    }
++
++    /**
++     * @param string $extension A lowercased file extension
++     */
++    private function isAllowedExtension(string $extension): bool
++    {
++        if (\in_array($extension, array_map('strtolower', $this->blacklistedExtensions), true)) {
++            return false;
++        }
++
++        if ([] === $this->allowedExtensions) {
++            return true;
+         }
+ 
+-        return sprintf(
+-            '%s/%s',
+-            $media->getUuid(),
+-            $filename
+-        );
++        return \in_array($extension, array_map('strtolower', $this->allowedExtensions), true);
+     }
+ 
+     private function getFileFolderPath(Media $media): string
+diff --git a/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php b/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php
+index 0c039a3..d64558a 100644
+--- a/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php
++++ b/src/Kunstmaan/MediaBundle/Helper/Image/ImageHandler.php
+@@ -63,7 +63,7 @@ class ImageHandler extends FileHandler
+         // copy of it next to the stored file under the name it was uploaded with, unless the
+         // stored file already has that name.
+         $content = $media->getContent();
+-        $key = $media->getUuid() . '/' . $media->getOriginalFilename();
++        $key = $media->getUuid() . '/' . $this->getStoredFilename((string) $media->getOriginalFilename());
+         if ($content instanceof File && false !== $content->getRealPath() && !$this->fileSystem->has($key)) {
+             $this->fileSystem->write($key, file_get_contents($content->getRealPath()));
+         }
+diff --git a/src/Kunstmaan/MediaBundle/Resources/config/handlers.yml b/src/Kunstmaan/MediaBundle/Resources/config/handlers.yml
+index 9dfdb3e..f68fe5b 100644
+--- a/src/Kunstmaan/MediaBundle/Resources/config/handlers.yml
++++ b/src/Kunstmaan/MediaBundle/Resources/config/handlers.yml
+@@ -27,6 +27,7 @@ services:
+             - [ setFileSystem, [ '@kunstmaan_media.filesystem' ] ]
+             - [ setMediaPath, [ '%kunstmaan_media.media_path%' ] ]
+             - [ setBlacklistedExtensions, [ '%kunstmaan_media.blacklisted_extensions%' ] ]
++            - [ setAllowedExtensions, [ '%kunstmaan_media.allowed_extensions%' ] ]
+             - [ setSlugifier, ['@kunstmaan_utilities.slugifier']]
+         tags:
+             -  { name: 'kunstmaan_media.media_handler' }
+@@ -38,6 +39,7 @@ services:
+             - [ setFileSystem, [ '@kunstmaan_media.filesystem' ] ]
+             - [ setMediaPath, [ '%kunstmaan_media.media_path%' ] ]
+             - [ setBlacklistedExtensions, [ '%kunstmaan_media.blacklisted_extensions%' ] ]
++            - [ setAllowedExtensions, [ '%kunstmaan_media.allowed_extensions%' ] ]
+             - [ setSlugifier, ['@kunstmaan_utilities.slugifier']]
+         tags:
+             -  { name: 'kunstmaan_media.media_handler' }

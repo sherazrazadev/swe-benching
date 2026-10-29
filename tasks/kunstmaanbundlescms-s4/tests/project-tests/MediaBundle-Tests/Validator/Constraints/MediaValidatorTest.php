@@ -1,0 +1,193 @@
+<?php
+
+namespace Kunstmaan\MediaBundle\Tests\Validator\Constraints;
+
+use Kunstmaan\MediaBundle\Entity\Media as MediaObject;
+use Kunstmaan\MediaBundle\Validator\Constraints\Media;
+use Kunstmaan\MediaBundle\Validator\Constraints\MediaValidator;
+use Symfony\Component\Validator\Test\ConstraintValidatorTestCase;
+
+class MediaValidatorTest extends ConstraintValidatorTestCase
+{
+    protected function createValidator(): MediaValidator
+    {
+        return new MediaValidator();
+    }
+
+    public function testMimeTypeIsIgnoredWhenNotSpecified()
+    {
+        $constraint = new Media();
+        $media = new MediaObject();
+        $media->setContentType('image/jpeg');
+
+        $this->validator->validate($media, $constraint);
+
+        $this->assertNoViolation();
+    }
+
+    /**
+     * @dataProvider dataMimeTypes
+     */
+    public function testMimeTypeMatches($contentType, $allowed, $message = null, array $parameters = [], $code = null)
+    {
+        $constraint = new Media(['mimeTypes' => $allowed]);
+        $media = (new MediaObject())->setContentType($contentType);
+
+        $this->validator->validate($media, $constraint);
+
+        if ($message && $code) {
+            $this->buildViolation($message)
+                ->setCode($code)
+                ->setParameters($parameters)
+                ->assertRaised();
+        } else {
+            $this->assertNoViolation();
+        }
+    }
+
+    public function testSvgIsNotTestedForDimensions()
+    {
+        $constraint = new Media(['minHeight' => 100]);
+        $media = (new MediaObject())->setContentType('image/svg+xml');
+
+        $this->validator->validate($media, $constraint);
+
+        $this->assertNoViolation();
+    }
+
+    /**
+     * @param string $dimension
+     * @param int    $value
+     * @param string $message
+     * @param int    $code
+     *
+     * @dataProvider dataDimensions
+     */
+    public function testDimensionsAreChecked($dimension, $value, $message = null, array $parameters = [], $code = null)
+    {
+        $constraint = new Media([$dimension => $value]);
+        $media = (new MediaObject())
+            ->setMetadataValue('original_width', 100)
+            ->setMetadataValue('original_height', 100)
+            ->setContentType('image/png');
+
+        $this->validator->validate($media, $constraint);
+
+        if ($message && $code) {
+            $this->buildViolation($message)
+                ->setCode($code)
+                ->setParameters($parameters)
+                ->assertRaised();
+        } else {
+            $this->assertNoViolation();
+        }
+    }
+
+    /**
+     * @dataProvider dataNonImageContentTypes
+     */
+    public function testDimensionsAreNotCheckedForNonImages(string $contentType)
+    {
+        $constraint = new Media(['minWidth' => 200]);
+        $media = (new MediaObject())
+            ->setMetadataValue('original_width', 100)
+            ->setMetadataValue('original_height', 100)
+            ->setContentType($contentType);
+
+        $this->validator->validate($media, $constraint);
+
+        $this->assertNoViolation();
+    }
+
+    public function dataNonImageContentTypes()
+    {
+        return [
+            'contains image' => ['application/x-image-thing'],
+            'no slash at all' => ['notanimageatall'],
+            'plain text' => ['text/plain'],
+            'pdf' => ['application/pdf'],
+        ];
+    }
+
+    /**
+     * The allowed mime types are compared case insensitively, but the image check below it was not,
+     * so an uppercase content type passed the allow list and then skipped the dimension check.
+     *
+     * @dataProvider dataUppercaseImageContentTypes
+     */
+    public function testDimensionsAreCheckedRegardlessOfContentTypeCase(string $contentType)
+    {
+        $constraint = new Media(['minWidth' => 200]);
+        $media = (new MediaObject())
+            ->setMetadataValue('original_width', 100)
+            ->setMetadataValue('original_height', 100)
+            ->setContentType($contentType);
+
+        $this->validator->validate($media, $constraint);
+
+        $this->buildViolation($constraint->minWidthMessage)
+            ->setParameter('{{ width }}', 100)
+            ->setParameter('{{ min_width }}', 200)
+            ->setCode(Media::TOO_NARROW_ERROR)
+            ->assertRaised();
+    }
+
+    public function dataUppercaseImageContentTypes()
+    {
+        return [
+            'fully uppercase' => ['IMAGE/PNG'],
+            'uppercase type' => ['IMAGE/png'],
+            'mixed case' => ['Image/Jpeg'],
+        ];
+    }
+
+    /**
+     * @dataProvider dataSvgContentTypes
+     */
+    public function testSvgIsNotTestedForDimensionsRegardlessOfCase(string $contentType)
+    {
+        $constraint = new Media(['minHeight' => 100]);
+        $media = (new MediaObject())->setContentType($contentType);
+
+        $this->validator->validate($media, $constraint);
+
+        $this->assertNoViolation();
+    }
+
+    public function dataSvgContentTypes()
+    {
+        return [
+            'lowercase' => ['image/svg+xml'],
+            'uppercase' => ['IMAGE/SVG+XML'],
+            'mixed case' => ['Image/Svg+Xml'],
+        ];
+    }
+
+    public function dataMimeTypes()
+    {
+        return [
+            ['image/png', ['image/png']],
+            ['image/png', ['image/jpg', 'image/png']],
+            ['image/png', ['image/*']],
+            ['image/PNG', ['image/png']],
+            ['image/png', ['image/PNG']],
+            ['image/png', ['image/jpg'], 'The type of the file is invalid ({{ type }}). Allowed types are {{ types }}.', ['{{ type }}' => '"image/png"', '{{ types }}' => '"image/jpg"'], Media::INVALID_MIME_TYPE_ERROR],
+            ['image/png', ['application/*'], 'The type of the file is invalid ({{ type }}). Allowed types are {{ types }}.', ['{{ type }}' => '"image/png"', '{{ types }}' => '"application/*"'], Media::INVALID_MIME_TYPE_ERROR],
+        ];
+    }
+
+    public function dataDimensions()
+    {
+        // image size is 100x100
+        return [
+            ['minHeight', 100],
+            ['maxHeight', 100],
+            ['minWidth', 100],
+            ['maxWidth', 100],
+            ['minWidth', 200, 'The image width is too small ({{ width }}px). Minimum width expected is {{ min_width }}px.', ['{{ width }}' => 100, '{{ min_width }}' => 200], Media::TOO_NARROW_ERROR],
+            ['maxWidth', 50, 'The image width is too big ({{ width }}px). Allowed maximum width is {{ max_width }}px.', ['{{ width }}' => 100, '{{ max_width }}' => 50], Media::TOO_WIDE_ERROR],
+            ['minHeight', 200, 'The image height is too small ({{ height }}px). Minimum height expected is {{ min_height }}px.', ['{{ height }}' => 100, '{{ min_height }}' => 200], Media::TOO_LOW_ERROR],
+            ['maxHeight', 50, 'The image height is too big ({{ height }}px). Allowed maximum height is {{ max_height }}px.', ['{{ height }}' => 100, '{{ max_height }}' => 50], Media::TOO_HIGH_ERROR],
+        ];
+    }
+}
