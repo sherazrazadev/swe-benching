@@ -53,6 +53,9 @@ case "$model" in
     model_id=mimo-v2.6-pro
     extra+=(--allow-agent-host=api.xiaomimimo.com)   # new tasks are no-network; allow the model host at run time (B4)
     effort=${EFFORT-}
+    # Claude Code does not know mimo-v2.6-pro ("unrecognized_model") and capped each reply at its 32000-token default;
+    # same cap as DeepSeek since 2026-10-29 (the provider accepts it: .github/workflows/model-check.yml)
+    extra+=(--ae CLAUDE_CODE_MAX_OUTPUT_TOKENS=131072)
     ;;
   *) echo "unknown model: $model (expected deepseek or mimo)" >&2; exit 2 ;;
 esac

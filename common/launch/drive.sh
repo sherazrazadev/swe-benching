@@ -42,6 +42,7 @@ case "$DRIVER" in
     export ANTHROPIC_BASE_URL=https://api.xiaomimimo.com/anthropic
     export ANTHROPIC_API_KEY="${MIMO_API_KEY:?MIMO_API_KEY not set in models.env}"
     export MODEL='mimo-v2.6-pro'
+    export CLAUDE_CODE_MAX_OUTPUT_TOKENS=131072   # as DeepSeek; Claude Code's default for an unknown model is 32000
     ;;
   *) echo "unknown driver: $DRIVER (expected deepseek or mimo)" >&2; exit 2 ;;
 esac
