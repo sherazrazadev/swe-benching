@@ -1,0 +1,157 @@
+diff --git a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/ProxyHeader.java b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/ProxyHeader.java
+index ffba485d..6f04a0d8 100644
+--- a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/ProxyHeader.java
++++ b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/ProxyHeader.java
+@@ -38,7 +38,9 @@ public enum ProxyHeader {
+ 
+     FORWARDED_HOST("X-Forwarded-Host"),
+ 
+-    FORWARDED_PORT("X-Forwarded-Port");
++    FORWARDED_PORT("X-Forwarded-Port"),
++
++    FORWARDED("Forwarded");
+ 
+     private final String header;
+ 
+diff --git a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
+index fabc898d..9baf774b 100644
+--- a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
++++ b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
+@@ -21,6 +21,7 @@ import jakarta.servlet.http.HttpServletRequest;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.Arrays;
++import java.util.Enumeration;
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.function.Predicate;
+@@ -47,6 +48,16 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+ 
+     private static final String ROOT_PATH = "/";
+ 
++    private static final String FORWARDED_ELEMENT_SEPARATOR = ",";
++
++    private static final String FORWARDED_PARAMETER_SEPARATOR = ";";
++
++    private static final String FORWARDED_VALUE_SEPARATOR = "=";
++
++    private static final String FORWARDED_HOST_PARAMETER = "host";
++
++    private static final String QUOTED_VALUE_DELIMITER = "\"";
++
+     private final List<String> allowedContextPaths;
+ 
+     public StandardRequestUriProvider(final List<String> allowedContextPaths) {
+@@ -98,7 +109,7 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         final String host;
+ 
+         final String serverName = request.getServerName();
+-        final String headerHost = getFirstHeader(request, ProxyHeader.PROXY_HOST, ProxyHeader.FORWARDED_HOST, ProxyHeader.HOST);
++        final String headerHost = getHostHeader(request);
+         if (headerHost == null) {
+             host = serverName;
+         } else {
+@@ -113,11 +124,31 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         return host;
+     }
+ 
++    private String getHostHeader(final HttpServletRequest request) {
++        final String forwardedHost = getForwardedHost(request);
++        if (forwardedHost != null) {
++            return forwardedHost;
++        }
++
++        final String proxyHost = getFirstHeader(request, ProxyHeader.PROXY_HOST);
++        if (proxyHost != null) {
++            return proxyHost;
++        }
++
++        // Forwarding chains append values in order, so the last value reflects the most recent proxy
++        final String forwardedHostHeader = getLastHeader(request, ProxyHeader.FORWARDED_HOST);
++        if (forwardedHostHeader != null) {
++            return forwardedHostHeader;
++        }
++
++        return getFirstHeader(request, ProxyHeader.HOST);
++    }
++
+     private int getPort(final HttpServletRequest request) {
+         final int port;
+ 
+         final int serverPort = request.getServerPort();
+-        final String headerHost = getFirstHeader(request, ProxyHeader.PROXY_HOST, ProxyHeader.FORWARDED_HOST);
++        final String headerHost = getPortHostHeader(request);
+         if (headerHost == null) {
+             port = getProxyPort(request);
+         } else {
+@@ -133,6 +164,70 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         return port;
+     }
+ 
++    private String getPortHostHeader(final HttpServletRequest request) {
++        final String forwardedHost = getForwardedHost(request);
++        if (forwardedHost != null) {
++            return forwardedHost;
++        }
++
++        final String proxyHost = getFirstHeader(request, ProxyHeader.PROXY_HOST);
++        if (proxyHost != null) {
++            return proxyHost;
++        }
++
++        return getLastHeader(request, ProxyHeader.FORWARDED_HOST);
++    }
++
++    private String getForwardedHost(final HttpServletRequest request) {
++        final Enumeration<String> forwardedValues = request.getHeaders(ProxyHeader.FORWARDED.getHeader());
++        if (forwardedValues == null || !forwardedValues.hasMoreElements()) {
++            return null;
++        }
++
++        final String forwarded = forwardedValues.nextElement();
++        if (forwarded == null || forwarded.isBlank()) {
++            return null;
++        }
++
++        final String element = forwarded.split(FORWARDED_ELEMENT_SEPARATOR)[0];
++        for (final String parameter : element.split(FORWARDED_PARAMETER_SEPARATOR)) {
++            final String[] keyValue = parameter.trim().split(FORWARDED_VALUE_SEPARATOR, 2);
++            if (keyValue.length == 2 && FORWARDED_HOST_PARAMETER.equalsIgnoreCase(keyValue[0].trim())) {
++                return stripQuotes(keyValue[1].trim());
++            }
++        }
++
++        return null;
++    }
++
++    private String stripQuotes(final String value) {
++        final String stripped;
++        if (value.length() >= 2 && value.startsWith(QUOTED_VALUE_DELIMITER) && value.endsWith(QUOTED_VALUE_DELIMITER)) {
++            stripped = value.substring(1, value.length() - 1);
++        } else {
++            stripped = value;
++        }
++
++        return stripped;
++    }
++
++    private String getLastHeader(final HttpServletRequest request, final ProxyHeader proxyHeader) {
++        String header = null;
++
++        final Enumeration<String> headerValues = request.getHeaders(proxyHeader.getHeader());
++        while (headerValues != null && headerValues.hasMoreElements()) {
++            final String headerValue = headerValues.nextElement();
++            if (headerValue != null && !headerValue.isBlank()) {
++                header = headerValue;
++            }
++        }
++        if (header == null) {
++            header = request.getHeader(proxyHeader.getHeader());
++        }
++
++        return header;
++    }
++
+     private int getProxyPort(final HttpServletRequest request) {
+         final int port;
+ 

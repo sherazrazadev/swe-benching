@@ -1,0 +1,393 @@
+diff -ruN pristine/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java app/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java
+--- a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java	2026-10-29 02:11:08.000000000 +0000
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java	2026-10-29 02:58:29.620442077 +0000
+@@ -54,6 +54,10 @@
+ 
+     private final String excludeCipherSuites;
+ 
++    private final List<String> declaredProxyAddresses;
++
++    private final int configuredPort;
++
+     private final Set<Integer> validPorts;
+ 
+     private SslContextFactory.Server sslContextFactory;
+@@ -70,6 +74,8 @@
+         includeCipherSuites = properties.getProperty(NiFiProperties.WEB_HTTPS_CIPHERSUITES_INCLUDE);
+         excludeCipherSuites = properties.getProperty(NiFiProperties.WEB_HTTPS_CIPHERSUITES_EXCLUDE);
+         headerSize = DataUnit.parseDataSize(properties.getWebMaxHeaderSize(), DataUnit.B).intValue();
++        configuredPort = getPort(properties);
++        declaredProxyAddresses = properties.getAllowedHostsAsList();
+         validPorts = getValidPorts(properties);
+ 
+         if (properties.isHTTPSConfigured()) {
+@@ -102,6 +108,9 @@
+         // Add HostHeaderCustomizer to set Host Header for HTTP/2 and HostHeaderHandler
+         httpConfiguration.addCustomizer(new HostHeaderCustomizer());
+ 
++        // Refuse proxy address headers that would advertise an undeclared public address
++        httpConfiguration.addCustomizer(new ProxyAddressValidator(declaredProxyAddresses, configuredPort));
++
+         final HostPortValidatorCustomizer hostPortValidatorCustomizer = new HostPortValidatorCustomizer(validPorts);
+         httpConfiguration.addCustomizer(hostPortValidatorCustomizer);
+ 
+diff -ruN pristine/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyAddressValidator.java app/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyAddressValidator.java
+--- a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyAddressValidator.java	1970-01-01 00:00:00.000000000 +0000
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyAddressValidator.java	2026-10-29 02:59:54.750645635 +0000
+@@ -0,0 +1,356 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.web.server.connector;
++
++import org.apache.nifi.web.servlet.shared.ProxyHeader;
++import org.eclipse.jetty.http.HttpException;
++import org.eclipse.jetty.http.HttpFields;
++import org.eclipse.jetty.http.HttpStatus;
++import org.eclipse.jetty.http.HttpURI;
++import org.eclipse.jetty.server.ConnectionMetaData;
++import org.eclipse.jetty.server.HttpConfiguration;
++import org.eclipse.jetty.server.Request;
++
++import java.net.InetSocketAddress;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Set;
++
++/**
++ * Request customizer that refuses a request whose proxy address headers would make the application
++ * advertise a public address other than one the administrator declared.
++ *
++ * <p>The generated authority of an absolute URL is built from the first proxy host source the
++ * request supplies, and the port may arrive either inside that value or in a separate proxy port
++ * header. Every value of every such header is therefore checked before the request reaches the
++ * handlers that build URLs. A value naming a host the administrator did not declare, or a port
++ * that is neither declared nor the port this connector listens on, is rejected with HTTP 421.</p>
++ *
++ * <p>Validation applies to plain and secure connections alike: a deployment that terminates TLS
++ * in front of the application receives plain requests, and those must not be able to choose the
++ * advertised address either. The single exception is a secure request whose proxy host names the
++ * address the request itself arrived on, which is how the application's own name is advertised
++ * when it is not listed as a proxy address.</p>
++ */
++public class ProxyAddressValidator implements HttpConfiguration.Customizer {
++    private static final String MISDIRECTED_REQUEST_REASON = "Unlisted Proxy Address Requested";
++
++    private static final String FORWARDED_ELEMENT_DELIMITER = ",";
++
++    private static final String FORWARDED_PARAMETER_DELIMITER = ";";
++
++    private static final String FORWARDED_PAIR_DELIMITER = "=";
++
++    private static final String FORWARDED_HOST_PARAMETER = "host";
++
++    private static final String QUOTE = "\"";
++
++    private static final String IPV6_START = "[";
++
++    private static final String IPV6_END = "]";
++
++    private static final String HOST_PORT_DELIMITER = ":";
++
++    private static final int FIRST_PORT = 1;
++
++    private static final int LAST_PORT = 65535;
++
++    /**
++     * Declared public ports per declared host. A host declared without a port maps to an empty set.
++     */
++    private final Map<String, Set<Integer>> declaredPortsByHost;
++
++    /**
++     * Every port declared by any public address, used for headers that state the port separately.
++     */
++    private final Set<Integer> declaredPorts;
++
++    /**
++     * The port the connector was configured to listen on, when it is a concrete port.
++     */
++    private final Set<Integer> configuredPorts;
++
++    public ProxyAddressValidator(final List<String> declaredAddresses, final int configuredPort) {
++        Objects.requireNonNull(declaredAddresses, "Declared public addresses required");
++
++        final Map<String, Set<Integer>> portsByHost = new HashMap<>();
++        final Set<Integer> ports = new HashSet<>();
++
++        for (final String declaredAddress : declaredAddresses) {
++            if (declaredAddress == null || declaredAddress.isBlank()) {
++                continue;
++            }
++
++            final Address address = parse(declaredAddress.trim());
++            if (address == null || address.host().isBlank()) {
++                continue;
++            }
++
++            final String host = normalizeHost(address.host());
++            final Set<Integer> hostPorts = portsByHost.computeIfAbsent(host, key -> new HashSet<>());
++            if (address.port() != null) {
++                hostPorts.add(address.port());
++                ports.add(address.port());
++            }
++        }
++
++        this.declaredPortsByHost = Collections.unmodifiableMap(portsByHost);
++        this.declaredPorts = Collections.unmodifiableSet(ports);
++        this.configuredPorts = configuredPort > 0 && configuredPort <= LAST_PORT
++                ? Set.of(configuredPort)
++                : Collections.emptySet();
++    }
++
++    @Override
++    public Request customize(final Request request, final HttpFields.Mutable responseHeaders) {
++        final HttpURI requestUri = request.getHttpURI();
++        final int requestPort = getRequestPort(request, requestUri);
++
++        validateHostHeader(request, requestUri, requestPort, ProxyHeader.PROXY_HOST.getHeader());
++        validateHostHeader(request, requestUri, requestPort, ProxyHeader.FORWARDED_HOST.getHeader());
++        validateForwardedHeader(request, requestUri, requestPort);
++
++        validatePortHeader(request, ProxyHeader.PROXY_PORT.getHeader());
++        validatePortHeader(request, ProxyHeader.FORWARDED_PORT.getHeader());
++
++        return request;
++    }
++
++    private void validateHostHeader(final Request request, final HttpURI requestUri, final int requestPort,
++                                    final String headerName) {
++        for (final String headerValue : getHeaderValues(request, headerName)) {
++            validateHostValue(request, requestUri, requestPort, headerValue);
++        }
++    }
++
++    /**
++     * Walk every RFC 7239 {@code Forwarded} element and check every {@code host=} parameter. The
++     * shared request resolver reads the first element of the first header value, so a check that
++     * looked only there would miss a host hidden in a later value or element.
++     */
++    private void validateForwardedHeader(final Request request, final HttpURI requestUri, final int requestPort) {
++        for (final String headerValue : getHeaderValues(request, ProxyHeader.FORWARDED.getHeader())) {
++            if (headerValue == null || headerValue.isBlank()) {
++                continue;
++            }
++            for (final String element : headerValue.split(FORWARDED_ELEMENT_DELIMITER)) {
++                for (final String parameter : element.split(FORWARDED_PARAMETER_DELIMITER)) {
++                    final String[] pair = parameter.trim().split(FORWARDED_PAIR_DELIMITER, 2);
++                    if (pair.length == 2 && FORWARDED_HOST_PARAMETER.equalsIgnoreCase(pair[0].trim())) {
++                        validateHostValue(request, requestUri, requestPort, stripQuotes(pair[1].trim()));
++                    }
++                }
++            }
++        }
++    }
++
++    private void validateHostValue(final Request request, final HttpURI requestUri, final int requestPort,
++                                   final String headerValue) {
++        if (headerValue == null) {
++            return;
++        }
++
++        final String value = headerValue.trim();
++        if (value.isEmpty()) {
++            // The resolver ignores empty values, so they cannot choose the advertised address.
++            return;
++        }
++
++        final Address address = parse(value);
++        if (address == null || address.host().isBlank()) {
++            throw misdirectedRequest();
++        }
++
++        if (isRequestAddress(request, requestUri, requestPort, address)) {
++            return;
++        }
++
++        final Set<Integer> hostPorts = declaredPortsByHost.get(normalizeHost(address.host()));
++        if (hostPorts == null) {
++            throw misdirectedRequest();
++        }
++
++        if (address.port() != null && !hostPorts.contains(address.port()) && !isListeningPort(request, address.port())) {
++            throw misdirectedRequest();
++        }
++    }
++
++    private void validatePortHeader(final Request request, final String headerName) {
++        for (final String headerValue : getHeaderValues(request, headerName)) {
++            if (headerValue == null) {
++                continue;
++            }
++
++            final String value = headerValue.trim();
++            if (value.isEmpty()) {
++                continue;
++            }
++
++            final Integer port = parsePort(value);
++            if (port == null || (!declaredPorts.contains(port) && !isListeningPort(request, port))) {
++                throw misdirectedRequest();
++            }
++        }
++    }
++
++    /**
++     * A secure request may advertise the host it arrived on even when that host is not listed as a
++     * public address, provided any stated port is the port the connection itself uses.
++     */
++    private boolean isRequestAddress(final Request request, final HttpURI requestUri, final int requestPort,
++                                     final Address address) {
++        if (!request.isSecure()) {
++            return false;
++        }
++
++        final String requestHost = getRequestHost(request, requestUri);
++        if (requestHost == null) {
++            return false;
++        }
++
++        return normalizeHost(address.host()).equals(normalizeHost(requestHost))
++                && (address.port() == null || address.port() == requestPort);
++    }
++
++    private String getRequestHost(final Request request, final HttpURI requestUri) {
++        final String uriHost = requestUri.getHost();
++        if (uriHost != null && !uriHost.isBlank()) {
++            return uriHost;
++        }
++
++        final String hostHeader = request.getHeaders().get(ProxyHeader.HOST.getHeader());
++        if (hostHeader == null || hostHeader.isBlank()) {
++            return null;
++        }
++
++        final Address address = parse(hostHeader.trim());
++        return address == null ? null : address.host();
++    }
++
++    private int getRequestPort(final Request request, final HttpURI requestUri) {
++        final int uriPort = requestUri.getPort();
++        return uriPort > 0 ? uriPort : getLocalPort(request);
++    }
++
++    private int getLocalPort(final Request request) {
++        final ConnectionMetaData connectionMetaData = request.getConnectionMetaData();
++        final InetSocketAddress localAddress = connectionMetaData == null ? null
++                : (InetSocketAddress) connectionMetaData.getLocalSocketAddress();
++        return localAddress == null ? -1 : localAddress.getPort();
++    }
++
++    private boolean isListeningPort(final Request request, final int port) {
++        return port == getLocalPort(request) || configuredPorts.contains(port);
++    }
++
++    private List<String> getHeaderValues(final Request request, final String headerName) {
++        final List<String> values = request.getHeaders().getValuesList(headerName);
++        return values == null ? Collections.emptyList() : values;
++    }
++
++    /**
++     * Parse a host with an optional port. Returns {@code null} when the value does not have the
++     * shape the shared request resolver accepts, so that an unrecognized form is refused rather
++     * than silently treated as harmless.
++     */
++    private Address parse(final String value) {
++        final String host;
++        final Integer port;
++
++        if (value.startsWith(IPV6_START)) {
++            final int closingBracket = value.indexOf(IPV6_END);
++            if (closingBracket < 0) {
++                return null;
++            }
++            host = value.substring(0, closingBracket + IPV6_END.length());
++            final String remainder = value.substring(closingBracket + IPV6_END.length());
++            if (remainder.isEmpty()) {
++                port = null;
++            } else if (remainder.startsWith(HOST_PORT_DELIMITER)) {
++                port = parsePort(remainder.substring(HOST_PORT_DELIMITER.length()));
++                if (port == null) {
++                    return null;
++                }
++            } else {
++                return null;
++            }
++        } else {
++            final int firstColon = value.indexOf(HOST_PORT_DELIMITER);
++            final int lastColon = value.lastIndexOf(HOST_PORT_DELIMITER);
++            if (firstColon < 0) {
++                host = value;
++                port = null;
++            } else if (firstColon != lastColon) {
++                // More than one colon without brackets: not a form the resolver understands.
++                return null;
++            } else if (lastColon == value.length() - 1) {
++                host = value.substring(0, lastColon);
++                port = null;
++            } else {
++                port = parsePort(value.substring(lastColon + 1));
++                if (port == null) {
++                    return null;
++                }
++                host = value.substring(0, lastColon);
++            }
++        }
++
++        return new Address(host, port);
++    }
++
++    private Integer parsePort(final String value) {
++        if (value == null || value.isEmpty()) {
++            return null;
++        }
++
++        for (int index = 0; index < value.length(); index++) {
++            if (!Character.isDigit(value.charAt(index))) {
++                return null;
++            }
++        }
++
++        try {
++            final int port = Integer.parseInt(value);
++            return port < FIRST_PORT || port > LAST_PORT ? null : port;
++        } catch (final NumberFormatException e) {
++            return null;
++        }
++    }
++
++    private String stripQuotes(final String value) {
++        if (value.length() >= 2 && value.startsWith(QUOTE) && value.endsWith(QUOTE)) {
++            return value.substring(1, value.length() - 1);
++        }
++        return value;
++    }
++
++    private String normalizeHost(final String host) {
++        return host.trim().toLowerCase(Locale.ROOT);
++    }
++
++    private HttpException.RuntimeException misdirectedRequest() {
++        return new HttpException.RuntimeException(HttpStatus.MISDIRECTED_REQUEST_421, MISDIRECTED_REQUEST_REASON);
++    }
++
++    private record Address(String host, Integer port) {
++    }
++}

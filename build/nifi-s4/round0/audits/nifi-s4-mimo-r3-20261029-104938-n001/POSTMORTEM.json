@@ -1,0 +1,79 @@
+{
+ "trial": "nifi-s4__TyeadAX",
+ "task": "nifi-s4",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-29T12:51:04+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T13:04:34+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "test-fault",
+  "confidence": "medium",
+  "summary": "Reward 0.0 comes from 13 functional failures; all 11 security tests pass. The model validated proxy host and port values inside the shared URL resolver (StandardRequestUriProvider). It got the allowed hosts from a new 'allowedHosts' servlet-context init parameter, which JettyServer.loadWar fills from nifi.web.proxy.host. This copies how the codebase already passes 'allowedContextPaths' to the same resolver. The hidden-test harness (ProxyAddressTestSupport) does not deploy a webapp. It builds the server with StandardServerProvider.getServer(properties) and adds LogoutCompleteRedirectFilter in a bare ServletContextHandler with no init parameters, so the declared allowed hosts can reach product code only through server/connector-level wiring. Under this harness the model's resolver sees an empty allow-list and refuses every proxy header with 400. The 13 failures match exactly the build's 'refuse_all functional_fail (13)' control. That means the graded outcome measures 'did the fix live at the Jetty connector layer' (as the reference ProxyHeaderValidatorCustomizer does), not 'are allowed addresses still advertised'. The instruction never names a layer. Reading the model's code against each failing test's inputs, its logic would advertise the allowed addresses in those cases if the allow-list were present: host-only, host:port, separate X-ProxyPort/X-Forwarded-Port, repeated values (last one used), and RFC 7239 host=. One failing test (proxyHostEqualToRequestHostIsAdvertised) also requires an undeclared 'X-ProxyHost: localhost' to be honoured. The instruction does not state this exemption, and its security property arguably forbids it. Residual uncertainty, which is why confidence is medium rather than high: I could not confirm from this folder that the production LogoutCompleteRedirectFilter is registered in a WebAppContext created by loadWar, and the code was not run. No contamination found.",
+  "items": [
+   {
+    "test": "FunctionalAllowedHostTest::allowedProxyHostIsAdvertisedOnSecureConnection / allowedProxyHostIsAdvertisedOnPlainConnection / allowedForwardedHostIsAdvertisedOnSecureConnection / allowedForwardedHostIsAdvertisedOnPlainConnection (4 fails)",
+    "outcome": "fail",
+    "model_behaviour": "isAllowedAddress() accepts a proxy host that matches a configured allowed host (changes.patch:149-177). The allow-list comes from servletContext.getInitParameter(\"allowedHosts\") (changes.patch:417-419, 430-445), which only JettyServer.loadWar sets (changes.patch:826). The harness's ServletContextHandler has no such parameter, so the list is empty, validateProxyAddress throws, and the filter returns 400 (changes.patch:853-857).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "FunctionalAllowedAuthorityTest::allowedHostWithConfiguredPortIsAdvertised / allowedHostWithSeparateProxyPortIsAdvertised / allowedHostWithSeparateForwardedPortIsAdvertised / allowedHostWithConfiguredPortIsAdvertisedOnPlainConnection (4 fails)",
+    "outcome": "fail",
+    "model_behaviour": "The model's logic matches host plus declared port 8443, whether the port comes inside the host value or in a separate header (changes.patch:157-174). It fails only because the allow-list is empty under the harness wiring, for the same reason as above.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "FunctionalRepeatedForwardedHostTest::valuesOfAnAllowedForwardingChainAreAdvertised / repeatedIdenticalAllowedValueIsAdvertised (2 fails)",
+    "outcome": "fail",
+    "model_behaviour": "Uses the last X-Forwarded-Host value and checks it against the allow-list (changes.patch:249-261). Both chains end in an allowed host, so with a populated allow-list they would be advertised. Refused here because the list is empty.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "FunctionalStandardForwardedHeaderTest::allowedHostParameterIsAdvertised / quotedAllowedHostParameterIsAdvertised (2 fails)",
+    "outcome": "fail",
+    "model_behaviour": "The Forwarded host= value goes through the same proxy-host path (getForwardedHost, changes.patch:242-245) and the same allow-list check. Refused only because the init parameter is missing in the harness.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "FunctionalDirectRequestTest::proxyHostEqualToRequestHostIsAdvertised",
+    "outcome": "fail",
+    "model_behaviour": "'X-ProxyHost: localhost' is not a declared address, so the model refuses it. It would do the same in production.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "Security* (11 tests)",
+    "outcome": "pass",
+    "model_behaviour": "Undeclared hosts and ports are refused with 400 and no Location header. Under the harness these passes are partly vacuous: the allow-list is empty, so everything is refused. The model's code does refuse unlisted values even with a populated list (changes.patch:149-177). The tests themselves are reasonable (status < 500, attacker value not in Location or body).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-pass"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript has no access to /tests, the hidden test class names, or any network fetch (no matches for /tests, curl, wget, github, Functional*/Security* test names, or ProxyAddressTestSupport). No netguard.log is present. The model also never consulted the upstream fix: it did not add a connector customizer.",
+  "evidence": [
+   "evidence/tests/support/ProxyAddressTestSupport.java:92-102: the server is built via StandardServerProvider.getServer(properties); the filter is added in `new ServletContextHandler()` with no init params",
+   "evidence/tests/support/ProxyAddressTestSupport.java:85: allowed hosts are given only as NiFiProperties WEB_PROXY_HOST, reachable only at server level",
+   "evidence/final-code/changes.patch:417-419: RequestUriBuilder reads allowedHosts from a servlet-context init parameter",
+   "evidence/final-code/changes.patch:826: `webappContext.getInitParams().put(ALLOWED_HOSTS_PARAMETER, props.getAllowedHosts())` in JettyServer.loadWar, mirroring the existing allowedContextPaths plumbing at the line above",
+   "evidence/final-code/changes.patch:853-857: a disallowed address leads to 400 with no redirect",
+   "evidence/solution/fix.patch:34-35: the reference adds ProxyHeaderValidatorCustomizer at the connector (FrameworkServerConnectorFactory), the only layer the harness wires properties into",
+   "evidence/solution/fix.patch:208-213: the reference exempts a proxy host equal to the request host on secure requests; the instruction never states this",
+   "evidence/build-notes.md:116: 'refuse_all functional_fail (13)'; this run has exactly 13 functional failures with all security tests passing",
+   "evidence/grading/results.json: security 11/11 pass, functional 6/19 pass",
+   "evidence/instruction.md:21-33: states the property and must-keep-working behaviours but no layer, and says nothing about exempting the request's own host",
+   "evidence/run.json: tool_calls_during_grading is empty, exception_info is null, so there is no harness timing issue"
+  ],
+  "recommended_action": "Do not count this as a model failure. Fix the harness so a fix at the URL-generation layer can see the configured allowed hosts: either set the same servlet-context init parameters JettyServer.loadWar sets (allowedContextPaths, plus anything derived from nifi.web.proxy.host), or deploy the filter through the product's real webapp wiring. Alternatively, state in the instruction that enforcement must happen at the connector/server layer. Drop proxyHostEqualToRequestHostIsAdvertised, or state the request-host exemption in the instruction. Then regrade this trial. A manual check that the production LogoutCompleteRedirectFilter sits inside a loadWar WebAppContext would confirm the model's fix works end-to-end."
+ }
+}

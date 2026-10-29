@@ -1,0 +1,280 @@
+diff --git a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/StandardServerProvider.java b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/StandardServerProvider.java
+index e09e4d10..e03f5858 100644
+--- a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/StandardServerProvider.java
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/StandardServerProvider.java
+@@ -21,6 +21,7 @@ import org.apache.nifi.util.NiFiProperties;
+ import org.apache.nifi.web.server.connector.FrameworkServerConnectorFactory;
+ import org.apache.nifi.web.server.handler.ContextPathRedirectPatternRule;
+ import org.apache.nifi.web.server.handler.HeaderWriterHandler;
++import org.apache.nifi.web.server.handler.ProxyAddressHandler;
+ import org.apache.nifi.web.server.log.RequestLogProvider;
+ import org.apache.nifi.web.server.log.StandardRequestLogProvider;
+ import org.eclipse.jetty.rewrite.handler.RedirectPatternRule;
+@@ -68,7 +69,7 @@ class StandardServerProvider implements ServerProvider {
+         final Server server = new Server(threadPool);
+         addConnectors(server, properties, sslContext);
+ 
+-        final Handler standardHandler = getStandardHandler();
++        final Handler standardHandler = getStandardHandler(properties);
+         server.setHandler(standardHandler);
+ 
+         final RewriteHandler defaultRewriteHandler = getDefaultRewriteHandler(properties);
+@@ -132,13 +133,16 @@ class StandardServerProvider implements ServerProvider {
+         }
+     }
+ 
+-    private Handler getStandardHandler() {
++    private Handler getStandardHandler(final NiFiProperties properties) {
+         // Standard Handler supporting an ordered sequence of Handlers invoked until completion
+         final Handler.Collection standardHandler = new Handler.Sequence();
+ 
+         // Set Handler for standard response headers
+         standardHandler.addHandler(new HeaderWriterHandler());
+ 
++        // Reject proxy address headers that do not name configured public addresses
++        standardHandler.addHandler(ProxyAddressHandler.fromProperties(properties));
++
+         return standardHandler;
+     }
+ }
+diff --git a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/handler/ProxyAddressHandler.java b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/handler/ProxyAddressHandler.java
+new file mode 100644
+index 00000000..43ac27a3
+--- /dev/null
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/handler/ProxyAddressHandler.java
+@@ -0,0 +1,235 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.web.server.handler;
++
++import org.apache.nifi.util.NiFiProperties;
++import org.apache.nifi.web.servlet.shared.ProxyHeader;
++import org.eclipse.jetty.http.HttpURI;
++import org.eclipse.jetty.server.ConnectionMetaData;
++import org.eclipse.jetty.server.Handler;
++import org.eclipse.jetty.server.Request;
++import org.eclipse.jetty.server.Response;
++import org.eclipse.jetty.util.Callback;
++
++import java.net.InetSocketAddress;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.Set;
++
++/**
++ * Handler validating proxy address request headers against configured public addresses
++ */
++public class ProxyAddressHandler extends Handler.Abstract {
++    private static final int MISDIRECTED_REQUEST = 421;
++
++    private static final String FORWARDED_HEADER = ProxyHeader.FORWARDED.getHeader();
++
++    private static final String FORWARDED_HOST_PARAMETER = "host";
++
++    private final Set<String> validHosts;
++
++    private final Set<Integer> validPorts;
++
++    public ProxyAddressHandler(final Set<String> validHosts, final Set<Integer> validPorts) {
++        this.validHosts = Objects.requireNonNull(validHosts);
++        this.validPorts = Objects.requireNonNull(validPorts);
++    }
++
++    public static ProxyAddressHandler fromProperties(final NiFiProperties properties) {
++        final Set<String> validHosts = new HashSet<>();
++        final Set<Integer> validPorts = new HashSet<>();
++        validPorts.add(properties.getSslPort() == null ? properties.getPort() : properties.getSslPort());
++
++        for (final String allowedHost : properties.getAllowedHostsAsList()) {
++            final String host;
++            if (allowedHost.startsWith("[")) {
++                final int closingBracket = allowedHost.indexOf(']');
++                host = closingBracket > 0 ? allowedHost.substring(0, closingBracket + 1) : allowedHost;
++                if (closingBracket > 0 && closingBracket + 2 < allowedHost.length() && allowedHost.charAt(closingBracket + 1) == ':') {
++                    addPort(validPorts, allowedHost.substring(closingBracket + 2));
++                }
++            } else {
++                final int separator = allowedHost.lastIndexOf(':');
++                if (separator > 0 && separator < allowedHost.length() - 1) {
++                    host = allowedHost.substring(0, separator);
++                    addPort(validPorts, allowedHost.substring(separator + 1));
++                } else {
++                    host = allowedHost;
++                }
++            }
++            if (!host.isBlank()) {
++                validHosts.add(host.toLowerCase(Locale.ROOT));
++            }
++        }
++
++        return new ProxyAddressHandler(validHosts, validPorts);
++    }
++
++    private static void addPort(final Set<Integer> validPorts, final String value) {
++        try {
++            validPorts.add(Integer.parseInt(value));
++        } catch (final NumberFormatException e) {
++            // Ignore an invalid configured port; the host remains valid
++        }
++    }
++
++    @Override
++    public boolean handle(final Request request, final Response response, final Callback callback) {
++        if (isValidRequest(request)) {
++            return false;
++        }
++        response.setStatus(MISDIRECTED_REQUEST);
++        callback.succeeded();
++        return true;
++    }
++
++    private boolean isValidRequest(final Request request) {
++        final HttpURI requestUri = request.getHttpURI();
++        final String requestHost = requestUri.getHost();
++        final boolean secureRequest = request.isSecure();
++        final int requestPort = getRequestPort(request, requestUri);
++
++        final List<String> proxyHostValues = new ArrayList<>();
++        addValues(proxyHostValues, request, ProxyHeader.PROXY_HOST.getHeader());
++        addValues(proxyHostValues, request, ProxyHeader.FORWARDED_HOST.getHeader());
++        addForwardedValues(proxyHostValues, request);
++
++        for (final String value : proxyHostValues) {
++            if (value == null || value.isBlank()) {
++                return false;
++            }
++            final String[] hostPort = splitHostPort(value.trim());
++            if (hostPort == null) {
++                return false;
++            }
++            final boolean requestHostMatched = secureRequest
++                    && hostPort[0].equalsIgnoreCase(requestHost)
++                    && (hostPort[1] == null || Integer.parseInt(hostPort[1]) == requestPort);
++            if (!requestHostMatched && !validHosts.contains(hostPort[0].toLowerCase(Locale.ROOT))) {
++                return false;
++            }
++            if (hostPort[1] != null && !validPorts.contains(Integer.parseInt(hostPort[1]))) {
++                return false;
++            }
++        }
++
++        final List<String> proxyPortValues = new ArrayList<>();
++        addValues(proxyPortValues, request, ProxyHeader.PROXY_PORT.getHeader());
++        addValues(proxyPortValues, request, ProxyHeader.FORWARDED_PORT.getHeader());
++        for (final String value : proxyPortValues) {
++            if (value == null || value.isBlank()) {
++                continue;
++            }
++            try {
++                if (!validPorts.contains(Integer.parseInt(value.trim()))) {
++                    return false;
++                }
++            } catch (final NumberFormatException e) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
++    private void addValues(final List<String> values, final Request request, final String header) {
++        final List<String> headerValues = request.getHeaders().getValuesList(header);
++        if (headerValues != null) {
++            values.addAll(headerValues);
++        }
++    }
++
++    private void addForwardedValues(final List<String> values, final Request request) {
++        final List<String> headerValues = request.getHeaders().getValuesList(FORWARDED_HEADER);
++        if (headerValues == null) {
++            return;
++        }
++        for (final String value : headerValues) {
++            if (value == null || value.isBlank()) {
++                continue;
++            }
++            for (final String element : value.split(",")) {
++                for (final String parameter : element.split(";")) {
++                    final String[] keyValue = parameter.trim().split("=", 2);
++                    if (keyValue.length == 2 && FORWARDED_HOST_PARAMETER.equalsIgnoreCase(keyValue[0].trim())) {
++                        String host = keyValue[1].trim();
++                        if (host.length() >= 2 && host.startsWith("\"") && host.endsWith("\"")) {
++                            host = host.substring(1, host.length() - 1);
++                        }
++                        values.add(host);
++                    }
++                }
++            }
++        }
++    }
++
++    private String[] splitHostPort(final String value) {
++        final String host;
++        final String port;
++        if (value.startsWith("[")) {
++            final int closingBracket = value.indexOf(']');
++            if (closingBracket < 0) {
++                return null;
++            }
++            host = value.substring(0, closingBracket + 1);
++            if (closingBracket + 1 < value.length()) {
++                if (value.charAt(closingBracket + 1) != ':') {
++                    return null;
++                }
++                port = value.substring(closingBracket + 2);
++            } else {
++                port = null;
++            }
++        } else {
++            final int separator = value.lastIndexOf(':');
++            if (separator > 0 && separator == value.indexOf(':') && separator < value.length() - 1) {
++                host = value.substring(0, separator);
++                port = value.substring(separator + 1);
++            } else {
++                host = value;
++                port = null;
++            }
++        }
++        if (port != null) {
++            try {
++                final int parsed = Integer.parseInt(port);
++                if (parsed < 1 || parsed > 65535) {
++                    return null;
++                }
++            } catch (final NumberFormatException e) {
++                return null;
++            }
++        }
++        return new String[]{host, port};
++    }
++
++    private int getRequestPort(final Request request, final HttpURI requestUri) {
++        if (requestUri.getPort() > 0) {
++            return requestUri.getPort();
++        }
++        return getLocalPort(request);
++    }
++
++    private int getLocalPort(final Request request) {
++        final ConnectionMetaData connectionMetaData = request.getConnectionMetaData();
++        final InetSocketAddress localSocketAddress = (InetSocketAddress) connectionMetaData.getLocalSocketAddress();
++        return localSocketAddress == null ? -1 : localSocketAddress.getPort();
++    }
++}

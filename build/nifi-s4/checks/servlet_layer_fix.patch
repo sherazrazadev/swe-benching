@@ -1,0 +1,261 @@
+diff --git a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
+index 9baf774..d6c1441 100644
+--- a/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
++++ b/nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java
+@@ -20,10 +20,14 @@ import jakarta.servlet.http.HttpServletRequest;
+ 
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Enumeration;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Objects;
++import java.util.Set;
+ import java.util.function.Predicate;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+@@ -58,6 +62,20 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+ 
+     private static final String QUOTED_VALUE_DELIMITER = "\"";
+ 
++    private static final String ALLOWED_HOSTS_PARAMETER = "allowedHosts";
++
++    private static final String ALLOWED_HOSTS_SEPARATOR = ",";
++
++    private static final String HOST_PORT_SEPARATOR = ":";
++
++    private static final String OPEN_BRACKET = "[";
++
++    private static final String CLOSE_BRACKET = "]";
++
++    private static final int MINIMUM_VALID_PORT_NUMBER = 1;
++
++    private static final int MAXIMUM_VALID_PORT_NUMBER = 65535;
++
+     private final List<String> allowedContextPaths;
+ 
+     public StandardRequestUriProvider(final List<String> allowedContextPaths) {
+@@ -109,7 +127,8 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         final String host;
+ 
+         final String serverName = request.getServerName();
+-        final String headerHost = getHostHeader(request);
++        // A request carrying any proxy address that is not an allowed public address keeps the address it arrived on
++        final String headerHost = isProxyAddressAllowed(request) ? getHostHeader(request) : null;
+         if (headerHost == null) {
+             host = serverName;
+         } else {
+@@ -148,6 +167,9 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         final int port;
+ 
+         final int serverPort = request.getServerPort();
++        if (!isProxyAddressAllowed(request)) {
++            return serverPort;
++        }
+         final String headerHost = getPortHostHeader(request);
+         if (headerHost == null) {
+             port = getProxyPort(request);
+@@ -259,6 +281,180 @@ public class StandardRequestUriProvider implements RequestUriProvider {
+         return port;
+     }
+ 
++    /**
++     * Determine whether every proxy address value supplied by the request names an allowed public
++     * address. A request carrying no proxy address, or carrying only values that name the address
++     * it arrived on, is allowed. Any other value makes the proxy addresses unusable, so the
++     * generated URL keeps the address the request arrived on.
++     */
++    private boolean isProxyAddressAllowed(final HttpServletRequest request) {
++        final List<String> allowedHosts = new ArrayList<>();
++        final Set<Integer> allowedPorts = new HashSet<>();
++        addConfiguredAddresses(request, allowedHosts, allowedPorts);
++
++        final String requestHost = request.getServerName();
++        final int requestPort = request.getServerPort();
++
++        for (final String proxyHost : getProxyHostValues(request)) {
++            if (!isAllowedHostPort(proxyHost, requestHost, requestPort, allowedHosts, allowedPorts)) {
++                return false;
++            }
++        }
++
++        for (final String proxyPort : getProxyPortValues(request)) {
++            final Integer port = parsePort(proxyPort);
++            if (port == null || !allowedPorts.contains(port)) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
++    private void addConfiguredAddresses(final HttpServletRequest request, final List<String> allowedHosts, final Set<Integer> allowedPorts) {
++        // The application's own listening port is always acceptable
++        allowedPorts.add(request.getServerPort());
++
++        final String configured = request.getServletContext() == null
++                ? null : request.getServletContext().getInitParameter(ALLOWED_HOSTS_PARAMETER);
++        if (configured == null) {
++            return;
++        }
++
++        for (final String entry : configured.split(ALLOWED_HOSTS_SEPARATOR)) {
++            final String trimmed = entry.trim();
++            if (trimmed.isEmpty()) {
++                continue;
++            }
++            final HostPort hostPort = parseHostPort(trimmed);
++            if (hostPort == null || hostPort.host().isBlank()) {
++                continue;
++            }
++            allowedHosts.add(hostPort.host().toLowerCase(Locale.ROOT));
++            if (hostPort.port() != null) {
++                allowedPorts.add(hostPort.port());
++            }
++        }
++    }
++
++    private boolean isAllowedHostPort(final String value, final String requestHost, final int requestPort,
++                                      final List<String> allowedHosts, final Set<Integer> allowedPorts) {
++        if (value == null || value.isBlank()) {
++            // A blank value carries no address and cannot determine the generated URL
++            return true;
++        }
++
++        final HostPort hostPort = parseHostPort(value.trim());
++        if (hostPort == null || hostPort.host().isBlank()) {
++            return false;
++        }
++
++        // A value naming the address the request itself arrived on is acceptable
++        if ((hostPort.port() == null || hostPort.port() == requestPort)
++                && hostPort.host().equalsIgnoreCase(requestHost)) {
++            return true;
++        }
++
++        if (!allowedHosts.contains(hostPort.host().toLowerCase(Locale.ROOT))) {
++            return false;
++        }
++        return hostPort.port() == null || allowedPorts.contains(hostPort.port());
++    }
++
++    private List<String> getProxyHostValues(final HttpServletRequest request) {
++        final List<String> values = new ArrayList<>();
++        addHeaderValues(values, request, ProxyHeader.PROXY_HOST);
++        addHeaderValues(values, request, ProxyHeader.FORWARDED_HOST);
++
++        final Enumeration<String> forwardedValues = request.getHeaders(ProxyHeader.FORWARDED.getHeader());
++        while (forwardedValues != null && forwardedValues.hasMoreElements()) {
++            final String forwarded = forwardedValues.nextElement();
++            if (forwarded == null || forwarded.isBlank()) {
++                continue;
++            }
++            for (final String element : forwarded.split(FORWARDED_ELEMENT_SEPARATOR)) {
++                for (final String parameter : element.split(FORWARDED_PARAMETER_SEPARATOR)) {
++                    final String[] keyValue = parameter.trim().split(FORWARDED_VALUE_SEPARATOR, 2);
++                    if (keyValue.length == 2 && FORWARDED_HOST_PARAMETER.equalsIgnoreCase(keyValue[0].trim())) {
++                        values.add(stripQuotes(keyValue[1].trim()));
++                    }
++                }
++            }
++        }
++
++        return values;
++    }
++
++    private List<String> getProxyPortValues(final HttpServletRequest request) {
++        final List<String> values = new ArrayList<>();
++        addHeaderValues(values, request, ProxyHeader.PROXY_PORT);
++        addHeaderValues(values, request, ProxyHeader.FORWARDED_PORT);
++        return values;
++    }
++
++    private void addHeaderValues(final List<String> values, final HttpServletRequest request, final ProxyHeader proxyHeader) {
++        final Enumeration<String> headerValues = request.getHeaders(proxyHeader.getHeader());
++        while (headerValues != null && headerValues.hasMoreElements()) {
++            values.add(headerValues.nextElement());
++        }
++    }
++
++    private Integer parsePort(final String value) {
++        if (value == null) {
++            return null;
++        }
++        try {
++            final int port = Integer.parseInt(value.trim());
++            if (port < MINIMUM_VALID_PORT_NUMBER || port > MAXIMUM_VALID_PORT_NUMBER) {
++                return null;
++            }
++            return port;
++        } catch (final NumberFormatException e) {
++            return null;
++        }
++    }
++
++    private HostPort parseHostPort(final String value) {
++        final String host;
++        final Integer port;
++
++        if (value.startsWith(OPEN_BRACKET)) {
++            final int closingBracket = value.indexOf(CLOSE_BRACKET);
++            if (closingBracket < 0) {
++                return null;
++            }
++            host = value.substring(0, closingBracket + 1);
++            if (closingBracket + 1 == value.length()) {
++                port = null;
++            } else {
++                if (!value.startsWith(HOST_PORT_SEPARATOR, closingBracket + 1)) {
++                    return null;
++                }
++                port = parsePort(value.substring(closingBracket + 2));
++                if (port == null) {
++                    return null;
++                }
++            }
++        } else {
++            final int separator = value.lastIndexOf(HOST_PORT_SEPARATOR);
++            if (separator > 0 && separator == value.indexOf(HOST_PORT_SEPARATOR) && separator < value.length() - 1) {
++                port = parsePort(value.substring(separator + 1));
++                if (port == null) {
++                    return null;
++                }
++                host = value.substring(0, separator);
++            } else {
++                host = value;
++                port = null;
++            }
++        }
++
++        return new HostPort(host, port);
++    }
++
++    private record HostPort(String host, Integer port) {
++    }
++
+     private String getPath(final HttpServletRequest request) {
+         final String path;
+ 
+diff --git a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/JettyServer.java b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/JettyServer.java
+index 706a349..64659f2 100644
+--- a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/JettyServer.java
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/JettyServer.java
+@@ -139,6 +139,7 @@ public class JettyServer implements NiFiServer, ExtensionUiLoader {
+     private static final Logger logger = LoggerFactory.getLogger(JettyServer.class);
+ 
+     private static final String ALLOWED_CONTEXT_PATHS_PARAMETER = "allowedContextPaths";
++    private static final String ALLOWED_HOSTS_PARAMETER = "allowedHosts";
+     private static final String CONTAINER_JAR_PATTERN = ".*/jetty-(jakarta-)?servlet-api-[^/]*\\.jar$|.*jakarta.servlet.jsp.jstl-[^/]*\\.jar";
+ 
+     private static final String CONTEXT_PATH_ALL = "/*";
+@@ -705,6 +706,7 @@ public class JettyServer implements NiFiServer, ExtensionUiLoader {
+     private WebAppContext loadWar(final File warFile, final String contextPath, final ClassLoader parentClassLoader) {
+         final WebAppContext webappContext = new WebAppContext(warFile.getPath(), contextPath);
+         webappContext.getInitParams().put(ALLOWED_CONTEXT_PATHS_PARAMETER, props.getAllowedContextPaths());
++        webappContext.getInitParams().put(ALLOWED_HOSTS_PARAMETER, String.join(",", props.getAllowedHostsAsList()));
+         webappContext.setMaxFormContentSize(WEB_APP_MAX_FORM_CONTENT_SIZE);
+         webappContext.setAttribute(MetaInfConfiguration.CONTAINER_JAR_PATTERN, CONTAINER_JAR_PATTERN);
+         webappContext.setErrorHandler(getErrorHandler());
