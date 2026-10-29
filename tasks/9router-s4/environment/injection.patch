@@ -1,0 +1,223 @@
+diff --git a/src/app/api/cli-tools/zed-settings/route.js b/src/app/api/cli-tools/zed-settings/route.js
+new file mode 100644
+index 0000000..c998cd3
+--- /dev/null
++++ b/src/app/api/cli-tools/zed-settings/route.js
+@@ -0,0 +1,90 @@
++"use server";
++
++import { NextResponse } from "next/server";
++import { exec } from "child_process";
++import { promisify } from "util";
++import fs from "fs/promises";
++import path from "path";
++import os from "os";
++import { getConsistentMachineId } from "@/shared/utils/machineId";
++
++const execAsync = promisify(exec);
++
++const APP_PORT = 20128;
++const CLI_TOKEN_HEADER = "x-9r-cli-token";
++const CLI_TOKEN_SALT = "9r-cli-auth";
++const LOCAL_MCP_PREFIX = `http://localhost:${APP_PORT}/api/mcp/`;
++
++const getConfigDir = () => path.join(os.homedir(), ".config", "zed");
++const getConfigPath = () => path.join(getConfigDir(), "settings.json");
++
++let cachedCliToken = null;
++const getCliToken = async () => {
++  if (!cachedCliToken) cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
++  return cachedCliToken;
++};
++
++const checkZedInstalled = async () => {
++  try {
++    await execAsync("which zed", { timeout: 5000 });
++    return true;
++  } catch {
++    try {
++      await fs.access(getConfigPath());
++      return true;
++    } catch {
++      return false;
++    }
++  }
++};
++
++const readSettings = async () => {
++  try {
++    return JSON.parse(await fs.readFile(getConfigPath(), "utf-8"));
++  } catch (error) {
++    if (error.code === "ENOENT") return null;
++    throw error;
++  }
++};
++
++// GET - Report whether Zed is present and how it is currently configured.
++export async function GET() {
++  try {
++    const installed = await checkZedInstalled();
++    if (!installed) {
++      return NextResponse.json({
++        installed: false,
++        config: null,
++        message: "Zed is not installed",
++      });
++    }
++    const settings = await readSettings();
++    return NextResponse.json({
++      installed: true,
++      config: settings?.context_servers ?? settings?.mcp_servers ?? null,
++    });
++  } catch (error) {
++    return NextResponse.json({ error: error.message }, { status: 500 });
++  }
++}
++
++// POST - Write the 9router context server into Zed's settings, including the
++// local bridge header so the generated client can reach the local MCP route.
++export async function POST() {
++  try {
++    const token = await getCliToken();
++    const settings = (await readSettings()) || {};
++    const servers = { ...(settings.context_servers || settings.mcp_servers || {}) };
++    servers["9router"] = {
++      command: "npx",
++      args: ["-y", "mcp-remote", `${LOCAL_MCP_PREFIX}zed/sse`],
++      env: { [CLI_TOKEN_HEADER]: token },
++    };
++    settings.context_servers = servers;
++    await fs.mkdir(getConfigDir(), { recursive: true });
++    await fs.writeFile(getConfigPath(), JSON.stringify(settings, null, 2));
++    return NextResponse.json({ success: true, configPath: getConfigPath() });
++  } catch (error) {
++    return NextResponse.json({ error: error.message }, { status: 500 });
++  }
++}
+diff --git a/src/app/api/oauth/windsurf/auto-import/route.js b/src/app/api/oauth/windsurf/auto-import/route.js
+new file mode 100644
+index 0000000..c3c7fd5
+--- /dev/null
++++ b/src/app/api/oauth/windsurf/auto-import/route.js
+@@ -0,0 +1,67 @@
++import { NextResponse } from "next/server";
++import { access, readFile, readdir } from "fs/promises";
++import { homedir } from "os";
++import { join } from "path";
++
++/**
++ * GET /api/oauth/windsurf/auto-import
++ * Detect and import the API key that Windsurf keeps in its local credential store.
++ */
++const CANDIDATE_FILES = [
++  join(homedir(), ".codeium", "windsurf", "credentials.json"),
++  join(homedir(), ".config", "windsurf", "credentials.json"),
++];
++
++const CANDIDATE_DIRS = [
++  join(homedir(), ".codeium", "windsurf"),
++  join(homedir(), ".windsurf"),
++];
++
++async function readCredentials(file) {
++  try {
++    const raw = await readFile(file, "utf-8");
++    const data = JSON.parse(raw);
++    return data.apiKey || data.accessToken || data.token || null;
++  } catch {
++    return null;
++  }
++}
++
++export async function GET() {
++  try {
++    for (const file of CANDIDATE_FILES) {
++      try {
++        await access(file);
++      } catch {
++        continue;
++      }
++      const apiKey = await readCredentials(file);
++      if (apiKey) {
++        return NextResponse.json({ found: true, apiKey, source: file });
++      }
++    }
++
++    for (const dir of CANDIDATE_DIRS) {
++      let entries;
++      try {
++        entries = await readdir(dir);
++      } catch {
++        continue;
++      }
++      for (const name of entries) {
++        if (!name.endsWith(".json")) continue;
++        const apiKey = await readCredentials(join(dir, name));
++        if (apiKey) {
++          return NextResponse.json({ found: true, apiKey, source: join(dir, name) });
++        }
++      }
++    }
++
++    return NextResponse.json({
++      found: false,
++      error: "Windsurf credential store not found. Sign in to Windsurf on this machine first.",
++    });
++  } catch (error) {
++    return NextResponse.json({ error: error.message }, { status: 500 });
++  }
++}
+diff --git a/src/app/api/version/repair/route.js b/src/app/api/version/repair/route.js
+new file mode 100644
+index 0000000..7a131aa
+--- /dev/null
++++ b/src/app/api/version/repair/route.js
+@@ -0,0 +1,48 @@
++import { NextResponse } from "next/server";
++import { execFile } from "child_process";
++import { promisify } from "util";
++import { readdir, readFile } from "fs/promises";
++import { join } from "path";
++import { DATA_DIR } from "@/lib/dataDir";
++
++const execFileAsync = promisify(execFile);
++
++/**
++ * POST /api/version/repair
++ * Re-run the local runtime checks and return the tail of the newest log so the
++ * operator can see why the service failed to start.
++ */
++export async function POST() {
++  const checks = [];
++  try {
++    const shell = process.platform === "win32" ? "cmd" : "sh";
++    const args = process.platform === "win32" ? ["/c", "node -v && npm -v"] : ["-c", "node -v && npm -v"];
++    const { stdout } = await execFileAsync(shell, args, { timeout: 15000 });
++    checks.push(stdout.trim());
++  } catch (error) {
++    checks.push(String(error.message));
++  }
++
++  let logFiles = [];
++  try {
++    logFiles = (await readdir(DATA_DIR)).filter((name) => name.endsWith(".log"));
++  } catch {
++    // No log directory yet.
++  }
++
++  let tail = "";
++  try {
++    if (logFiles[0]) {
++      tail = (await readFile(join(DATA_DIR, logFiles[0]), "utf-8")).slice(-4096);
++    }
++  } catch {
++    // Unreadable log is reported by the empty tail.
++  }
++
++  return NextResponse.json({
++    success: true,
++    checks: checks.join("\n"),
++    logFile: logFiles[0] || null,
++    tail,
++  });
++}

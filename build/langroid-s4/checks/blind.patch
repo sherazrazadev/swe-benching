@@ -1,0 +1,121 @@
+diff -ruN a/langroid/agent/tools/file_tools.py b/langroid/agent/tools/file_tools.py
+--- a/langroid/agent/tools/file_tools.py	2026-10-29 01:13:15.000000000 +0000
++++ b/langroid/agent/tools/file_tools.py	2026-10-29 01:28:28.017717787 +0000
+@@ -13,6 +13,47 @@
+ from langroid.utils.system import create_file, list_dir, read_file, rmdir
+ 
+ 
++def _confine_path(
++    base: str | Path,
++    user_path: str | Path,
++    *,
++    expand_leading_tilde: bool = False,
++) -> Path:
++    """Return the location that ``user_path`` denotes inside the tool's directory.
++
++    Every file tool is created bound to one directory (``base``). This helper
++    computes the canonical location the underlying file operation will actually
++    touch, following symlinks, and raises ``PermissionError`` when that location
++    is not ``base`` itself or somewhere beneath it. Handlers call it before
++    performing any work, so a refused request has no side effect.
++
++    ``expand_leading_tilde`` mirrors the interpretation used by the specific
++    underlying helper: ``read_file`` expands a leading ``~`` before opening the
++    file, whereas the create/append/list/remove/move helpers operate on the
++    literal path. Checking the wrong interpretation would let a path slip past
++    the guard and be resolved differently by the sink.
++
++    Raises:
++        PermissionError: If the location lies outside ``base``.
++    """
++    root = Path(base).resolve()
++    candidate = Path(user_path)
++    if expand_leading_tilde:
++        try:
++            candidate = candidate.expanduser()
++        except RuntimeError:
++            # No home directory is available, so the read helper cannot expand
++            # it either; keep the literal path that will be used in that case.
++            pass
++    target = (root / candidate).resolve()
++    if target != root and root not in target.parents:
++        raise PermissionError(
++            f"Path {str(user_path)!r} is outside the tool's directory "
++            f"{str(root)!r}"
++        )
++    return target
++
++
+ class ReadFileTool(ToolMessage):
+     request: str = "read_file_tool"
+     purpose: str = "Read the contents of a <file_path>"
+@@ -57,8 +98,12 @@
+     def handle(self) -> str:
+         # return contents as str for LLM to read
+         # ASSUME: file_path should be relative to the curr_dir
++        dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(dir, self.file_path, expand_leading_tilde=True)
++        except PermissionError as e:
++            return f"Error: {e}"
+         try:
+-            dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
+             with chdir(dir):
+                 # if file doesn't exist, return an error message
+                 content = read_file(self.file_path, self._line_nums)
+@@ -165,6 +210,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(curr_dir, self.file_path)
++        except PermissionError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content)
+             msg = f"Content written to {self.file_path}"
+@@ -222,6 +271,10 @@
+     def handle(self) -> str:
+         # ASSUME: dir_path should be relative to the curr_dir_path
+         dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(dir, self.dir_path)
++        except PermissionError as e:
++            return f"Error: {e}"
+         with chdir(dir):
+             contents = list_dir(self.dir_path)
+ 
+@@ -268,6 +321,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(curr_dir, self.file_path)
++        except PermissionError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content, if_exists="append")
+         return f"Content appended to {self.file_path}"
+@@ -301,6 +358,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(curr_dir, self.file_path)
++        except PermissionError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             target = Path(self.file_path)
+             if target.is_dir():
+@@ -339,6 +400,11 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine_path(curr_dir, self.src_path)
++            _confine_path(curr_dir, self.dst_path)
++        except PermissionError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             shutil.move(self.src_path, self.dst_path)
+         return f"Moved {self.src_path} to {self.dst_path}"

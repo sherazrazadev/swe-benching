@@ -1,0 +1,98 @@
+--- a/crates/swc_html_minifier/src/lib.rs
++++ b/crates/swc_html_minifier/src/lib.rs
+@@ -1413,7 +1413,7 @@
+ 
+         previous.children = vec![Child::Text(Text {
+             span: DUMMY_SP,
+-            data: serialized.into(),
++            data: Self::escape_json_for_html_script(serialized).into(),
+             raw: None,
+         })];
+ 
+@@ -1846,6 +1846,20 @@
+         result.ok()
+     }
+ 
++    /// Escapes serialized JSON so it cannot terminate its containing HTML
++    /// `script` element.
++    ///
++    /// HTML tokenization recognizes `</script` before the JSON is parsed.
++    /// Serializing an escaped `<` as a literal character can therefore turn
++    /// JSON data into a different HTML element structure.
++    fn escape_json_for_html_script(json: String) -> String {
++        if json.contains('<') {
++            json.replace('<', "\\u003C")
++        } else {
++            json
++        }
++    }
++
+     /// Normalizes the fixed-shape JSON documents that browsers consume as structured
+     /// script data. Empty values and repeated list entries carry no meaning in these
+     /// formats, so they are dropped while the document is rewritten.
+@@ -1858,7 +1872,9 @@
+ 
+         normalize_structured_json(&mut value);
+ 
+-        serde_json::to_string(&value).ok()
++        serde_json::to_string(&value)
++            .ok()
++            .map(Self::escape_json_for_html_script)
+     }
+ 
+     fn need_minify_js(&self) -> bool {
+@@ -2830,7 +2846,7 @@
+                     None => return,
+                 };
+ 
+-                n.data = minified.into();
++                n.data = Self::escape_json_for_html_script(minified).into();
+             }
+             Some(MinifierType::Css) => {
+                 let minified =
+@@ -2897,6 +2913,45 @@
+     }
+ }
+ 
++/// Escapes HTML end tags for the enclosing `script` element in JavaScript text.
++///
++/// The tag name is matched case-insensitively and ends at `>`, `/` or whitespace,
++/// which is what the HTML tokenizer accepts, so every form a browser would read as
++/// the end of the element gets a backslash after the `<`.
++fn escape_script_end_tags(code: &str) -> String {
++    let bytes = code.as_bytes();
++    let mut result = String::with_capacity(code.len());
++    let mut copied = 0;
++    let mut index = 0;
++
++    while index + 8 <= bytes.len() {
++        if bytes[index] == b'<'
++            && bytes[index + 1] == b'/'
++            && bytes[index + 2..index + 8].eq_ignore_ascii_case(b"script")
++            && matches!(
++                bytes.get(index + 8),
++                Some(b'>')
++                    | Some(b'/')
++                    | Some(b' ')
++                    | Some(b'\t')
++                    | Some(b'\n')
++                    | Some(b'\x0C')
++                    | Some(b'\r')
++            )
++        {
++            result.push_str(&code[copied..=index]);
++            result.push('\\');
++            copied = index + 1;
++        }
++
++        index += 1;
++    }
++
++    result.push_str(&code[copied..]);
++
++    result
++}
++
+ /// Returns the text of a plain `application/json` data block, or `None` when the
+ /// element is not one.
+ fn json_data_text(element: &Element) -> Option<String> {

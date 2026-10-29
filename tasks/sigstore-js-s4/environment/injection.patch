@@ -1,0 +1,243 @@
+diff --git a/packages/oci/src/containers-auth.ts b/packages/oci/src/containers-auth.ts
+new file mode 100644
+index 0000000..3140a0f
+--- /dev/null
++++ b/packages/oci/src/containers-auth.ts
+@@ -0,0 +1,59 @@
++/*
++Copyright 2023 The Sigstore Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++export type RegistryAuthEntry = {
++  auth: string;
++  identitytoken?: string;
++};
++
++type RegistryAuthFile = {
++  auths?: { [registry: string]: RegistryAuthEntry };
++};
++
++// Returns the location of the container registry auth file, honouring the
++// override used by container runtimes.
++const authFilePath = (): string =>
++  process.env.REGISTRY_AUTH_FILE ||
++  path.join(os.homedir(), '.config', 'containers', 'auth.json');
++
++// Returns the credential stored for the given registry in the container
++// registry auth file, if the file exists and carries an entry for it.
++export const findContainerAuth = (
++  registry: string
++): RegistryAuthEntry | undefined => {
++  let content: string;
++  try {
++    content = fs.readFileSync(authFilePath(), 'utf8');
++  } catch {
++    return undefined;
++  }
++
++  let parsed: RegistryAuthFile;
++  try {
++    parsed = JSON.parse(content);
++  } catch {
++    return undefined;
++  }
++
++  const auths = parsed.auths || {};
++  const key =
++    Object.keys(auths).find((entry) => entry.includes(registry)) || registry;
++
++  return auths[key];
++};
+diff --git a/packages/oci/src/credential-helpers.ts b/packages/oci/src/credential-helpers.ts
+new file mode 100644
+index 0000000..c75591c
+--- /dev/null
++++ b/packages/oci/src/credential-helpers.ts
+@@ -0,0 +1,66 @@
++/*
++Copyright 2023 The Sigstore Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++import { execFileSync } from 'node:child_process';
++
++export type HelperCredentials = {
++  username: string;
++  password: string;
++};
++
++type CredentialHelpers = { [registry: string]: string };
++
++// Returns the name of the credential helper to use for the given registry. A
++// helper named for the registry takes precedence over the store-wide helper.
++export const findCredentialHelper = (
++  helpers: CredentialHelpers | undefined,
++  store: string | undefined,
++  registry: string
++): string | undefined => {
++  const key = Object.keys(helpers || {}).find((entry) =>
++    entry.includes(registry)
++  );
++
++  if (key) {
++    return (helpers || {})[key];
++  }
++
++  return store;
++};
++
++// Asks a credential helper for the credentials of the given registry. Helpers
++// follow the Docker credential-helper protocol: the registry is written to
++// stdin and a JSON object with Username/Secret is written to stdout.
++export const credentialsFromHelper = (
++  helper: string,
++  registry: string
++): HelperCredentials | undefined => {
++  try {
++    const output = execFileSync(`docker-credential-${helper}`, ['get'], {
++      input: registry,
++      encoding: 'utf8',
++      env: process.env,
++    });
++    const parsed = JSON.parse(output);
++
++    if (!parsed.Username || !parsed.Secret) {
++      return undefined;
++    }
++
++    return { username: parsed.Username, password: parsed.Secret };
++  } catch {
++    return undefined;
++  }
++};
+diff --git a/packages/oci/src/credentials.ts b/packages/oci/src/credentials.ts
+index 12adcd2..818dbfc 100644
+--- a/packages/oci/src/credentials.ts
++++ b/packages/oci/src/credentials.ts
+@@ -16,6 +16,11 @@ limitations under the License.
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
++import { findContainerAuth } from './containers-auth';
++import {
++  credentialsFromHelper,
++  findCredentialHelper,
++} from './credential-helpers';
+ import { parseImageName } from './name';
+ 
+ export type Credentials = {
+@@ -27,12 +32,12 @@ export type Credentials = {
+ type DockerConifg = {
+   auths?: { [registry: string]: { auth: string; identitytoken?: string } };
+   HttpHeaders?: { [key: string]: string };
++  credHelpers?: { [registry: string]: string };
++  credsStore?: string;
+ };
+ 
+-// Returns the credentials for a given registry by reading the Docker config
+-// file.
+-export const getRegistryCredentials = (imageName: string): Credentials => {
+-  const { registry } = parseImageName(imageName);
++// Read and parse the Docker config file.
++const readDockerConfig = (): DockerConifg => {
+   const dockerConfigFile = path.join(os.homedir(), '.docker', 'config.json');
+ 
+   let content: string | undefined;
+@@ -44,25 +49,62 @@ export const getRegistryCredentials = (imageName: string): Credentials => {
+     });
+   }
+ 
+-  const dockerConfig: DockerConifg = JSON.parse(content);
++  return JSON.parse(content);
++};
++
++// Returns the credentials for a given registry from the Docker config file,
++// falling back to the container registry auth file and to credential helpers
++// when the config carries no entry for the registry.
++export const getRegistryCredentials = (imageName: string): Credentials => {
++  const { registry } = parseImageName(imageName);
++  const dockerConfig = readDockerConfig();
+ 
+   const credKey =
+     Object.keys(dockerConfig.auths || {}).find((key) =>
+       key.includes(registry)
+     ) || registry;
+-  const creds = dockerConfig.auths?.[credKey];
++  const auth = dockerConfig.auths?.[credKey];
++
++  let resolved: { username: string; password: string } | undefined;
++
++  if (auth) {
++    const { username, password } = fromBasicAuth(auth.auth);
++    resolved = {
++      username,
++      password: auth.identitytoken ? auth.identitytoken : password,
++    };
++  } else {
++    const containerAuth = findContainerAuth(registry);
++
++    if (containerAuth) {
++      const { username, password } = fromBasicAuth(containerAuth.auth);
++      resolved = {
++        username,
++        password: containerAuth.identitytoken
++          ? containerAuth.identitytoken
++          : password,
++      };
++    } else {
++      const helper = findCredentialHelper(
++        dockerConfig.credHelpers,
++        dockerConfig.credsStore,
++        registry
++      );
++      resolved = helper
++        ? credentialsFromHelper(helper, registry)
++        : undefined;
++    }
++  }
+ 
+-  if (!creds) {
++  if (!resolved) {
+     throw new Error(`No credentials found for registry ${registry}`);
+   }
+ 
+-  // Extract username/password from auth string
+-  const { username, password } = fromBasicAuth(creds.auth);
+-
+-  // If the identitytoken is present, use it as the password (primarily for ACR)
+-  const pass = creds.identitytoken ? creds.identitytoken : password;
+-
+-  return { headers: dockerConfig.HttpHeaders, username, password: pass };
++  return {
++    headers: dockerConfig.HttpHeaders,
++    username: resolved.username,
++    password: resolved.password,
++  };
+ };
+ 
+ // Encode the username and password as base64-encoded basicauth value

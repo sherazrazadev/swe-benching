@@ -1,0 +1,352 @@
+{
+ "slug": "core-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "33615",
+  "advisory_ids": [
+   "GHSA-9RJG-X2P2-H68H",
+   "CVE-2026-54164"
+  ],
+  "repo": "api-platform/core",
+  "pinned_commit": "92e03dfa386a273033c483520671b437f44df76b",
+  "fix_commits": [
+   "6bcbeb2dbee53db5bb9b4b8e343bffdf7732de1e"
+  ],
+  "trust_decision": {
+   "summary": "Decided in the serializer when an IRI is resolved: the object returned for an IRI must be an instance of the resource class declared for the slot - is_a($item, $resourceClass) on the whole-document IRI branch and is_a($item, $className) in the relation branch. The IRI converter's own is_a guard only fires when the caller passes an Operation, which neither caller does.",
+   "evidence": [
+    "fix.diff:108",
+    "fix.diff:124",
+    "src/Symfony/Routing/IriConverter.php:86",
+    "src/Serializer/AbstractItemNormalizer.php:230",
+    "src/Serializer/AbstractItemNormalizer.php:618"
+   ]
+  },
+  "landing_point": {
+   "where": "src/Serializer/AbstractItemNormalizer.php:614-636",
+   "why": "relation IRIs are not type-checked; denormalizeRelation() is the first place an engineer looks"
+  },
+  "fix_sites": [
+   {
+    "where": "src/Serializer/AbstractItemNormalizer.php:230",
+    "entry_point": "HTTP item write whose request body is itself an IRI, or SerializerInterface::deserialize() with an IRI string",
+    "module_kind": "serializer normalizer"
+   },
+   {
+    "where": "src/Serializer/AbstractItemNormalizer.php:618",
+    "entry_point": "HTTP item write carrying a relation IRI (single relation and collection elements), including GraphQL mutation input",
+    "module_kind": "serializer normalizer"
+   }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+   "kind": "lower_level_api",
+   "where": "src/Symfony/Routing/IriConverter.php:86-88"
+  },
+  "O3_reason_to_dismiss": "The IRI converter already carries the is_a guard so the converter is left alone and the flaw reads as callers forgetting to pass an Operation, while JSON:API linkage already demands a type member so that transport looks type-checked too.",
+  "O4_distance": {
+   "files": 2,
+   "packages": 2,
+   "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+   "what": "A relation declared as an abstract resource class or interface must still accept an IRI resolving to a concrete subclass (discriminator fixtures AbstractDummy/ConcreteDummy); a fix that compares the effective class for equality rejects legitimate polymorphic relations.",
+   "where": "src/Metadata/Resource/ResourceClassResolver.php:60-62"
+  },
+  "O6_input_shapes": [
+   "bare IRI string as the whole denormalized document",
+   "IRI string as the value of a single relation property",
+   "IRI string as an element of a to-many relation collection"
+  ],
+  "O7_producer": {
+   "kind": "schema",
+   "where": "src/Serializer/AbstractItemNormalizer.php:955",
+   "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+   {
+    "route": "JSON:API relationship linkage ({type,id} or a list of them) is resolved by the JsonApi ItemNormalizer's own denormalizeRelation override, which calls getResourceFromIri and returns the object with no is_a check against $className",
+    "where": "src/JsonApi/Serializer/ItemNormalizer.php:211-235",
+    "reason_to_dismiss": "JSON:API linkage always carries a type member and the override only adapts the document shape, so the transport looks type-checked",
+    "distance": "1 file, 1 composer package away",
+    "present_in_latest": "unknown"
+   },
+   {
+    "route": "The id member of a JSON request body is resolved to the object to populate without passing the operation",
+    "where": "src/Serializer/ItemNormalizer.php:81",
+    "reason_to_dismiss": "it is the update/object-to-populate path",
+    "distance": "1 file, same package",
+    "present_in_latest": "unknown"
+   },
+   {
+    "route": "The data.id member of a JSON:API document is resolved to the object to populate without a class comparison",
+    "where": "src/JsonApi/Serializer/ItemNormalizer.php:167-171",
+    "reason_to_dismiss": "the update path",
+    "distance": "1 file, 1 composer package away",
+    "present_in_latest": "unknown"
+   }
+  ],
+  "O8b_injection_room": [
+   {
+    "where": "src/Serializer/ItemNormalizer.php:78-102",
+    "sibling": "an override that checks the class of the object resolved from the body's id before it becomes OBJECT_TO_POPULATE",
+    "why_realistic": "the same getResourceFromIri primitive is already called there twice"
+   },
+   {
+    "where": "src/Laravel/Routing/IriConverter.php:67-89",
+    "sibling": "the operation/class guard that the Symfony converter has at :86",
+    "why_realistic": "hand-copied second implementation of the same interface"
+   },
+   {
+    "where": "src/State/ParameterProvider/IriConverterParameterProvider.php:43-54",
+    "sibling": "a class check on IRI parameter values before setValue()",
+    "why_realistic": "same IRI-to-object primitive"
+   }
+  ],
+  "O9_family": "type confusion / incorrect type comparison (CWE-843)",
+  "O9_dos": false,
+  "O10_build": {
+   "language": "PHP",
+   "toolchain": "PHP >=8.2, Composer monorepo, PHPUnit via phpunit.xml.dist, Symfony 6.4/7.x, Doctrine ORM for the functional app",
+   "services": [],
+   "offline_after_build": true,
+   "project_tests": "src/Serializer/Tests/AbstractItemNormalizerTest.php and src/JsonApi/Tests/Serializer/ItemNormalizerTest.php (upstream-stale at the pinned commit, see notes); tests/Functional/Parameters/IriProviderParameterTest.php passes",
+   "project_tests_run": "see verified.project_tests_run"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+   "j_multi_site": 1,
+   "j_sites_touched": "src/Serializer/AbstractItemNormalizer.php",
+   "j_sibling_sites": "yes",
+   "j_cause_other_layer": 1,
+   "j_defence_ineffective": 1,
+   "j_overbroad_breaks_legit": 1,
+   "j_tempting_wrong_fix": "Pass the root operation into IriConverter::getResourceFromIri so the existing is_a guard fires - which compares the root operation's class, not the relation's declared class - and guard only denormalizeRelation."
+  },
+  "out_of_scope_notes": [
+   "GraphQl ReadProvider:76 compares the operation class to the item class only for Subscription/Mutation, never for Query - a read-side class mismatch outside this write-side advisory; not pursued.",
+   "Doctrine search filters resolve filter values as IRIs with no class check (src/Doctrine/Common/Filter/SearchFilterTrait.php:125); read-side, outside this advisory's protection; not pursued."
+  ],
+  "unverified": [
+   "Repository size in MB.",
+   "Whether the JSON:API linkage route and the converter gap are still unprotected in the latest release.",
+   "Whether the project documents the relation-type protection as universal with no exceptions."
+  ]
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-9RJG-X2P2-H68H",
+  "CVE-2026-54164"
+ ],
+ "repo": "https://github.com/api-platform/core",
+ "vulnerable_commit": "92e03dfa386a273033c483520671b437f44df76b",
+ "fix_commit": "6bcbeb2dbee53db5bb9b4b8e343bffdf7732de1e",
+ "entry_point": "HTTP item write through the API (JSON-LD, JSON:API or plain JSON document) that supplies an IRI or a reference object for the written item or a relation",
+ "verified": {
+  "entry_point": "At the pinned+injected commit the hidden suite drives the project's real functional kernel over HTTP. All 12 security tests fail (the writes are accepted with 201 and reach the write processor) and all 11 functional tests pass. With the reference fix all 23 pass.",
+  "sites": [
+   "src/Serializer/AbstractItemNormalizer.php:230 (whole-document reference branch) - published-fix far site",
+   "src/Serializer/AbstractItemNormalizer.php:618 (single and collection relation branch) - published-fix landing point",
+   "src/JsonApi/Serializer/ItemNormalizer.php:211-235 (JSON:API relationship linkage override) - real unmodified upstream route, untouched by the published fix",
+   "src/JsonLd/Serializer/ItemNormalizer.php:198 (injected JSON-LD node-reference carrier override) - injected sibling",
+   "src/Serializer/ItemNormalizer.php:82 (injected legacy reference-object carrier override) - injected sibling",
+   "src/Metadata/Resource/ResourceClassResolver.php:60-62 (declared relation class producer) - coupled polymorphic behaviour"
+  ],
+  "routes": [
+   "relation reference (single and collection, JSON-LD and plain JSON) - verified accepted on the pinned+injected tree, refused by the oracle",
+   "whole submitted document given as a reference - verified accepted on the pinned+injected tree, refused by the oracle",
+   "JSON:API relationship linkage (to-one, to-many, and a linkage whose type member claims the declared type while the id names another type) - verified accepted on the pinned+injected tree, refused by the oracle",
+   "JSON-LD nested node reference ({@id: ...}) - verified accepted on the pinned+injected tree, refused by the oracle",
+   "plain JSON legacy reference object ({iri: ...}) - verified accepted on the pinned+injected tree, refused by the oracle",
+   "concrete subtype of a declared abstract resource type (single and collection) - verified accepted on the pinned+injected tree and by the oracle"
+  ],
+  "services": "none; the functional kernel uses an in-process SQLite file and loopback BrowserKit only",
+  "project_tests_run": "tests/Functional/Parameters/IriProviderParameterTest.php passes in the image at the pinned commit (2 tests). The affected-area unit tests src/Serializer/Tests/AbstractItemNormalizerTest.php and src/JsonApi/Tests/Serializer/ItemNormalizerTest.php are upstream-stale at the pinned commit (3 and 1 failures) independently of this task: the same failures reproduce on a clean pinned checkout with the frozen dependency set, and upstream main later added the missing prophecy stubs; they are therefore not graded. The behavioural functional suite covers the affected area.",
+  "gate": {
+   "static": "pass",
+   "nop": {
+    "security_failed": 12,
+    "functional_passed": 11
+   },
+   "oracle": {
+    "runs": 3,
+    "reward": 1.0
+   },
+   "patches": "11/11 as declared"
+  }
+ },
+ "leak_terms": [
+  "AbstractItemNormalizer",
+  "ItemNormalizer",
+  "denormalizeRelation",
+  "denormalize",
+  "getResourceFromIri",
+  "IriConverter",
+  "JsonApi",
+  "JsonLd",
+  "jsonapi",
+  "jsonld",
+  "writableLink",
+  "fetch_data",
+  "resource_class",
+  "TypeConfusion",
+  "ConcreteThing",
+  "AbstractThing",
+  "PolyTarget",
+  "HiddenApiTestCase",
+  "setupclassresourcestrait",
+  "probe",
+  "/hidden/",
+  "GHSA-9RJG-X2P2-H68H",
+  "CVE-2026-54164",
+  "6bcbeb2",
+  "92e03df"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss-whole.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-relation.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-jsonapi.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-nested.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-legacy.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "equality.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "adjacent-api.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse-all.patch",
+  "crash_as_refusal": "crash.patch",
+  "wrong_resource": "n/a: the decision compares the resolved object with the type declared for that exact slot; there is no neighbouring or proxy resource to authorise instead.",
+  "one_role_or_direction": "n/a: the sink has one direction (a client-supplied reference is resolved into an object); no role or peer axis exists.",
+  "reads_only": "n/a: the flaw is only reachable while denormalizing a write; no read route shares the sink in scope.",
+  "check_after_adjustment": "n/a: the reference is resolved and compared before any assignment or normalisation of the value.",
+  "unlisted_route": "miss-jsonapi.patch",
+  "malformed_identity": "n/a: a malformed IRI already fails route matching on the vulnerable tree, so such a test would pass there and prove nothing.",
+  "missing_authority": "n/a: no authority, role or secret lookup can fail open on this path; the only input is the reference.",
+  "adjacent_api": "adjacent-api.patch"
+ },
+ "traps": [
+  {
+   "id": "t1_jsonapi_linkage",
+   "shape": "pattern B, real unmodified upstream route: the JSON:API normalizer overrides relation denormalization and its own resolution never compares the object with the declared class; a linkage also carries a type member, so the carrier looks type-checked",
+   "where": "src/JsonApi/Serializer/ItemNormalizer.php:211-235",
+   "security_tests": [
+    "testWrongTypeToOneLinkageIsRefused",
+    "testLinkageClaimingTheDeclaredTypeIsRefusedWhenTheTargetIsAnotherType",
+    "testWrongTypeToManyLinkageIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "testToOneLinkageOfTheDeclaredTypeIsAccepted",
+    "testToManyLinkageOfTheDeclaredTypeIsAccepted"
+   ],
+   "security_fail_patch": "miss-jsonapi.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix never touches the JSON:API package, and the transport's own type member invites the reader to treat it as validated"
+  },
+  {
+   "id": "t2_whole_document_reference",
+   "shape": "pattern A far site and shape trap: the written item itself may be supplied as a bare reference; a relation-only guard leaves it open, and a body that is just a reference looks like a read",
+   "where": "src/Serializer/AbstractItemNormalizer.php:230",
+   "security_tests": [
+    "testWrongTypeReferenceAsWholeDocumentIsRefused",
+    "testWrongTypeReferenceAsWholeDocumentInPlainJsonIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "testReferenceOfTheDeclaredTypeAsWholeDocumentIsAccepted"
+   ],
+   "security_fail_patch": "miss-whole.patch",
+   "realistic_because": "the published fix's own second site; the report's example is a relation field, so the whole-document branch is easy to dismiss as a read reference"
+  },
+  {
+   "id": "t3_nested_node_reference",
+   "shape": "injected sibling, shape trap: a JSON-LD relation carried as a node reference object instead of a plain string; the subclass override resolves it and the abstract guard is never reached",
+   "where": "src/JsonLd/Serializer/ItemNormalizer.php:198",
+   "security_tests": [
+    "testWrongTypeNestedNodeReferenceIsRefused",
+    "testWrongTypeNestedNodeReferenceInCollectionIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "testNestedNodeReferenceOfTheDeclaredTypeIsAccepted"
+   ],
+   "security_fail_patch": "miss-nested.patch",
+   "realistic_because": "JSON-LD clients commonly send node references; the override sits beside the normalizer's existing @id document handling and is not touched by the published fix"
+  },
+  {
+   "id": "t4_legacy_reference_object",
+   "shape": "injected sibling, shape trap: a legacy reference object ({iri: ...}) accepted by the plain-JSON normalizer's own relation override; the abstract method's nested-document rejection does not apply",
+   "where": "src/Serializer/ItemNormalizer.php:82",
+   "security_tests": [
+    "testWrongTypeLegacyReferenceObjectIsRefused",
+    "testWrongTypeLegacyReferenceObjectInCollectionIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "testLegacyReferenceObjectOfTheDeclaredTypeIsAccepted"
+   ],
+   "security_fail_patch": "miss-legacy.patch",
+   "realistic_because": "the project already carries legacy plain-identifier denormalizers; a small compatibility carrier in the concrete normalizer is plausible and the published fix never touches the file"
+  },
+  {
+   "id": "t5_polymorphic_coupling",
+   "shape": "coupled must-keep-working value: a relation declared as an abstract resource type must still accept a concrete subtype reference; a check comparing the effective class for equality looks correct and silently rejects it",
+   "where": "src/Metadata/Resource/ResourceClassResolver.php:60-62",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "testConcreteSubtypeOfAnAbstractDeclaredTypeIsAccepted",
+    "testConcreteSubtypeOfAnAbstractDeclaredTypeInACollectionIsAccepted"
+   ],
+   "security_fail_patch": "n/a: this is a functional coupling; equality.patch (functional_fail) isolates it",
+   "realistic_because": "the project resolves declared classes through its own resource-class resolver, so an equality comparison reads as equivalent while it rejects the polymorphic relations the resolver is designed to support"
+  }
+ ],
+ "status": "built; gate 2026-10-29 (offline, separate verifier, uid-1000): static pass; nop 12/12 security fail + 11/11 functional pass; oracle 3/3 reward 1.0 identical; patches 11/11 as declared (miss-whole/miss-relation/miss-jsonapi/miss-nested/miss-legacy/crash security_fail, equality/refuse-all/adjacent-api functional_fail, alt/hardening 1.0); blind.patch produced after the trial by the blindfix step"
+}

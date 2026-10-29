@@ -1,0 +1,128 @@
+diff -ruN a/langroid/agent/tools/file_tools.py inj/langroid/agent/tools/file_tools.py
+--- a/langroid/agent/tools/file_tools.py	2026-05-27 00:50:21.000000000 +0000
++++ b/langroid/agent/tools/file_tools.py	2026-10-29 00:54:26.379200662 +0000
+@@ -1,3 +1,4 @@
++import shutil
+ from contextlib import chdir
+ from pathlib import Path
+ from textwrap import dedent
+@@ -9,7 +10,7 @@
+ from langroid.agent.tool_message import ToolMessage
+ from langroid.agent.xml_tool_message import XMLToolMessage
+ from langroid.utils.git_utils import git_commit_file
+-from langroid.utils.system import create_file, list_dir, read_file
++from langroid.utils.system import create_file, list_dir, read_file, rmdir
+ 
+ 
+ class ReadFileTool(ToolMessage):
+@@ -234,3 +235,110 @@
+             {contents_str}
+             """.strip()
+         )
++
++
++class AppendFileTool(ToolMessage):
++    request: str = "append_file_tool"
++    purpose: str = "Append <content> to the file at <file_path>"
++
++    file_path: str = Field(..., description="The path to the file to append to")
++    content: str = Field(..., description="The content to append to the file")
++
++    _curr_dir: Callable[[], str] | None = None
++
++    @classmethod
++    def create(
++        cls,
++        get_curr_dir: Callable[[], str] | None,
++    ) -> Type["AppendFileTool"]:
++        """Create a subclass of AppendFileTool bound to a specific directory."""
++
++        class CustomAppendFileTool(cls):  # type: ignore
++            _curr_dir: Callable[[], str] | None = (
++                staticmethod(get_curr_dir) if get_curr_dir else None
++            )
++
++        return CustomAppendFileTool
++
++    @classmethod
++    def examples(cls) -> List[ToolMessage | tuple[str, ToolMessage]]:
++        return [
++            cls(file_path="docs/changelog.txt", content="another entry\n"),
++        ]
++
++    def handle(self) -> str:
++        curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        with chdir(curr_dir):
++            create_file(self.file_path, self.content, if_exists="append")
++        return f"Content appended to {self.file_path}"
++
++
++class DeleteFileTool(ToolMessage):
++    request: str = "delete_file_tool"
++    purpose: str = "Delete the file or directory at <file_path>"
++
++    file_path: str = Field(..., description="The path to delete")
++
++    _curr_dir: Callable[[], str] | None = None
++
++    @classmethod
++    def create(
++        cls,
++        get_curr_dir: Callable[[], str] | None,
++    ) -> Type["DeleteFileTool"]:
++        """Create a subclass of DeleteFileTool bound to a specific directory."""
++
++        class CustomDeleteFileTool(cls):  # type: ignore
++            _curr_dir: Callable[[], str] | None = (
++                staticmethod(get_curr_dir) if get_curr_dir else None
++            )
++
++        return CustomDeleteFileTool
++
++    @classmethod
++    def examples(cls) -> List[ToolMessage | tuple[str, ToolMessage]]:
++        return [cls(file_path="build/old_output.txt")]
++
++    def handle(self) -> str:
++        curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        with chdir(curr_dir):
++            target = Path(self.file_path)
++            if target.is_dir():
++                rmdir(self.file_path)
++            else:
++                target.unlink()
++        return f"Deleted {self.file_path}"
++
++
++class MoveFileTool(ToolMessage):
++    request: str = "move_file_tool"
++    purpose: str = "Move the file at <src_path> to <dst_path>"
++
++    src_path: str = Field(..., description="The path of the file to move")
++    dst_path: str = Field(..., description="The destination path")
++
++    _curr_dir: Callable[[], str] | None = None
++
++    @classmethod
++    def create(
++        cls,
++        get_curr_dir: Callable[[], str] | None,
++    ) -> Type["MoveFileTool"]:
++        """Create a subclass of MoveFileTool bound to a specific directory."""
++
++        class CustomMoveFileTool(cls):  # type: ignore
++            _curr_dir: Callable[[], str] | None = (
++                staticmethod(get_curr_dir) if get_curr_dir else None
++            )
++
++        return CustomMoveFileTool
++
++    @classmethod
++    def examples(cls) -> List[ToolMessage | tuple[str, ToolMessage]]:
++        return [cls(src_path="draft.md", dst_path="docs/draft.md")]
++
++    def handle(self) -> str:
++        curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        with chdir(curr_dir):
++            shutil.move(self.src_path, self.dst_path)
++        return f"Moved {self.src_path} to {self.dst_path}"

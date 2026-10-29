@@ -1,0 +1,303 @@
+--- a/src/dashboardGuard.js
++++ b/src/dashboardGuard.js
+@@ -1,127 +1,138 @@
+ import { NextResponse } from "next/server";
+-import { getSettings } from "@/lib/localDb";
++import { getSettings, validateApiKey } from "@/lib/localDb";
+ import { getConsistentMachineId } from "@/shared/utils/machineId";
+ import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
+ 
+ const CLI_TOKEN_HEADER = "x-9r-cli-token";
+ const CLI_TOKEN_SALT = "9r-cli-auth";
+ 
+-let cachedCliToken = null;
+-async function getCliToken() {
+-  if (!cachedCliToken) cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
+-  return cachedCliToken;
++let cliTokenPromise = null;
++function loadCliToken() {
++  if (!cliTokenPromise) cliTokenPromise = getConsistentMachineId(CLI_TOKEN_SALT);
++  return cliTokenPromise;
+ }
+ 
+-async function hasValidCliToken(request) {
+-  const token = request.headers.get(CLI_TOKEN_HEADER);
+-  if (!token) return false;
+-  return token === await getCliToken();
++async function cliTokenMatches(request) {
++  const supplied = request.headers.get(CLI_TOKEN_HEADER);
++  if (typeof supplied !== "string" || supplied.length === 0) return false;
++  const expected = await loadCliToken();
++  if (typeof expected !== "string" || expected.length === 0) return false;
++  return supplied === expected;
+ }
+ 
+-// Always require JWT token regardless of requireLogin setting
+-const ALWAYS_PROTECTED = [
+-  "/api/shutdown",
+-  "/api/settings/database",
++const PUBLIC_API = [
++  "/api/health", "/api/init", "/api/locale", "/api/auth/login", "/api/auth/logout",
++  "/api/auth/status", "/api/auth/oidc", "/api/version", "/api/settings/require-login",
+ ];
+ 
+-// Require auth, but allow through if requireLogin is disabled
+-const PROTECTED_API_PATHS = [
+-  "/api/settings",
+-  "/api/keys",
+-  "/api/providers/client",
+-  "/api/provider-nodes/validate",
+-  "/api/cli-tools",
+-  "/api/mcp",
+-  "/api/translator",
+-  "/api/tunnel",
++const LLM_PREFIXES = ["/v1", "/v1beta", "/api/v1", "/api/v1beta"];
++
++const ALWAYS_PROTECTED = [
++  "/api/shutdown", "/api/settings/database", "/api/version/shutdown", "/api/version/update",
++  "/api/oauth/cursor/auto-import", "/api/oauth/kiro/auto-import",
+ ];
+ 
+-// Routes that spawn child processes — restrict to localhost regardless of auth.
+-const LOCAL_ONLY_PATHS = [
+-  "/api/cli-tools/cowork-settings",
+-  "/api/mcp/",
+-  "/api/tunnel/tailscale-install",
++const HOST_ACTIONS = [
++  "/api/cli-tools/cowork-settings", "/api/mcp/", "/api/tunnel/tailscale-install",
++  "/api/tunnel/tailscale-start-daemon", "/api/tunnel/tailscale-login",
++  "/api/tunnel/tailscale-enable", "/api/tunnel/tailscale-disable",
++  "/api/tunnel/enable", "/api/tunnel/disable",
++  "/api/oauth/cursor/auto-import", "/api/oauth/kiro/auto-import",
++  "/api/version/update", "/api/version/shutdown", "/api/shutdown",
++  "/api/oauth/windsurf/auto-import", "/api/cli-tools/zed-settings", "/api/version/repair",
+ ];
+ 
+-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+-
+-function isLoopbackHostname(h) {
+-  if (!h) return false;
+-  const name = h.split(":")[0].replace(/^\[|\]$/g, "").toLowerCase();
+-  return LOOPBACK_HOSTS.has(name);
++function matchesPrefix(pathname, prefixes) {
++  for (const prefix of prefixes) {
++    const bare = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
++    if (pathname === bare || pathname.startsWith(prefix)) return true;
++  }
++  return false;
+ }
+ 
+-// Same-host gate: Host header must be loopback AND (if present) Origin must match.
+-// Defends against tunnel/LAN access, remote browser CSRF, and cross-site form posts.
+-function isLocalRequest(request) {
++function isLoopbackHostname(host) {
++  if (typeof host !== "string" || host.length === 0) return false;
++  const name = host.split(":")[0].replace(/^\[|\]$/g, "").toLowerCase();
++  return name === "localhost" || name === "127.0.0.1" || name === "::1";
++}
++
++function claimsLoopback(request) {
+   if (!isLoopbackHostname(request.headers.get("host"))) return false;
+   const origin = request.headers.get("origin");
+-  if (origin) {
+-    try {
+-      if (!isLoopbackHostname(new URL(origin).hostname)) return false;
+-    } catch { return false; }
+-  }
+-  return true;
+-}
+-
+-async function hasValidToken(request) {
+-  const token = request.cookies.get("auth_token")?.value;
+-  return await verifyDashboardAuthToken(token);
+-}
+-
+-// Read settings directly from DB to avoid self-fetch deadlock in proxy
+-async function loadSettings() {
++  if (!origin) return true;
+   try {
+-    return await getSettings();
++    return isLoopbackHostname(new URL(origin).hostname);
+   } catch {
+-    return null;
++    return false;
+   }
+ }
+ 
+-async function isAuthenticated(request) {
+-  if (await hasValidToken(request)) return true;
+-  const settings = await loadSettings();
+-  if (settings && settings.requireLogin === false) return true;
+-  return false;
++function isPublicApi(pathname) {
++  if (matchesPrefix(pathname, LLM_PREFIXES)) return true;
++  return PUBLIC_API.some((p) => pathname === p || pathname.startsWith(`${p}/`));
++}
++
++async function llmAllowed(request) {
++  if (claimsLoopback(request)) return true;
++  if (await cliTokenMatches(request)) return true;
++  const authHeader = request.headers.get("Authorization");
++  const key = authHeader && authHeader.startsWith("Bearer ")
++    ? authHeader.slice(7)
++    : request.headers.get("x-api-key");
++  if (!key) return false;
++  return await validateApiKey(key);
++}
++
++async function sessionValid(request) {
++  const cookie = request.cookies.get("auth_token")?.value;
++  return await verifyDashboardAuthToken(cookie);
++}
++
++async function settingsAllow(request) {
++  try {
++    const settings = await getSettings();
++    return !!(settings && settings.requireLogin === false);
++  } catch {
++    return false;
++  }
+ }
+ 
+ export async function proxy(request) {
+-  const { pathname } = request.nextUrl;
++  const pathname = request.nextUrl.pathname;
+ 
+-  // Local-only gate for spawn-capable routes (CVE GHSA-fhh6-4qxv-rpqj).
+-  if (LOCAL_ONLY_PATHS.some((p) => pathname.startsWith(p))) {
+-    if (!isLocalRequest(request)) {
+-      return NextResponse.json({ error: "Local only: MCP requires localhost access" }, { status: 403 });
++  if (matchesPrefix(pathname, HOST_ACTIONS)) {
++    if (!(await cliTokenMatches(request))) {
++      return NextResponse.json({ error: "machine-local credential required" }, { status: 403 });
+     }
++    return NextResponse.next();
+   }
+ 
+-  // Always protected - require valid JWT or local CLI token (machineId-based)
+-  if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
+-    if (await hasValidCliToken(request) || await hasValidToken(request))
+-      return NextResponse.next();
++  if (matchesPrefix(pathname, ALWAYS_PROTECTED)) {
++    if ((await cliTokenMatches(request)) || (await sessionValid(request))) return NextResponse.next();
+     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+   }
+ 
+-  // Protect sensitive API endpoints (allow CLI token, JWT, or requireLogin=false)
+-  if (PROTECTED_API_PATHS.some((p) => pathname.startsWith(p))) {
+-    if (pathname === "/api/settings/require-login") return NextResponse.next();
+-    if (await hasValidCliToken(request) || await isAuthenticated(request))
++  if (matchesPrefix(pathname, LLM_PREFIXES)) {
++    if (await llmAllowed(request)) return NextResponse.next();
++    return NextResponse.json({ error: "API key required" }, { status: 401 });
++  }
++
++  if (pathname.startsWith("/api/")) {
++    if (isPublicApi(pathname)) return NextResponse.next();
++    if ((await cliTokenMatches(request)) || (await sessionValid(request)) || (await settingsAllow(request))) {
+       return NextResponse.next();
++    }
+     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+   }
+ 
+-  // Protect all dashboard routes
+   if (pathname.startsWith("/dashboard")) {
+     let requireLogin = true;
+     let tunnelDashboardAccess = true;
+-
+     try {
+-      const settings = await loadSettings();
++      const settings = await getSettings();
+       if (settings) {
+         requireLogin = settings.requireLogin !== false;
+         tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
+-
+-        // Block tunnel/tailscale access if disabled (redirect to login)
+         if (!tunnelDashboardAccess) {
+           const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
+           const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
+@@ -132,33 +143,16 @@
+         }
+       }
+     } catch {
+-      // On error, keep defaults (require login, block tunnel)
++      // keep defaults
+     }
+-
+-    // If login not required, allow through
+     if (!requireLogin) return NextResponse.next();
+-
+-    // Verify JWT token
+-    const token = request.cookies.get("auth_token")?.value;
+-    if (token) {
+-      if (await verifyDashboardAuthToken(token)) {
+-        return NextResponse.next();
+-      } else {
+-        return NextResponse.redirect(new URL("/login", request.url));
+-      }
+-    }
+-
++    if (await sessionValid(request)) return NextResponse.next();
+     return NextResponse.redirect(new URL("/login", request.url));
+   }
+ 
+-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
+   if (pathname === "/") {
+     return NextResponse.redirect(new URL("/dashboard", request.url));
+   }
+ 
+   return NextResponse.next();
+ }
+-
+-export const config = {
+-  matcher: ["/", "/dashboard/:path*"],
+-};
+--- a/src/proxy.js
++++ b/src/proxy.js
+@@ -1,18 +1,5 @@
+ export { proxy } from "./dashboardGuard";
+ 
+ export const config = {
+-  matcher: [
+-    "/",
+-    "/dashboard/:path*",
+-    "/api/shutdown",
+-    "/api/settings/:path*",
+-    "/api/keys",
+-    "/api/keys/:path*",
+-    "/api/providers/client",
+-    "/api/provider-nodes/validate",
+-    "/api/cli-tools/:path*",
+-    "/api/mcp/:path*",
+-    "/api/translator/:path*",
+-    "/api/tunnel/:path*",
+-  ],
++  matcher: ["/:path*"],
+ };
+--- a/src/app/api/tunnel/tailscale-install/route.js
++++ b/src/app/api/tunnel/tailscale-install/route.js
+@@ -36,8 +36,14 @@
+   const encoder = new TextEncoder();
+   const stream = new ReadableStream({
+     async start(controller) {
++      let closed = false;
+       const send = (event, data) => {
+-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
++        if (closed) return;
++        try {
++          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
++        } catch {
++          closed = true;
++        }
+       };
+ 
+       try {
+@@ -52,7 +58,7 @@
+           : error.message;
+         send("error", { error: msg });
+       } finally {
+-        controller.close();
++        if (!closed) { try { controller.close(); } catch {} }
+       }
+     },
+   });

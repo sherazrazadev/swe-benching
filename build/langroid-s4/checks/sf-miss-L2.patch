@@ -1,0 +1,140 @@
+diff -ruN a/langroid/agent/tools/file_tools.py b/langroid/agent/tools/file_tools.py
+--- a/langroid/agent/tools/file_tools.py	2026-10-29 00:54:26.379200662 +0000
++++ b/langroid/agent/tools/file_tools.py	2026-10-29 01:01:11.910779394 +0000
+@@ -10,7 +10,13 @@
+ from langroid.agent.tool_message import ToolMessage
+ from langroid.agent.xml_tool_message import XMLToolMessage
+ from langroid.utils.git_utils import git_commit_file
+-from langroid.utils.system import create_file, list_dir, read_file, rmdir
++from langroid.utils.system import (
++    create_file,
++    list_dir,
++    read_file,
++    rmdir,
++    safe_resolve_path,
++)
+ 
+ 
+ class ReadFileTool(ToolMessage):
+@@ -59,6 +65,10 @@
+         # ASSUME: file_path should be relative to the curr_dir
+         try:
+             dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++            try:
++                _lexical_confine(dir, self.file_path)
++            except ValueError as e:
++                return f"Error: {e}"
+             with chdir(dir):
+                 # if file doesn't exist, return an error message
+                 content = read_file(self.file_path, self._line_nums)
+@@ -165,6 +175,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _lexical_confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content)
+             msg = f"Content written to {self.file_path}"
+@@ -222,6 +236,10 @@
+     def handle(self) -> str:
+         # ASSUME: dir_path should be relative to the curr_dir_path
+         dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _lexical_confine(dir, self.dir_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(dir):
+             contents = list_dir(self.dir_path)
+ 
+@@ -268,6 +286,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _lexical_confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content, if_exists="append")
+         return f"Content appended to {self.file_path}"
+@@ -301,6 +323,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _lexical_confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             target = Path(self.file_path)
+             if target.is_dir():
+@@ -339,6 +365,25 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _lexical_confine(curr_dir, self.src_path)
++            _lexical_confine(curr_dir, self.dst_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             shutil.move(self.src_path, self.dst_path)
+         return f"Moved {self.src_path} to {self.dst_path}"
++
++
++def _lexical_confine(base_dir, user_path) -> None:
++    """Reject a path whose normalized spelling leaves the base directory."""
++    import os
++
++    base = os.path.abspath(str(base_dir))
++    for raw in (str(user_path), os.path.expanduser(str(user_path))):
++        candidate = raw if os.path.isabs(raw) else os.path.join(base, raw)
++        candidate = os.path.normpath(candidate)
++        if candidate != base and not candidate.startswith(base + os.sep):
++            raise ValueError(
++                f"Path '{user_path}' is outside the allowed directory '{base}'"
++            )
+diff -ruN a/langroid/utils/system.py b/langroid/utils/system.py
+--- a/langroid/utils/system.py	2026-05-27 00:50:21.000000000 +0000
++++ b/langroid/utils/system.py	2026-10-29 01:01:11.910905851 +0000
+@@ -187,6 +187,37 @@
+     return str(uuid.uuid4())
+ 
+ 
++def expand_user_path(path: str | Path) -> Path:
++    """Expand a leading ``~``, falling back to the literal path when the home
++    directory cannot be determined."""
++    p = Path(path)
++    try:
++        return p.expanduser()
++    except RuntimeError:
++        return p
++
++
++def safe_resolve_path(base_dir: str | Path, user_path: str | Path) -> Path:
++    """Resolve ``user_path`` relative to ``base_dir`` and ensure it stays inside.
++
++    A ``~`` path is checked under both interpretations -- expanded (as the read
++    helper uses it) and literal (as the write/list helpers use it) -- and
++    rejected if either escapes. Symlinks are resolved by ``Path.resolve``.
++
++    Raises:
++        ValueError: If the resolved path escapes ``base_dir``.
++    """
++    base = Path(base_dir).resolve()
++    expanded = (base / expand_user_path(user_path)).resolve()
++    literal = (base / Path(user_path)).resolve()
++    for target in (expanded, literal):
++        if target != base and base not in target.parents:
++            raise ValueError(
++                f"Path '{user_path}' is outside the allowed directory '{base}'"
++            )
++    return expanded
++
++
+ def create_file(
+     filepath: str | Path,
+     content: str = "",

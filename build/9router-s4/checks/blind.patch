@@ -1,0 +1,533 @@
+diff -ruN pristine/src/dashboardGuard.js app/src/dashboardGuard.js
+--- a/src/dashboardGuard.js	2026-10-29 01:05:50.000000000 +0000
++++ b/src/dashboardGuard.js	2026-10-29 01:24:41.267213546 +0000
+@@ -1,75 +1,94 @@
+ import { NextResponse } from "next/server";
+-import { getSettings } from "@/lib/localDb";
++import { getSettings, validateApiKey } from "@/lib/localDb";
+ import { getConsistentMachineId } from "@/shared/utils/machineId";
+ import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
++import { SCOPE, classifyRequest, isLoopbackHostname } from "@/lib/auth/requestPolicy";
+ 
+ const CLI_TOKEN_HEADER = "x-9r-cli-token";
+ const CLI_TOKEN_SALT = "9r-cli-auth";
+ 
++// The machine-local secret is the token the product's own CLI derives from this
++// machine's id. It is the only credential that allows acting on the host.
+ let cachedCliToken = null;
+ async function getCliToken() {
+-  if (!cachedCliToken) cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
+-  return cachedCliToken;
++  if (cachedCliToken) return cachedCliToken;
++  try {
++    const derived = await getConsistentMachineId(CLI_TOKEN_SALT);
++    if (derived) cachedCliToken = derived;
++    return derived || null;
++  } catch {
++    return null;
++  }
++}
++
++// Comparing in constant time keeps the token from leaking through timing.
++function tokensMatch(supplied, expected) {
++  if (typeof supplied !== "string" || typeof expected !== "string") return false;
++  if (supplied.length !== expected.length) return false;
++  let difference = 0;
++  for (let i = 0; i < supplied.length; i += 1) {
++    difference |= supplied.charCodeAt(i) ^ expected.charCodeAt(i);
++  }
++  return difference === 0;
+ }
+ 
+ async function hasValidCliToken(request) {
+-  const token = request.headers.get(CLI_TOKEN_HEADER);
++  const supplied = request.headers.get(CLI_TOKEN_HEADER);
++  if (!supplied) return false;
++  const expected = await getCliToken();
++  // Fail closed when this machine's secret cannot be derived.
++  if (!expected) return false;
++  return tokensMatch(supplied, expected);
++}
++
++async function hasValidSession(request) {
++  const token = request.cookies?.get?.("auth_token")?.value;
+   if (!token) return false;
+-  return token === await getCliToken();
++  try {
++    return Boolean(await verifyDashboardAuthToken(token));
++  } catch {
++    return false;
++  }
+ }
+ 
+-// Always require JWT token regardless of requireLogin setting
+-const ALWAYS_PROTECTED = [
+-  "/api/shutdown",
+-  "/api/settings/database",
+-];
+-
+-// Require auth, but allow through if requireLogin is disabled
+-const PROTECTED_API_PATHS = [
+-  "/api/settings",
+-  "/api/keys",
+-  "/api/providers/client",
+-  "/api/provider-nodes/validate",
+-  "/api/cli-tools",
+-  "/api/mcp",
+-  "/api/translator",
+-  "/api/tunnel",
+-];
+-
+-// Routes that spawn child processes — restrict to localhost regardless of auth.
+-const LOCAL_ONLY_PATHS = [
+-  "/api/cli-tools/cowork-settings",
+-  "/api/mcp/",
+-  "/api/tunnel/tailscale-install",
+-];
+-
+-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+-
+-function isLoopbackHostname(h) {
+-  if (!h) return false;
+-  const name = h.split(":")[0].replace(/^\[|\]$/g, "").toLowerCase();
+-  return LOOPBACK_HOSTS.has(name);
+-}
+-
+-// Same-host gate: Host header must be loopback AND (if present) Origin must match.
+-// Defends against tunnel/LAN access, remote browser CSRF, and cross-site form posts.
+-function isLocalRequest(request) {
++function readApiKey(request) {
++  const authorization = request.headers.get("Authorization");
++  if (authorization?.startsWith("Bearer ")) return authorization.slice(7).trim();
++  return request.headers.get("x-api-key") || "";
++}
++
++async function hasValidApiKey(request) {
++  const apiKey = readApiKey(request);
++  if (!apiKey) return false;
++  try {
++    return Boolean(await validateApiKey(apiKey));
++  } catch {
++    return false;
++  }
++}
++
++// The model API has its own key auth; on-machine callers are exempt from it.
++// This host/origin check is used for that exemption only — it is never used to
++// authorize a host operation.
++function isOnThisMachine(request) {
+   if (!isLoopbackHostname(request.headers.get("host"))) return false;
+   const origin = request.headers.get("origin");
+-  if (origin) {
+-    try {
+-      if (!isLoopbackHostname(new URL(origin).hostname)) return false;
+-    } catch { return false; }
++  if (!origin) return true;
++  try {
++    return isLoopbackHostname(new URL(origin).host);
++  } catch {
++    return false;
+   }
+-  return true;
+ }
+ 
+-async function hasValidToken(request) {
+-  const token = request.cookies.get("auth_token")?.value;
+-  return await verifyDashboardAuthToken(token);
++async function canUseModelApi(request) {
++  if (isOnThisMachine(request)) return true;
++  if (await hasValidCliToken(request)) return true;
++  if (await hasValidSession(request)) return true;
++  return hasValidApiKey(request);
+ }
+ 
+-// Read settings directly from DB to avoid self-fetch deadlock in proxy
++// Read settings directly from the DB to avoid a self-fetch deadlock in the proxy.
+ async function loadSettings() {
+   try {
+     return await getSettings();
+@@ -78,87 +97,87 @@
+   }
+ }
+ 
+-async function isAuthenticated(request) {
+-  if (await hasValidToken(request)) return true;
++async function isOperator(request) {
++  if (await hasValidCliToken(request)) return true;
++  if (await hasValidSession(request)) return true;
+   const settings = await loadSettings();
+-  if (settings && settings.requireLogin === false) return true;
+-  return false;
++  return settings?.requireLogin === false;
+ }
+ 
+-export async function proxy(request) {
+-  const { pathname } = request.nextUrl;
+-
+-  // Local-only gate for spawn-capable routes (CVE GHSA-fhh6-4qxv-rpqj).
+-  if (LOCAL_ONLY_PATHS.some((p) => pathname.startsWith(p))) {
+-    if (!isLocalRequest(request)) {
+-      return NextResponse.json({ error: "Local only: MCP requires localhost access" }, { status: 403 });
+-    }
+-  }
++async function isStrictOperator(request) {
++  if (await hasValidCliToken(request)) return true;
++  return hasValidSession(request);
++}
+ 
+-  // Always protected - require valid JWT or local CLI token (machineId-based)
+-  if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
+-    if (await hasValidCliToken(request) || await hasValidToken(request))
+-      return NextResponse.next();
+-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+-  }
++function refuse(message, status) {
++  return NextResponse.json({ error: message }, { status });
++}
+ 
+-  // Protect sensitive API endpoints (allow CLI token, JWT, or requireLogin=false)
+-  if (PROTECTED_API_PATHS.some((p) => pathname.startsWith(p))) {
+-    if (pathname === "/api/settings/require-login") return NextResponse.next();
+-    if (await hasValidCliToken(request) || await isAuthenticated(request))
+-      return NextResponse.next();
+-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+-  }
++async function guardDashboard(request) {
++  let requireLogin = true;
++  let tunnelDashboardAccess = true;
+ 
+-  // Protect all dashboard routes
+-  if (pathname.startsWith("/dashboard")) {
+-    let requireLogin = true;
+-    let tunnelDashboardAccess = true;
+-
+-    try {
+-      const settings = await loadSettings();
+-      if (settings) {
+-        requireLogin = settings.requireLogin !== false;
+-        tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
+-
+-        // Block tunnel/tailscale access if disabled (redirect to login)
+-        if (!tunnelDashboardAccess) {
+-          const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
+-          const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
+-          const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
+-          if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
+-            return NextResponse.redirect(new URL("/login", request.url));
+-          }
++  try {
++    const settings = await loadSettings();
++    if (settings) {
++      requireLogin = settings.requireLogin !== false;
++      tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
++
++      // Block tunnel/tailscale access if disabled (redirect to login).
++      if (!tunnelDashboardAccess) {
++        const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
++        const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
++        const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
++        if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
++          return NextResponse.redirect(new URL("/login", request.url));
+         }
+       }
+-    } catch {
+-      // On error, keep defaults (require login, block tunnel)
+     }
++  } catch {
++    // On error keep the defaults: require login, block tunnel.
++  }
+ 
+-    // If login not required, allow through
+-    if (!requireLogin) return NextResponse.next();
++  if (!requireLogin) return NextResponse.next();
+ 
+-    // Verify JWT token
+-    const token = request.cookies.get("auth_token")?.value;
+-    if (token) {
+-      if (await verifyDashboardAuthToken(token)) {
+-        return NextResponse.next();
+-      } else {
+-        return NextResponse.redirect(new URL("/login", request.url));
+-      }
+-    }
++  if (await hasValidSession(request)) return NextResponse.next();
++  return NextResponse.redirect(new URL("/login", request.url));
++}
+ 
+-    return NextResponse.redirect(new URL("/login", request.url));
+-  }
++export async function proxy(request) {
++  const pathname = request.nextUrl?.pathname || "/";
++  const method = request.method || "GET";
+ 
+-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
+-  if (pathname === "/") {
+-    return NextResponse.redirect(new URL("/dashboard", request.url));
+-  }
++  switch (classifyRequest(pathname, method)) {
++    // Host operations: machine-local secret only. A dashboard session, a Host
++    // or Origin header, or anything else the caller says is not enough.
++    case SCOPE.HOST:
++      if (await hasValidCliToken(request)) return NextResponse.next();
++      return refuse("Host operations require the machine-local CLI token", 403);
+ 
+-  return NextResponse.next();
+-}
++    case SCOPE.PUBLIC:
++      return NextResponse.next();
+ 
+-export const config = {
+-  matcher: ["/", "/dashboard/:path*"],
+-};
++    case SCOPE.MODEL_API:
++      // CORS preflight carries no credential by design and performs no work.
++      if (method.toUpperCase() === "OPTIONS") return NextResponse.next();
++      if (await canUseModelApi(request)) return NextResponse.next();
++      return refuse("API key required for remote model API access", 401);
++
++    case SCOPE.STRICT:
++      if (await isStrictOperator(request)) return NextResponse.next();
++      return refuse("Unauthorized", 401);
++
++    case SCOPE.OPERATOR:
++      if (await isOperator(request)) return NextResponse.next();
++      return refuse("Unauthorized", 401);
++
++    case SCOPE.DASHBOARD:
++      return guardDashboard(request);
++
++    default:
++      if (pathname === "/") {
++        return NextResponse.redirect(new URL("/dashboard", request.url));
++      }
++      return NextResponse.next();
++  }
++}
+diff -ruN pristine/src/lib/auth/requestPolicy.js app/src/lib/auth/requestPolicy.js
+--- a/src/lib/auth/requestPolicy.js	1970-01-01 00:00:00.000000000 +0000
++++ b/src/lib/auth/requestPolicy.js	2026-10-29 01:23:52.295000567 +0000
+@@ -0,0 +1,198 @@
++/**
++ * Request classification for the 9router access guard.
++ *
++ * Every request is reduced to one authority class from the table below. The
++ * guard then decides which credential that class accepts. Nothing here talks to
++ * the database or to NextResponse: keeping the routing table pure makes it easy
++ * to read the policy in one place and keeps the guard free of import cycles.
++ *
++ * Classes
++ *   HOST      Controls host processes/services, runs commands on the host, or
++ *             reads host-held secrets (other applications' credential stores,
++ *             the machine secret). Only the machine-local CLI token is proof;
++ *             no request header may stand in for it.
++ *   PUBLIC    Explicitly public, pre-login endpoints.
++ *   MODEL_API The product's model API, which carries its own key auth. Local
++ *             first-party callers are exempt; remote callers need a credential.
++ *   STRICT    Operator credential even when the install disabled login.
++ *   OPERATOR  Any operator credential (dashboard session or CLI token); an
++ *             install that disabled login counts as already authenticated.
++ *   DASHBOARD Dashboard pages.
++ *   OTHER     Pages and assets.
++ *
++ * Anything under /api that is not listed as PUBLIC, MODEL_API or HOST falls
++ * through to OPERATOR, so a new route is protected by default: adding an
++ * endpoint cannot silently reopen the API.
++ */
++
++export const SCOPE = Object.freeze({
++  HOST: "host",
++  PUBLIC: "public",
++  MODEL_API: "model-api",
++  STRICT: "strict-operator",
++  OPERATOR: "operator",
++  DASHBOARD: "dashboard",
++  OTHER: "other",
++});
++
++// Paths (and their subtrees) that act on the host. POST-only style rules are
++// split out below so a read-only sibling keeps working for dashboard users.
++const HOST_TREES = [
++  // process / service control and self-update
++  "/api/shutdown",
++  "/api/version/update",
++  "/api/version/shutdown",
++  "/api/version/repair",
++  "/api/tunnel/enable",
++  "/api/tunnel/disable",
++  "/api/tunnel/tailscale-install",
++  "/api/tunnel/tailscale-start-daemon",
++  "/api/tunnel/tailscale-login",
++  "/api/tunnel/tailscale-enable",
++  "/api/tunnel/tailscale-disable",
++  // spawns MCP servers and proxies their stdio over the host
++  "/api/mcp",
++  // read another application's credential store on this machine
++  "/api/oauth/cursor/auto-import",
++  "/api/oauth/kiro/auto-import",
++  "/api/oauth/windsurf/auto-import",
++  // write the machine secret into another tool's configuration
++  "/api/cli-tools/cowork-settings",
++  "/api/cli-tools/zed-settings",
++];
++
++// Routes that mix read-only status with host actions: only the mutating verbs
++// are host operations.
++const HOST_METHOD_RULES = [
++  {
++    tree: "/api/cli-tools/antigravity-mitm",
++    methods: new Set(["POST", "DELETE", "PATCH"]),
++  },
++];
++
++const PUBLIC_EXACT = new Set([
++  "/api/health",
++  "/api/init",
++  "/api/locale",
++  "/api/version",
++  "/api/auth/login",
++  "/api/auth/logout",
++  "/api/auth/status",
++  "/api/settings/require-login",
++]);
++
++const PUBLIC_TREES = ["/api/auth/oidc"];
++
++// Model API surfaces. They authenticate themselves with an API key; only the
++// on-machine exemption is decided here.
++const MODEL_API_TREES = ["/v1", "/v1beta", "/api/v1", "/api/v1beta"];
++
++// Operator credential required even when the install has login disabled.
++const STRICT_OPERATOR_TREES = ["/api/settings/database"];
++
++/**
++ * Percent-decode a path, at most a few rounds so %252e still lands on "."
++ * while a malformed escape is left untouched.
++ */
++function decodeRepeatedly(value) {
++  let current = value;
++  for (let round = 0; round < 3; round += 1) {
++    let decoded;
++    try {
++      decoded = decodeURIComponent(current);
++    } catch {
++      return current;
++    }
++    if (decoded === current) return current;
++    current = decoded;
++  }
++  return current;
++}
++
++/**
++ * Reduce a request path to a comparable form: percent-decoded, leading slash,
++ * no duplicate separators, no "." / ".." segments and no trailing slash. A
++ * route reached as "/api//version/./repair/" therefore gets the same decision
++ * as the canonical path.
++ */
++export function normalizePath(pathname) {
++  const withoutQuery = String(pathname ?? "/").split(/[?#]/, 1)[0] || "/";
++  const raw = decodeRepeatedly(withoutQuery);
++  const segments = [];
++  for (const segment of raw.split("/")) {
++    if (segment === "" || segment === ".") continue;
++    if (segment === "..") {
++      segments.pop();
++      continue;
++    }
++    segments.push(segment);
++  }
++  return `/${segments.join("/")}`;
++}
++
++export function isUnder(pathname, tree) {
++  return pathname === tree || pathname.startsWith(`${tree}/`);
++}
++
++/**
++ * True when a Host header (or the hostname of an origin) names the loopback
++ * interface. This is deliberately used only for the model API's on-machine
++ * exemption; it is never proof of locality for a host operation.
++ */
++export function isLoopbackHostname(host) {
++  if (!host) return false;
++  const value = String(host).trim().toLowerCase();
++
++  // "[::1]" and "[::1]:20128" — take what is between the brackets.
++  let name;
++  if (value.startsWith("[")) {
++    const end = value.indexOf("]");
++    name = end === -1 ? value.slice(1) : value.slice(1, end);
++  } else {
++    const firstColon = value.indexOf(":");
++    // A single colon separates host and port; two or more is a bare IPv6 literal.
++    name = firstColon === -1 || value.indexOf(":", firstColon + 1) !== -1
++      ? value
++      : value.slice(0, firstColon);
++  }
++
++  return name === "localhost" || name === "127.0.0.1" || name === "::1";
++}
++
++function matchesHostRule(pathname, method) {
++  if (HOST_TREES.some((tree) => isUnder(pathname, tree))) return true;
++  return HOST_METHOD_RULES.some(
++    (rule) => isUnder(pathname, rule.tree) && rule.methods.has(method),
++  );
++}
++
++function isPublic(pathname) {
++  if (PUBLIC_EXACT.has(pathname)) return true;
++  return PUBLIC_TREES.some((tree) => isUnder(pathname, tree));
++}
++
++function isModelApi(pathname) {
++  return MODEL_API_TREES.some((tree) => isUnder(pathname, tree));
++}
++
++function isStrictOperator(pathname) {
++  return STRICT_OPERATOR_TREES.some((tree) => isUnder(pathname, tree));
++}
++
++/**
++ * @param {string} pathname path from request.nextUrl
++ * @param {string} [method] HTTP method, case-insensitive
++ * @returns {string} one of SCOPE
++ */
++export function classifyRequest(pathname, method = "GET") {
++  const path = normalizePath(pathname);
++  const verb = String(method || "GET").toUpperCase();
++
++  if (matchesHostRule(path, verb)) return SCOPE.HOST;
++  if (isPublic(path)) return SCOPE.PUBLIC;
++  if (isModelApi(path)) return SCOPE.MODEL_API;
++  if (isStrictOperator(path)) return SCOPE.STRICT;
++  if (path === "/api" || path.startsWith("/api/")) return SCOPE.OPERATOR;
++  if (isUnder(path, "/dashboard")) return SCOPE.DASHBOARD;
++  return SCOPE.OTHER;
++}
+diff -ruN pristine/src/proxy.js app/src/proxy.js
+--- a/src/proxy.js	2026-10-29 01:05:50.000000000 +0000
++++ b/src/proxy.js	2026-10-29 01:22:03.732510842 +0000
+@@ -1,18 +1,8 @@
+ export { proxy } from "./dashboardGuard";
+ 
++// Run the access decision for every request except Next's own build assets.
++// A short matcher that enumerates routes silently exempts every route it does
++// not name, so the guard must see the whole surface.
+ export const config = {
+-  matcher: [
+-    "/",
+-    "/dashboard/:path*",
+-    "/api/shutdown",
+-    "/api/settings/:path*",
+-    "/api/keys",
+-    "/api/keys/:path*",
+-    "/api/providers/client",
+-    "/api/provider-nodes/validate",
+-    "/api/cli-tools/:path*",
+-    "/api/mcp/:path*",
+-    "/api/translator/:path*",
+-    "/api/tunnel/:path*",
+-  ],
++  matcher: ["/((?!_next|favicon\\.ico).*)"],
+ };

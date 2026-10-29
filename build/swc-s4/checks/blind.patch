@@ -1,0 +1,107 @@
+--- a/crates/swc_html_minifier/src/lib.rs	2026-10-29 01:07:35.000000000 +0000
++++ b/crates/swc_html_minifier/src/lib.rs	2026-10-29 02:15:43.149207115 +0000
+@@ -1413,7 +1413,7 @@
+ 
+         previous.children = vec![Child::Text(Text {
+             span: DUMMY_SP,
+-            data: serialized.into(),
++            data: escape_json_for_script_text(serialized).into(),
+             raw: None,
+         })];
+ 
+@@ -1858,7 +1858,9 @@
+ 
+         normalize_structured_json(&mut value);
+ 
+-        serde_json::to_string(&value).ok()
++        serde_json::to_string(&value)
++            .ok()
++            .map(escape_json_for_script_text)
+     }
+ 
+     fn need_minify_js(&self) -> bool {
+@@ -2156,7 +2158,7 @@
+         let minified = match String::from_utf8(buf) {
+             // Avoid generating the sequence "</script" in JS code
+             // TODO move it to ecma codegen under the option?
+-            Ok(minified) => minified.replace("</script>", "<\\/script>"),
++            Ok(minified) => escape_script_end_tags(&minified).into_owned(),
+             _ => return None,
+         };
+ 
+@@ -2830,7 +2832,7 @@
+                     None => return,
+                 };
+ 
+-                n.data = minified.into();
++                n.data = escape_json_for_script_text(minified).into();
+             }
+             Some(MinifierType::Css) => {
+                 let minified =
+@@ -2897,6 +2899,66 @@
+     }
+ }
+ 
++/// Writes JSON script data so that it can never be read as HTML markup.
++///
++/// A literal `<` in a `script` text node can open a tag: at minimum an end tag
++/// for the element itself, and in foreign content such as SVG every tag. Since
++/// `<` carries no special meaning to a JSON parser, every one is emitted as a
++/// unicode escape instead; both spellings decode to the same value.
++fn escape_json_for_script_text(json: String) -> String {
++    if json.contains('<') {
++        json.replace('<', "\\u003c")
++    } else {
++        json
++    }
++}
++
++/// Escapes every spelling of a `script` end tag inside JavaScript text.
++///
++/// The HTML tokenizer ends the element at `</script` whose tag name is matched
++/// ASCII case-insensitively and whose last character is followed by `>`, `/`, or
++/// an ASCII whitespace character. Escaping only the exact lowercase `</script>`
++/// spelling therefore leaves `</SCRIPT>`, `</script >` and similar forms able to
++/// terminate the element. The backslash inserted after `<` is harmless in the
++/// strings, templates, regular expressions and comments where such a sequence
++/// can occur in valid JavaScript.
++fn escape_script_end_tags(code: &str) -> Cow<'_, str> {
++    const TAG_NAME: &[u8] = b"script";
++
++    let bytes = code.as_bytes();
++    let mut escaped: Option<String> = None;
++    let mut copied_to = 0;
++
++    for (start, _) in code.match_indices('<') {
++        let rest = &bytes[start..];
++
++        let is_script_end_tag = rest.starts_with(b"</")
++            && rest
++                .get(2..2 + TAG_NAME.len())
++                .is_some_and(|name| name.eq_ignore_ascii_case(TAG_NAME))
++            && rest
++                .get(2 + TAG_NAME.len())
++                .is_some_and(|&next| matches!(next, b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\x0C' | b'\r'));
++
++        if !is_script_end_tag {
++            continue;
++        }
++
++        let output = escaped.get_or_insert_with(|| String::with_capacity(code.len()));
++        output.push_str(&code[copied_to..=start]);
++        output.push('\\');
++        copied_to = start + 1;
++    }
++
++    match escaped {
++        Some(mut output) => {
++            output.push_str(&code[copied_to..]);
++            Cow::Owned(output)
++        }
++        None => Cow::Borrowed(code),
++    }
++}
++
+ /// Returns the text of a plain `application/json` data block, or `None` when the
+ /// element is not one.
+ fn json_data_text(element: &Element) -> Option<String> {

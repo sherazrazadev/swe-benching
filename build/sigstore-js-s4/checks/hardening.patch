@@ -1,0 +1,151 @@
+diff --git a/packages/oci/src/containers-auth.ts b/packages/oci/src/containers-auth.ts
+index 3140a0f..23020a6 100644
+--- a/packages/oci/src/containers-auth.ts
++++ b/packages/oci/src/containers-auth.ts
+@@ -16,6 +16,7 @@ limitations under the License.
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
++import { canonicalizeRegistry } from './name';
+ 
+ export type RegistryAuthEntry = {
+   auth: string;
+@@ -52,8 +53,10 @@ export const findContainerAuth = (
+   }
+ 
+   const auths = parsed.auths || {};
+-  const key =
+-    Object.keys(auths).find((entry) => entry.includes(registry)) || registry;
++  const target = canonicalizeRegistry(registry);
++  const key = Object.keys(auths).find(
++    (entry) => canonicalizeRegistry(entry) === target
++  );
+ 
+-  return auths[key];
++  return key ? auths[key] : undefined;
+ };
+diff --git a/packages/oci/src/credential-helpers.ts b/packages/oci/src/credential-helpers.ts
+index c75591c..dc0f17c 100644
+--- a/packages/oci/src/credential-helpers.ts
++++ b/packages/oci/src/credential-helpers.ts
+@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ import { execFileSync } from 'node:child_process';
++import { canonicalizeRegistry } from './name';
+ 
+ export type HelperCredentials = {
+   username: string;
+@@ -29,8 +30,9 @@ export const findCredentialHelper = (
+   store: string | undefined,
+   registry: string
+ ): string | undefined => {
+-  const key = Object.keys(helpers || {}).find((entry) =>
+-    entry.includes(registry)
++  const target = canonicalizeRegistry(registry);
++  const key = Object.keys(helpers || {}).find(
++    (entry) => canonicalizeRegistry(entry) === target
+   );
+ 
+   if (key) {
+diff --git a/packages/oci/src/credentials.ts b/packages/oci/src/credentials.ts
+index 818dbfc..9a2a7e8 100644
+--- a/packages/oci/src/credentials.ts
++++ b/packages/oci/src/credentials.ts
+@@ -21,7 +21,7 @@ import {
+   credentialsFromHelper,
+   findCredentialHelper,
+ } from './credential-helpers';
+-import { parseImageName } from './name';
++import { canonicalizeRegistry, parseImageName } from './name';
+ 
+ export type Credentials = {
+   readonly username: string;
+@@ -59,11 +59,15 @@ export const getRegistryCredentials = (imageName: string): Credentials => {
+   const { registry } = parseImageName(imageName);
+   const dockerConfig = readDockerConfig();
+ 
+-  const credKey =
+-    Object.keys(dockerConfig.auths || {}).find((key) =>
+-      key.includes(registry)
+-    ) || registry;
+-  const auth = dockerConfig.auths?.[credKey];
++  // Select the credential whose registry canonicalizes to exactly the target
++  // registry. Exact (rather than substring) matching is required to avoid
++  // using credentials configured for one registry for a different registry
++  // whose name happens to be a substring of the configured key.
++  const target = canonicalizeRegistry(registry);
++  const credKey = Object.keys(dockerConfig.auths || {}).find(
++    (key) => canonicalizeRegistry(key) === target
++  );
++  const auth = credKey ? dockerConfig.auths?.[credKey] : undefined;
+ 
+   let resolved: { username: string; password: string } | undefined;
+ 
+@@ -96,7 +100,7 @@ export const getRegistryCredentials = (imageName: string): Credentials => {
+     }
+   }
+ 
+-  if (!resolved) {
++  if (!resolved || !resolved.username || !resolved.password) {
+     throw new Error(`No credentials found for registry ${registry}`);
+   }
+ 
+diff --git a/packages/oci/src/image.ts b/packages/oci/src/image.ts
+index eea13df..dbcdefc 100644
+--- a/packages/oci/src/image.ts
++++ b/packages/oci/src/image.ts
+@@ -20,7 +20,7 @@ import {
+ } from './constants';
+ import { Credentials } from './credentials';
+ import { HTTPError, OCIError } from './error';
+-import { ImageName } from './name';
++import { ImageName, canonicalizeRegistry } from './name';
+ import {
+   RegistryFetchOptions as FetchOptions,
+   RegistryClient,
+@@ -230,5 +230,7 @@ const digestToTag = (digest: string): string => {
+ // registry.
+ // https://github.com/moby/moby/blob/v24.0.2/registry/config.go#L25-L48
+ const canonicalizeRegistryName = (registry: string): string => {
+-  return registry.endsWith('docker.io') ? DOCKER_DEFAULT_REGISTRY : registry;
++  return canonicalizeRegistry(registry) === 'docker.io'
++    ? DOCKER_DEFAULT_REGISTRY
++    : registry;
+ };
+diff --git a/packages/oci/src/name.ts b/packages/oci/src/name.ts
+index fcba3fe..ae55670 100644
+--- a/packages/oci/src/name.ts
++++ b/packages/oci/src/name.ts
+@@ -62,6 +62,31 @@ const DOMAIN_RE = expression(
+ // Capture the registry domain and path components of a repository name.
+ const ANCHORED_NAME_RE = anchored(capture(DOMAIN_RE), '\\/', capture(NAME_RE));
+ 
++// Well-known aliases for the Docker Hub registry. Docker stores Hub
++// credentials under a handful of different keys depending on how the user
++// authenticated, so they all need to canonicalize to the same host.
++const DOCKER_HUB_ALIASES = new Set([
++  'docker.io',
++  'index.docker.io',
++  'registry-1.docker.io',
++]);
++
++// Canonicalizes a registry hostname or a Docker config auth key to a
++// comparable host[:port] value by stripping any scheme/path and normalizing
++// the well-known Docker Hub aliases.
++export const canonicalizeRegistry = (value: string): string => {
++  if (typeof value !== 'string' || value.trim() === '') {
++    throw new Error('Invalid registry name');
++  }
++
++  // Strip the scheme (e.g. "https://") if present.
++  let host = value.trim().replace(/^https?:\/\//, '');
++  // Strip any path/query (everything after the first '/').
++  host = host.split('/')[0];
++
++  return DOCKER_HUB_ALIASES.has(host) ? 'docker.io' : host;
++};
++
+ // Parses a fully qualified image name into its registry and path components.
+ export const parseImageName = (image: string): ImageName => {
+   const matches = image.match(ANCHORED_NAME_RE);

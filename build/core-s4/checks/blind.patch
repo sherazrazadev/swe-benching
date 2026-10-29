@@ -1,0 +1,111 @@
+diff -ruN pristine/src/JsonApi/Serializer/ItemNormalizer.php app/src/JsonApi/Serializer/ItemNormalizer.php
+--- a/src/JsonApi/Serializer/ItemNormalizer.php	2026-10-29 01:23:03.000000000 +0000
++++ b/src/JsonApi/Serializer/ItemNormalizer.php	2026-10-29 01:38:49.426497818 +0000
+@@ -215,7 +215,7 @@
+         }
+ 
+         try {
+-            return $this->iriConverter->getResourceFromIri($value['id'], $context + ['fetch_data' => true]);
++            return $this->resolveResourceReference($value['id'], $className, $context);
+         } catch (ItemNotFoundException $e) {
+             if (!isset($context['not_normalizable_value_exceptions'])) {
+                 throw new RuntimeException($e->getMessage(), $e->getCode(), $e);
+diff -ruN pristine/src/JsonLd/Serializer/ItemNormalizer.php app/src/JsonLd/Serializer/ItemNormalizer.php
+--- a/src/JsonLd/Serializer/ItemNormalizer.php	2026-10-29 01:23:06.000000000 +0000
++++ b/src/JsonLd/Serializer/ItemNormalizer.php	2026-10-29 01:38:48.982504942 +0000
+@@ -199,7 +199,7 @@
+     {
+         // Support node references for relations, as emitted by JSON-LD clients.
+         if (\is_array($value) && isset($value['@id']) && \is_string($value['@id'])) {
+-            return $this->iriConverter->getResourceFromIri($value['@id'], $context + ['fetch_data' => true]);
++            return $this->resolveResourceReference($value['@id'], $className, $context);
+         }
+ 
+         return parent::denormalizeRelation($attributeName, $propertyMetadata, $className, $value, $format, $context);
+diff -ruN pristine/src/Serializer/AbstractItemNormalizer.php app/src/Serializer/AbstractItemNormalizer.php
+--- a/src/Serializer/AbstractItemNormalizer.php	2026-10-29 01:23:03.000000000 +0000
++++ b/src/Serializer/AbstractItemNormalizer.php	2026-10-29 01:38:45.864554949 +0000
+@@ -56,6 +56,7 @@
+     use ContextTrait;
+     use InputOutputMetadataTrait;
+     use OperationContextTrait;
++    use ResourceReferenceTrait;
+ 
+     protected PropertyAccessorInterface $propertyAccessor;
+     protected array $localCache = [];
+@@ -227,7 +228,7 @@
+ 
+         if (\is_string($data)) {
+             try {
+-                return $this->iriConverter->getResourceFromIri($data, $context + ['fetch_data' => true]);
++                return $this->resolveResourceReference($data, $resourceClass, $context);
+             } catch (ItemNotFoundException $e) {
+                 if (!isset($context['not_normalizable_value_exceptions'])) {
+                     throw new UnexpectedValueException($e->getMessage(), $e->getCode(), $e);
+@@ -615,7 +616,7 @@
+     {
+         if (\is_string($value)) {
+             try {
+-                return $this->iriConverter->getResourceFromIri($value, $context + ['fetch_data' => true]);
++                return $this->resolveResourceReference($value, $className, $context);
+             } catch (ItemNotFoundException $e) {
+                 if (false === ($context['denormalize_throw_on_relation_not_found'] ?? true)) {
+                     return null;
+diff -ruN pristine/src/Serializer/ItemNormalizer.php app/src/Serializer/ItemNormalizer.php
+--- a/src/Serializer/ItemNormalizer.php	2026-10-29 01:23:06.000000000 +0000
++++ b/src/Serializer/ItemNormalizer.php	2026-10-29 01:38:48.328515438 +0000
+@@ -83,7 +83,7 @@
+     {
+         // Legacy clients send a relation as a reference object instead of a plain IRI.
+         if (\is_array($value) && isset($value['iri']) && \is_string($value['iri'])) {
+-            return $this->iriConverter->getResourceFromIri($value['iri'], $context + ['fetch_data' => true]);
++            return $this->resolveResourceReference($value['iri'], $className, $context);
+         }
+ 
+         return parent::denormalizeRelation($attributeName, $propertyMetadata, $className, $value, $format, $context);
+diff -ruN pristine/src/Serializer/ResourceReferenceTrait.php app/src/Serializer/ResourceReferenceTrait.php
+--- a/src/Serializer/ResourceReferenceTrait.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/Serializer/ResourceReferenceTrait.php	2026-10-29 01:38:43.034600317 +0000
+@@ -0,0 +1,42 @@
++<?php
++
++/*
++ * This file is part of the API Platform project.
++ *
++ * (c) Kévin Dunglas <dunglas@gmail.com>
++ *
++ * For the full copyright and license information, please view the LICENSE
++ * file that was distributed with this source code.
++ */
++
++declare(strict_types=1);
++
++namespace ApiPlatform\Serializer;
++
++use ApiPlatform\Metadata\Exception\InvalidArgumentException;
++
++/**
++ * Resolves client-supplied references while enforcing the resource type they stand for.
++ *
++ * A reference may only name an object that is an instance of the resource class declared by the
++ * relation (or by the document itself): a concrete subtype satisfies that declaration, anything
++ * else is a client error and must abort the write before it reaches the processor.
++ */
++trait ResourceReferenceTrait
++{
++    /**
++     * @param string $resourceClass the resource class declared by the relation or the document
++     *
++     * @throws InvalidArgumentException when the referenced object is not an instance of the declared class
++     */
++    protected function resolveResourceReference(string $iri, string $resourceClass, array $context): object
++    {
++        $resource = $this->iriConverter->getResourceFromIri($iri, $context + ['fetch_data' => true]);
++
++        if (!$resource instanceof $resourceClass) {
++            throw new InvalidArgumentException(\sprintf('The iri "%s" does not reference a resource of type "%s".', $iri, $resourceClass));
++        }
++
++        return $resource;
++    }
++}

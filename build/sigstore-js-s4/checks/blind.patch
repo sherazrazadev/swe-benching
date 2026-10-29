@@ -1,0 +1,181 @@
+diff -ruN a/packages/oci/src/containers-auth.ts b/packages/oci/src/containers-auth.ts
+--- a/packages/oci/src/containers-auth.ts	2026-10-29 01:03:20.000000000 +0000
++++ b/packages/oci/src/containers-auth.ts	2026-10-29 01:14:55.186531149 +0000
+@@ -16,6 +16,7 @@
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
++import { findRegistryEntry } from './registry-key';
+ 
+ export type RegistryAuthEntry = {
+   auth: string;
+@@ -52,8 +53,7 @@
+   }
+ 
+   const auths = parsed.auths || {};
+-  const key =
+-    Object.keys(auths).find((entry) => entry.includes(registry)) || registry;
++  const key = findRegistryEntry(Object.keys(auths), registry);
+ 
+-  return auths[key];
++  return key === undefined ? undefined : auths[key];
+ };
+diff -ruN a/packages/oci/src/credential-helpers.ts b/packages/oci/src/credential-helpers.ts
+--- a/packages/oci/src/credential-helpers.ts	2026-10-29 01:03:20.000000000 +0000
++++ b/packages/oci/src/credential-helpers.ts	2026-10-29 01:14:55.956529930 +0000
+@@ -14,6 +14,7 @@
+ limitations under the License.
+ */
+ import { execFileSync } from 'node:child_process';
++import { findRegistryEntry } from './registry-key';
+ 
+ export type HelperCredentials = {
+   username: string;
+@@ -29,9 +30,7 @@
+   store: string | undefined,
+   registry: string
+ ): string | undefined => {
+-  const key = Object.keys(helpers || {}).find((entry) =>
+-    entry.includes(registry)
+-  );
++  const key = findRegistryEntry(Object.keys(helpers || {}), registry);
+ 
+   if (key) {
+     return (helpers || {})[key];
+diff -ruN a/packages/oci/src/credentials.ts b/packages/oci/src/credentials.ts
+--- a/packages/oci/src/credentials.ts	2026-10-29 01:03:20.000000000 +0000
++++ b/packages/oci/src/credentials.ts	2026-10-29 01:15:50.292439920 +0000
+@@ -22,6 +22,7 @@
+   findCredentialHelper,
+ } from './credential-helpers';
+ import { parseImageName } from './name';
++import { findRegistryEntry } from './registry-key';
+ 
+ export type Credentials = {
+   readonly username: string;
+@@ -59,11 +60,15 @@
+   const { registry } = parseImageName(imageName);
+   const dockerConfig = readDockerConfig();
+ 
+-  const credKey =
+-    Object.keys(dockerConfig.auths || {}).find((key) =>
+-      key.includes(registry)
+-    ) || registry;
+-  const auth = dockerConfig.auths?.[credKey];
++  // Only an entry that denotes exactly this registry may supply its
++  // credentials. Falling back to a key that merely contains the registry name
++  // would send one registry's credentials to another.
++  const credKey = findRegistryEntry(
++    Object.keys(dockerConfig.auths || {}),
++    registry
++  );
++  const auth =
++    credKey === undefined ? undefined : dockerConfig.auths?.[credKey];
+ 
+   let resolved: { username: string; password: string } | undefined;
+ 
+diff -ruN a/packages/oci/src/image.ts b/packages/oci/src/image.ts
+--- a/packages/oci/src/image.ts	2026-10-29 01:03:18.000000000 +0000
++++ b/packages/oci/src/image.ts	2026-10-29 01:15:01.960520367 +0000
+@@ -21,6 +21,7 @@
+ import { Credentials } from './credentials';
+ import { HTTPError, OCIError } from './error';
+ import { ImageName } from './name';
++import { registryEndpoint } from './registry-key';
+ import {
+   RegistryFetchOptions as FetchOptions,
+   RegistryClient,
+@@ -29,7 +30,6 @@
+ 
+ import type { Descriptor, ImageIndex, ImageManifest } from './types';
+ 
+-const DOCKER_DEFAULT_REGISTRY = 'registry-1.docker.io';
+ const EMPTY_BLOB = Buffer.from('{}');
+ 
+ export type AddArtifactOptions = {
+@@ -46,7 +46,7 @@
+ 
+   constructor(image: ImageName, creds: Credentials, opts?: FetchOptions) {
+     this.#client = new RegistryClient(
+-      canonicalizeRegistryName(image.registry),
++      registryEndpoint(image.registry),
+       image.path,
+       opts
+     );
+@@ -224,11 +224,3 @@
+ const digestToTag = (digest: string): string => {
+   return digest.replace(':', '-');
+ };
+-
+-// Canonicalize the registry name to match the format used by the registry
+-// client. This is used primarily to handle the special case of the Docker Hub
+-// registry.
+-// https://github.com/moby/moby/blob/v24.0.2/registry/config.go#L25-L48
+-const canonicalizeRegistryName = (registry: string): string => {
+-  return registry.endsWith('docker.io') ? DOCKER_DEFAULT_REGISTRY : registry;
+-};
+diff -ruN a/packages/oci/src/registry-key.ts b/packages/oci/src/registry-key.ts
+--- a/packages/oci/src/registry-key.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/oci/src/registry-key.ts	2026-10-29 01:14:51.428537239 +0000
+@@ -0,0 +1,61 @@
++/*
++Copyright 2023 The Sigstore Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Docker Hub is reachable under several interchangeable host names and Docker
++// records its credentials under whichever spelling the user authenticated
++// with. They all denote the same registry.
++const DOCKER_HUB_HOSTS = new Set([
++  'docker.io',
++  'index.docker.io',
++  'registry-1.docker.io',
++]);
++
++const DOCKER_HUB_IDENTITY = 'docker.io';
++const DOCKER_HUB_ENDPOINT = 'registry-1.docker.io';
++
++// Reduces a registry name - or a key in a credentials file, which may carry a
++// scheme and a path - to the host[:port] that identifies the registry. Case
++// does not distinguish registries, and neither does anything in the stored key
++// after the authority.
++export const registryHost = (value: string): string => {
++  const withoutScheme = value.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
++  const authority = withoutScheme.split(/[/?#]/, 1)[0].toLowerCase();
++
++  return DOCKER_HUB_HOSTS.has(authority) ? DOCKER_HUB_IDENTITY : authority;
++};
++
++// Two names denote the same registry only when their host[:port] parts are
++// identical. A name that merely contains, or ends with, another name is a
++// different registry.
++export const sameRegistry = (left: string, right: string): boolean =>
++  registryHost(left) === registryHost(right);
++
++// Finds the key in a credentials file that denotes exactly the given registry.
++// Returns undefined when the file holds no entry for that registry; callers
++// must then refuse rather than substitute another registry's credentials.
++export const findRegistryEntry = (
++  keys: string[],
++  registry: string
++): string | undefined => keys.find((key) => sameRegistry(key, registry));
++
++// Returns the host that requests for the given registry are addressed to.
++// Only an exact Docker Hub alias is rewritten to Docker Hub's API endpoint; a
++// host that merely ends with "docker.io" belongs to a different registry and
++// must keep its own endpoint.
++export const registryEndpoint = (registry: string): string =>
++  registryHost(registry) === DOCKER_HUB_IDENTITY
++    ? DOCKER_HUB_ENDPOINT
++    : registry;

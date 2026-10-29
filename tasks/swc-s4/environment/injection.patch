@@ -1,0 +1,181 @@
+diff --git a/crates/swc_html_minifier/src/lib.rs b/crates/swc_html_minifier/src/lib.rs
+index d952d23d3..2856d2515 100644
+--- a/crates/swc_html_minifier/src/lib.rs
++++ b/crates/swc_html_minifier/src/lib.rs
+@@ -1363,6 +1363,63 @@ impl<C: MinifyCss> Minifier<'_, C> {
+         })])
+     }
+ 
++    /// Consecutive `application/json` blocks that both hold arrays are combined into one
++    /// block: templating often splits a single data list across elements, and one block
++    /// is smaller than two.
++    fn merge_json_data_blocks(&self, children: &mut Vec<Child>) {
++        let mut result: Vec<Child> = Vec::with_capacity(children.len());
++
++        for child in take(children) {
++            let merged = match (result.last_mut(), &child) {
++                (Some(Child::Element(previous)), Child::Element(next)) => {
++                    self.merge_json_blocks(previous, next)
++                }
++                _ => false,
++            };
++
++            if !merged {
++                result.push(child);
++            }
++        }
++
++        *children = result;
++    }
++
++    fn merge_json_blocks(&self, previous: &mut Element, next: &Element) -> bool {
++        let (Some(previous_text), Some(next_text)) =
++            (json_data_text(previous), json_data_text(next))
++        else {
++            return false;
++        };
++
++        let (Ok(mut previous_value), Ok(next_value)) = (
++            serde_json::from_str::<Value>(&previous_text),
++            serde_json::from_str::<Value>(&next_text),
++        ) else {
++            return false;
++        };
++
++        let (Value::Array(previous_items), Value::Array(next_items)) =
++            (&mut previous_value, next_value)
++        else {
++            return false;
++        };
++
++        previous_items.extend(next_items);
++
++        let Ok(serialized) = serde_json::to_string(&previous_value) else {
++            return false;
++        };
++
++        previous.children = vec![Child::Text(Text {
++            span: DUMMY_SP,
++            data: serialized.into(),
++            raw: None,
++        })];
++
++        true
++    }
++
+     fn minify_children(&mut self, children: &mut Vec<Child>) -> Vec<Child> {
+         if children.is_empty() {
+             return Vec::new();
+@@ -1789,6 +1846,21 @@ impl<C: MinifyCss> Minifier<'_, C> {
+         result.ok()
+     }
+ 
++    /// Normalizes the fixed-shape JSON documents that browsers consume as structured
++    /// script data. Empty values and repeated list entries carry no meaning in these
++    /// formats, so they are dropped while the document is rewritten.
++    fn minify_structured_script(&self, data: String) -> Option<String> {
++        let mut value = serde_json::from_str::<Value>(&data).ok()?;
++
++        if !value.is_object() {
++            return None;
++        }
++
++        normalize_structured_json(&mut value);
++
++        serde_json::to_string(&value).ok()
++    }
++
+     fn need_minify_js(&self) -> bool {
+         match self.options.minify_js {
+             MinifyJsOption::Bool(value) => value,
+@@ -2548,6 +2620,10 @@ impl<C: MinifyCss> VisitMut for Minifier<'_, C> {
+ 
+         n.visit_mut_children_with(self);
+ 
++        if self.options.merge_metadata_elements {
++            self.merge_json_data_blocks(&mut n.children);
++        }
++
+         // Remove all leading and trailing whitespaces for the `body` element
+         if n.namespace == Namespace::HTML && n.tag_name == "body" && self.need_collapse_whitespace()
+         {
+@@ -2657,6 +2733,18 @@ impl<C: MinifyCss> VisitMut for Minifier<'_, C> {
+                         .map(|v| v.to_ascii_lowercase().trim().into());
+ 
+                     match type_attribute_value.as_deref() {
++                        Some("importmap" | "speculationrules") if self.need_minify_json() => {
++                            match self.minify_structured_script(n.data.to_string()) {
++                                Some(minified) => {
++                                    n.data = minified.into();
++
++                                    return;
++                                }
++                                // Not a well-formed structured document, use the generic JSON
++                                // minifier, which leaves invalid input untouched.
++                                None => text_type = Some(MinifierType::Json),
++                            }
++                        }
+                         Some("module") if self.need_minify_js() => {
+                             text_type = Some(MinifierType::JsModule);
+                         }
+@@ -2809,6 +2897,60 @@ impl<C: MinifyCss> VisitMut for Minifier<'_, C> {
+     }
+ }
+ 
++/// Returns the text of a plain `application/json` data block, or `None` when the
++/// element is not one.
++fn json_data_text(element: &Element) -> Option<String> {
++    if !matches!(element.namespace, Namespace::HTML | Namespace::SVG)
++        || element.tag_name != "script"
++        || element.attributes.len() != 1
++    {
++        return None;
++    }
++
++    let attribute = &element.attributes[0];
++
++    if attribute.name != "type"
++        || !attribute
++            .value
++            .as_deref()
++            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
++    {
++        return None;
++    }
++
++    match element.children.first() {
++        Some(Child::Text(text)) => Some(text.data.to_string()),
++        _ => None,
++    }
++}
++
++/// Drops empty object members and repeated strings in arrays from a structured JSON
++/// script, in place.
++fn normalize_structured_json(value: &mut Value) {
++    match value {
++        Value::Object(map) => {
++            map.retain(|_, member| !matches!(member, Value::String(value) if value.is_empty()));
++
++            for member in map.values_mut() {
++                normalize_structured_json(member);
++            }
++        }
++        Value::Array(items) => {
++            let mut seen = FxHashMap::default();
++
++            items.retain(|item| match item {
++                Value::String(value) => seen.insert(value.clone(), ()).is_none(),
++                _ => true,
++            });
++
++            for item in items.iter_mut() {
++                normalize_structured_json(item);
++            }
++        }
++        _ => {}
++    }
++}
++
+ struct AttributeNameCounter {
+     tree: FxHashMap<Atom, usize>,
+ }

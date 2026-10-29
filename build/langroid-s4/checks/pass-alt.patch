@@ -1,0 +1,95 @@
+diff -ruN a/langroid/agent/tools/file_tools.py b/langroid/agent/tools/file_tools.py
+--- a/langroid/agent/tools/file_tools.py	2026-10-29 00:54:26.379200662 +0000
++++ b/langroid/agent/tools/file_tools.py	2026-10-29 01:01:14.600815138 +0000
+@@ -59,6 +59,10 @@
+         # ASSUME: file_path should be relative to the curr_dir
+         try:
+             dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++            try:
++                _confine(dir, self.file_path)
++            except ValueError as e:
++                return f"Error: {e}"
+             with chdir(dir):
+                 # if file doesn't exist, return an error message
+                 content = read_file(self.file_path, self._line_nums)
+@@ -165,6 +169,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content)
+             msg = f"Content written to {self.file_path}"
+@@ -222,6 +230,10 @@
+     def handle(self) -> str:
+         # ASSUME: dir_path should be relative to the curr_dir_path
+         dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine(dir, self.dir_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(dir):
+             contents = list_dir(self.dir_path)
+ 
+@@ -268,6 +280,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             create_file(self.file_path, self.content, if_exists="append")
+         return f"Content appended to {self.file_path}"
+@@ -301,6 +317,10 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine(curr_dir, self.file_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             target = Path(self.file_path)
+             if target.is_dir():
+@@ -339,6 +359,36 @@
+ 
+     def handle(self) -> str:
+         curr_dir = (self._curr_dir and self._curr_dir()) or Path.cwd()
++        try:
++            _confine(curr_dir, self.src_path)
++            _confine(curr_dir, self.dst_path)
++        except ValueError as e:
++            return f"Error: {e}"
+         with chdir(curr_dir):
+             shutil.move(self.src_path, self.dst_path)
+         return f"Moved {self.src_path} to {self.dst_path}"
++
++
++def _confine(base_dir, user_path) -> None:
++    """Reject a path that resolves outside the tool's directory, using real paths."""
++    import os
++
++    base = os.path.realpath(str(base_dir))
++    raw = str(user_path)
++    expanded = os.path.expanduser(raw)
++    candidates = [raw]
++    if expanded != raw:
++        candidates.append(expanded)
++    for cand in candidates:
++        target = cand if os.path.isabs(cand) else os.path.join(base, cand)
++        target = os.path.realpath(target)
++        if target == base:
++            continue
++        try:
++            inside = os.path.commonpath([base, target]) == base
++        except ValueError:
++            inside = False
++        if not inside:
++            raise ValueError(
++                f"Path '{user_path}' is outside the allowed directory '{base}'"
++            )

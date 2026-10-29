@@ -1,0 +1,209 @@
+{
+ "slug": "sigstore-js-s4",
+ "candidate": "screener-v2 entry 12927: GHSA-PF56-329R-95RW / CVE-2026-59891 (sigstore/sigstore-js), pinned a063789da477ab9bb9ad266878f095e36a264804, fix 85c58380758b97ce1b74ef470e55cc21f9d3aa89",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "pinned_commit": "a063789da477ab9bb9ad266878f095e36a264804; the published fix 85c5838 touches only packages/oci/src/credentials.ts and packages/oci/src/__tests__/credentials.test.ts (plus a changeset). The pinned commit does not contain the advisory's regression tests.",
+  "entry_point": "Library public API of @sigstore/oci, reached by the CLI 'attach' command: getRegistryCredentials(imageName) selects the stored credential, and attachArtifactToImage({imageName, credentials, ...}) is the request the CLI makes with it. The tests compose the two exactly as packages/cli/src/commands/attach.ts does; no internal helper is called.",
+  "sites": [
+   "packages/oci/src/credentials.ts:49-53 (pinned) substring credential selection - published fix",
+   "packages/oci/src/image.ts:232-234 (pinned) suffix-based Docker Hub destination identity - real, unmodified upstream, never touched by the published fix, still present in upstream main e77ae769",
+   "packages/oci/src/containers-auth.ts:56 (injected tree) container auth-file key selection - injected sibling",
+   "packages/oci/src/credential-helpers.ts:33 (injected tree) credential-helper key selection - injected sibling"
+  ],
+  "routes": [
+   "substring selection in the Docker config auths map (published fix): target registry contained in a configured key, port-bearing key, and a target that matches only part of a stored scheme/path key",
+   "registry identity at the network boundary (real uncovered route): a host whose name ends with a Docker Hub name is addressed as registry-1.docker.io while the credential was selected for the parsed host",
+   "container registry auth file (injected sibling): the same substring selection against the auths map in the container auth file",
+   "credential helper (injected sibling): a helper named for one registry is selected for another registry by substring and asked for that registry's credential"
+  ],
+  "routes_investigated_not_built": [
+   "packages/oci/src/registry.ts:184-202 (pinned) blob upload PUT follows an absolute cross-origin Location with the registry Authorization header attached. Confirmed leaking at the pinned commit. Not built: the OCI distribution spec allows object-storage-backed absolute upload locations, so covering it needs a second protection (origin-scoped forwarding) rather than this advisory's credential-selection property. Upstream later added origin-scoped fetch helpers for it; outside this advisory's published fix.",
+   "packages/oci/src/registry.ts:295-302 and 311-323 (pinned) bearer-token realm from the WWW-Authenticate challenge receives Basic credentials / username+password. Confirmed by reading the pinned code. Not built: the token service is protocol-mandated and is normally a different host from the registry; the same second protection (origin scoping) applies. Upstream later addressed it with the same origin-scoped fetch helpers."
+  ],
+  "services": [],
+  "project_tests_run": "packages/oci/src/__tests__/credentials.test.ts (8 tests, pinned version, restored pristine by test.sh) passes on the injected tree and on the reference fix. The full oci package suite (56 tests, packages/oci/src/__tests__/*.test.ts) passes on the reference fix; npx tsc --build packages/oci/tsconfig.json type-checks the injected and fixed trees.",
+  "local_runs": "injected tree: security 0/6 pass (all six exploits succeed), functional 31/31 pass. Reference fix: security 6/6, functional 31/31. Variants: published-only 3 security fail (network identity + both injected sources), each miss-* exactly its one security test, strip-port the port test, fallback-open three selection tests, over-broad four functional tests, refuse-all sixteen functional tests, hardening and alternative 1.0.",
+  "gate_results": {
+   "static": "PASS (no warnings; blind patch intentionally not yet written)",
+   "nop": "PASS: security 0/6 pass, functional 31/31 pass, reward 0.0",
+   "oracle": "PASS: 3 runs, reward 1.0 each, identical results (6/6 security, 31/31 functional)",
+   "patches": "PASS: 10 checks behaved as declared (6 security_fail, 2 functional_fail, 2 pass)"
+  }
+ },
+ "leak_terms": [
+  "getRegistryCredentials",
+  "attachArtifactToImage",
+  "canonicalizeRegistry",
+  "canonicalizeRegistryName",
+  "DOCKER_HUB_ALIASES",
+  "parseImageName",
+  "credentials.ts",
+  "containers-auth.ts",
+  "credential-helpers.ts",
+  "image.ts",
+  "name.ts",
+  "registry.ts",
+  "credentials.test.ts",
+  "credHelpers",
+  "credsStore",
+  "auth.json",
+  "REGISTRY_AUTH_FILE",
+  "fromBasicAuth",
+  "toBasicAuth",
+  "substring",
+  "includes",
+  "registry-1.docker.io",
+  "notdocker.io"
+ ],
+ "patch_checks": [
+  {
+   "patch": "published-only.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "the published upstream fix only: substring matching is replaced by canonical exact matching in the Docker config lookup, but the network destination identity and both injected credential sources are untouched"
+  },
+  {
+   "patch": "miss-network-identity.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the destination-identity change in image.ts (only the network-identity security test fails)"
+  },
+  {
+   "patch": "miss-container-auth.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the container auth-file selection change (only that source's security test fails)"
+  },
+  {
+   "patch": "miss-credential-helper.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the credential-helper selection change (only that source's security test fails)"
+  },
+  {
+   "patch": "strip-port.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "canonicalizes the host but drops the port, so a credential for host:5000 still resolves for the same host on the default port"
+  },
+  {
+   "patch": "fallback-open.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "exact matching plus a fall back to the first stored credential when no exact entry exists"
+  },
+  {
+   "patch": "over-broad.patch",
+   "expect": "functional_fail",
+   "kind": "variant",
+   "note": "treats the raw stored string as the identity, so scheme/path entries and Docker Hub aliases stop resolving"
+  },
+  {
+   "patch": "refuse-all.patch",
+   "expect": "functional_fail",
+   "kind": "variant",
+   "note": "refuses every credential lookup, killing legitimate use"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive validation in the shared registry-identity helper and in credential resolution; scores 1.0"
+  },
+  {
+   "patch": "alternative.patch",
+   "expect": "pass",
+   "kind": "variant",
+   "note": "a second complete fix with a different canonicalization implementation (regex authority parse) and an explicit alias set at the network boundary; scores 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse-all.patch",
+  "crash_as_refusal": "n/a: the refusal is a synchronous thrown error from a library lookup; there is no separate crash or response-status channel to distinguish from a clean error, and the security tests accept any error",
+  "wrong_resource": "miss-network-identity.patch",
+  "one_role_or_direction": "n/a: only one direction leaks (a configured key that contains the target registry); the reverse direction already fails closed at the pinned commit",
+  "reads_only": "n/a: there is no read/write split; every credential lookup follows the same selection path",
+  "check_after_adjustment": "strip-port.patch",
+  "unlisted_route": "published-only.patch",
+  "malformed_identity": "strip-port.patch",
+  "missing_authority": "fallback-open.patch",
+  "adjacent_api": "over-broad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_network_identity",
+   "pattern": "B (real, unmodified upstream route where the protection never existed)",
+   "shape": "the identity used to select the credential is not the identity used to address the request: a host whose name ends with a Docker Hub name is addressed as registry-1.docker.io, so the credential stored for the parsed host is presented to Docker Hub",
+   "where": "packages/oci/src/image.ts:232-234 (pinned)",
+   "security_tests": [
+    "a request to a registry only carries that registry's credentials::does not send credentials stored for one host to another registry"
+   ],
+   "coupled_functional_tests": [
+    "requests go to the registry the credentials belong to::authenticates to Docker Hub with credentials stored under an alias",
+    "requests go to the registry the credentials belong to::authenticates to a plain registry with its own credentials"
+   ],
+   "security_fail_patch": "miss-network-identity.patch",
+   "realistic_because": "real, unmodified upstream code (the published fix never touches it and it is still present in upstream main); the suffix rule is a deliberate-looking Docker Hub special case with a moby source reference"
+  },
+  {
+   "id": "T2_key_shapes",
+   "pattern": "B (coupled must-keep-working values next to the published site)",
+   "shape": "a naive exact comparison looks right for a bare host but mishandles the accepted stored forms: scheme/path entries, host:port entries, Docker Hub aliases, and a stored path that merely contains the target",
+   "where": "packages/oci/src/credentials.ts:49-53 (pinned)",
+   "security_tests": [
+    "registry credentials are bound to the registry they were stored for::does not use a stored credential whose name merely contains the image registry",
+    "registry credentials are bound to the registry they were stored for::does not use a stored credential for the same host on a different port",
+    "registry credentials are bound to the registry they were stored for::does not use a stored credential that only matches part of the stored path"
+   ],
+   "coupled_functional_tests": [
+    "credential selection keeps working::returns the credential stored under a scheme and path form",
+    "credential selection keeps working::returns the credential stored for a registry reached on a port",
+    "credential selection keeps working::returns the credential stored under a Docker Hub alias",
+    "getRegistryCredentials (project test)::when credentials exist for the registry (partial match)"
+   ],
+   "security_fail_patch": "strip-port.patch",
+   "realistic_because": "real, unmodified upstream code; the pinned project test already asserts the scheme/path form, and real Docker configs carry scheme/path, port and Hub-alias keys"
+  },
+  {
+   "id": "T3_container_auth_source",
+   "pattern": "injected sibling (second credential source)",
+   "shape": "a second credential store (the container registry auth file) uses its own key matching, so the identity rule has to be applied there too",
+   "where": "packages/oci/src/containers-auth.ts:56 (injected tree)",
+   "security_tests": [
+    "every credential source stays bound to its registry::does not use a container auth file entry stored for another registry"
+   ],
+   "coupled_functional_tests": [
+    "the additional credential sources keep working::returns an exact container auth file entry",
+    "the additional credential sources keep working::prefers the Docker config entry over the container auth file"
+   ],
+   "security_fail_patch": "miss-container-auth.patch",
+   "realistic_because": "injected copy of the same lookup for container-runtime auth files; the published fix never touches it"
+  },
+  {
+   "id": "T4_credential_helper_source",
+   "pattern": "injected sibling (second credential source with a different mechanism)",
+   "shape": "a credential helper is chosen by matching the helper's stored registry key against the target by substring, so the helper that holds one registry's secret is asked for another registry's credential",
+   "where": "packages/oci/src/credential-helpers.ts:33 (injected tree)",
+   "security_tests": [
+    "every credential source stays bound to its registry::does not use a credential helper named for another registry"
+   ],
+   "coupled_functional_tests": [
+    "the additional credential sources keep working::returns credentials from a helper named for the registry",
+    "the additional credential sources keep working::returns credentials from the store-wide helper"
+   ],
+   "security_fail_patch": "miss-credential-helper.patch",
+   "realistic_because": "injected support for Docker credential helpers, a documented config.json feature this code ignores; the published fix never touches it"
+  }
+ ],
+ "status": "built and gate-green (stage-wise): static PASS; nop PASS (security 0/6 = all six fail on the vulnerable tree, functional 31/31); oracle PASS 3x (reward 1.0, identical 6/6 + 31/31); patches PASS (published-only 3 security fail; each miss-* exactly its one test; strip-port the port test; fallback-open three selection tests; over-broad four functional; refuse-all sixteen functional; hardening and alternative 1.0). blind.patch declared for the later blind-fix step."
+}
