@@ -4,11 +4,11 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 
 **ACCEPTED** = gate sound, both models failed all 3 runs, every failing run audited as the model's own failure (Claude Opus, `common/audit/postmortem.py`) and the fairness review READY (DeepSeek, `pipelines/sibling/9-fairness`), decided automatically. **REJECTED** = a model solved it, the owner dropped it, or it was still unfair after one repair (fairfix, re-gate and fresh trials). **in final checks** = passed the trials; audits, fairness, a repair or extra runs still under way, nothing recorded yet.
 
-## Totals (65 tasks)
+## Totals (71 tasks)
 
 | ACCEPTED | REJECTED | in final checks | unsound | running |
 |---|---|---|---|---|
-| 2 | 45 | 2 | 4 | 12 |
+| 2 | 50 | 3 | 4 | 12 |
 
 ## Batches
 
@@ -24,10 +24,11 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 | [8](batch-08.md) | 2026-10-28T00:04Z | 1 | 0 | 1 | 0 | 0 | 0 | [40606332971](https://github.com/sherazrazadev/swe-benching/actions/runs/40606332971) |
 | [9](batch-09.md) | 2026-10-28T03:37Z | 6 | 0 | 6 | 0 | 0 | 0 | [40627768818](https://github.com/sherazrazadev/swe-benching/actions/runs/40627768818) |
 | [10](batch-10.md) | 2026-10-28T07:00Z | 6 | 0 | 5 | 0 | 1 | 0 | [40647352109](https://github.com/sherazrazadev/swe-benching/actions/runs/40647352109) |
-| [11](batch-11.md) | 2026-10-28T14:57Z | 6 | 0 | 0 | 6 | 0 | 0 | [40711090816](https://github.com/sherazrazadev/swe-benching/actions/runs/40711090816) |
+| [11](batch-11.md) | 2026-10-28T14:57Z | 6 | 0 | 5 | 1 | 0 | 0 | [40711090816](https://github.com/sherazrazadev/swe-benching/actions/runs/40711090816) |
 | [12](batch-12.md) | 2026-10-28T16:15Z | 6 | 1 | 4 | 1 | 0 | 0 | [40724061049](https://github.com/sherazrazadev/swe-benching/actions/runs/40724061049) |
 | [13](batch-13.md) | 2026-10-28T20:30Z | 6 | 0 | 5 | 1 | 0 | 0 | [40763748092](https://github.com/sherazrazadev/swe-benching/actions/runs/40763748092) |
 | [14](batch-14.md) | 2026-10-28T23:48Z | 6 | 0 | 0 | 6 | 0 | 0 | [40789876505](https://github.com/sherazrazadev/swe-benching/actions/runs/40789876505) |
+| [15](batch-15.md) | 2026-10-29T00:45Z | 6 | 0 | 0 | 6 | 0 | 0 | [40796101408](https://github.com/sherazrazadev/swe-benching/actions/runs/40796101408) |
 
 ## Accepted tasks (2)
 
