@@ -1,0 +1,347 @@
+diff --git a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java
+index 24ce43a5..8085f151 100644
+--- a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java
+@@ -31,6 +31,7 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
+ import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Set;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+@@ -54,6 +55,8 @@ public class FrameworkServerConnectorFactory extends StandardServerConnectorFact
+ 
+     private final String excludeCipherSuites;
+ 
++    private final Set<String> validProxyHosts;
++
+     private final Set<Integer> validPorts;
+ 
+     private SslContextFactory.Server sslContextFactory;
+@@ -70,6 +73,7 @@ public class FrameworkServerConnectorFactory extends StandardServerConnectorFact
+         includeCipherSuites = properties.getProperty(NiFiProperties.WEB_HTTPS_CIPHERSUITES_INCLUDE);
+         excludeCipherSuites = properties.getProperty(NiFiProperties.WEB_HTTPS_CIPHERSUITES_EXCLUDE);
+         headerSize = DataUnit.parseDataSize(properties.getWebMaxHeaderSize(), DataUnit.B).intValue();
++        validProxyHosts = getValidProxyHosts(properties);
+         validPorts = getValidPorts(properties);
+ 
+         if (properties.isHTTPSConfigured()) {
+@@ -102,6 +106,9 @@ public class FrameworkServerConnectorFactory extends StandardServerConnectorFact
+         // Add HostHeaderCustomizer to set Host Header for HTTP/2 and HostHeaderHandler
+         httpConfiguration.addCustomizer(new HostHeaderCustomizer());
+ 
++        final ProxyHeaderValidatorCustomizer proxyHeaderValidatorCustomizer = new ProxyHeaderValidatorCustomizer(validProxyHosts, validPorts);
++        httpConfiguration.addCustomizer(proxyHeaderValidatorCustomizer);
++
+         final HostPortValidatorCustomizer hostPortValidatorCustomizer = new HostPortValidatorCustomizer(validPorts);
+         httpConfiguration.addCustomizer(hostPortValidatorCustomizer);
+ 
+@@ -159,6 +166,48 @@ public class FrameworkServerConnectorFactory extends StandardServerConnectorFact
+         return ObjectUtils.getIfNull(httpsPort, httpPort);
+     }
+ 
++    private static Set<String> getValidProxyHosts(final NiFiProperties properties) {
++        final Set<String> validProxyHosts = new HashSet<>();
++
++        final List<String> allowedHosts = properties.getAllowedHostsAsList();
++        for (final String allowedHost : allowedHosts) {
++            final String host = getHost(allowedHost);
++            if (StringUtils.isNotBlank(host)) {
++                validProxyHosts.add(host.toLowerCase(Locale.ROOT));
++            }
++        }
++
++        return validProxyHosts;
++    }
++
++    private static String getHost(final String allowedHost) {
++        final String host;
++
++        if (allowedHost.startsWith("[")) {
++            // Bracketed IPv6 address with an optional port following the closing bracket
++            final int closingBracket = allowedHost.indexOf(']');
++            host = closingBracket > 0 ? allowedHost.substring(0, closingBracket + 1) : allowedHost;
++        } else {
++            final int separator = allowedHost.lastIndexOf(':');
++            if (separator > 0 && separator < allowedHost.length() - 1 && isPortNumber(allowedHost.substring(separator + 1))) {
++                host = allowedHost.substring(0, separator);
++            } else {
++                host = allowedHost;
++            }
++        }
++
++        return host;
++    }
++
++    private static boolean isPortNumber(final String value) {
++        try {
++            Integer.parseInt(value);
++            return true;
++        } catch (final NumberFormatException e) {
++            return false;
++        }
++    }
++
+     private static Set<Integer> getValidPorts(final NiFiProperties properties) {
+         final Set<Integer> validPorts = new HashSet<>();
+ 
+diff --git a/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyHeaderValidatorCustomizer.java b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyHeaderValidatorCustomizer.java
+new file mode 100644
+index 00000000..8fcdcc77
+--- /dev/null
++++ b/nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyHeaderValidatorCustomizer.java
+@@ -0,0 +1,253 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.web.server.connector;
++
++import org.apache.nifi.web.servlet.shared.ProxyHeader;
++import org.eclipse.jetty.http.HttpException;
++import org.eclipse.jetty.http.HttpFields;
++import org.eclipse.jetty.http.HttpStatus;
++import org.eclipse.jetty.http.HttpURI;
++import org.eclipse.jetty.server.ConnectionMetaData;
++import org.eclipse.jetty.server.HttpConfiguration;
++import org.eclipse.jetty.server.Request;
++
++import java.net.InetSocketAddress;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.Set;
++
++/**
++ * Jetty Request Customizer implementing validation for supported Proxy Request Headers
++ */
++public class ProxyHeaderValidatorCustomizer implements HttpConfiguration.Customizer {
++    private static final String MISDIRECTED_REQUEST_REASON = "Invalid Proxy Host Requested";
++
++    private static final Set<String> SUPPORTED_PROXY_HOST_HEADERS = Set.of(
++            ProxyHeader.PROXY_HOST.getHeader(),
++            ProxyHeader.FORWARDED_HOST.getHeader()
++    );
++
++    private static final String FORWARDED_HEADER = ProxyHeader.FORWARDED.getHeader();
++
++    private static final String FORWARDED_ELEMENT_SEPARATOR = ",";
++
++    private static final String FORWARDED_PARAMETER_SEPARATOR = ";";
++
++    private static final String FORWARDED_VALUE_SEPARATOR = "=";
++
++    private static final String FORWARDED_HOST_PARAMETER = "host";
++
++    private static final String QUOTED_VALUE_DELIMITER = "\"";
++
++    private static final int MINIMUM_PORT_NUMBER = 1;
++
++    private static final int MAXIMUM_PORT_NUMBER = 65535;
++
++    private final Set<String> validProxyHosts;
++
++    private final Set<Integer> validPorts;
++
++    public ProxyHeaderValidatorCustomizer(final Set<String> validProxyHosts, final Set<Integer> validPorts) {
++        this.validProxyHosts = Objects.requireNonNull(validProxyHosts, "Valid Proxy Hosts required");
++        this.validPorts = Objects.requireNonNull(validPorts, "Valid Ports required");
++    }
++
++    /**
++     * Validate requested proxy host and port header values against allowed values and throw HTTP 421 on invalid values
++     *
++     * @param request HTTP Request to be evaluated
++     * @param responseHeaders HTTP Response headers
++     * @return Valid HTTP Request
++     */
++    @Override
++    public Request customize(final Request request, final HttpFields.Mutable responseHeaders) {
++        validateProxyHostHeaders(request);
++        validateProxyPortHeaders(request);
++
++        return request;
++    }
++
++    private void validateProxyHostHeaders(final Request request) {
++        final HttpURI requestUri = request.getHttpURI();
++        final String requestHost = requestUri.getHost();
++        final boolean secureRequest = request.isSecure();
++        final int requestPort = getRequestPort(request, requestUri);
++
++        final List<String> proxyHostValues = new ArrayList<>();
++        for (final String proxyHostHeader : SUPPORTED_PROXY_HOST_HEADERS) {
++            addHeaderValues(proxyHostValues, request, proxyHostHeader);
++        }
++        addForwardedHostValues(proxyHostValues, request);
++
++        for (final String proxyHostValue : proxyHostValues) {
++            if (proxyHostValue == null) {
++                continue;
++            }
++
++            final String proxyHost = proxyHostValue.trim();
++            // Include empty and blank values for enforced validation of request headers
++            if (proxyHost.isBlank()) {
++                throw misdirectedRequest();
++            }
++
++            final HostPort hostPort = parseHostPort(proxyHost);
++            if (hostPort == null || hostPort.host().isBlank()) {
++                throw misdirectedRequest();
++            }
++
++            // Allow proxy host header matching request host based on TLS SNI and DNS SAN requirements
++            final boolean requestHostMatched = secureRequest
++                    && hostPort.host().equalsIgnoreCase(requestHost)
++                    && (hostPort.port() == null || hostPort.port() == requestPort);
++            if (requestHostMatched) {
++                continue;
++            }
++
++            if (!validProxyHosts.contains(hostPort.host().toLowerCase(Locale.ROOT))) {
++                throw misdirectedRequest();
++            }
++            if (hostPort.port() != null && !validPorts.contains(hostPort.port())) {
++                throw misdirectedRequest();
++            }
++        }
++    }
++
++    private void validateProxyPortHeaders(final Request request) {
++        final List<String> proxyPortValues = new ArrayList<>();
++        addHeaderValues(proxyPortValues, request, ProxyHeader.PROXY_PORT.getHeader());
++        addHeaderValues(proxyPortValues, request, ProxyHeader.FORWARDED_PORT.getHeader());
++
++        for (final String proxyPortValue : proxyPortValues) {
++            if (proxyPortValue == null || proxyPortValue.isBlank()) {
++                continue;
++            }
++
++            final Integer port = parsePort(proxyPortValue.trim());
++            if (port == null || !validPorts.contains(port)) {
++                throw misdirectedRequest();
++            }
++        }
++    }
++
++    private void addHeaderValues(final List<String> values, final Request request, final String header) {
++        final List<String> headerValues = request.getHeaders().getValuesList(header);
++        if (headerValues != null) {
++            values.addAll(headerValues);
++        }
++    }
++
++    private void addForwardedHostValues(final List<String> values, final Request request) {
++        final List<String> forwardedValues = request.getHeaders().getValuesList(FORWARDED_HEADER);
++        if (forwardedValues == null) {
++            return;
++        }
++
++        for (final String forwardedValue : forwardedValues) {
++            if (forwardedValue == null || forwardedValue.isBlank()) {
++                continue;
++            }
++            for (final String element : forwardedValue.split(FORWARDED_ELEMENT_SEPARATOR)) {
++                for (final String parameter : element.split(FORWARDED_PARAMETER_SEPARATOR)) {
++                    final String[] keyValue = parameter.trim().split(FORWARDED_VALUE_SEPARATOR, 2);
++                    if (keyValue.length == 2 && FORWARDED_HOST_PARAMETER.equalsIgnoreCase(keyValue[0].trim())) {
++                        values.add(stripQuotes(keyValue[1].trim()));
++                    }
++                }
++            }
++        }
++    }
++
++    private HostPort parseHostPort(final String value) {
++        final String host;
++        final Integer port;
++
++        if (value.startsWith("[")) {
++            final int closingBracket = value.indexOf(']');
++            if (closingBracket < 0) {
++                return null;
++            }
++            host = value.substring(0, closingBracket + 1);
++            if (closingBracket + 1 < value.length()) {
++                if (value.charAt(closingBracket + 1) != ':') {
++                    return null;
++                }
++                port = parsePort(value.substring(closingBracket + 2));
++                if (port == null) {
++                    return null;
++                }
++            } else {
++                port = null;
++            }
++        } else {
++            final int separator = value.lastIndexOf(':');
++            if (separator > 0 && separator == value.indexOf(':') && separator < value.length() - 1) {
++                port = parsePort(value.substring(separator + 1));
++                if (port == null) {
++                    return null;
++                }
++                host = value.substring(0, separator);
++            } else {
++                host = value;
++                port = null;
++            }
++        }
++
++        return new HostPort(host, port);
++    }
++
++    private Integer parsePort(final String value) {
++        try {
++            final int port = Integer.parseInt(value);
++            if (port < MINIMUM_PORT_NUMBER || port > MAXIMUM_PORT_NUMBER) {
++                return null;
++            }
++            return port;
++        } catch (final NumberFormatException e) {
++            return null;
++        }
++    }
++
++    private String stripQuotes(final String value) {
++        if (value.length() >= 2 && value.startsWith(QUOTED_VALUE_DELIMITER) && value.endsWith(QUOTED_VALUE_DELIMITER)) {
++            return value.substring(1, value.length() - 1);
++        }
++        return value;
++    }
++
++    private int getRequestPort(final Request request, final HttpURI requestUri) {
++        final int uriPort = requestUri.getPort();
++        if (uriPort > 0) {
++            return uriPort;
++        }
++        return getLocalPort(request);
++    }
++
++    private int getLocalPort(final Request request) {
++        final ConnectionMetaData connectionMetaData = request.getConnectionMetaData();
++        final InetSocketAddress localSocketAddress = (InetSocketAddress) connectionMetaData.getLocalSocketAddress();
++        return localSocketAddress == null ? -1 : localSocketAddress.getPort();
++    }
++
++    private HttpException.RuntimeException misdirectedRequest() {
++        return new HttpException.RuntimeException(HttpStatus.MISDIRECTED_REQUEST_421, MISDIRECTED_REQUEST_REASON);
++    }
++
++    private record HostPort(String host, Integer port) {
++    }
++}

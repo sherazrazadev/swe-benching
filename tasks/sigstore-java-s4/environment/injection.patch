@@ -1,0 +1,336 @@
+diff --git a/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java b/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
+new file mode 100644
+index 0000000..68632a9
+--- /dev/null
++++ b/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
+@@ -0,0 +1,156 @@
++/*
++ * Copyright 2025 The Sigstore Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dev.sigstore;
++
++import com.google.api.client.util.Preconditions;
++import dev.sigstore.encryption.certificates.Certificates;
++import dev.sigstore.encryption.signers.Verifiers;
++import dev.sigstore.fulcio.client.FulcioVerificationException;
++import dev.sigstore.fulcio.client.FulcioVerifier;
++import dev.sigstore.rekor.client.HashedRekordRequest;
++import dev.sigstore.rekor.client.RekorEntry;
++import dev.sigstore.rekor.client.RekorTypeException;
++import dev.sigstore.rekor.client.RekorTypes;
++import dev.sigstore.rekor.client.RekorVerificationException;
++import dev.sigstore.rekor.client.RekorVerifier;
++import dev.sigstore.trustroot.SigstoreConfigurationException;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.security.InvalidAlgorithmParameterException;
++import java.security.InvalidKeyException;
++import java.security.NoSuchAlgorithmException;
++import java.security.SignatureException;
++import java.security.cert.CertPath;
++import java.security.cert.CertificateException;
++import java.security.cert.CertificateExpiredException;
++import java.security.cert.CertificateNotYetValidException;
++import java.security.cert.X509Certificate;
++import java.security.spec.InvalidKeySpecException;
++import java.util.Base64;
++import java.util.Date;
++import java.util.Objects;
++
++/**
++ * Verifies a detached artifact signature against the certificate and transparency log entry that
++ * accompany it.
++ *
++ * <p>This is useful when the artifact, its signature, the signing certificate and a Rekor entry
++ * are carried separately instead of in a bundle. The caller supplies the digest of the artifact
++ * and the signature over that digest.
++ */
++public class DetachedSignatureVerifier {
++
++  private final FulcioVerifier fulcioVerifier;
++  private final RekorVerifier rekorVerifier;
++
++  private DetachedSignatureVerifier(FulcioVerifier fulcioVerifier, RekorVerifier rekorVerifier) {
++    this.fulcioVerifier = fulcioVerifier;
++    this.rekorVerifier = rekorVerifier;
++  }
++
++  public static Builder builder() {
++    return new Builder();
++  }
++
++  public static class Builder {
++
++    private TrustedRootProvider trustedRootProvider;
++
++    public DetachedSignatureVerifier build()
++        throws InvalidAlgorithmParameterException,
++            CertificateException,
++            InvalidKeySpecException,
++            NoSuchAlgorithmException,
++            SigstoreConfigurationException {
++      Preconditions.checkNotNull(trustedRootProvider);
++      var trustedRoot = trustedRootProvider.get();
++      return new DetachedSignatureVerifier(
++          FulcioVerifier.newFulcioVerifier(trustedRoot),
++          RekorVerifier.newRekorVerifier(trustedRoot));
++    }
++
++    public Builder trustedRootProvider(TrustedRootProvider trustedRootProvider) {
++      this.trustedRootProvider = trustedRootProvider;
++      return this;
++    }
++  }
++
++  /**
++   * Verify that a detached signature belongs to the given certificate and that the certificate was
++   * valid when the accompanying transparency log entry was created.
++   *
++   * @param signingCert the certificate chain used to sign the artifact
++   * @param artifactDigest the sha256 digest of the artifact
++   * @param signature the signature over {@code artifactDigest}
++   * @param entry the transparency log entry that records the signature
++   * @throws KeylessVerificationException if the materials could not be verified
++   */
++  public void verify(
++      CertPath signingCert, byte[] artifactDigest, byte[] signature, RekorEntry entry)
++      throws KeylessVerificationException {
++    var leafCert = Certificates.getLeaf(signingCert);
++
++    try {
++      fulcioVerifier.verifySigningCertificate(signingCert);
++    } catch (FulcioVerificationException | IOException ex) {
++      throw new KeylessVerificationException(
++          "Fulcio certificate was not valid: " + ex.getMessage(), ex);
++    }
++
++    try {
++      RekorTypes.getHashedRekordV001(entry);
++      var calculatedHashedRekord =
++          HashedRekordRequest.newHashedRekordRequest(
++                  artifactDigest, Certificates.toPemBytes(leafCert), signature)
++              .toJsonPayload();
++      var body = new String(Base64.getDecoder().decode(entry.getBody()), StandardCharsets.UTF_8);
++      if (!Objects.equals(calculatedHashedRekord, body)) {
++        throw new KeylessVerificationException(
++            "Provided verification materials are inconsistent with log entry");
++      }
++    } catch (IOException e) {
++      throw new RuntimeException("Unexpected IOException on valid leafCert", e);
++    } catch (RekorTypeException re) {
++      throw new KeylessVerificationException("Unexpected rekor type", re);
++    }
++
++    try {
++      if (!Verifiers.newVerifier(leafCert.getPublicKey()).verifyDigest(artifactDigest, signature)) {
++        throw new KeylessVerificationException("Artifact signature was not valid");
++      }
++    } catch (NoSuchAlgorithmException | InvalidKeyException ex) {
++      throw new RuntimeException(ex);
++    } catch (SignatureException ex) {
++      throw new KeylessVerificationException(
++          "Signature could not be processed: " + ex.getMessage(), ex);
++    }
++
++    try {
++      rekorVerifier.verifyEntry(entry);
++    } catch (RekorVerificationException ex) {
++      throw new KeylessVerificationException("Transparency log entry could not be verified", ex);
++    }
++
++    var entryDate = Date.from(entry.getIntegratedTimeInstant());
++    try {
++      leafCert.checkValidity(entryDate);
++    } catch (CertificateNotYetValidException e) {
++      throw new KeylessVerificationException("Signing time was before certificate validity", e);
++    } catch (CertificateExpiredException e) {
++      throw new KeylessVerificationException("Signing time was after certificate expiry", e);
++    }
++  }
++}
+diff --git a/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java b/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java
+index e17757e..6e2638b 100644
+--- a/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java
++++ b/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java
+@@ -15,18 +15,25 @@
+  */
+ package dev.sigstore.bundle;
+ 
++import static dev.sigstore.json.GsonSupplier.GSON;
++
++import com.google.common.io.CharStreams;
++import com.google.gson.JsonObject;
+ import com.google.protobuf.ByteString;
+ import dev.sigstore.AlgorithmRegistry;
++import dev.sigstore.json.JsonParseException;
+ import dev.sigstore.json.ProtoJson;
+ import dev.sigstore.proto.ProtoMutators;
+ import dev.sigstore.proto.common.v1.HashAlgorithm;
+ import dev.sigstore.rekor.client.ImmutableInclusionProof;
+ import dev.sigstore.rekor.client.ImmutableRekorEntry;
+ import dev.sigstore.rekor.client.ImmutableVerification;
++import dev.sigstore.rekor.client.RekorEntry;
+ import java.io.IOException;
+ import java.io.Reader;
+ import java.security.cert.CertPath;
+ import java.security.cert.CertificateException;
++import java.util.ArrayList;
+ import java.util.Base64;
+ import java.util.List;
+ import java.util.stream.Collectors;
+@@ -34,10 +41,26 @@ import org.bouncycastle.util.encoders.Hex;
+ 
+ class BundleReader {
+ 
++  // The pre-protobuf CLI wrote detached signing materials with the Rekor entry in the
++  // Rekor API response shape. Older signatures in the wild are still verified through it.
++  static final String DETACHED_MEDIA_TYPE =
++      "application/vnd.dev.sigstore.bundle+json;version=0.1-detached";
++
+   static Bundle readBundle(Reader jsonReader) throws BundleParseException {
++    String bundleJson;
++    try {
++      bundleJson = CharStreams.toString(jsonReader);
++    } catch (IOException ioe) {
++      throw new BundleParseException("Could not process bundle json", ioe);
++    }
++    var detachedBundle = asDetachedBundle(bundleJson);
++    if (detachedBundle != null) {
++      return readDetachedBundle(detachedBundle);
++    }
++
+     var protoBundleBuilder = dev.sigstore.proto.bundle.v1.Bundle.newBuilder();
+     try {
+-      ProtoJson.parser().merge(jsonReader, protoBundleBuilder);
++      ProtoJson.parser().merge(bundleJson, protoBundleBuilder);
+     } catch (IOException ioe) {
+       throw new BundleParseException("Could not process bundle json", ioe);
+     }
+@@ -184,4 +207,115 @@ class BundleReader {
+ 
+     return bundleBuilder.build();
+   }
++
++  private static JsonObject asDetachedBundle(String bundleJson) {
++    try {
++      var root = GSON.get().fromJson(bundleJson, JsonObject.class);
++      if (root == null || !root.has("mediaType") || !root.get("mediaType").isJsonPrimitive()) {
++        return null;
++      }
++      if (!DETACHED_MEDIA_TYPE.equals(root.get("mediaType").getAsString())) {
++        return null;
++      }
++      return root;
++    } catch (JsonParseException | RuntimeException e) {
++      // Not a detached bundle document; the protobuf reader reports the actual problem.
++      return null;
++    }
++  }
++
++  private static Bundle readDetachedBundle(JsonObject root) throws BundleParseException {
++    var verificationMaterial = root.getAsJsonObject("verificationMaterial");
++    if (verificationMaterial == null) {
++      throw new BundleParseException("Could not find verification material in bundle json");
++    }
++    var entryJson = verificationMaterial.getAsJsonObject("rekorEntry");
++    if (entryJson == null) {
++      throw new BundleParseException("Could not find any tlog entries in bundle json");
++    }
++    RekorEntry entry;
++    try {
++      entry = GSON.get().fromJson(entryJson, RekorEntry.class);
++    } catch (JsonParseException | RuntimeException e) {
++      throw new BundleParseException("Could not parse rekor entry", e);
++    }
++    if (entry == null) {
++      throw new BundleParseException("Could not parse rekor entry");
++    }
++    if (entry.getVerification().getInclusionProof() == null) {
++      throw new BundleParseException("Could not find an inclusion proof");
++    }
++
++    var bundleBuilder =
++        ImmutableBundle.builder().mediaType(Bundle.BUNDLE_V_0_3_1).addEntries(entry);
++
++    try {
++      bundleBuilder.certPath(ProtoMutators.toCertPath(readCertificates(verificationMaterial)));
++    } catch (CertificateException ce) {
++      throw new BundleParseException("Could not parse bundle certificate chain", ce);
++    }
++
++    var messageSignature = root.getAsJsonObject("messageSignature");
++    if (messageSignature == null) {
++      throw new BundleParseException("A MessageSignature or DSSEEnvelope must be provided");
++    }
++    var signature = Base64.getDecoder().decode(messageSignature.get("signature").getAsString());
++    var messageDigest = messageSignature.getAsJsonObject("messageDigest");
++    if (messageDigest == null) {
++      bundleBuilder.messageSignature(
++          ImmutableMessageSignature.builder().signature(signature).build());
++    } else {
++      var algorithm = messageDigest.get("algorithm").getAsString();
++      if (!HashAlgorithm.SHA2_256.name().equals(algorithm)) {
++        throw new BundleParseException(
++            "Cannot read message digests of type " + algorithm + ", only SHA2_256 is supported");
++      }
++      bundleBuilder.messageSignature(
++          ImmutableMessageSignature.builder()
++              .messageDigest(
++                  ImmutableMessageDigest.builder()
++                      .hashAlgorithm(AlgorithmRegistry.HashAlgorithm.SHA2_256)
++                      .digest(Base64.getDecoder().decode(messageDigest.get("digest").getAsString()))
++                      .build())
++              .signature(signature)
++              .build());
++    }
++
++    var timestampData = verificationMaterial.getAsJsonObject("timestampVerificationData");
++    if (timestampData != null && timestampData.has("rfc3161Timestamps")) {
++      for (var timestamp : timestampData.getAsJsonArray("rfc3161Timestamps")) {
++        bundleBuilder.addTimestamps(
++            ImmutableTimestamp.builder()
++                .rfc3161Timestamp(
++                    Base64.getDecoder()
++                        .decode(timestamp.getAsJsonObject().get("signedTimestamp").getAsString()))
++                .build());
++      }
++    }
++
++    return bundleBuilder.build();
++  }
++
++  private static List<dev.sigstore.proto.common.v1.X509Certificate> readCertificates(
++      JsonObject verificationMaterial) {
++    List<dev.sigstore.proto.common.v1.X509Certificate> certificates = new ArrayList<>();
++    var chain = verificationMaterial.getAsJsonObject("x509CertificateChain");
++    if (chain != null && chain.has("certificates")) {
++      for (var certificate : chain.getAsJsonArray("certificates")) {
++        certificates.add(toCertificate(certificate.getAsJsonObject().get("rawBytes").getAsString()));
++      }
++      return certificates;
++    }
++    var certificate = verificationMaterial.getAsJsonObject("certificate");
++    if (certificate != null) {
++      certificates.add(toCertificate(certificate.get("rawBytes").getAsString()));
++    }
++    return certificates;
++  }
++
++  private static dev.sigstore.proto.common.v1.X509Certificate toCertificate(String rawBytes) {
++    return dev.sigstore.proto.common.v1.X509Certificate.newBuilder()
++        .setRawBytes(ByteString.copyFrom(Base64.getDecoder().decode(rawBytes)))
++        .build();
++  }
+ }

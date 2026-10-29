@@ -1,0 +1,278 @@
+diff -ruN pristine/pkg/component/garden/projectrbac/accessoverlay.go app/pkg/component/garden/projectrbac/accessoverlay.go
+--- a/pkg/component/garden/projectrbac/accessoverlay.go	2026-10-29 02:09:44.000000000 +0000
++++ b/pkg/component/garden/projectrbac/accessoverlay.go	1970-01-01 00:00:00.000000000 +0000
+@@ -1,53 +0,0 @@
+-// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
+-//
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package projectrbac
+-
+-import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+-
+-	corev1 "k8s.io/api/core/v1"
+-	rbacv1 "k8s.io/api/rbac/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
+-)
+-
+-const accessOverlayConfigMapName = "gardener-project-access"
+-
+-// projectAccessOverlay contains additional project subjects contributed through the project
+-// namespace. Extension controllers use it to render project access for the service accounts they
+-// manage without requiring the manage-members verb on the Project itself.
+-type projectAccessOverlay struct {
+-	Admin                 []rbacv1.Subject `json:"admin,omitempty"`
+-	Member                []rbacv1.Subject `json:"member,omitempty"`
+-	UserAccessManager     []rbacv1.Subject `json:"uam,omitempty"`
+-	Viewer                []rbacv1.Subject `json:"viewer,omitempty"`
+-	ServiceAccountManager []rbacv1.Subject `json:"serviceAccountManager,omitempty"`
+-}
+-
+-// accessOverlay reads the project access overlay from the project namespace. It returns nil when no
+-// overlay is present.
+-func (p *projectRBAC) accessOverlay(ctx context.Context) (*projectAccessOverlay, error) {
+-	configMap := &corev1.ConfigMap{}
+-	if err := p.client.Get(ctx, client.ObjectKey{Namespace: *p.project.Spec.Namespace, Name: accessOverlayConfigMapName}, configMap); err != nil {
+-		if apierrors.IsNotFound(err) {
+-			return nil, nil
+-		}
+-		return nil, err
+-	}
+-
+-	data, ok := configMap.Data["subjects"]
+-	if !ok || len(data) == 0 {
+-		return nil, nil
+-	}
+-
+-	overlay := &projectAccessOverlay{}
+-	if err := json.Unmarshal([]byte(data), overlay); err != nil {
+-		return nil, fmt.Errorf("failed parsing the project access overlay: %w", err)
+-	}
+-
+-	return overlay, nil
+-}
+diff -ruN pristine/pkg/component/garden/projectrbac/projectrbac.go app/pkg/component/garden/projectrbac/projectrbac.go
+--- a/pkg/component/garden/projectrbac/projectrbac.go	2026-10-29 02:09:44.000000000 +0000
++++ b/pkg/component/garden/projectrbac/projectrbac.go	2026-10-29 02:44:50.319068439 +0000
+@@ -99,18 +99,9 @@
+ 		}
+ 	}
+ 
+-	overlay, err := p.accessOverlay(ctx)
+-	if err != nil {
+-		return err
+-	}
+-	if overlay != nil {
+-		admins = append(admins, overlay.Admin...)
+-		members = append(members, overlay.Member...)
+-		uams = append(uams, overlay.UserAccessManager...)
+-		viewers = append(viewers, overlay.Viewer...)
+-		serviceAccountManagers = append(serviceAccountManagers, overlay.ServiceAccountManager...)
+-	}
+-
++	// Project access is rendered exclusively from the project's spec (owner and members). It must
++	// not be merged from additional stored configuration, because such a source has no path
++	// through the manage-members authorization check.
+ 	fns := []flow.TaskFn{
+ 		// project admin resources
+ 		func(ctx context.Context) error {
+diff -ruN pristine/plugin/pkg/global/customverbauthorizer/admission.go app/plugin/pkg/global/customverbauthorizer/admission.go
+--- a/plugin/pkg/global/customverbauthorizer/admission.go	2026-10-29 02:09:44.000000000 +0000
++++ b/plugin/pkg/global/customverbauthorizer/admission.go	2026-10-29 02:44:46.688928427 +0000
+@@ -159,13 +159,13 @@
+ 		return c.authorize(ctx, a, CustomVerbModifyProjectTolerationsWhitelist, "modify .spec.tolerations.whitelist")
+ 	}
+ 
+-	// Service account requests come from automation which is authorized separately and manages
+-	// project members outside of the user access management flow.
+-	if !isAutomationRequest(a.GetUserInfo()) && mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, obj.Spec.Owner, a.GetUserInfo()) {
++	// The identity of the requester never authorizes an access change by itself; only the stored
++	// owner, the initial owner on creation, and the manage-members verb can.
++	if mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, oldObj.Spec.Owner, obj.Spec.Owner, a.GetUserInfo(), a.GetOperation()) {
+ 		return c.authorize(ctx, a, CustomVerbProjectManageMembers, "manage human users or groups in .spec.members")
+ 	}
+ 
+-	if mustCheckProjectOwner(oldObj.Spec.Owner, obj.Spec.Owner, a.GetUserInfo()) {
++	if mustCheckProjectOwner(oldObj.Spec.Owner, obj.Spec.Owner, a.GetUserInfo(), a.GetOperation()) {
+ 		return c.authorize(ctx, a, CustomVerbProjectManageMembers, "manage owner in .spec.owner")
+ 	}
+ 
+@@ -281,79 +281,112 @@
+ 	return !apiequality.Semantic.DeepEqual(oldTolerations.Whitelist, tolerations.Whitelist)
+ }
+ 
+-func mustCheckProjectOwner(oldOwner *rbacv1.Subject, owner *rbacv1.Subject, userInfo user.Info) bool {
+-	// allow to set owner initially
+-	if oldOwner == nil && owner != nil {
++func mustCheckProjectOwner(oldOwner *rbacv1.Subject, owner *rbacv1.Subject, userInfo user.Info, operation admission.Operation) bool {
++	// The owner is determined when the project is created. The mutator defaults the creator as the
++	// owner if the request does not name one.
++	if operation == admission.Create {
+ 		return false
+ 	}
+ 
+-	// allow owner to change owner
+-	if userIsOwner(userInfo, oldOwner) {
++	// The current owner may hand the project over.
++	if oldOwner != nil && userIsOwner(userInfo, oldOwner) {
+ 		return false
+ 	}
+ 
++	// In particular, a project which records no owner must not have one installed without
++	// authorization: the previous `oldOwner == nil` shortcut let any updater take the project over.
+ 	return !apiequality.Semantic.DeepEqual(oldOwner, owner)
+ }
+ 
+-func mustCheckProjectMembers(oldMembers, members []core.ProjectMember, owner *rbacv1.Subject, userInfo user.Info) bool {
++func mustCheckProjectMembers(oldMembers, members []core.ProjectMember, oldOwner, newOwner *rbacv1.Subject, userInfo user.Info, operation admission.Operation) bool {
+ 	if apiequality.Semantic.DeepEqual(oldMembers, members) {
+ 		return false
+ 	}
+ 
+-	// If the user submitting this admission request is the owner then it will be/is bound to the `manage-members`
+-	// custom verb anyway, so let's allow him to add/remove human users.
+-	if userIsOwner(userInfo, owner) {
++	// On creation the creator becomes the owner (unless the request names one), so the initial
++	// member list belongs to the creator.
++	if operation == admission.Create {
++		if newOwner == nil {
++			return false
++		}
++		if userIsOwner(userInfo, newOwner) {
++			return false
++		}
++	}
++
++	// The stored owner is bound to the `manage-members` custom verb anyway, so it may manage the
++	// member list without an additional check.
++	if oldOwner != nil && userIsOwner(userInfo, oldOwner) {
+ 		return false
+ 	}
+ 
+-	var oldHumanUsers, newHumanUsers = findHumanUsersWithRoles(oldMembers), findHumanUsersWithRoles(members)
+-	// Remove owner subject from `members` list to always allow it to be added
+-	if owner != nil && isHumanUser(*owner) {
+-		ownerKey := humanMemberKey(*owner)
+-		removeEntriesWithMember(oldHumanUsers, ownerKey)
+-		removeEntriesWithMember(newHumanUsers, ownerKey)
++	oldGrants, newGrants := collectNonServiceAccountGrants(oldMembers), collectNonServiceAccountGrants(members)
++	// An owner entry grants nothing beyond what the owner already has, and a change of the owner
++	// is checked separately by mustCheckProjectOwner. Ignore both the stored and the incoming
++	// owner so that the automatically maintained owner membership is never treated as a change.
++	for _, owner := range []*rbacv1.Subject{oldOwner, newOwner} {
++		if owner != nil {
++			removeGrantsForSubject(oldGrants, subjectKey(*owner))
++			removeGrantsForSubject(newGrants, subjectKey(*owner))
++		}
+ 	}
+ 
+-	return !oldHumanUsers.Equal(newHumanUsers)
++	return !oldGrants.Equal(newGrants)
+ }
+ 
+-type humanMembership struct {
+-	member string
+-	role   string
++// accessGrant is one role held by one member subject. A member with several roles produces several
++// grants; a member without roles produces a grant with an empty role so that its presence counts.
++type accessGrant struct {
++	subject string
++	role    string
+ }
+ 
+-func findHumanUsersWithRoles(members []core.ProjectMember) sets.Set[humanMembership] {
+-	result := sets.New[humanMembership]()
++// collectNonServiceAccountGrants returns the grants held by subjects that are not service accounts.
++// Service accounts are managed outside of the user access management flow, so changes to them are
++// permitted under the ordinary project update permission.
++func collectNonServiceAccountGrants(members []core.ProjectMember) sets.Set[accessGrant] {
++	grants := sets.New[accessGrant]()
+ 
+ 	for _, member := range members {
+-		if isHumanUser(member.Subject) {
+-			memberKey := humanMemberKey(member.Subject)
+-			// Create a unique key that includes both subject and roles
+-			for _, role := range member.Roles {
+-				result.Insert(humanMembership{member: memberKey, role: role})
+-			}
+-			// If no roles are specified, still create an entry with empty role
+-			if len(member.Roles) == 0 {
+-				result.Insert(humanMembership{member: memberKey, role: ""})
+-			}
++		if isServiceAccountSubject(member.Subject) {
++			continue
++		}
++
++		key := subjectKey(member.Subject)
++		if len(member.Roles) == 0 {
++			grants.Insert(accessGrant{subject: key})
++		}
++		for _, role := range member.Roles {
++			grants.Insert(accessGrant{subject: key, role: role})
+ 		}
+ 	}
+ 
+-	return result
++	return grants
+ }
+ 
+-func isHumanUser(subject rbacv1.Subject) bool {
+-	return subject.Kind == rbacv1.UserKind && !strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)
++// isServiceAccountSubject reports whether a member subject is a service account. Only subjects of
++// kind ServiceAccount and users whose name has the `system:serviceaccount:<namespace>:<name>` form
++// qualify. In particular a group is never a service account, even if its name has that shape, and
++// `system:serviceaccounts`/`system:serviceaccounts:<namespace>` are groups.
++func isServiceAccountSubject(subject rbacv1.Subject) bool {
++	switch subject.Kind {
++	case rbacv1.ServiceAccountKind:
++		return true
++	case rbacv1.UserKind:
++		return strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)
++	default:
++		return false
++	}
+ }
+ 
+-func humanMemberKey(subject rbacv1.Subject) string {
++func subjectKey(subject rbacv1.Subject) string {
+ 	return subject.Kind + subject.Name
+ }
+ 
+-func removeEntriesWithMember(set sets.Set[humanMembership], member string) {
+-	for membership := range set {
+-		if membership.member == member {
+-			set.Delete(membership)
++func removeGrantsForSubject(grants sets.Set[accessGrant], subject string) {
++	for grant := range grants {
++		if grant.subject == subject {
++			delete(grants, grant)
+ 		}
+ 	}
+ }
+diff -ruN pristine/plugin/pkg/global/customverbauthorizer/compat.go app/plugin/pkg/global/customverbauthorizer/compat.go
+--- a/plugin/pkg/global/customverbauthorizer/compat.go	2026-10-29 02:09:44.000000000 +0000
++++ b/plugin/pkg/global/customverbauthorizer/compat.go	1970-01-01 00:00:00.000000000 +0000
+@@ -1,19 +0,0 @@
+-// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
+-//
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package customverbauthorizer
+-
+-import (
+-	"strings"
+-
+-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+-	"k8s.io/apiserver/pkg/authentication/user"
+-)
+-
+-// isAutomationRequest reports whether an admission request is issued by a service account.
+-// Service accounts are provisioned and authorized by the operator for automation purposes and
+-// manage project members outside of the user access management flow.
+-func isAutomationRequest(info user.Info) bool {
+-	return info != nil && strings.HasPrefix(info.GetName(), serviceaccount.ServiceAccountUsernamePrefix)
+-}

@@ -1,0 +1,65 @@
+diff --git a/src/serena/dashboard.py b/src/serena/dashboard.py
+index 70a691d..16dfa6e 100644
+--- a/src/serena/dashboard.py
++++ b/src/serena/dashboard.py
+@@ -15,7 +15,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Optional, Self
+ 
+ import psutil
+-from flask import Flask, Response, redirect, request, send_from_directory
++from flask import Flask, Response, abort, redirect, request, send_from_directory
+ from PIL import Image
+ from pydantic import BaseModel
+ from sensai.util import logging
+@@ -781,6 +781,13 @@ class SerenaDashboardAPI:
+ 
+         cli.show_server_banner = lambda *args, **kwargs: None
+ 
++        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
++
++        @self._app.before_request
++        def _check_request_host() -> None:
++            if request.host not in allowed:
++                abort(403)
++
+         self._app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+         return port
+ 
+@@ -1138,6 +1145,13 @@ class SerenaDashboardTrayManager:
+ 
+         log.info("Starting tray manager")
+ 
++        allowed = {f"127.0.0.1:{self.PORT}", f"localhost:{self.PORT}"}
++
++        @self._app.before_request
++        def _check_request_host() -> None:
++            if request.host not in allowed:
++                abort(403)
++
+         dashboard_path = Path(SERENA_DASHBOARD_DIR)
+ 
+         # select the appropriate icon for the platform
+diff --git a/src/serena/dashboard_standalone.py b/src/serena/dashboard_standalone.py
+index 3d7c88a..b16b3b7 100644
+--- a/src/serena/dashboard_standalone.py
++++ b/src/serena/dashboard_standalone.py
+@@ -7,10 +7,19 @@ application is unchanged; this module only selects how it is served.
+ 
+ from wsgiref.simple_server import make_server
+ 
++from flask import abort, request
++
+ from serena.dashboard import SerenaDashboardAPI
+ 
+ 
+ def serve(dashboard: SerenaDashboardAPI, host: str, port: int) -> None:
+     """Serve ``dashboard`` on ``host``/``port`` until the process is stopped."""
++    allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
++
++    @dashboard.app.before_request
++    def _check_request_host() -> None:
++        if request.host not in allowed:
++            abort(403)
++
+     with make_server(host, port, dashboard.app) as httpd:
+         httpd.serve_forever()

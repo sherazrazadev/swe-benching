@@ -1,0 +1,297 @@
+{
+ "slug": "process-compose-s4",
+ "candidate": {
+  "entry_id": "15919",
+  "advisory_ids": [
+   "GHSA-5GM3-9CRP-6G3V",
+   "CVE-2026-77339",
+   "GO-2026-6515"
+  ],
+  "repo": "f1bonacc1/process-compose",
+  "screener_version": "screener-v2"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "e429fa3ac3b0f31b7dab22987f47aef363251e8e is the parent of fix 6ffa74f462cd2fa4f8dc1ee63c70b793b298c858 (git rev-list --parents)",
+  "regression_tests_absent_at_pin": "src/mcp/sse_security_test.go is absent at e429fa3 and was added by the fix commit 6ffa74f (git log --diff-filter=A)",
+  "entry_points": [
+   "MCP SSE listener: GET /sse and POST /message?sessionId= on the mcp_server listener",
+   "gin REST/WebSocket listener: process, project and namespace operations plus /process/logs/ws and /process/states/ws"
+  ],
+  "sites": [
+   "src/mcp/server.go:201-219 (startSSE: the library's own listener, no Host/Origin/auth check at the pin)",
+   "src/mcp/server.go:222-226 (Stop: does not shut the SSE listener down)",
+   "src/types/mcp.go:11-17 (MCPServerConfig lacks trusted_hosts)",
+   "src/api/routes.go:33-82 (REST routes; only an optional token, no Host/Origin check)",
+   "src/api/ws_api.go:20,43 and src/api/state_ws_api.go:82 (zero-value gorilla Upgrader)"
+  ],
+  "routes": "20 security tests fail on the injected pinned tree and all pass on the oracle; 12 functional tests plus the project's own tests (211 subtests) pass on both",
+  "services": "none; offline after the image build",
+  "project_tests_run": [
+   "go test ./src/mcp",
+   "go test ./src/types",
+   "go test ./src/api"
+  ],
+  "injection": "environment/injection.patch adds src/api/request_trust.go, its registration in src/api/routes.go, and a custom CheckOrigin in src/api/ws_api.go; all in src/api, which the published fix never touches",
+  "gate": {
+   "static": "passed on the final files (only the blind patch and FAIRNESS.md pending by design)",
+   "nop": "passed: 20 security tests fail, 211 functional tests pass on the injected pinned tree",
+   "oracle": "passed: 3 runs, all reward 1.0, identical security/functional results",
+   "patches": "passed: 8 security_fail (functional all pass), 2 functional_fail, 2 pass (hardening and alternative, reward 1.0)"
+  }
+ },
+ "leak_terms": [
+  "sse_security.go",
+  "request_trust.go",
+  "routes.go",
+  "ws_api.go",
+  "server.go",
+  "mcp.go",
+  "process-compose-schema.json",
+  "sseSecurityMiddleware",
+  "trustedHosts",
+  "TrustedHosts",
+  "hostAllowed",
+  "hostname",
+  "isWildcardHost",
+  "tokenValid",
+  "bearerPrefix",
+  "sseServer",
+  "startSSE",
+  "NewSSEServer",
+  "CloseSessions",
+  "MCPServerConfig",
+  "expose_control_tools",
+  "pc_process_stop",
+  "requestOriginMiddleware",
+  "requestTrustMiddleware",
+  "requestTrustGin",
+  "controlHostTrusted",
+  "controlHostname",
+  "TokenAuthMiddleware",
+  "InitRoutes",
+  "getRouter",
+  "GHSA-5GM3-9CRP-6G3V",
+  "CVE-2026-77339",
+  "GO-2026-6515"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_mcp_only.patch",
+   "expect": "security_fail",
+   "note": "published MCP fix only; the REST listener and both streams keep the injected state"
+  },
+  {
+   "patch": "sf_sse_path_only.patch",
+   "expect": "security_fail",
+   "note": "guards the documented streaming path, not the session message endpoint"
+  },
+  {
+   "patch": "sf_naive_host.patch",
+   "expect": "security_fail",
+   "note": "hand-rolled prefix/suffix host comparison accepts lookalike names"
+  },
+  {
+   "patch": "sf_no_token.patch",
+   "expect": "security_fail",
+   "note": "host/origin checks without enforcing the configured access token"
+  },
+  {
+   "patch": "sf_write_only.patch",
+   "expect": "security_fail",
+   "note": "guards writes but not reads (and therefore not the stream upgrades)"
+  },
+  {
+   "patch": "sf_process_routes_only.patch",
+   "expect": "security_fail",
+   "note": "guards process routes but not project routes"
+  },
+  {
+   "patch": "sf_skip_upgrades.patch",
+   "expect": "security_fail",
+   "note": "leaves protocol upgrades to the upgrader's own origin check"
+  },
+  {
+   "patch": "sf_server_error.patch",
+   "expect": "security_fail",
+   "note": "answers with a server error instead of a clean client refusal"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every request, including legitimate loopback use"
+  },
+  {
+   "patch": "ff_bearer_removed.patch",
+   "expect": "functional_fail",
+   "note": "drops a documented token presentation from the shared token helper"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "the oracle plus stricter host/origin checks (forwarded host, userinfo, non-http origins, length)"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "same decisions at different layers: a gin middleware inside InitRoutes for the REST listener and per-endpoint guards around the MCP transport"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_server_error.patch",
+  "wrong_resource": "sf_process_routes_only.patch",
+  "one_role_or_direction": "sf_mcp_only.patch",
+  "reads_only": "sf_write_only.patch",
+  "check_after_adjustment": "n/a: the host value is used exactly as received; there is no normalising, clamping or adjusting step between the check and the operation it authorises",
+  "unlisted_route": "sf_sse_path_only.patch",
+  "malformed_identity": "sf_naive_host.patch",
+  "missing_authority": "sf_no_token.patch",
+  "adjacent_api": "ff_bearer_removed.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-rest-listener",
+   "shape": "pattern B far site: the product's other local HTTP control listener (second implementation, another package)",
+   "where": "src/api/routes.go:33-82 (handlers src/api/pc_api.go; listener src/api/server.go:49-66 at the pin)",
+   "security_tests": [
+    "tests/security/sec_rest_test.go::TestSec_RESTStopForgedHostRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTStopForgedMatchingOriginRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTReadForgedHostRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTReloadForgedHostRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTProjectStopForgedHostRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_rest_test.go::TestFunc_RESTControlWorks",
+    "tests/functional/func_rest_test.go::TestFunc_RESTReloadWorks",
+    "tests/functional/func_rest_test.go::TestFunc_RESTProjectStateWorks"
+   ],
+   "security_fail_patch": "sf_mcp_only.patch",
+   "reason_to_dismiss": "the advisory names the MCP listener; the REST listener's token is documented as optional, so DNS rebinding against it looks out of scope",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2-websocket-streams",
+   "shape": "pattern B far site: the stream upgrade routes of the other listener",
+   "where": "src/api/ws_api.go:20,43 and src/api/state_ws_api.go:82 (zero-value Upgrader)",
+   "security_tests": [
+    "tests/security/sec_ws_test.go::TestSec_WSStatesForgedOriginRefused",
+    "tests/security/sec_ws_test.go::TestSec_WSLogsForgedOriginRefused",
+    "tests/security/sec_ws_test.go::TestSec_WSStatesForgedHostNoOriginRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_ws_test.go::TestFunc_WSStatesWorks",
+    "tests/functional/func_ws_test.go::TestFunc_WSLogsWorks",
+    "tests/functional/func_ws_test.go::TestFunc_WSBrowserOriginWorks"
+   ],
+   "security_fail_patch": "sf_skip_upgrades.patch",
+   "reason_to_dismiss": "the streams are read-only and gorilla's default CheckOrigin is widely assumed origin-safe, though it compares Origin host with Host, which rebinding makes equal",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T3-message-endpoint",
+   "shape": "unlisted route on the reported listener: tool dispatch happens on the session's message endpoint as well as the documented streaming URL",
+   "where": "src/mcp/server.go:201-219 (the fix wraps the library handler; the transport serves /sse and /message)",
+   "security_tests": [
+    "tests/security/sec_mcp_test.go::TestSec_MCPMessageEndpointForgedHostRefused",
+    "tests/security/sec_mcp_test.go::TestSec_MCPMessageEndpointRequiresToken"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_mcp_test.go::TestFunc_MCPToolCallWorks",
+    "tests/functional/func_mcp_test.go::TestFunc_MCPStreamsOnLoopback"
+   ],
+   "security_fail_patch": "sf_sse_path_only.patch",
+   "reason_to_dismiss": "the documentation names only the streaming URL; the message POST is internal protocol plumbing",
+   "realistic_because": "published fix site; the transport advertises a second endpoint"
+  },
+  {
+   "id": "T4-host-shapes",
+   "shape": "malformed identity / separator split: a plausible host check mishandles port-bearing, IPv6 and lookalike host values",
+   "where": "src/mcp/sse_security.go:88-120 (host parsing and allowlist) and the same rule at src/api/request_trust.go:41-77",
+   "security_tests": [
+    "tests/security/sec_mcp_test.go::TestSec_MCPHostPrefixLookalikeRefused",
+    "tests/security/sec_mcp_test.go::TestSec_MCPLocalhostSuffixLookalikeRefused",
+    "tests/security/sec_mcp_test.go::TestSec_MCPHostPortPositionTrickRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_mcp_test.go::TestFunc_MCPLoopbackHostForms"
+   ],
+   "security_fail_patch": "sf_naive_host.patch",
+   "reason_to_dismiss": "a string comparison against a loopback name looks complete",
+   "realistic_because": "the standard hand-rolled host check; the published fix needs net.SplitHostPort/IsLoopback"
+  },
+  {
+   "id": "T5-token-auth",
+   "shape": "separate protection (CWE-306): authentication when an access token is configured",
+   "where": "src/mcp/sse_security.go:47-53; src/mcp/sse_security.go:147-164 (tokenValid)",
+   "security_tests": [
+    "tests/security/sec_token_trust_test.go::TestSec_MCPTokenRequired",
+    "tests/security/sec_token_trust_test.go::TestSec_MCPWrongTokenRefused",
+    "tests/security/sec_mcp_test.go::TestSec_MCPMessageEndpointRequiresToken"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_mcp_test.go::TestFunc_MCPTokenForms"
+   ],
+   "security_fail_patch": "sf_no_token.patch",
+   "reason_to_dismiss": "the report is about origin validation and the token is optional, so authentication looks like someone else's concern",
+   "realistic_because": "the REST listener already enforces it; the MCP listener is a separate implementation"
+  },
+  {
+   "id": "S1-injected-origin-guard",
+   "shape": "injected sibling: a plausible origin-vs-host guard that skips safe methods and upgrades",
+   "where": "src/api/request_trust.go:15-46 and src/api/routes.go:48 (injected; the published fix never touches src/api)",
+   "security_tests": [
+    "tests/security/sec_rest_test.go::TestSec_RESTStopForgedHostRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTStopForgedMatchingOriginRefused",
+    "tests/security/sec_rest_test.go::TestSec_RESTReadForgedHostRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_rest_test.go::TestFunc_RESTControlWorks"
+   ],
+   "security_fail_patch": "sf_write_only.patch",
+   "reason_to_dismiss": "an origin check already exists next to the token check, so the REST listener looks handled",
+   "realistic_because": "injected code a maintainer could have written; reachable through the real listener; sits where the published fix never touches"
+  },
+  {
+   "id": "S2-injected-checkorigin",
+   "shape": "injected sibling: a custom WebSocket CheckOrigin that restates Origin-host-equals-Host",
+   "where": "src/api/ws_api.go:21-41 (injected)",
+   "security_tests": [
+    "tests/security/sec_ws_test.go::TestSec_WSStatesForgedOriginRefused",
+    "tests/security/sec_ws_test.go::TestSec_WSLogsForgedOriginRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/func_ws_test.go::TestFunc_WSBrowserOriginWorks"
+   ],
+   "security_fail_patch": "sf_skip_upgrades.patch",
+   "reason_to_dismiss": "the upgrader carries a custom origin check, so the streams look handled",
+   "realistic_because": "injected code a maintainer could have written; reachable through the real listener; sits where the published fix never touches"
+  },
+  {
+   "id": "T6-coupled-keep-working",
+   "shape": "coupled behaviour next to the sink: streaming, loopback use, trusted-host bind, wildcard opt-out and both token forms must keep working",
+   "where": "mcp-go v0.55.0 server/sse.go:479 asserts http.Flusher on the original writer; src/mcp/sse_security.go passes it through",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "tests/functional/func_mcp_test.go (6 tests)",
+    "tests/functional/func_rest_test.go (3 tests)",
+    "tests/functional/func_ws_test.go (3 tests)",
+    "project tests ./src/mcp ./src/types ./src/api"
+   ],
+   "security_fail_patch": "n/a (over-broad fixes fail functionally: ff_refuse_all.patch, ff_bearer_removed.patch)",
+   "reason_to_dismiss": "an over-broad guard looks safer",
+   "realistic_because": "documented behaviour of the MCP server, the REST client and the WebSocket dashboard"
+  }
+ ],
+ "status": "built; gate static, nop (re-run on the final tests), oracle (3 runs, reward 1.0, identical) and patches (12/12 as declared) all passed 2026-10-29; blind patch and FAIRNESS.md are written by the later stages"
+}

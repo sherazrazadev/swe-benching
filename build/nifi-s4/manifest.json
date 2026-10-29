@@ -1,0 +1,238 @@
+{
+ "slug": "nifi-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "entry_id": "24615",
+  "advisory_ids": [
+   "GHSA-8VM2-C32J-MVFR",
+   "CVE-2026-54665"
+  ],
+  "repo": "apache/nifi",
+  "pinned_commit": "d54864b63b2df37a5184685deb67570d82222eca",
+  "fix_commits": [
+   "41625c4433898922b0a3e7635f597cb4ef197c28"
+  ],
+  "pattern_fit": "B",
+  "O9_family": "Origin validation error / host header injection into generated absolute URLs (CWE-346)",
+  "O11_fix_minutes": 45,
+  "note": "Full screener record is in build/nifi-s4/BUILD-PROMPT.md."
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "Real HTTP(S) requests to the NiFi web connector built by the product's own StandardServerProvider: a request to /nifi/logout-complete is handled by the product's LogoutCompleteRedirectFilter, which builds an absolute redirect from the shared request URI resolver. On the pinned (plus injected) code, X-ProxyHost / X-Forwarded-Host / Forwarded / X-ProxyPort values become the redirect authority. Probed on the pinned commit and reproduced by 11 security testcases.",
+  "sites": [
+   "nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java:97-114 (getHost reads proxy host headers with no allow-list) [published landing point]",
+   "nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java:136-148 (getPort reads proxy port headers with no allow-list) [uncovered route L1]",
+   "nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/FrameworkServerConnectorFactory.java (allow-list parser and HttpConfiguration customizer) [published fix]",
+   "nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty/src/main/java/org/apache/nifi/web/server/connector/ProxyHeaderValidatorCustomizer.java (new customizer) [published fix, oracle]",
+   "nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java getLastHeader/getForwardedHost (injected siblings L3, L4)"
+  ],
+  "routes": [
+   "HTTPS request with X-ProxyHost or X-Forwarded-Host naming an unlisted host (published path; injected code makes both reach the resolver)",
+   "Plain-HTTP request with either proxy host header (published check does nothing when request.isSecure() is false) [L2]",
+   "HTTPS request with an allowed host but X-ProxyPort / X-Forwarded-Port naming an unlisted port, or host:port with an unlisted port [L1]",
+   "HTTPS request with a repeated X-Forwarded-Host whose last value is unlisted (injected resolver reads the last value; Jetty HttpFields.get returns the first) [L3]",
+   "HTTPS request with a standard Forwarded host= parameter naming an unlisted host (injected resolver parses it; the connector-level check does not) [L4]"
+  ],
+  "variants": [
+   "X-ProxyHost and X-Forwarded-Host",
+   "secure and plain connections",
+   "authority host and authority port (separate port headers and host:port)",
+   "repeated forwarding header values (allowed then unlisted)",
+   "standard structured Forwarded host parameter, plain and quoted"
+  ],
+  "services": [],
+  "project_tests_run": "nifi-commons/nifi-web-servlet-shared StandardRequestUriProviderTest (22) and RequestUriBuilderTest (3); nifi-framework-bundle/nifi-framework/nifi-web/nifi-jetty StandardServerProviderTest (4). All pass offline in the environment image at the pinned (plus injected) commit; the connector test is also run as a functional testcase in the verifier.",
+  "no_leaked_regression_tests": "The fix commit 41625c44 is the direct child of the pinned commit d54864b6; its added proxy-host assertions in StandardServerProviderTest and its new customizer are absent at the pinned commit. Only the pre-existing StandardServerProviderTest (renamed copy) is used in the functional group."
+ },
+ "leak_terms": [
+  "StandardRequestUriProvider",
+  "ProxyHeaderValidatorCustomizer",
+  "FrameworkServerConnectorFactory",
+  "HostPortValidatorCustomizer",
+  "ProxyAddressHandler",
+  "StandardServerProvider",
+  "getValidProxyHosts",
+  "getAllowedHostsAsList",
+  "HOST_PORT_SEPARATOR",
+  "nifi.web.proxy.host",
+  "nifi-jetty",
+  "nifi-web-servlet-shared",
+  "nifi-framework-bundle",
+  "X-Forwarded-Host",
+  "Forwarded",
+  "X-ProxyPort",
+  "X-Forwarded-Port",
+  "Misdirected Request",
+  "421",
+  "CVE-2026-54665",
+  "GHSA-8vm2-c32j-mvfr",
+  "41625c4433",
+  "d54864b63b",
+  "NIFI-15953",
+  "ProxyHeader"
+ ],
+ "patch_checks": [
+  {
+   "patch": "published_fix_only.patch",
+   "expect": "functional_fail",
+   "why": "the upstream fix as published: exact-string host match rejects the legitimate configured host:port form, and it leaves the injected input forms open"
+  },
+  {
+   "patch": "secure_only.patch",
+   "expect": "security_fail",
+   "lever": "L2",
+   "why": "the tempting wrong fix: validate only when the connection is secure, leaving the plain-HTTP route open"
+  },
+  {
+   "patch": "no_port_check.patch",
+   "expect": "security_fail",
+   "lever": "L1",
+   "why": "validates the host but not the authority port"
+  },
+  {
+   "patch": "first_value_only.patch",
+   "expect": "security_fail",
+   "lever": "L3",
+   "why": "checks only the first value of a repeated forwarding header while the resolver uses the last"
+  },
+  {
+   "patch": "no_forwarded.patch",
+   "expect": "security_fail",
+   "lever": "L4",
+   "why": "ignores the standard structured forwarding host parameter while the resolver honours it"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "why": "refuses every request that carries a proxy address, breaking legitimate allowed addresses"
+  },
+  {
+   "patch": "crash_on_bad.patch",
+   "expect": "security_fail",
+   "why": "throws an unchecked exception instead of refusing with a client error (server error)"
+  },
+  {
+   "patch": "port_only.patch",
+   "expect": "security_fail",
+   "why": "validates the port but not the host (wrong part of the authority)"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "oracle plus length and control-character hardening of the validated value"
+  },
+  {
+   "patch": "alt_correct_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "different design: validates in a Jetty Handler added to the product's standard handler chain, driven by the default handler that ServerProvider installs"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_on_bad.patch",
+  "wrong_resource": "port_only.patch",
+  "one_role_or_direction": "n/a: the decision does not depend on a caller role or a request direction; the plain-connection route is covered as unlisted_route",
+  "reads_only": "n/a: the protected operation is URL generation on every request; there is no separate read path and write path",
+  "check_after_adjustment": "no_port_check.patch",
+  "unlisted_route": "secure_only.patch",
+  "malformed_identity": "n/a: the value is an authority (host and port), not a structured identity; malformed authorities are refused by the same check",
+  "missing_authority": "n/a: no external authority or permission object is consulted; the decision is against a configured allow-list",
+  "adjacent_api": "no_forwarded.patch"
+ },
+ "traps": [
+  {
+   "id": "L1",
+   "pattern": "B",
+   "shape": "HOW-type coupled value and shape: the protected authority is host AND port; configured public addresses may carry a port, and proxy port headers are consumed with no allow-list",
+   "where": "nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java:136-148",
+   "reason_to_dismiss": "the report's example is a bare host and the Host header's own port already has a separate validator, so the proxy port looks handled",
+   "security_tests": [
+    "SecurityProxyPortHeaderTest::secureRequestWithUnlistedProxyPortIsNotAdvertised",
+    "SecurityProxyPortHeaderTest::secureRequestWithUnlistedForwardedPortIsNotAdvertised",
+    "SecurityProxyPortHeaderTest::secureRequestWithUnlistedPortInProxyHostIsNotAdvertised",
+    "SecurityProxyPortHeaderTest::plainRequestWithUnlistedProxyPortIsNotAdvertised"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalAllowedAuthorityTest::allowedHostWithConfiguredPortIsAdvertised",
+    "FunctionalAllowedAuthorityTest::allowedHostWithSeparateProxyPortIsAdvertised",
+    "FunctionalAllowedAuthorityTest::allowedHostWithSeparateForwardedPortIsAdvertised",
+    "FunctionalAllowedAuthorityTest::allowedHostWithConfiguredPortIsAdvertisedOnPlainConnection"
+   ],
+   "security_fail_patch": "no_port_check.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix's own allow-list parser splits configured host:port entries and drops the port"
+  },
+  {
+   "id": "L2",
+   "pattern": "B",
+   "shape": "HOW-type route where the protection never existed: the published check runs only for secure requests",
+   "where": "nifi-commons/nifi-web-servlet-shared/src/main/java/org/apache/nifi/web/servlet/shared/StandardRequestUriProvider.java:97-114 and the secure branch of the published customizer",
+   "reason_to_dismiss": "the pinned documentation scopes the proxy host property and Host matching to secure deployments, so a plain-HTTP deployment reads as out of scope",
+   "security_tests": [
+    "SecurityProxyHostHeaderTest::plainRequestWithUnlistedProxyHostIsNotAdvertised",
+    "SecurityProxyHostHeaderTest::plainRequestWithUnlistedForwardedHostIsNotAdvertised",
+    "SecurityProxyPortHeaderTest::plainRequestWithUnlistedProxyPortIsNotAdvertised"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalAllowedHostTest::allowedProxyHostIsAdvertisedOnPlainConnection",
+    "FunctionalAllowedHostTest::allowedForwardedHostIsAdvertisedOnPlainConnection",
+    "FunctionalAllowedAuthorityTest::allowedHostWithConfiguredPortIsAdvertisedOnPlainConnection",
+    "FunctionalDirectRequestTest::directPlainRequestKeepsRequestAddress"
+   ],
+   "security_fail_patch": "secure_only.patch",
+   "realistic_because": "real, unmodified upstream code; the published customizer returns the request unchanged when request.isSecure() is false"
+  },
+  {
+   "id": "L3",
+   "pattern": "B",
+   "shape": "HOW-type injected parser differential: the shared resolver reads the LAST value of a repeated forwarding header, the Jetty check reads only the first",
+   "where": "injected StandardRequestUriProvider.getHost / getLastHeader; the check reads HttpFields.get (first field)",
+   "reason_to_dismiss": "a single-valued header is assumed and the check and the resolver look consistent",
+   "security_tests": [
+    "SecurityRepeatedForwardedHostTest::allowedValueFollowedByUnlistedValueIsNotAdvertised"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalRepeatedForwardedHostTest::valuesOfAnAllowedForwardingChainAreAdvertised",
+    "FunctionalRepeatedForwardedHostTest::repeatedIdenticalAllowedValueIsAdvertised"
+   ],
+   "security_fail_patch": "first_value_only.patch",
+   "realistic_because": "injected: a forwarding-chain resolver that honours the most recent hop, reachable through the real connector; Jetty's HttpFields.get really does return the first field"
+  },
+  {
+   "id": "L4",
+   "pattern": "B",
+   "shape": "HOW-type injected second parsing implementation: the shared resolver honours the RFC 7239 Forwarded host parameter, which the connector-level allow-list never inspects",
+   "where": "injected StandardRequestUriProvider.getForwardedHost; the check's supported header set names only the two NiFi proxy headers",
+   "reason_to_dismiss": "the documented proxy headers are the two NiFi-specific ones; a generic standard header looks unrelated to the property and to the reported header",
+   "security_tests": [
+    "SecurityStandardForwardedHeaderTest::unlistedHostParameterIsNotAdvertised",
+    "SecurityStandardForwardedHeaderTest::quotedUnlistedHostParameterIsNotAdvertised"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalStandardForwardedHeaderTest::allowedHostParameterIsAdvertised",
+    "FunctionalStandardForwardedHeaderTest::quotedAllowedHostParameterIsAdvertised"
+   ],
+   "security_fail_patch": "no_forwarded.patch",
+   "realistic_because": "injected: standard proxy-header support added to the shared resolver, with the connector-level allow-list left behind"
+  }
+ ],
+ "other_published_sites_tested": {
+  "both NiFi proxy host header names on a secure connection (the published fix's own path)": "SecurityProxyHostHeaderTest::secureRequestWithUnlistedProxyHostIsNotAdvertised, ...ForwardedHostIsNotAdvertised",
+  "request-host exemption on a secure connection": "FunctionalDirectRequestTest::proxyHostEqualToRequestHostIsAdvertised",
+  "direct requests with no proxy address (secure and plain)": "FunctionalDirectRequestTest::directSecureRequestKeepsRequestAddress, directPlainRequestKeepsRequestAddress",
+  "a server error is not an acceptable refusal": "SecurityProxyPortHeaderTest (any 5xx fails assertAddressNotAdvertised); crash_on_bad.patch"
+ },
+ "status": "built (gate PASSED: static, nop, oracle, patches; blind patch and FAIRNESS.md pending, written by others)",
+ "notes": "Local results before the gate (docker, offline /opt/m2): nop security 0/11 functional 19/19; oracle 11/11 and 19/19 twice identically; every check patch behaved as declared (secure_only 3 security fail, no_port_check 4, first_value_only 1, no_forwarded 2, port_only 7, crash_on_bad 11; refuse_all 13 functional fail; published_fix_only 8 security + 1 functional fail; hardening and alt_correct_fix 0/0). The pin is the direct parent of the fix; the fix's regression assertions are absent at the pin."
+}

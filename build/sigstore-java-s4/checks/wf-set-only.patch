@@ -1,0 +1,95 @@
+diff --git a/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java b/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
+index 68632a9..f095a64 100644
+--- a/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
++++ b/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
+@@ -144,6 +144,13 @@ public class DetachedSignatureVerifier {
+       throw new KeylessVerificationException("Transparency log entry could not be verified", ex);
+     }
+ 
++    // The entry time stands for the signing time only when the log signed it. Without a
++    // verified log signature there is nothing here that establishes the signing time.
++    var set = entry.getVerification().getSignedEntryTimestamp();
++    if (set == null || set.isEmpty()) {
++      throw new KeylessVerificationException("No verified signing time was provided");
++    }
++
+     var entryDate = Date.from(entry.getIntegratedTimeInstant());
+     try {
+       leafCert.checkValidity(entryDate);
+diff --git a/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java b/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java
+index 30d0425..aeb05d3 100644
+--- a/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java
++++ b/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java
+@@ -61,8 +61,10 @@ import java.security.cert.CertificateExpiredException;
+ import java.security.cert.CertificateNotYetValidException;
+ import java.security.cert.X509Certificate;
+ import java.security.spec.InvalidKeySpecException;
++import java.time.Instant;
+ import java.util.Arrays;
+ import java.util.Base64;
++import java.util.Date;
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.stream.Collectors;
+@@ -183,20 +185,41 @@ public class KeylessVerifier {
+       signature = dsseEnvelope.getSignature();
+     }
+ 
+-    verifyTimestamps(leafCert, bundle.getTimestamps(), signature);
+-
+     try {
+       rekorVerifier.verifyEntry(rekorEntry);
+     } catch (RekorVerificationException ex) {
+       throw new KeylessVerificationException("Transparency log entry could not be verified", ex);
+     }
++
++    // Only a log signature that was actually verified authenticates the entry time. An
++    // entry may carry the field with no signature in it, and then the time is not proven.
++    var set = rekorEntry.getVerification().getSignedEntryTimestamp();
++    if (set == null || set.isEmpty()) {
++      throw new KeylessVerificationException("No verified signing time was provided");
++    }
++    var entryTime = rekorEntry.getIntegratedTimeInstant();
++
++    verifyTimestamps(leafCert, bundle.getTimestamps(), entryTime, signature);
+   }
+ 
+   private void verifyTimestamps(
+-      X509Certificate leafCert, List<Bundle.Timestamp> timestamps, byte[] signature)
++      X509Certificate leafCert,
++      List<Bundle.Timestamp> timestamps,
++      Instant entryTime,
++      byte[] signature)
+       throws KeylessVerificationException {
+-    if (timestamps == null || timestamps.isEmpty()) {
+-      return;
++    if (timestamps.isEmpty() && entryTime == null) {
++      throw new KeylessVerificationException("No valid timestamps found in bundle");
++    }
++    if (entryTime != null) {
++      var entryDate = Date.from(entryTime);
++      try {
++        leafCert.checkValidity(entryDate);
++      } catch (CertificateNotYetValidException e) {
++        throw new KeylessVerificationException("Signing time was before certificate validity", e);
++      } catch (CertificateExpiredException e) {
++        throw new KeylessVerificationException("Signing time was after certificate expiry", e);
++      }
+     }
+     for (Bundle.Timestamp timestamp : timestamps) {
+       byte[] tsBytes = timestamp.getRfc3161Timestamp();
+diff --git a/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java b/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java
+index cdb03d2..c3267ee 100644
+--- a/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java
++++ b/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java
+@@ -71,7 +71,9 @@ public abstract class Bundle {
+   @Value.Check
+   protected void checkAtLeastOneTimestamp() {
+     for (var entry : getEntries()) {
+-      if (entry.getVerification().getSignedEntryTimestamp() != null) {
++      if (entry.getVerification().getSignedEntryTimestamp() != null
++          && !entry.getVerification().getSignedEntryTimestamp().isEmpty()
++          && entry.getIntegratedTime() > 0) {
+         return;
+       }
+     }

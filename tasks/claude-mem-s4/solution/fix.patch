@@ -1,0 +1,299 @@
+diff -ruN a/src/bin/cleanup-duplicates.ts b/src/bin/cleanup-duplicates.ts
+--- a/src/bin/cleanup-duplicates.ts	2026-04-06 21:18:28.000000000 +0000
++++ b/src/bin/cleanup-duplicates.ts	2026-10-29 01:58:29.515961154 +0000
+@@ -17,7 +17,8 @@
+   const duplicateObsQuery = db['db'].prepare(`
+     SELECT memory_session_id, title, subtitle, type, COUNT(*) as count, GROUP_CONCAT(id) as ids
+     FROM observations
+-    GROUP BY memory_session_id, title, subtitle, type
++    GROUP BY memory_session_id, type, title, subtitle, facts, narrative, concepts,
++             files_read, files_modified, prompt_number
+     HAVING count > 1
+   `);
+ 
+@@ -52,7 +53,8 @@
+   const duplicateSumQuery = db['db'].prepare(`
+     SELECT memory_session_id, request, completed, learned, COUNT(*) as count, GROUP_CONCAT(id) as ids
+     FROM session_summaries
+-    GROUP BY memory_session_id, request, completed, learned
++    GROUP BY memory_session_id, request, investigated, learned, completed,
++             next_steps, notes, prompt_number
+     HAVING count > 1
+   `);
+ 
+diff -ruN a/src/bin/import-xml-observations.ts b/src/bin/import-xml-observations.ts
+--- a/src/bin/import-xml-observations.ts	2026-04-06 21:18:28.000000000 +0000
++++ b/src/bin/import-xml-observations.ts	2026-10-29 01:58:39.799299830 +0000
+@@ -304,17 +304,6 @@
+     // Try parsing as observation first
+     const observation = parseObservation(block);
+     if (observation) {
+-      // Check for duplicate
+-      const existingObs = db['db'].prepare(`
+-        SELECT id FROM observations
+-        WHERE memory_session_id = ? AND title = ? AND subtitle = ? AND type = ?
+-      `).get(memorySessionId, observation.title, observation.subtitle, observation.type);
+-
+-      if (existingObs) {
+-        duplicateObs++;
+-        continue;
+-      }
+-
+       try {
+         db.storeObservation(
+           memorySessionId,
+@@ -336,17 +325,6 @@
+     // Try parsing as summary
+     const summary = parseSummary(block);
+     if (summary) {
+-      // Check for duplicate
+-      const existingSum = db['db'].prepare(`
+-        SELECT id FROM session_summaries
+-        WHERE memory_session_id = ? AND request = ? AND completed = ? AND learned = ?
+-      `).get(memorySessionId, summary.request, summary.completed, summary.learned);
+-
+-      if (existingSum) {
+-        duplicateSum++;
+-        continue;
+-      }
+-
+       try {
+         db.storeSummary(
+           memorySessionId,
+diff -ruN a/src/services/sqlite/SessionStore.ts b/src/services/sqlite/SessionStore.ts
+--- a/src/services/sqlite/SessionStore.ts	2026-10-29 01:58:49.756032537 +0000
++++ b/src/services/sqlite/SessionStore.ts	2026-10-29 01:58:24.093763536 +0000
+@@ -1542,7 +1542,7 @@
+     const timestampIso = new Date(timestampEpoch).toISOString();
+ 
+     // Content-hash deduplication
+-    const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++    const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+     const existing = findDuplicateObservation(this.db, contentHash, timestampEpoch);
+     if (existing) {
+       return { id: existing.id, createdAtEpoch: existing.created_at_epoch };
+@@ -1668,7 +1668,7 @@
+ 
+       for (const observation of observations) {
+         // Content-hash deduplication (same logic as storeObservation singular)
+-        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+         const existing = findDuplicateObservation(this.db, contentHash, timestampEpoch);
+         if (existing) {
+           observationIds.push(existing.id);
+@@ -1784,7 +1784,7 @@
+ 
+       for (const observation of observations) {
+         // Content-hash deduplication (same logic as storeObservation singular)
+-        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+         const existing = findDuplicateObservation(this.db, contentHash, timestampEpoch);
+         if (existing) {
+           observationIds.push(existing.id);
+@@ -2349,11 +2349,29 @@
+     created_at: string;
+     created_at_epoch: number;
+   }): { imported: boolean; id: number } {
+-    // Check if observation already exists
++    // Check if the same observation row was already imported. A replay of the
++    // same export has every content field equal; anything that differs is a
++    // different observation and must be kept.
+     const existing = this.db.prepare(`
+       SELECT id FROM observations
+-      WHERE memory_session_id = ? AND title = ? AND created_at_epoch = ?
+-    `).get(obs.memory_session_id, obs.title, obs.created_at_epoch) as { id: number } | undefined;
++      WHERE memory_session_id = ? AND text IS ? AND type = ? AND title IS ?
++        AND subtitle IS ? AND facts IS ? AND narrative IS ? AND concepts IS ?
++        AND files_read IS ? AND files_modified IS ? AND prompt_number IS ?
++        AND created_at_epoch = ?
++    `).get(
++      obs.memory_session_id,
++      obs.text,
++      obs.type,
++      obs.title,
++      obs.subtitle,
++      obs.facts,
++      obs.narrative,
++      obs.concepts,
++      obs.files_read,
++      obs.files_modified,
++      obs.prompt_number,
++      obs.created_at_epoch
++    ) as { id: number } | undefined;
+ 
+     if (existing) {
+       return { imported: false, id: existing.id };
+diff -ruN a/src/services/sqlite/import/bulk.ts b/src/services/sqlite/import/bulk.ts
+--- a/src/services/sqlite/import/bulk.ts	2026-04-06 21:18:28.000000000 +0000
++++ b/src/services/sqlite/import/bulk.ts	2026-10-29 01:58:24.094089089 +0000
+@@ -143,15 +143,33 @@
+     created_at_epoch: number;
+   }
+ ): ImportResult {
+-  // Check if observation already exists
++  // Check if the same observation row was already imported. A replay of the
++  // same export has every content field equal; anything that differs is a
++  // different observation and must be kept.
+   const existing = db
+     .prepare(
+       `
+       SELECT id FROM observations
+-      WHERE memory_session_id = ? AND title = ? AND created_at_epoch = ?
++      WHERE memory_session_id = ? AND text IS ? AND type = ? AND title IS ?
++        AND subtitle IS ? AND facts IS ? AND narrative IS ? AND concepts IS ?
++        AND files_read IS ? AND files_modified IS ? AND prompt_number IS ?
++        AND created_at_epoch = ?
+     `
+     )
+-    .get(obs.memory_session_id, obs.title, obs.created_at_epoch) as
++    .get(
++      obs.memory_session_id,
++      obs.text,
++      obs.type,
++      obs.title,
++      obs.subtitle,
++      obs.facts,
++      obs.narrative,
++      obs.concepts,
++      obs.files_read,
++      obs.files_modified,
++      obs.prompt_number,
++      obs.created_at_epoch
++    ) as
+     | { id: number }
+     | undefined;
+ 
+diff -ruN a/src/services/sqlite/observations/store.ts b/src/services/sqlite/observations/store.ts
+--- a/src/services/sqlite/observations/store.ts	2026-04-06 21:18:28.000000000 +0000
++++ b/src/services/sqlite/observations/store.ts	2026-10-29 01:58:02.167262085 +0000
+@@ -13,16 +13,49 @@
+ const DEDUP_WINDOW_MS = 30_000;
+ 
+ /**
++ * The remaining content fields of an observation, used so that the identity
++ * distinguishes observations that differ in anything other than title/narrative.
++ */
++export interface ObservationContentFields {
++  type?: string | null;
++  subtitle?: string | null;
++  facts?: string[] | null;
++  concepts?: string[] | null;
++  files_read?: string[] | null;
++  files_modified?: string[] | null;
++}
++
++/**
++ * Encode a fixed list of parts so that no two different lists share an encoding:
++ * each part is prefixed with its length in code units.
++ */
++function encodeIdentityParts(parts: string[]): string {
++  return parts.map(part => `${part.length}:${part}`).join('');
++}
++
++/**
+  * Compute a short content hash for deduplication.
+- * Uses (memory_session_id, title, narrative) as the semantic identity of an observation.
++ * Uses every content field of the observation as its identity.
+  */
+ export function computeObservationContentHash(
+   memorySessionId: string,
+   title: string | null,
+-  narrative: string | null
++  narrative: string | null,
++  content?: ObservationContentFields | null
+ ): string {
++  const parts = [
++    memorySessionId ?? '',
++    content?.type ?? '',
++    title ?? '',
++    content?.subtitle ?? '',
++    JSON.stringify(content?.facts ?? []),
++    narrative ?? '',
++    JSON.stringify(content?.concepts ?? []),
++    JSON.stringify(content?.files_read ?? []),
++    JSON.stringify(content?.files_modified ?? [])
++  ];
+   return createHash('sha256')
+-    .update((memorySessionId || '') + (title || '') + (narrative || ''))
++    .update(encodeIdentityParts(parts))
+     .digest('hex')
+     .slice(0, 16);
+ }
+@@ -65,7 +98,7 @@
+   const resolvedProject = project || getCurrentProjectName();
+ 
+   // Content-hash deduplication
+-  const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++  const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+   const existing = findDuplicateObservation(db, contentHash, timestampEpoch);
+   if (existing) {
+     logger.debug('DEDUP', `Skipped duplicate observation | contentHash=${contentHash} | existingId=${existing.id}`);
+diff -ruN a/src/services/sqlite/summaries/store.ts b/src/services/sqlite/summaries/store.ts
+--- a/src/services/sqlite/summaries/store.ts	2026-10-29 01:58:49.756368766 +0000
++++ b/src/services/sqlite/summaries/store.ts	2026-10-29 01:58:08.246396716 +0000
+@@ -17,10 +17,17 @@
+   memorySessionId: string,
+   summary: SummaryInput
+ ): string {
++  const parts = [
++    memorySessionId ?? '',
++    summary.request ?? '',
++    summary.investigated ?? '',
++    summary.learned ?? '',
++    summary.completed ?? '',
++    summary.next_steps ?? '',
++    summary.notes ?? ''
++  ];
+   return createHash('sha256')
+-    .update((memorySessionId || '') + (summary.request || '') + (summary.investigated || '') +
+-            (summary.learned || '') + (summary.completed || '') + (summary.next_steps || '') +
+-            (summary.notes || ''))
++    .update(parts.map(part => `${part.length}:${part}`).join(''))
+     .digest('hex')
+     .slice(0, 16);
+ }
+diff -ruN a/src/services/sqlite/transactions.ts b/src/services/sqlite/transactions.ts
+--- a/src/services/sqlite/transactions.ts	2026-10-29 01:58:49.756422836 +0000
++++ b/src/services/sqlite/transactions.ts	2026-10-29 01:58:02.166294578 +0000
+@@ -74,7 +74,7 @@
+     `);
+ 
+     for (const observation of observations) {
+-      const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++      const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+       const existing = findDuplicateObservation(db, contentHash, timestampEpoch);
+       if (existing) {
+         observationIds.push(existing.id);
+@@ -180,7 +180,7 @@
+     `);
+ 
+     for (const observation of observations) {
+-      const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
++      const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative, observation);
+       const existing = findDuplicateObservation(db, contentHash, timestampEpoch);
+       if (existing) {
+         observationIds.push(existing.id);
+diff -ruN a/src/services/sync/ChromaSync.ts b/src/services/sync/ChromaSync.ts
+--- a/src/services/sync/ChromaSync.ts	2026-10-29 01:59:07.988459790 +0000
++++ b/src/services/sync/ChromaSync.ts	2026-10-29 01:58:16.774394059 +0000
+@@ -122,8 +122,19 @@
+    * documents instead of writing a second copy.
+    */
+   private observationContentId(obs: StoredObservation): string {
++    const parts = [
++      obs.memory_session_id ?? '',
++      obs.type ?? '',
++      obs.title ?? '',
++      obs.subtitle ?? '',
++      obs.facts ?? '',
++      obs.narrative ?? '',
++      obs.concepts ?? '',
++      obs.files_read ?? '',
++      obs.files_modified ?? ''
++    ];
+     return createHash('sha256')
+-      .update((obs.memory_session_id || '') + (obs.title || '') + (obs.narrative || ''))
++      .update(parts.map(part => `${part.length}:${part}`).join(''))
+       .digest('hex')
+       .slice(0, 16);
+   }

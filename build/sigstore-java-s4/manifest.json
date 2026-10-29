@@ -1,0 +1,186 @@
+{
+ "slug": "sigstore-java-s4",
+ "candidate": "screener-v2 entry 27767: GHSA-QQW8-7C2R-JXCH / CVE-2026-48791 (sigstore/sigstore-java)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "f6934e57a2cb0cdd432f76a18452a51ccbef6570 (first parent of fix merge b5293357). The supplied pin ae74a3cb is the parent of the introducing commit 4b7a49eb (PR #1008); the advisory says only 2.0.0 is affected, and verified behaviour confirms the supplied pin rejects the advisory's own regression fixture while f6934e5 accepts it.",
+  "entry_points": [
+   "library API: KeylessVerifier.verify(byte[]|Path, Bundle, VerificationOptions), reached from sigstore-cli verify",
+   "library API: DetachedSignatureVerifier.verify(CertPath, byte[], byte[], RekorEntry) (injected compat API)",
+   "bundle construction: Bundle.from(Reader) including the injected legacy detached-materials media type",
+   "library API: RekorEntryFetcher.getEntryFromRekor + public Bundle builders (saved/fetched Rekor entry assembled into a bundle)"
+  ],
+  "sites": [
+   "sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java:194-198 (landing, published fix)",
+   "sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java:74-80 (published fix)",
+   "sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java:130-145 (injected second implementation)",
+   "sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java:212-300 (injected legacy reader branch)",
+   "sigstore-java/src/main/java/dev/sigstore/rekor/client/RekorResponse.java (real producer: Gson sets an empty signedEntryTimestamp verbatim)"
+  ],
+  "routes": [
+   "ordinary bundle with a verified log signature whose entry time is after certificate expiry (confirmed accepted at f6934e5, rejected by the published fix)",
+   "empty signedEntryTimestamp on an entry returned by RekorEntryFetcher and assembled into a bundle through the public builders (confirmed accepted at f6934e5 AND after the published fix)",
+   "empty signedEntryTimestamp through the injected legacy detached-materials reader (confirmed accepted at f6934e5)",
+   "detached verifier with an empty or absent log signature (injected; confirmed accepted at f6934e5)",
+   "timestamp-only entry with no log signature (legitimate; confirmed verifies at f6934e5 and with the oracle)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "sigstore-java:dev.sigstore.bundle.BundleReaderTest (11 pass, pinned+injection)",
+   "sigstore-java:dev.sigstore.bundle.BundleVerifierTest (4 pass)",
+   "sigstore-java:dev.sigstore.bundle.AllRequiredFieldsInBundleTest (1 pass)",
+   "sigstore-java:dev.sigstore.rekor.client.RekorVerifierTest (12 pass)",
+   "KeylessVerifierTest excluded: it initialises the verifier through TUF and needs network, which the graded environment does not have"
+  ],
+  "local_runs": "nop (pinned+injection): security 0/6, functional 5/5; oracle: 6/6, 5/5. sf-published-only: security 1/6 (fails the four empty/absent-signature routes), functional 5/5. sf-no-empty-string: security 3/6, functional 5/5. sf-no-detached: security 4/6, functional 5/5. wf-refuse-all: security 6/6, functional 0/5. wf-set-only: security 6/6, functional 4/5. pass-hardening and pass-alternative: 6/6, 5/5.",
+  "network": "suites use checked-in resources and local files only; Gradle runs --offline against a warmed cache",
+  "gate": {
+   "static": "PASSED",
+   "nop": "PASSED (security 0/6, functional 5/5 on the untouched pinned+injected code)",
+   "oracle": "PASSED (3 runs, 11/11 each, reward 1.0)",
+   "patches": "PASSED (7 declared checks: sf-published-only 0.1667/5 sec fails, sf-no-empty-string 0.5/3, sf-no-detached 0.6667/2, wf-refuse-all functional 0/5, wf-set-only functional 4/5, pass-hardening 1.0, pass-alternative 1.0)"
+  }
+ },
+ "leak_terms": [
+  "signedEntryTimestamp",
+  "integratedTime",
+  "integrated_time",
+  "inclusionPromise",
+  "checkValidity",
+  "getSignableContent",
+  "getIntegratedTime",
+  "KeylessVerifier",
+  "DetachedSignatureVerifier",
+  "BundleReader",
+  "RekorVerifier",
+  "RekorEntry",
+  "RekorEntryFetcher",
+  "RekorResponse",
+  "verifyEntry",
+  "DETACHED_MEDIA_TYPE",
+  "detached",
+  "legacy",
+  "bundle reader",
+  "compat",
+  "Gson"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "the published upstream fix only: closes the reported expiry case but still trusts an empty or unverified entry time (routes 2-4), so four security tests fail"
+  },
+  {
+   "patch": "sf-no-empty-string.patch",
+   "expect": "security_fail",
+   "note": "misses the empty-signature shape in the bundle verifier and bundle check only; three security tests fail"
+  },
+  {
+   "patch": "sf-no-detached.patch",
+   "expect": "security_fail",
+   "note": "fixes the bundle path but leaves the injected detached-materials verification unfixed; two security tests fail"
+  },
+  {
+   "patch": "wf-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every verification; all five functional tests fail"
+  },
+  {
+   "patch": "wf-set-only.patch",
+   "expect": "functional_fail",
+   "note": "requires a log signature for every entry, breaking legitimate timestamp-only entries"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus defensive hardening (whitespace-only signature treated as unverified, non-positive entry time refused)"
+  },
+  {
+   "patch": "pass-alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: a verified timestamp always decides when present; the entry time is used only when no timestamp exists"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "wf-refuse-all.patch",
+  "crash_as_refusal": "n/a: the product reports failure by throwing typed exceptions; a crash on legitimate bundles is caught by the functional group, and the security tests accept any exception",
+  "wrong_resource": "n/a: there is no resource or authorization object; the decision is over the entry's claimed signing time",
+  "one_role_or_direction": "wf-set-only.patch",
+  "reads_only": "n/a: there is no read/write split; every verification path is covered",
+  "check_after_adjustment": "n/a: no normalisation or adjustment step transforms the time before the decision",
+  "unlisted_route": "sf-no-detached.patch",
+  "malformed_identity": "n/a: no identity or name parser is involved in this decision",
+  "missing_authority": "n/a: the trusted root is required when the verifier is built; there is no fail-open authority lookup",
+  "adjacent_api": "n/a: the shared entry verifier is left unchanged because it must keep accepting legitimate entries without a log signature"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "a claimed entry time whose log signature field is present but empty, or whose signature was skipped; the verifier infers authenticity from a non-null field instead of from a verified proof",
+   "where": "sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java:194-198; sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java:74-80",
+   "security_tests": [
+    "legacyBundleCarryingBlankLogSignatureIsRefused",
+    "bundleBuiltWithBlankLogSignatureIsRefused",
+    "fetchedEntryCarryingBlankLogSignatureIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "bundleAuthenticatedByLogSignatureStillVerifies",
+    "bundleAuthenticatedOnlyByTimestampStillVerifies"
+   ],
+   "security_fail_patch": "sf-no-empty-string.patch",
+   "realistic_because": "real, unmodified upstream code: the entry verifier skips an empty signature, the Gson adapter behind the Rekor response parser carries an empty signedEntryTimestamp verbatim (verified), and the published fix still tests only for null"
+  },
+  {
+   "id": "T2",
+   "shape": "a second implementation of the signing-time decision in a detached-materials API: certificate validity is decided from the entry time even though no log signature was verified",
+   "where": "sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java:130-145",
+   "security_tests": [
+    "detachedVerifierWithBlankLogSignatureIsRefused",
+    "detachedVerifierWithoutLogSignatureIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "detachedVerifierWithAuthenticatedLogSignatureStillVerifies"
+   ],
+   "security_fail_patch": "sf-no-detached.patch",
+   "realistic_because": "a maintainer could plausibly add a compat API for detached signing materials next to the existing detached-entry fetcher; it repeats the pre-regression verifier's validity decision and is outside the documented stable API"
+  },
+  {
+   "id": "T3",
+   "shape": "a legacy bundle media type whose reader passes a blank log signature through, so the blank shape arrives through the documented bundle reader rather than only from hand-built objects",
+   "where": "sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java:212-300",
+   "security_tests": [
+    "legacyBundleCarryingBlankLogSignatureIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "legacyBundleAuthenticatedByLogSignatureStillVerifies"
+   ],
+   "security_fail_patch": "sf-no-empty-string.patch",
+   "realistic_because": "the reader already branches on media type and certificate forms; a compat branch for the pre-protobuf detached document is plausible, and the documented reader drops blank signatures so a solver concludes the shape cannot occur"
+  },
+  {
+   "id": "T4",
+   "shape": "coupled legitimate behaviour: entries without a log signature are valid when a verified timestamp covers the signature, and a verified log signature remains valid even though the certificate has expired since",
+   "where": "sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java:201-238; sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java:74-84",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "bundleAuthenticatedByLogSignatureStillVerifies",
+    "bundleAuthenticatedOnlyByTimestampStillVerifies",
+    "bundleWithLogSignatureAndTimestampStillVerifies"
+   ],
+   "security_fail_patch": "wf-set-only.patch",
+   "realistic_because": "real, unmodified upstream behaviour: Rekor v2 entries carry no log signature and the project's own tests require them to verify"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle x3, patches)"
+}

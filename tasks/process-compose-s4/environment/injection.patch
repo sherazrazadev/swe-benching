@@ -1,0 +1,98 @@
+diff -ruN pristine/src/api/request_trust.go inj/src/api/request_trust.go
+--- a/src/api/request_trust.go	1970-01-01 00:00:00.000000000 +0000
++++ b/src/api/request_trust.go	2026-10-29 01:54:43.101040102 +0000
+@@ -0,0 +1,43 @@
++package api
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++)
++
++// requestOriginMiddleware rejects browser requests whose Origin does not match
++// the host the request was addressed to. Non-browser clients do not send an
++// Origin and are unaffected. Safe methods and protocol upgrades are handled by
++// their own handlers.
++func requestOriginMiddleware() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		switch c.Request.Method {
++		case http.MethodGet, http.MethodHead, http.MethodOptions:
++			c.Next()
++			return
++		}
++		if strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
++			c.Next()
++			return
++		}
++
++		origin := c.GetHeader("Origin")
++		if origin == "" {
++			c.Next()
++			return
++		}
++		u, err := url.Parse(origin)
++		if err != nil || u.Host == "" {
++			c.AbortWithStatus(http.StatusForbidden)
++			return
++		}
++		if !strings.EqualFold(u.Host, c.Request.Host) {
++			c.AbortWithStatus(http.StatusForbidden)
++			return
++		}
++		c.Next()
++	}
++}
+diff -ruN pristine/src/api/routes.go inj/src/api/routes.go
+--- a/src/api/routes.go	2026-07-04 14:17:07.000000000 +0000
++++ b/src/api/routes.go	2026-10-29 01:54:48.766904673 +0000
+@@ -45,6 +45,8 @@
+ 		r.Use(TokenAuthMiddleware(authToken))
+ 	}
+ 
++	r.Use(requestOriginMiddleware())
++
+ 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+ 	r.GET("/", func(c *gin.Context) {
+ 		location := url.URL{Path: "/swagger/index.html"}
+diff -ruN pristine/src/api/ws_api.go inj/src/api/ws_api.go
+--- a/src/api/ws_api.go	2026-07-04 14:17:07.000000000 +0000
++++ b/src/api/ws_api.go	2026-10-29 01:54:48.767022297 +0000
+@@ -4,6 +4,7 @@
+ 	"errors"
+ 	"net"
+ 	"net/http"
++	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -17,7 +18,26 @@
+ 	"github.com/rs/zerolog/log"
+ )
+ 
+-var upgrader = websocket.Upgrader{}
++var upgrader = websocket.Upgrader{CheckOrigin: allowRequestOrigin}
++
++// allowRequestOrigin accepts a WebSocket upgrade when the browser Origin
++// matches the host the request was addressed to, or when it is a loopback
++// origin. Clients that do not send an Origin are accepted.
++func allowRequestOrigin(r *http.Request) bool {
++	origin := r.Header.Get("Origin")
++	if origin == "" {
++		return true
++	}
++	u, err := url.Parse(origin)
++	if err != nil {
++		return false
++	}
++	if strings.EqualFold(u.Host, r.Host) {
++		return true
++	}
++	h := u.Hostname()
++	return strings.EqualFold(h, "localhost") || strings.HasPrefix(h, "127.")
++}
+ 
+ // @Schemes
+ // @Id                    LogsStream

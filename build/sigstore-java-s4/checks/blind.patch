@@ -1,0 +1,180 @@
+--- a/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
++++ b/sigstore-java/src/main/java/dev/sigstore/DetachedSignatureVerifier.java
+@@ -144,6 +144,15 @@
+       throw new KeylessVerificationException("Transparency log entry could not be verified", ex);
+     }
+ 
++    // verifyEntry authenticated the entry time only if the entry carried a signed entry
++    // timestamp. With a blank or absent one the claimed time was never proven, so the
++    // certificate's validity cannot be decided from it.
++    var signedEntryTimestamp = entry.getVerification().getSignedEntryTimestamp();
++    if (signedEntryTimestamp == null || signedEntryTimestamp.isEmpty()) {
++      throw new KeylessVerificationException(
++          "No verified signing time was provided with the transparency log entry");
++    }
++
+     var entryDate = Date.from(entry.getIntegratedTimeInstant());
+     try {
+       leafCert.checkValidity(entryDate);
+--- a/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java
++++ b/sigstore-java/src/main/java/dev/sigstore/KeylessVerifier.java
+@@ -61,8 +61,10 @@
+ import java.security.cert.CertificateNotYetValidException;
+ import java.security.cert.X509Certificate;
+ import java.security.spec.InvalidKeySpecException;
++import java.time.Instant;
+ import java.util.Arrays;
+ import java.util.Base64;
++import java.util.Date;
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.stream.Collectors;
+@@ -183,39 +185,88 @@
+       signature = dsseEnvelope.getSignature();
+     }
+ 
+-    verifyTimestamps(leafCert, bundle.getTimestamps(), signature);
+-
+     try {
+       rekorVerifier.verifyEntry(rekorEntry);
+     } catch (RekorVerificationException ex) {
+       throw new KeylessVerificationException("Transparency log entry could not be verified", ex);
+     }
++
++    // Entry verification above is what turns a signed entry timestamp into a proof. Only when
++    // such a proof exists may the carried integrated time be used as the signing time.
++    verifySigningTime(
++        leafCert, bundle.getTimestamps(), authenticatedEntryTime(rekorEntry), signature);
+   }
+ 
+-  private void verifyTimestamps(
+-      X509Certificate leafCert, List<Bundle.Timestamp> timestamps, byte[] signature)
+-      throws KeylessVerificationException {
+-    if (timestamps == null || timestamps.isEmpty()) {
+-      return;
++  /**
++   * The entry's integrated time is an authenticated signing time only when the entry carries a
++   * non-empty signed entry timestamp, which {@link RekorVerifier#verifyEntry(RekorEntry)} has
++   * just validated. A missing or empty field proves nothing, so it yields {@code null}.
++   */
++  private static Instant authenticatedEntryTime(RekorEntry entry) {
++    var signedEntryTimestamp = entry.getVerification().getSignedEntryTimestamp();
++    if (signedEntryTimestamp == null || signedEntryTimestamp.isEmpty()) {
++      return null;
+     }
+-    for (Bundle.Timestamp timestamp : timestamps) {
+-      byte[] tsBytes = timestamp.getRfc3161Timestamp();
+-      if (tsBytes == null || tsBytes.length == 0) {
+-        throw new KeylessVerificationException(
+-            "Found an empty or null RFC3161 timestamp in bundle");
+-      }
+-      try {
+-        var tsResp = ImmutableTimestampResponse.builder().encoded(tsBytes).build();
+-        timestampVerifier.verify(tsResp, signature);
+-        leafCert.checkValidity(tsResp.getGenTime());
+-      } catch (TimestampException
+-          | CertificateNotYetValidException
+-          | CertificateExpiredException
+-          | TimestampVerificationException e) {
+-        throw new KeylessVerificationException(
+-            "RFC3161 timestamp verification failed: " + e.getMessage(), e);
++    return entry.getIntegratedTimeInstant();
++  }
++
++  /**
++   * Decide certificate validity from authenticated times only. Every authenticated time must fall
++   * within the certificate's validity, and at least one such time must exist: either the
++   * log-authenticated entry time or a timestamp token verified against a trusted authority.
++   */
++  private void verifySigningTime(
++      X509Certificate leafCert,
++      List<Bundle.Timestamp> timestamps,
++      Instant entryTime,
++      byte[] signature)
++      throws KeylessVerificationException {
++    boolean hasAuthenticatedTime = false;
++    if (entryTime != null) {
++      hasAuthenticatedTime = true;
++      checkValidityAt(leafCert, entryTime);
++    }
++    if (timestamps != null) {
++      for (Bundle.Timestamp timestamp : timestamps) {
++        hasAuthenticatedTime = true;
++        verifyTimestamp(leafCert, timestamp, signature);
+       }
+     }
++    if (!hasAuthenticatedTime) {
++      throw new KeylessVerificationException(
++          "Bundle has no authenticated signing time: no verified log signature and no timestamp");
++    }
++  }
++
++  private void verifyTimestamp(
++      X509Certificate leafCert, Bundle.Timestamp timestamp, byte[] signature)
++      throws KeylessVerificationException {
++    byte[] tsBytes = timestamp.getRfc3161Timestamp();
++    if (tsBytes == null || tsBytes.length == 0) {
++      throw new KeylessVerificationException("Found an empty or null RFC3161 timestamp in bundle");
++    }
++    try {
++      var tsResp = ImmutableTimestampResponse.builder().encoded(tsBytes).build();
++      timestampVerifier.verify(tsResp, signature);
++      leafCert.checkValidity(tsResp.getGenTime());
++    } catch (TimestampException
++        | CertificateNotYetValidException
++        | CertificateExpiredException
++        | TimestampVerificationException e) {
++      throw new KeylessVerificationException(
++          "RFC3161 timestamp verification failed: " + e.getMessage(), e);
++    }
++  }
++
++  private static void checkValidityAt(X509Certificate leafCert, Instant signingTime)
++      throws KeylessVerificationException {
++    try {
++      leafCert.checkValidity(Date.from(signingTime));
++    } catch (CertificateNotYetValidException e) {
++      throw new KeylessVerificationException("Signing time was before certificate validity", e);
++    } catch (CertificateExpiredException e) {
++      throw new KeylessVerificationException("Signing time was after certificate expiry", e);
++    }
+   }
+ 
+   @VisibleForTesting
+--- a/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java
++++ b/sigstore-java/src/main/java/dev/sigstore/bundle/Bundle.java
+@@ -71,7 +71,10 @@
+   @Value.Check
+   protected void checkAtLeastOneTimestamp() {
+     for (var entry : getEntries()) {
+-      if (entry.getVerification().getSignedEntryTimestamp() != null) {
++      // A blank signed entry timestamp is not a signature, so it cannot stand in as proof of
++      // the entry time. Only a non-empty value can ever be verified later.
++      var signedEntryTimestamp = entry.getVerification().getSignedEntryTimestamp();
++      if (signedEntryTimestamp != null && !signedEntryTimestamp.isEmpty()) {
+         return;
+       }
+     }
+--- a/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java
++++ b/sigstore-java/src/main/java/dev/sigstore/bundle/BundleReader.java
+@@ -242,6 +242,20 @@
+     if (entry == null) {
+       throw new BundleParseException("Could not parse rekor entry");
+     }
++    var legacySet = entry.getVerification().getSignedEntryTimestamp();
++    if (legacySet != null && legacySet.isEmpty()) {
++      // The payload shape still permits an empty field, but an empty field is not a signature.
++      // Normalize it away so no later stage can mistake the carried entry time for a proven one.
++      entry =
++          ImmutableRekorEntry.builder()
++              .from(entry)
++              .verification(
++                  ImmutableVerification.builder()
++                      .from(entry.getVerification())
++                      .signedEntryTimestamp(null)
++                      .build())
++              .build();
++    }
+     if (entry.getVerification().getInclusionProof() == null) {
+       throw new BundleParseException("Could not find an inclusion proof");
+     }

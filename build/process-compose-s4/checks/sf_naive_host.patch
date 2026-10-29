@@ -1,0 +1,454 @@
+diff -ruN -x pc -x vtesting -x .git inj/schemas/process-compose-schema.json variants/sf_naive_host/schemas/process-compose-schema.json
+--- a/schemas/process-compose-schema.json	2026-07-04 14:17:07.000000000 +0000
++++ b/schemas/process-compose-schema.json	2026-10-29 01:55:01.983837183 +0000
+@@ -176,6 +176,12 @@
+         },
+         "expose_control_tools": {
+           "type": "boolean"
++        },
++        "trusted_hosts": {
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
+         }
+       },
+       "type": "object"
+diff -ruN -x pc -x vtesting -x .git inj/src/api/request_trust.go variants/sf_naive_host/src/api/request_trust.go
+--- a/src/api/request_trust.go	2026-10-29 01:54:43.101040102 +0000
++++ b/src/api/request_trust.go	2026-10-29 01:55:06.413317104 +0000
+@@ -1,43 +1,81 @@
+ package api
+ 
+ import (
++	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+-
+-	"github.com/gin-gonic/gin"
+ )
+ 
+-// requestOriginMiddleware rejects browser requests whose Origin does not match
+-// the host the request was addressed to. Non-browser clients do not send an
+-// Origin and are unaffected. Safe methods and protocol upgrades are handled by
+-// their own handlers.
+-func requestOriginMiddleware() gin.HandlerFunc {
+-	return func(c *gin.Context) {
+-		switch c.Request.Method {
+-		case http.MethodGet, http.MethodHead, http.MethodOptions:
+-			c.Next()
+-			return
+-		}
+-		if strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+-			c.Next()
+-			return
+-		}
++// requestTrustMiddleware restricts a local control listener to requests that a
++// trusted local client could make. A request is trusted when the Host it is
++// addressed to is the local machine (a loopback address or localhost) or a name
++// the operator configured; a present Origin must satisfy the same rule. The
++// original handler is called unchanged so protocol upgrades keep working.
++func requestTrustMiddleware(trusted []string) func(http.Handler) http.Handler {
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if !controlHostTrusted(r.Host, trusted) {
++				http.Error(w, "untrusted host", http.StatusForbidden)
++				return
++			}
++			if origin := r.Header.Get("Origin"); origin != "" {
++				u, err := url.Parse(origin)
++				if err != nil || !controlHostTrusted(u.Host, trusted) {
++					http.Error(w, "untrusted origin", http.StatusForbidden)
++					return
++				}
++			}
++			next.ServeHTTP(w, r)
++		})
++	}
++}
++
++// controlHostname extracts the bare host from a "host" or "host:port" value,
++// stripping any port, IPv6 brackets and a trailing dot so it can be matched.
++func controlHostname(hostport string) string {
++	h := hostport
++	if host, _, err := net.SplitHostPort(h); err == nil {
++		h = host
++	} else {
++		h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
++	}
++	return strings.TrimSuffix(h, ".")
++}
+ 
+-		origin := c.GetHeader("Origin")
+-		if origin == "" {
+-			c.Next()
+-			return
++// controlHostTrusted reports whether hostport names the local machine, is in
++// trusted (case-insensitively), or matches the explicit "*" opt-out. It fails
++// closed on an empty host.
++func controlHostTrusted(hostport string, trusted []string) bool {
++	for _, t := range trusted {
++		if t == "*" {
++			return true
+ 		}
+-		u, err := url.Parse(origin)
+-		if err != nil || u.Host == "" {
+-			c.AbortWithStatus(http.StatusForbidden)
+-			return
++	}
++	h := controlHostname(hostport)
++	if h == "" {
++		return false
++	}
++	if ip := net.ParseIP(h); ip != nil {
++		if ip.IsLoopback() {
++			return true
+ 		}
+-		if !strings.EqualFold(u.Host, c.Request.Host) {
+-			c.AbortWithStatus(http.StatusForbidden)
+-			return
++	} else if strings.EqualFold(h, "localhost") {
++		return true
++	}
++	for _, t := range trusted {
++		if strings.EqualFold(h, controlHostname(t)) {
++			return true
+ 		}
+-		c.Next()
+ 	}
++	return false
++}
++
++// isWildcardBind reports whether a configured listen address means "all
++// interfaces"; such an address is not a name clients address the listener by.
++func isWildcardBind(hostport string) bool {
++	if ip := net.ParseIP(controlHostname(hostport)); ip != nil {
++		return ip.IsUnspecified()
++	}
++	return false
+ }
+diff -ruN -x pc -x vtesting -x .git inj/src/api/routes.go variants/sf_naive_host/src/api/routes.go
+--- a/src/api/routes.go	2026-10-29 01:54:48.766904673 +0000
++++ b/src/api/routes.go	2026-10-29 01:55:01.987837055 +0000
+@@ -45,8 +45,6 @@
+ 		r.Use(TokenAuthMiddleware(authToken))
+ 	}
+ 
+-	r.Use(requestOriginMiddleware())
+-
+ 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+ 	r.GET("/", func(c *gin.Context) {
+ 		location := url.URL{Path: "/swagger/index.html"}
+diff -ruN -x pc -x vtesting -x .git inj/src/api/server.go variants/sf_naive_host/src/api/server.go
+--- a/src/api/server.go	2026-07-04 14:17:07.000000000 +0000
++++ b/src/api/server.go	2026-10-29 01:55:10.597489718 +0000
+@@ -51,9 +51,17 @@
+ 	endPoint := fmt.Sprintf("%s:%d", address, port)
+ 	log.Info().Msgf("start http server listening %s", endPoint)
+ 
++	// A TCP listener is reachable from the network (and therefore from a
++	// browser), so every request must be addressed to a trusted local name.
++	// The configured listen address is itself a name clients address it by,
++	// unless it is a wildcard ("all interfaces") address.
++	trusted := []string{}
++	if address != "" && !isWildcardBind(address) {
++		trusted = append(trusted, address)
++	}
+ 	server := &http.Server{
+ 		Addr:    endPoint,
+-		Handler: router.Handler(),
++		Handler: requestTrustMiddleware(trusted)(router),
+ 	}
+ 
+ 	go func() {
+diff -ruN -x pc -x vtesting -x .git inj/src/api/ws_api.go variants/sf_naive_host/src/api/ws_api.go
+--- a/src/api/ws_api.go	2026-10-29 01:54:48.767022297 +0000
++++ b/src/api/ws_api.go	2026-10-29 01:55:01.985837119 +0000
+@@ -4,7 +4,6 @@
+ 	"errors"
+ 	"net"
+ 	"net/http"
+-	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -18,26 +17,7 @@
+ 	"github.com/rs/zerolog/log"
+ )
+ 
+-var upgrader = websocket.Upgrader{CheckOrigin: allowRequestOrigin}
+-
+-// allowRequestOrigin accepts a WebSocket upgrade when the browser Origin
+-// matches the host the request was addressed to, or when it is a loopback
+-// origin. Clients that do not send an Origin are accepted.
+-func allowRequestOrigin(r *http.Request) bool {
+-	origin := r.Header.Get("Origin")
+-	if origin == "" {
+-		return true
+-	}
+-	u, err := url.Parse(origin)
+-	if err != nil {
+-		return false
+-	}
+-	if strings.EqualFold(u.Host, r.Host) {
+-		return true
+-	}
+-	h := u.Hostname()
+-	return strings.EqualFold(h, "localhost") || strings.HasPrefix(h, "127.")
+-}
++var upgrader = websocket.Upgrader{}
+ 
+ // @Schemes
+ // @Id                    LogsStream
+diff -ruN -x pc -x vtesting -x .git inj/src/mcp/server.go variants/sf_naive_host/src/mcp/server.go
+--- a/src/mcp/server.go	2026-07-04 14:17:07.000000000 +0000
++++ b/src/mcp/server.go	2026-10-29 01:55:01.979837311 +0000
+@@ -2,10 +2,13 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	stdLog "log"
++	"net/http"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/f1bonacc1/process-compose/src/types"
+ 	"github.com/mark3labs/mcp-go/mcp"
+@@ -43,6 +46,8 @@
+ 	cancel         context.CancelFunc
+ 	stdin          io.Reader
+ 	stdout         io.Writer
++	httpServer     *http.Server
++	sseServer      *server.SSEServer
+ }
+ 
+ // NewServer creates a new MCP server instance
+@@ -205,12 +210,21 @@
+ 		Str("address", addr).
+ 		Msg("Starting MCP server with SSE transport")
+ 
+-	// Create SSE server
++	// Create SSE server. It is served through our own http.Server so we can
++	// wrap it with a Host/Origin/auth trust boundary (see sseSecurityMiddleware)
++	// that guards against browser DNS-rebinding attacks. No WithSSECORS is used:
++	// the middleware gate makes the library's default ACAO:* header moot.
+ 	sseServer := server.NewSSEServer(s.mcpServer)
++	s.sseServer = sseServer
++	s.httpServer = &http.Server{
++		Addr:    addr,
++		Handler: s.sseSecurityMiddleware(sseServer),
++	}
++	s.warnInsecureSSE()
+ 
+ 	// SSE transport blocks, so run in goroutine
+ 	go func() {
+-		if err := sseServer.Start(addr); err != nil {
++		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 			log.Error().Err(err).Msg("MCP SSE server error")
+ 		}
+ 	}()
+@@ -222,6 +236,18 @@
+ func (s *Server) Stop() error {
+ 	log.Info().Msg("Stopping MCP server")
+ 	s.cancel()
++	if s.httpServer != nil {
++		// Drop long-lived SSE connections first so Shutdown can return, then
++		// shut down the listener within a bounded timeout.
++		if s.sseServer != nil {
++			s.sseServer.CloseSessions()
++		}
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		if err := s.httpServer.Shutdown(ctx); err != nil {
++			log.Error().Err(err).Msg("MCP SSE server shutdown error")
++		}
++	}
+ 	return nil
+ }
+ 
+diff -ruN -x pc -x vtesting -x .git inj/src/mcp/sse_security.go variants/sf_naive_host/src/mcp/sse_security.go
+--- a/src/mcp/sse_security.go	1970-01-01 00:00:00.000000000 +0000
++++ b/src/mcp/sse_security.go	2026-10-29 02:01:21.298434084 +0000
+@@ -0,0 +1,161 @@
++package mcp
++
++import (
++	"crypto/subtle"
++	"net"
++	"net/http"
++	"net/url"
++	"slices"
++	"strings"
++
++	"github.com/f1bonacc1/process-compose/src/config"
++	"github.com/rs/zerolog/log"
++)
++
++// sseSecurityMiddleware guards the MCP SSE listener against browser-driven
++// attacks (notably DNS rebinding) before any request reaches the MCP dispatch.
++//
++// Checks run in order and fail closed:
++//  1. Host allowlist  - the primary DNS-rebinding defense. A browser cannot
++//     forge the Host header to a loopback name, so only loopback (or explicitly
++//     trusted) hosts are accepted.
++//  2. Origin allowlist - defense-in-depth for cross-origin browser requests.
++//  3. Optional token   - when PC_API_TOKEN is configured, require it via
++//     X-PC-Token-Key or Authorization: Bearer.
++//
++// The original http.ResponseWriter is passed straight through: mcp-go asserts
++// w.(http.Flusher) directly, so wrapping the writer would break SSE streaming.
++func (s *Server) sseSecurityMiddleware(next http.Handler) http.Handler {
++	trusted := s.trustedHosts()
++	token := config.GetApiToken()
++
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// 1. Host validation (use r.Host only; never trust X-Forwarded-Host).
++		if !hostAllowed(hostname(r.Host), trusted) {
++			reject(w, r, http.StatusForbidden, "untrusted host")
++			return
++		}
++
++		// 2. Origin validation, only when the header is present.
++		if origin := r.Header.Get("Origin"); origin != "" {
++			u, err := url.Parse(origin)
++			if err != nil || !hostAllowed(hostname(u.Host), trusted) {
++				reject(w, r, http.StatusForbidden, "untrusted origin")
++				return
++			}
++		}
++
++		// 3. Optional token authentication.
++		if token != "" && !tokenValid(r, token) {
++			w.Header().Set("WWW-Authenticate", "Bearer")
++			reject(w, r, http.StatusUnauthorized, "invalid or missing token")
++			return
++		}
++
++		next.ServeHTTP(w, r)
++	})
++}
++
++// trustedHosts is the set of extra host names accepted in addition to loopback.
++// It includes the operator-configured trusted_hosts plus the configured bind
++// host when that host is a concrete name/IP. A wildcard bind (0.0.0.0 / ::) is
++// deliberately excluded - treating "bound to all interfaces" as "trust all
++// hosts" would reopen the vulnerability.
++func (s *Server) trustedHosts() []string {
++	trusted := make([]string, 0, len(s.config.TrustedHosts)+1)
++	trusted = append(trusted, s.config.TrustedHosts...)
++	if h := s.config.Host; h != "" && !isWildcardHost(h) {
++		trusted = append(trusted, h)
++	}
++	return trusted
++}
++
++// warnInsecureSSE logs prominent warnings for SSE configurations that reduce
++// the effectiveness of the trust boundary, without refusing to start.
++func (s *Server) warnInsecureSSE() {
++	if s.config.ExposeControlTools && config.GetApiToken() == "" {
++		log.Warn().Msg("MCP SSE: expose_control_tools is enabled without an auth token; " +
++			"Host/Origin validation still blocks browser DNS-rebinding, but set " +
++			config.EnvVarApiToken + " to require authentication for MCP clients")
++	}
++	if isWildcardHost(s.config.Host) && len(s.config.TrustedHosts) == 0 {
++		log.Warn().Str("host", s.config.Host).Msg("MCP SSE: bound to a wildcard address with no trusted_hosts; " +
++			"non-loopback clients will be rejected. Add their host name/IP to mcp_server.trusted_hosts")
++	}
++}
++
++// hostname extracts the bare host from a "host" or "host:port" value, stripping
++// any port, IPv6 brackets, and a trailing dot so it can be matched robustly.
++func hostname(hostport string) string {
++	h := hostport
++	if host, _, err := net.SplitHostPort(h); err == nil {
++		h = host
++	} else {
++		h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
++	}
++	return strings.TrimSuffix(h, ".")
++}
++
++// hostAllowed reports whether h is loopback, an explicitly trusted name, or the
++// "*" wildcard opt-out. It fails closed on an empty host.
++func hostAllowed(h string, trusted []string) bool {
++	if slices.Contains(trusted, "*") { // explicit, documented opt-out
++		return true
++	}
++	if h == "" {
++		return false
++	}
++	lower := strings.ToLower(h)
++	if strings.HasPrefix(h, "127.") || h == "::1" || strings.HasPrefix(lower, "localhost") {
++		return true
++	}
++	for _, t := range trusted {
++		if strings.EqualFold(h, t) {
++			return true
++		}
++	}
++	return false
++}
++
++// isWildcardHost reports whether h is an unspecified/wildcard bind address such
++// as 0.0.0.0 or ::.
++func isWildcardHost(h string) bool {
++	if ip := net.ParseIP(hostname(h)); ip != nil {
++		return ip.IsUnspecified()
++	}
++	return false
++}
++
++// bearerPrefix is the (case-insensitive) Authorization scheme prefix accepted
++// for MCP SSE token auth.
++const bearerPrefix = "Bearer "
++
++// tokenValid checks the request auth token against the configured token using a
++// constant-time comparison. The token may be supplied via the X-PC-Token-Key
++// header or an Authorization: Bearer header (used by MCP clients).
++func tokenValid(r *http.Request, token string) bool {
++	provided := r.Header.Get(config.TokenHeader)
++	if provided == "" {
++		if auth := r.Header.Get("Authorization"); auth != "" {
++			// Strip an optional "Bearer " scheme; the scheme name is
++			// case-insensitive per RFC 7235 §2.1.
++			if len(auth) >= len(bearerPrefix) && strings.EqualFold(auth[:len(bearerPrefix)], bearerPrefix) {
++				auth = auth[len(bearerPrefix):]
++			}
++			provided = strings.TrimSpace(auth)
++		}
++	}
++	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
++}
++
++// reject logs the denied request (never the token) and writes an HTTP error.
++func reject(w http.ResponseWriter, r *http.Request, status int, reason string) {
++	log.Warn().
++		Str("remote_addr", r.RemoteAddr).
++		Str("method", r.Method).
++		Str("path", r.URL.Path).
++		Str("host", r.Host).
++		Str("origin", r.Header.Get("Origin")).
++		Msgf("MCP SSE: rejected request: %s", reason)
++	http.Error(w, reason, status)
++}
+diff -ruN -x pc -x vtesting -x .git inj/src/types/mcp.go variants/sf_naive_host/src/types/mcp.go
+--- a/src/types/mcp.go	2026-07-04 14:17:07.000000000 +0000
++++ b/src/types/mcp.go	2026-10-29 01:55:01.981837247 +0000
+@@ -11,9 +11,10 @@
+ type MCPServerConfig struct {
+ 	Host               string `yaml:"host,omitempty"`
+ 	Port               int    `yaml:"port,omitempty"`
+-	Transport          string `yaml:"transport,omitempty"`            // Optional: defaults to "sse"
+-	Timeout            string `yaml:"timeout,omitempty"`              // Optional: defaults to "5m"
+-	ExposeControlTools bool   `yaml:"expose_control_tools,omitempty"` // Optional: when true, expose built-in pc_* control tools
++	Transport          string   `yaml:"transport,omitempty"`            // Optional: defaults to "sse"
++	Timeout            string   `yaml:"timeout,omitempty"`              // Optional: defaults to "5m"
++	ExposeControlTools bool     `yaml:"expose_control_tools,omitempty"` // Optional: when true, expose built-in pc_* control tools
++	TrustedHosts       []string `yaml:"trusted_hosts,omitempty"`        // Optional: extra Host/Origin names trusted by the SSE listener (loopback is always allowed; "*" disables the check)
+ }
+ 
+ // IsEnabled returns true if MCP server is configured

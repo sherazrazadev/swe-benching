@@ -1,0 +1,487 @@
+diff -ruN pristine/schemas/process-compose-schema.json app/schemas/process-compose-schema.json
+--- a/schemas/process-compose-schema.json	2026-10-29 02:13:29.000000000 +0000
++++ b/schemas/process-compose-schema.json	2026-10-29 02:36:50.850011096 +0000
+@@ -176,6 +176,12 @@
+         },
+         "expose_control_tools": {
+           "type": "boolean"
++        },
++        "trusted_hosts": {
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
+         }
+       },
+       "type": "object"
+diff -ruN pristine/src/api/request_trust.go app/src/api/request_trust.go
+--- a/src/api/request_trust.go	2026-10-29 02:13:31.000000000 +0000
++++ b/src/api/request_trust.go	2026-10-29 02:36:23.908038616 +0000
+@@ -2,42 +2,18 @@
+ 
+ import (
+ 	"net/http"
+-	"net/url"
+-	"strings"
+ 
+-	"github.com/gin-gonic/gin"
++	"github.com/f1bonacc1/process-compose/src/reqtrust"
+ )
+ 
+-// requestOriginMiddleware rejects browser requests whose Origin does not match
+-// the host the request was addressed to. Non-browser clients do not send an
+-// Origin and are unaffected. Safe methods and protocol upgrades are handled by
+-// their own handlers.
+-func requestOriginMiddleware() gin.HandlerFunc {
+-	return func(c *gin.Context) {
+-		switch c.Request.Method {
+-		case http.MethodGet, http.MethodHead, http.MethodOptions:
+-			c.Next()
+-			return
+-		}
+-		if strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+-			c.Next()
+-			return
+-		}
+-
+-		origin := c.GetHeader("Origin")
+-		if origin == "" {
+-			c.Next()
+-			return
+-		}
+-		u, err := url.Parse(origin)
+-		if err != nil || u.Host == "" {
+-			c.AbortWithStatus(http.StatusForbidden)
+-			return
+-		}
+-		if !strings.EqualFold(u.Host, c.Request.Host) {
+-			c.AbortWithStatus(http.StatusForbidden)
+-			return
+-		}
+-		c.Next()
++// newTCPControlHandler applies the local-client trust rule to a TCP control
++// listener before any route sees the request. Binding the check here (rather
++// than inside the router) covers every route - reads, controls and the
++// WebSocket upgrades - and leaves the unix-socket listener, which a browser
++// cannot reach, unchanged.
++func newTCPControlHandler(routes http.Handler, bindAddress string, trustedHosts []string) http.Handler {
++	guard := reqtrust.Guard{
++		Trusted: reqtrust.TrustedHosts(bindAddress, trustedHosts),
+ 	}
++	return guard.Wrap(routes)
+ }
+diff -ruN pristine/src/api/routes.go app/src/api/routes.go
+--- a/src/api/routes.go	2026-10-29 02:13:31.000000000 +0000
++++ b/src/api/routes.go	2026-10-29 02:36:33.395027357 +0000
+@@ -6,6 +6,7 @@
+ 
+ 	"github.com/f1bonacc1/process-compose/src/config"
+ 	_ "github.com/f1bonacc1/process-compose/src/docs"
++	"github.com/f1bonacc1/process-compose/src/reqtrust"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/rs/zerolog/log"
+ 	swaggerFiles "github.com/swaggo/files"
+@@ -13,10 +14,11 @@
+ )
+ 
+ // TokenAuthMiddleware enforces API access using an auth token if configured.
++// The token is accepted in either documented form: X-PC-Token-Key, or an
++// Authorization header with the (case-insensitive) Bearer scheme.
+ func TokenAuthMiddleware(token string) gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+-		reqToken := c.GetHeader(config.TokenHeader)
+-		if reqToken != token {
++		if token != "" && !reqtrust.TokenValid(c.Request, token) {
+ 			log.Error().
+ 				Str("client_ip", c.ClientIP()).
+ 				Str("method", c.Request.Method).
+@@ -45,8 +47,6 @@
+ 		r.Use(TokenAuthMiddleware(authToken))
+ 	}
+ 
+-	r.Use(requestOriginMiddleware())
+-
+ 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+ 	r.GET("/", func(c *gin.Context) {
+ 		location := url.URL{Path: "/swagger/index.html"}
+diff -ruN pristine/src/api/server.go app/src/api/server.go
+--- a/src/api/server.go	2026-10-29 02:13:29.000000000 +0000
++++ b/src/api/server.go	2026-10-29 02:36:26.120035361 +0000
+@@ -46,14 +46,14 @@
+ 	return server, nil
+ }
+ 
+-func StartHttpServerWithTCP(useLogger bool, address string, port int, project app.IProject) (*http.Server, error) {
++func StartHttpServerWithTCP(useLogger bool, address string, port int, trustedHosts []string, project app.IProject) (*http.Server, error) {
+ 	router := getRouter(useLogger, project)
+ 	endPoint := fmt.Sprintf("%s:%d", address, port)
+ 	log.Info().Msgf("start http server listening %s", endPoint)
+ 
+ 	server := &http.Server{
+ 		Addr:    endPoint,
+-		Handler: router.Handler(),
++		Handler: newTCPControlHandler(router, address, trustedHosts),
+ 	}
+ 
+ 	go func() {
+diff -ruN pristine/src/api/ws_api.go app/src/api/ws_api.go
+--- a/src/api/ws_api.go	2026-10-29 02:13:31.000000000 +0000
++++ b/src/api/ws_api.go	2026-10-29 02:36:37.955022689 +0000
+@@ -4,7 +4,6 @@
+ 	"errors"
+ 	"net"
+ 	"net/http"
+-	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -18,26 +17,11 @@
+ 	"github.com/rs/zerolog/log"
+ )
+ 
+-var upgrader = websocket.Upgrader{CheckOrigin: allowRequestOrigin}
+-
+-// allowRequestOrigin accepts a WebSocket upgrade when the browser Origin
+-// matches the host the request was addressed to, or when it is a loopback
+-// origin. Clients that do not send an Origin are accepted.
+-func allowRequestOrigin(r *http.Request) bool {
+-	origin := r.Header.Get("Origin")
+-	if origin == "" {
+-		return true
+-	}
+-	u, err := url.Parse(origin)
+-	if err != nil {
+-		return false
+-	}
+-	if strings.EqualFold(u.Host, r.Host) {
+-		return true
+-	}
+-	h := u.Hostname()
+-	return strings.EqualFold(h, "localhost") || strings.HasPrefix(h, "127.")
+-}
++// upgrader upgrades loopback and operator-trusted WebSocket clients. The
++// listener-level trust guard has already refused every request whose Host or
++// Origin is untrusted, so gorilla's default same-origin check is the last
++// line of defence rather than the only one.
++var upgrader = websocket.Upgrader{}
+ 
+ // @Schemes
+ // @Id                    LogsStream
+diff -ruN pristine/src/cmd/root.go app/src/cmd/root.go
+--- a/src/cmd/root.go	2026-10-29 02:13:29.000000000 +0000
++++ b/src/cmd/root.go	2026-10-29 02:36:48.112013404 +0000
+@@ -223,17 +223,27 @@
+ 	}
+ }
+ 
+-func startHttpServerIfEnabled(useLogger bool, runner *app.ProjectRunner) (*http.Server, error) {
++func startHttpServerIfEnabled(useLogger bool, runner *app.ProjectRunner, trustedHosts []string) (*http.Server, error) {
+ 	if !*pcFlags.NoServer {
+ 		if *pcFlags.IsUnixSocket {
+ 			return api.StartHttpServerWithUnixSocket(useLogger, *pcFlags.UnixSocketPath, runner)
+ 		}
+-		return api.StartHttpServerWithTCP(useLogger, *pcFlags.Address, *pcFlags.PortNum, runner)
++		return api.StartHttpServerWithTCP(useLogger, *pcFlags.Address, *pcFlags.PortNum, trustedHosts, runner)
+ 	}
+ 
+ 	return nil, nil
+ }
+ 
++// controlTrustedHosts returns the operator-configured names that the local
++// control listeners accept in addition to loopback. They are configured under
++// mcp_server.trusted_hosts and apply to every TCP listener the product runs.
++func controlTrustedHosts(project *types.Project) []string {
++	if project == nil || project.MCPServer == nil {
++		return nil
++	}
++	return project.MCPServer.TrustedHosts
++}
++
+ func waitForProjectAndServer(useLogger bool, runner *app.ProjectRunner, project *types.Project) error {
+ 	// Create and start MCP server if enabled
+ 	mcpManager := mcp.NewMCPManager(runner, project.MCPServer, project.Processes)
+@@ -251,7 +261,7 @@
+ 		*pcFlags.KeepProjectOn = true
+ 	}
+ 
+-	server, err := startHttpServerIfEnabled(useLogger, runner)
++	server, err := startHttpServerIfEnabled(useLogger, runner, controlTrustedHosts(project))
+ 	if err != nil {
+ 		return err
+ 	}
+diff -ruN pristine/src/mcp/server.go app/src/mcp/server.go
+--- a/src/mcp/server.go	2026-10-29 02:13:29.000000000 +0000
++++ b/src/mcp/server.go	2026-10-29 02:36:21.054042816 +0000
+@@ -2,11 +2,16 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	stdLog "log"
++	"net/http"
+ 	"sync"
++	"time"
+ 
++	"github.com/f1bonacc1/process-compose/src/config"
++	"github.com/f1bonacc1/process-compose/src/reqtrust"
+ 	"github.com/f1bonacc1/process-compose/src/types"
+ 	"github.com/mark3labs/mcp-go/mcp"
+ 	"github.com/mark3labs/mcp-go/server"
+@@ -43,6 +48,8 @@
+ 	cancel         context.CancelFunc
+ 	stdin          io.Reader
+ 	stdout         io.Writer
++	httpServer     *http.Server
++	sseServer      *server.SSEServer
+ }
+ 
+ // NewServer creates a new MCP server instance
+@@ -205,12 +212,25 @@
+ 		Str("address", addr).
+ 		Msg("Starting MCP server with SSE transport")
+ 
+-	// Create SSE server
++	// Create SSE server. The listener is served through our own http.Server so
++	// every request - on both the documented /sse stream and the session's
++	// /message dispatch endpoint - passes the same trust rule before mcp-go
++	// sees it. The handler is passed the original ResponseWriter because the
++	// transport asserts http.Flusher to stream events.
+ 	sseServer := server.NewSSEServer(s.mcpServer)
++	guard := reqtrust.Guard{
++		Trusted: reqtrust.TrustedHosts(s.config.Host, s.config.TrustedHosts),
++		Token:   config.GetApiToken(),
++	}
++	s.sseServer = sseServer
++	s.httpServer = &http.Server{
++		Addr:    addr,
++		Handler: guard.Wrap(sseServer),
++	}
+ 
+ 	// SSE transport blocks, so run in goroutine
+ 	go func() {
+-		if err := sseServer.Start(addr); err != nil {
++		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 			log.Error().Err(err).Msg("MCP SSE server error")
+ 		}
+ 	}()
+@@ -222,6 +242,17 @@
+ func (s *Server) Stop() error {
+ 	log.Info().Msg("Stopping MCP server")
+ 	s.cancel()
++	if s.sseServer != nil {
++		// End long-lived streams first so Shutdown is not held open by them.
++		s.sseServer.CloseSessions()
++	}
++	if s.httpServer != nil {
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		if err := s.httpServer.Shutdown(ctx); err != nil {
++			log.Error().Err(err).Msg("MCP SSE server shutdown error")
++		}
++	}
+ 	return nil
+ }
+ 
+diff -ruN pristine/src/reqtrust/reqtrust.go app/src/reqtrust/reqtrust.go
+--- a/src/reqtrust/reqtrust.go	1970-01-01 00:00:00.000000000 +0000
++++ b/src/reqtrust/reqtrust.go	2026-10-29 02:36:09.966054293 +0000
+@@ -0,0 +1,176 @@
++// Package reqtrust implements the one trust rule that every process-compose
++// local HTTP control listener applies to an incoming request.
++//
++// A request is trusted only when:
++//
++//   - the Host it is addressed to names the local machine (any loopback
++//     address, or "localhost") or a name the operator listed in the MCP
++//     server's trusted_hosts setting (the special entry "*" disables the
++//     check), and
++//   - an Origin header, when one is present, names a trusted host by the same
++//     rule, and
++//   - when an access token is configured, the request presents it.
++//
++// Anything else is refused with a client error before it can reach a handler,
++// so a refused request has no side effect and returns no process data.
++package reqtrust
++
++import (
++	"crypto/subtle"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++
++	"github.com/f1bonacc1/process-compose/src/config"
++	"github.com/rs/zerolog/log"
++)
++
++// Wildcard disables host and origin checking when the operator explicitly
++// lists it in trusted_hosts. It is the documented opt-out.
++const Wildcard = "*"
++
++// Guard wraps a listener's handler with the trust rule. Token is empty when
++// the listener authenticates separately (the REST router keeps its own token
++// middleware); Trusted is the resolved allowlist, see TrustedHosts.
++type Guard struct {
++	Trusted []string
++	Token   string
++}
++
++// Wrap returns a handler that refuses untrusted requests and passes trusted
++// ones to next unchanged. The original ResponseWriter is forwarded as-is: the
++// MCP SSE transport asserts http.Flusher on it directly, so it must not be
++// wrapped.
++func (g Guard) Wrap(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !HostTrusted(r.Host, g.Trusted) {
++			refuse(w, r, http.StatusForbidden, "untrusted host")
++			return
++		}
++		if origin := r.Header.Get("Origin"); origin != "" && !OriginTrusted(origin, g.Trusted) {
++			refuse(w, r, http.StatusForbidden, "untrusted origin")
++			return
++		}
++		if g.Token != "" && !TokenValid(r, g.Token) {
++			w.Header().Set("WWW-Authenticate", `Bearer realm="process-compose"`)
++			refuse(w, r, http.StatusUnauthorized, "invalid or missing token")
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++// TrustedHosts resolves the host allowlist for a listener. The names the
++// operator configured always apply; the concrete address the listener is
++// bound to is added because local clients legitimately address it by that
++// name. A wildcard bind ("all interfaces") is deliberately not added: no
++// client addresses a listener as 0.0.0.0, and trusting it would let an
++// attacker-chosen Host through.
++func TrustedHosts(bind string, configured []string) []string {
++	out := make([]string, 0, len(configured)+1)
++	out = append(out, configured...)
++	if bind != "" && !isWildcardBind(bind) {
++		out = append(out, bind)
++	}
++	return out
++}
++
++// HostTrusted reports whether hostport names a trusted host.
++func HostTrusted(hostport string, trusted []string) bool {
++	for _, name := range trusted {
++		if name == Wildcard {
++			return true
++		}
++	}
++	host := Hostname(hostport)
++	if host == "" {
++		return false // fail closed on an absent or unparsable host
++	}
++	if ip := net.ParseIP(host); ip != nil {
++		return ip.IsLoopback() // 127.0.0.0/8 and ::1
++	}
++	if strings.EqualFold(host, "localhost") {
++		return true
++	}
++	for _, name := range trusted {
++		if name != Wildcard && strings.EqualFold(host, Hostname(name)) {
++			return true
++		}
++	}
++	return false
++}
++
++// OriginTrusted reports whether a present Origin header names a trusted host.
++// The literal "null" origin and any unparsable value are not trusted.
++func OriginTrusted(origin string, trusted []string) bool {
++	u, err := url.Parse(origin)
++	if err != nil || u.Host == "" {
++		return false
++	}
++	return HostTrusted(u.Host, trusted)
++}
++
++// Hostname reduces a Host or Origin authority to the bare host: it drops the
++// port, IPv6 brackets and a trailing root dot. Values that carry the port in
++// the wrong place (for example "attacker.example:127.0.0.1") are never
++// silently reinterpreted - SplitHostPort fails and the whole string stays,
++// which then fails the trust test.
++func Hostname(hostport string) string {
++	host := hostport
++	if h, _, err := net.SplitHostPort(hostport); err == nil {
++		host = h
++	} else {
++		host = strings.TrimPrefix(host, "[")
++		host = strings.TrimSuffix(host, "]")
++	}
++	return strings.TrimSuffix(host, ".")
++}
++
++// TokenValid reports whether the request presents want through either
++// documented form: X-PC-Token-Key, or Authorization with the Bearer scheme
++// (the scheme name is case-insensitive). The comparison is constant time.
++func TokenValid(r *http.Request, want string) bool {
++	presented := r.Header.Get(config.TokenHeader)
++	if presented == "" {
++		if token, ok := bearerToken(r.Header.Get("Authorization")); ok {
++			presented = token
++		}
++	}
++	return subtle.ConstantTimeCompare([]byte(presented), []byte(want)) == 1
++}
++
++// bearerToken extracts the credentials from an Authorization value when it
++// uses the Bearer scheme.
++func bearerToken(header string) (string, bool) {
++	header = strings.TrimSpace(header)
++	sep := strings.IndexByte(header, ' ')
++	if sep < 0 {
++		return "", false
++	}
++	if !strings.EqualFold(header[:sep], "Bearer") {
++		return "", false
++	}
++	return strings.TrimSpace(header[sep+1:]), true
++}
++
++// isWildcardBind reports whether a bind address means "all interfaces".
++func isWildcardBind(hostport string) bool {
++	if ip := net.ParseIP(Hostname(hostport)); ip != nil {
++		return ip.IsUnspecified()
++	}
++	return false
++}
++
++// refuse logs the denial (never credential material) and writes a client
++// error, which is how the contract requires an untrusted request to end.
++func refuse(w http.ResponseWriter, r *http.Request, status int, reason string) {
++	log.Warn().
++		Str("remote_addr", r.RemoteAddr).
++		Str("method", r.Method).
++		Str("path", r.URL.Path).
++		Str("host", r.Host).
++		Str("origin", r.Header.Get("Origin")).
++		Msgf("refused untrusted request: %s", reason)
++	http.Error(w, reason, status)
++}
+diff -ruN pristine/src/types/mcp.go app/src/types/mcp.go
+--- a/src/types/mcp.go	2026-10-29 02:13:29.000000000 +0000
++++ b/src/types/mcp.go	2026-10-29 02:36:53.583009926 +0000
+@@ -9,11 +9,12 @@
+ 
+ // MCPServerConfig defines the top-level MCP server configuration
+ type MCPServerConfig struct {
+-	Host               string `yaml:"host,omitempty"`
+-	Port               int    `yaml:"port,omitempty"`
+-	Transport          string `yaml:"transport,omitempty"`            // Optional: defaults to "sse"
+-	Timeout            string `yaml:"timeout,omitempty"`              // Optional: defaults to "5m"
+-	ExposeControlTools bool   `yaml:"expose_control_tools,omitempty"` // Optional: when true, expose built-in pc_* control tools
++	Host               string   `yaml:"host,omitempty"`
++	Port               int      `yaml:"port,omitempty"`
++	Transport          string   `yaml:"transport,omitempty"`            // Optional: defaults to "sse"
++	Timeout            string   `yaml:"timeout,omitempty"`              // Optional: defaults to "5m"
++	ExposeControlTools bool     `yaml:"expose_control_tools,omitempty"` // Optional: when true, expose built-in pc_* control tools
++	TrustedHosts       []string `yaml:"trusted_hosts,omitempty"`        // Optional: extra Host/Origin names trusted by the local control listeners; loopback and localhost are always trusted, "*" disables the check
+ }
+ 
+ // IsEnabled returns true if MCP server is configured

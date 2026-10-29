@@ -1,0 +1,246 @@
+diff --git a/pkg/component/garden/projectrbac/accessoverlay.go b/pkg/component/garden/projectrbac/accessoverlay.go
+deleted file mode 100644
+index 4ae498752..000000000
+--- a/pkg/component/garden/projectrbac/accessoverlay.go
++++ /dev/null
+@@ -1,53 +0,0 @@
+-// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
+-//
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package projectrbac
+-
+-import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+-
+-	corev1 "k8s.io/api/core/v1"
+-	rbacv1 "k8s.io/api/rbac/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
+-)
+-
+-const accessOverlayConfigMapName = "gardener-project-access"
+-
+-// projectAccessOverlay contains additional project subjects contributed through the project
+-// namespace. Extension controllers use it to render project access for the service accounts they
+-// manage without requiring the manage-members verb on the Project itself.
+-type projectAccessOverlay struct {
+-	Admin                 []rbacv1.Subject `json:"admin,omitempty"`
+-	Member                []rbacv1.Subject `json:"member,omitempty"`
+-	UserAccessManager     []rbacv1.Subject `json:"uam,omitempty"`
+-	Viewer                []rbacv1.Subject `json:"viewer,omitempty"`
+-	ServiceAccountManager []rbacv1.Subject `json:"serviceAccountManager,omitempty"`
+-}
+-
+-// accessOverlay reads the project access overlay from the project namespace. It returns nil when no
+-// overlay is present.
+-func (p *projectRBAC) accessOverlay(ctx context.Context) (*projectAccessOverlay, error) {
+-	configMap := &corev1.ConfigMap{}
+-	if err := p.client.Get(ctx, client.ObjectKey{Namespace: *p.project.Spec.Namespace, Name: accessOverlayConfigMapName}, configMap); err != nil {
+-		if apierrors.IsNotFound(err) {
+-			return nil, nil
+-		}
+-		return nil, err
+-	}
+-
+-	data, ok := configMap.Data["subjects"]
+-	if !ok || len(data) == 0 {
+-		return nil, nil
+-	}
+-
+-	overlay := &projectAccessOverlay{}
+-	if err := json.Unmarshal([]byte(data), overlay); err != nil {
+-		return nil, fmt.Errorf("failed parsing the project access overlay: %w", err)
+-	}
+-
+-	return overlay, nil
+-}
+diff --git a/pkg/component/garden/projectrbac/projectrbac.go b/pkg/component/garden/projectrbac/projectrbac.go
+index c900bbd0b..7eb21fec6 100644
+--- a/pkg/component/garden/projectrbac/projectrbac.go
++++ b/pkg/component/garden/projectrbac/projectrbac.go
+@@ -99,18 +99,6 @@ func (p *projectRBAC) Deploy(ctx context.Context) error {
+ 		}
+ 	}
+ 
+-	overlay, err := p.accessOverlay(ctx)
+-	if err != nil {
+-		return err
+-	}
+-	if overlay != nil {
+-		admins = append(admins, overlay.Admin...)
+-		members = append(members, overlay.Member...)
+-		uams = append(uams, overlay.UserAccessManager...)
+-		viewers = append(viewers, overlay.Viewer...)
+-		serviceAccountManagers = append(serviceAccountManagers, overlay.ServiceAccountManager...)
+-	}
+-
+ 	fns := []flow.TaskFn{
+ 		// project admin resources
+ 		func(ctx context.Context) error {
+diff --git a/plugin/pkg/global/customverbauthorizer/admission.go b/plugin/pkg/global/customverbauthorizer/admission.go
+index f5dc5d464..4d45ce9a4 100644
+--- a/plugin/pkg/global/customverbauthorizer/admission.go
++++ b/plugin/pkg/global/customverbauthorizer/admission.go
+@@ -159,13 +159,11 @@ func (c *CustomVerbAuthorizer) admitProjects(ctx context.Context, a admission.At
+ 		return c.authorize(ctx, a, CustomVerbModifyProjectTolerationsWhitelist, "modify .spec.tolerations.whitelist")
+ 	}
+ 
+-	// Service account requests come from automation which is authorized separately and manages
+-	// project members outside of the user access management flow.
+-	if !isAutomationRequest(a.GetUserInfo()) && mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, obj.Spec.Owner, a.GetUserInfo()) {
++	if mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, obj.Spec.Owner, a.GetUserInfo(), a.GetOperation()) {
+ 		return c.authorize(ctx, a, CustomVerbProjectManageMembers, "manage human users or groups in .spec.members")
+ 	}
+ 
+-	if mustCheckProjectOwner(oldObj.Spec.Owner, obj.Spec.Owner, a.GetUserInfo()) {
++	if mustCheckProjectOwner(oldObj.Spec.Owner, obj.Spec.Owner, a.GetUserInfo(), a.GetOperation()) {
+ 		return c.authorize(ctx, a, CustomVerbProjectManageMembers, "manage owner in .spec.owner")
+ 	}
+ 
+@@ -281,60 +279,69 @@ func mustCheckProjectTolerationsWhitelist(oldTolerations, tolerations *core.Proj
+ 	return !apiequality.Semantic.DeepEqual(oldTolerations.Whitelist, tolerations.Whitelist)
+ }
+ 
+-func mustCheckProjectOwner(oldOwner *rbacv1.Subject, owner *rbacv1.Subject, userInfo user.Info) bool {
+-	// allow to set owner initially
+-	if oldOwner == nil && owner != nil {
++func mustCheckProjectOwner(oldOwner *rbacv1.Subject, owner *rbacv1.Subject, userInfo user.Info, operation admission.Operation) bool {
++	// setting the owner as part of the creation is always allowed
++	if operation == admission.Create {
+ 		return false
+ 	}
+ 
+-	// allow owner to change owner
+-	if userIsOwner(userInfo, oldOwner) {
++	// allow the current owner to change the owner
++	if oldOwner != nil && userIsOwner(userInfo, oldOwner) {
+ 		return false
+ 	}
+ 
+ 	return !apiequality.Semantic.DeepEqual(oldOwner, owner)
+ }
+ 
+-func mustCheckProjectMembers(oldMembers, members []core.ProjectMember, owner *rbacv1.Subject, userInfo user.Info) bool {
++func mustCheckProjectMembers(oldMembers, members []core.ProjectMember, owner *rbacv1.Subject, userInfo user.Info, operation admission.Operation) bool {
+ 	if apiequality.Semantic.DeepEqual(oldMembers, members) {
+ 		return false
+ 	}
+ 
++	// On creation the mutator defaults the creator as owner, so the creator is entitled to the
++	// initial member list.
++	if operation == admission.Create && owner == nil {
++		return false
++	}
++
+ 	// If the user submitting this admission request is the owner then it will be/is bound to the `manage-members`
+ 	// custom verb anyway, so let's allow him to add/remove human users.
+-	if userIsOwner(userInfo, owner) {
++	if owner != nil && userIsOwner(userInfo, owner) {
+ 		return false
+ 	}
+ 
+-	var oldHumanUsers, newHumanUsers = findHumanUsersWithRoles(oldMembers), findHumanUsersWithRoles(members)
++	var oldNonServiceAccounts, newNonServiceAccounts = findNonServiceAccountsWithRoles(oldMembers), findNonServiceAccountsWithRoles(members)
+ 	// Remove owner subject from `members` list to always allow it to be added
+-	if owner != nil && isHumanUser(*owner) {
+-		ownerKey := humanMemberKey(*owner)
+-		removeEntriesWithMember(oldHumanUsers, ownerKey)
+-		removeEntriesWithMember(newHumanUsers, ownerKey)
++	if owner != nil && !isServiceAccountSubject(*owner) {
++		ownerKey := memberSubjectKey(*owner)
++		removeEntriesWithMember(oldNonServiceAccounts, ownerKey)
++		removeEntriesWithMember(newNonServiceAccounts, ownerKey)
+ 	}
+ 
+-	return !oldHumanUsers.Equal(newHumanUsers)
++	return newNonServiceAccounts.Difference(oldNonServiceAccounts).Len() > 0
+ }
+ 
+-type humanMembership struct {
++// membership is a data structure representing project member with one of its roles.
++// Project members with multiple roles can create a membership for each role.
++// Members with no roles associated, can create a membership with empty role.
++type membership struct {
+ 	member string
+ 	role   string
+ }
+ 
+-func findHumanUsersWithRoles(members []core.ProjectMember) sets.Set[humanMembership] {
+-	result := sets.New[humanMembership]()
++func findNonServiceAccountsWithRoles(members []core.ProjectMember) sets.Set[membership] {
++	result := sets.New[membership]()
+ 
+ 	for _, member := range members {
+-		if isHumanUser(member.Subject) {
+-			memberKey := humanMemberKey(member.Subject)
++		if !isServiceAccountSubject(member.Subject) {
++			memberKey := memberSubjectKey(member.Subject)
+ 			// Create a unique key that includes both subject and roles
+ 			for _, role := range member.Roles {
+-				result.Insert(humanMembership{member: memberKey, role: role})
++				result.Insert(membership{member: memberKey, role: role})
+ 			}
+ 			// If no roles are specified, still create an entry with empty role
+ 			if len(member.Roles) == 0 {
+-				result.Insert(humanMembership{member: memberKey, role: ""})
++				result.Insert(membership{member: memberKey, role: ""})
+ 			}
+ 		}
+ 	}
+@@ -342,15 +349,24 @@ func findHumanUsersWithRoles(members []core.ProjectMember) sets.Set[humanMembers
+ 	return result
+ }
+ 
+-func isHumanUser(subject rbacv1.Subject) bool {
+-	return subject.Kind == rbacv1.UserKind && !strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)
++func isServiceAccountSubject(subject rbacv1.Subject) bool {
++	// Service account groups, e.g. (subject.Kind == "Group" && strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountGroupPrefix))
++	// are not considered as service account subjects, otherwise it would allow project admins to manage also service account groups
++	// which is not allowed (see docs/usage/project/projects.md#user-access-management).
++	var (
++		isServiceAccount              = subject.APIGroup == "" && subject.Kind == rbacv1.ServiceAccountKind
++		isServiceAccountAsUserSubject = subject.APIGroup == rbacv1.GroupName && subject.Kind == rbacv1.UserKind &&
++			strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)
++	)
++
++	return isServiceAccount || isServiceAccountAsUserSubject
+ }
+ 
+-func humanMemberKey(subject rbacv1.Subject) string {
++func memberSubjectKey(subject rbacv1.Subject) string {
+ 	return subject.Kind + subject.Name
+ }
+ 
+-func removeEntriesWithMember(set sets.Set[humanMembership], member string) {
++func removeEntriesWithMember(set sets.Set[membership], member string) {
+ 	for membership := range set {
+ 		if membership.member == member {
+ 			set.Delete(membership)
+diff --git a/plugin/pkg/global/customverbauthorizer/compat.go b/plugin/pkg/global/customverbauthorizer/compat.go
+deleted file mode 100644
+index 74298a845..000000000
+--- a/plugin/pkg/global/customverbauthorizer/compat.go
++++ /dev/null
+@@ -1,19 +0,0 @@
+-// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
+-//
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package customverbauthorizer
+-
+-import (
+-	"strings"
+-
+-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+-	"k8s.io/apiserver/pkg/authentication/user"
+-)
+-
+-// isAutomationRequest reports whether an admission request is issued by a service account.
+-// Service accounts are provisioned and authorized by the operator for automation purposes and
+-// manage project members outside of the user access management flow.
+-func isAutomationRequest(info user.Info) bool {
+-	return info != nil && strings.HasPrefix(info.GetName(), serviceaccount.ServiceAccountUsernamePrefix)
+-}

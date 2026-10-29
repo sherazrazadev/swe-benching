@@ -1,0 +1,412 @@
+diff --git a/src/services/sqlite/SessionStore.ts b/src/services/sqlite/SessionStore.ts
+index aaaf8754..d2a12bb7 100644
+--- a/src/services/sqlite/SessionStore.ts
++++ b/src/services/sqlite/SessionStore.ts
+@@ -14,6 +14,7 @@ import {
+ } from '../../types/database.js';
+ import type { PendingMessageStore } from './PendingMessageStore.js';
+ import { computeObservationContentHash, findDuplicateObservation } from './observations/store.js';
++import { storeSummary as storeSummaryRecord } from './summaries/store.js';
+ 
+ /**
+  * Session data store for SDK sessions, observations, and summaries
+@@ -51,6 +52,7 @@ export class SessionStore {
+     this.addOnUpdateCascadeToForeignKeys();
+     this.addObservationContentHashColumn();
+     this.addSessionCustomTitleColumn();
++    this.addSessionSummaryContentHashColumn();
+   }
+ 
+   /**
+@@ -857,6 +859,22 @@ export class SessionStore {
+     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
+   }
+ 
++  /**
++   * Add content_hash column to session_summaries for deduplication (migration 26)
++   */
++  private addSessionSummaryContentHashColumn(): void {
++    const tableInfo = this.db.query('PRAGMA table_info(session_summaries)').all() as TableColumnInfo[];
++    const hasColumn = tableInfo.some(col => col.name === 'content_hash');
++
++    if (!hasColumn) {
++      this.db.run('ALTER TABLE session_summaries ADD COLUMN content_hash TEXT');
++      this.db.run('CREATE INDEX IF NOT EXISTS idx_session_summaries_content_hash ON session_summaries(content_hash, created_at_epoch)');
++      logger.debug('DB', 'Added content_hash column to session_summaries table with index');
++    }
++
++    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
++  }
++
+   /**
+    * Add custom_title column to sdk_sessions for agent attribution (migration 23)
+    */
+@@ -1580,36 +1598,15 @@ export class SessionStore {
+     discoveryTokens: number = 0,
+     overrideTimestampEpoch?: number
+   ): { id: number; createdAtEpoch: number } {
+-    // Use override timestamp if provided (for processing backlog messages with original timestamps)
+-    const timestampEpoch = overrideTimestampEpoch ?? Date.now();
+-    const timestampIso = new Date(timestampEpoch).toISOString();
+-
+-    const stmt = this.db.prepare(`
+-      INSERT INTO session_summaries
+-      (memory_session_id, project, request, investigated, learned, completed,
+-       next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-    `);
+-
+-    const result = stmt.run(
++    return storeSummaryRecord(
++      this.db,
+       memorySessionId,
+       project,
+-      summary.request,
+-      summary.investigated,
+-      summary.learned,
+-      summary.completed,
+-      summary.next_steps,
+-      summary.notes,
+-      promptNumber || null,
++      summary,
++      promptNumber,
+       discoveryTokens,
+-      timestampIso,
+-      timestampEpoch
++      overrideTimestampEpoch
+     );
+-
+-    return {
+-      id: Number(result.lastInsertRowid),
+-      createdAtEpoch: timestampEpoch
+-    };
+   }
+ 
+   /**
+@@ -1701,28 +1698,15 @@ export class SessionStore {
+       // 2. Store summary if provided
+       let summaryId: number | null = null;
+       if (summary) {
+-        const summaryStmt = this.db.prepare(`
+-          INSERT INTO session_summaries
+-          (memory_session_id, project, request, investigated, learned, completed,
+-           next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-        `);
+-
+-        const result = summaryStmt.run(
++        summaryId = storeSummaryRecord(
++          this.db,
+           memorySessionId,
+           project,
+-          summary.request,
+-          summary.investigated,
+-          summary.learned,
+-          summary.completed,
+-          summary.next_steps,
+-          summary.notes,
+-          promptNumber || null,
++          summary,
++          promptNumber,
+           discoveryTokens,
+-          timestampIso,
+           timestampEpoch
+-        );
+-        summaryId = Number(result.lastInsertRowid);
++        ).id;
+       }
+ 
+       return { observationIds, summaryId, createdAtEpoch: timestampEpoch };
+@@ -1830,28 +1814,15 @@ export class SessionStore {
+       // 2. Store summary if provided
+       let summaryId: number | undefined;
+       if (summary) {
+-        const summaryStmt = this.db.prepare(`
+-          INSERT INTO session_summaries
+-          (memory_session_id, project, request, investigated, learned, completed,
+-           next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-        `);
+-
+-        const result = summaryStmt.run(
++        summaryId = storeSummaryRecord(
++          this.db,
+           memorySessionId,
+           project,
+-          summary.request,
+-          summary.investigated,
+-          summary.learned,
+-          summary.completed,
+-          summary.next_steps,
+-          summary.notes,
+-          promptNumber || null,
++          summary,
++          promptNumber,
+           discoveryTokens,
+-          timestampIso,
+           timestampEpoch
+-        );
+-        summaryId = Number(result.lastInsertRowid);
++        ).id;
+       }
+ 
+       // 3. Mark pending message as processed
+diff --git a/src/services/sqlite/migrations/runner.ts b/src/services/sqlite/migrations/runner.ts
+index aff03d6e..7f60c70d 100644
+--- a/src/services/sqlite/migrations/runner.ts
++++ b/src/services/sqlite/migrations/runner.ts
+@@ -35,6 +35,7 @@ export class MigrationRunner {
+     this.addObservationContentHashColumn();
+     this.addSessionCustomTitleColumn();
+     this.createObservationFeedbackTable();
++    this.addSessionSummaryContentHashColumn();
+   }
+ 
+   /**
+@@ -891,4 +892,20 @@ export class MigrationRunner {
+     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
+     logger.debug('DB', 'Created observation_feedback table for usage tracking');
+   }
++
++  /**
++   * Add content_hash column to session_summaries for deduplication (migration 26)
++   */
++  private addSessionSummaryContentHashColumn(): void {
++    const tableInfo = this.db.query('PRAGMA table_info(session_summaries)').all() as TableColumnInfo[];
++    const hasColumn = tableInfo.some(col => col.name === 'content_hash');
++
++    if (!hasColumn) {
++      this.db.run('ALTER TABLE session_summaries ADD COLUMN content_hash TEXT');
++      this.db.run('CREATE INDEX IF NOT EXISTS idx_session_summaries_content_hash ON session_summaries(content_hash, created_at_epoch)');
++      logger.debug('DB', 'Added content_hash column to session_summaries table with index');
++    }
++
++    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
++  }
+ }
+diff --git a/src/services/sqlite/summaries/store.ts b/src/services/sqlite/summaries/store.ts
+index f790b718..7cae1ab3 100644
+--- a/src/services/sqlite/summaries/store.ts
++++ b/src/services/sqlite/summaries/store.ts
+@@ -1,10 +1,46 @@
+ /**
+  * Store session summaries in the database
+  */
++import { createHash } from 'crypto';
+ import type { Database } from 'bun:sqlite';
+ import { logger } from '../../../utils/logger.js';
+ import type { SummaryInput, StoreSummaryResult } from './types.js';
+ 
++/** Deduplication window: summaries with the same content hash within this window are skipped */
++const SUMMARY_DEDUP_WINDOW_MS = 30_000;
++
++/**
++ * Compute a short content hash for deduplication.
++ * Uses the summary content as the record's identity.
++ */
++export function computeSummaryContentHash(
++  memorySessionId: string,
++  summary: SummaryInput
++): string {
++  return createHash('sha256')
++    .update((memorySessionId || '') + (summary.request || '') + (summary.investigated || '') +
++            (summary.learned || '') + (summary.completed || '') + (summary.next_steps || '') +
++            (summary.notes || ''))
++    .digest('hex')
++    .slice(0, 16);
++}
++
++/**
++ * Check if a duplicate summary exists within the dedup window.
++ * Returns the existing summary's id and timestamp if found, null otherwise.
++ */
++export function findDuplicateSummary(
++  db: Database,
++  contentHash: string,
++  timestampEpoch: number
++): { id: number; created_at_epoch: number } | null {
++  const windowStart = timestampEpoch - SUMMARY_DEDUP_WINDOW_MS;
++  const stmt = db.prepare(
++    'SELECT id, created_at_epoch FROM session_summaries WHERE content_hash = ? AND created_at_epoch > ?'
++  );
++  return (stmt.get(contentHash, windowStart) as { id: number; created_at_epoch: number } | null);
++}
++
+ /**
+  * Store a session summary (from SDK parsing)
+  * Assumes session already exists - will fail with FK error if not
+@@ -30,11 +66,19 @@ export function storeSummary(
+   const timestampEpoch = overrideTimestampEpoch ?? Date.now();
+   const timestampIso = new Date(timestampEpoch).toISOString();
+ 
++  // Content-hash deduplication
++  const contentHash = computeSummaryContentHash(memorySessionId, summary);
++  const existing = findDuplicateSummary(db, contentHash, timestampEpoch);
++  if (existing) {
++    logger.debug('DEDUP', `Skipped duplicate summary | contentHash=${contentHash} | existingId=${existing.id}`);
++    return { id: existing.id, createdAtEpoch: existing.created_at_epoch };
++  }
++
+   const stmt = db.prepare(`
+     INSERT INTO session_summaries
+     (memory_session_id, project, request, investigated, learned, completed,
+-     next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++     next_steps, notes, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch)
++    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   `);
+ 
+   const result = stmt.run(
+@@ -48,6 +92,7 @@ export function storeSummary(
+     summary.notes,
+     promptNumber || null,
+     discoveryTokens,
++    contentHash,
+     timestampIso,
+     timestampEpoch
+   );
+diff --git a/src/services/sqlite/transactions.ts b/src/services/sqlite/transactions.ts
+index 66da9ebd..6e8fdd40 100644
+--- a/src/services/sqlite/transactions.ts
++++ b/src/services/sqlite/transactions.ts
+@@ -11,6 +11,7 @@ import { logger } from '../../utils/logger.js';
+ import type { ObservationInput } from './observations/types.js';
+ import type { SummaryInput } from './summaries/types.js';
+ import { computeObservationContentHash, findDuplicateObservation } from './observations/store.js';
++import { storeSummary } from './summaries/store.js';
+ 
+ /**
+  * Result from storeObservations / storeObservationsAndMarkComplete transaction
+@@ -103,28 +104,15 @@ export function storeObservationsAndMarkComplete(
+     // 2. Store summary if provided
+     let summaryId: number | null = null;
+     if (summary) {
+-      const summaryStmt = db.prepare(`
+-        INSERT INTO session_summaries
+-        (memory_session_id, project, request, investigated, learned, completed,
+-         next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-      `);
+-
+-      const result = summaryStmt.run(
++      summaryId = storeSummary(
++        db,
+         memorySessionId,
+         project,
+-        summary.request,
+-        summary.investigated,
+-        summary.learned,
+-        summary.completed,
+-        summary.next_steps,
+-        summary.notes,
+-        promptNumber || null,
++        summary,
++        promptNumber,
+         discoveryTokens,
+-        timestampIso,
+         timestampEpoch
+-      );
+-      summaryId = Number(result.lastInsertRowid);
++      ).id;
+     }
+ 
+     // 3. Mark pending message as processed
+@@ -222,28 +210,15 @@ export function storeObservations(
+     // 2. Store summary if provided
+     let summaryId: number | null = null;
+     if (summary) {
+-      const summaryStmt = db.prepare(`
+-        INSERT INTO session_summaries
+-        (memory_session_id, project, request, investigated, learned, completed,
+-         next_steps, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-      `);
+-
+-      const result = summaryStmt.run(
++      summaryId = storeSummary(
++        db,
+         memorySessionId,
+         project,
+-        summary.request,
+-        summary.investigated,
+-        summary.learned,
+-        summary.completed,
+-        summary.next_steps,
+-        summary.notes,
+-        promptNumber || null,
++        summary,
++        promptNumber,
+         discoveryTokens,
+-        timestampIso,
+         timestampEpoch
+-      );
+-      summaryId = Number(result.lastInsertRowid);
++      ).id;
+     }
+ 
+     return { observationIds, summaryId, createdAtEpoch: timestampEpoch };
+diff --git a/src/services/sync/ChromaSync.ts b/src/services/sync/ChromaSync.ts
+index 9f3e01d1..5459d869 100644
+--- a/src/services/sync/ChromaSync.ts
++++ b/src/services/sync/ChromaSync.ts
+@@ -12,6 +12,7 @@
+  * Design: Fail-fast with no fallbacks - if Chroma is unavailable, syncing fails.
+  */
+ 
++import { createHash } from 'crypto';
+ import { ChromaMcpManager } from './ChromaMcpManager.js';
+ import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
+ import { SessionStore } from '../sqlite/SessionStore.js';
+@@ -115,12 +116,25 @@ export class ChromaSync {
+     });
+   }
+ 
++  /**
++   * Stable content-derived identity for an observation's vector documents.
++   * Keeps document ids stable across re-imports so a re-sync updates the same
++   * documents instead of writing a second copy.
++   */
++  private observationContentId(obs: StoredObservation): string {
++    return createHash('sha256')
++      .update((obs.memory_session_id || '') + (obs.title || '') + (obs.narrative || ''))
++      .digest('hex')
++      .slice(0, 16);
++  }
++
+   /**
+    * Format observation into Chroma documents (granular approach)
+    * Each semantic field becomes a separate vector document
+    */
+   private formatObservationDocs(obs: StoredObservation): ChromaDocument[] {
+     const documents: ChromaDocument[] = [];
++    const contentId = this.observationContentId(obs);
+ 
+     // Parse JSON fields
+     const facts = obs.facts ? JSON.parse(obs.facts) : [];
+@@ -155,7 +169,7 @@ export class ChromaSync {
+     // Narrative as separate document
+     if (obs.narrative) {
+       documents.push({
+-        id: `obs_${obs.id}_narrative`,
++        id: `obs_${contentId}_narrative`,
+         document: obs.narrative,
+         metadata: { ...baseMetadata, field_type: 'narrative' }
+       });
+@@ -164,7 +178,7 @@ export class ChromaSync {
+     // Text as separate document (legacy field)
+     if (obs.text) {
+       documents.push({
+-        id: `obs_${obs.id}_text`,
++        id: `obs_${contentId}_text`,
+         document: obs.text,
+         metadata: { ...baseMetadata, field_type: 'text' }
+       });
+@@ -173,7 +187,7 @@ export class ChromaSync {
+     // Each fact as separate document
+     facts.forEach((fact: string, index: number) => {
+       documents.push({
+-        id: `obs_${obs.id}_fact_${index}`,
++        id: `obs_${contentId}_fact_${index}`,
+         document: fact,
+         metadata: { ...baseMetadata, field_type: 'fact', fact_index: index }
+       });

@@ -1,0 +1,237 @@
+{
+ "slug": "gardener-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17626",
+  "advisory_ids": [
+   "GHSA-GFJV-GQF2-C888",
+   "CVE-2026-79767",
+   "GO-2026-6568"
+  ],
+  "repo": "gardener/gardener",
+  "pinned_commit": "c3f8b61ec40efbe001458770bf6282c4cdd8b6c7",
+  "fix_commits": [
+   "63751db97dca6cc5ee5f966d4963415de6ae5545"
+  ],
+  "pattern_fit": "B",
+  "O1_entry_points": 2,
+  "O9_family": "authorization bypass (CWE-863): incomplete subject-kind classification in a Kubernetes admission plugin lets project admins/members grant project RBAC to groups without the manage-members verb",
+  "O11_fix_minutes": 40,
+  "O13_recall_risk": "medium",
+  "note": "The full screener record is in BUILD-PROMPT.md of this build directory. The ownerless-project route and both injected siblings are additional; the owner-entry-exemption and nil-owner leads from O8 were tested before use."
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "track": "injected",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "gardener-apiserver validating admission for Project create/update: a request that changes .spec.members or .spec.owner without the manage-members custom verb is admitted when the change only involves a group, when the stored project records no owner, or when the requester is a service account; the project controller's projectrbac.Deploy then renders the resulting subjects into ClusterRoleBindings/RoleBindings. Driven as Go tests: a mock authorizer answers per-verb and a controller-runtime fake client backs the renderer. Locally every security test fails on the injected pinned tree by assertion and every functional test passes there too.",
+  "sites": [
+   "plugin/pkg/global/customverbauthorizer/admission.go:162 (admitProjects -> mustCheckProjectMembers) [published landing point]",
+   "plugin/pkg/global/customverbauthorizer/admission.go:270-306 (mustCheckProjectOwner / mustCheckProjectMembers / userIsOwner nil-owner handling) [uncovered route T1, real code]",
+   "plugin/pkg/global/customverbauthorizer/admission.go:343-353 (subject classifier; upstream fix site; shape trap T2) [published]",
+   "plugin/pkg/global/customverbauthorizer/compat.go (injected) + the call site in admitProjects [injected sibling T4]",
+   "pkg/component/garden/projectrbac/accessoverlay.go (injected) + Deploy merge in projectrbac.go:96-107 [injected sibling T3]"
+  ],
+  "routes": [
+   "Project UPDATE/CREATE that adds, removes or re-roles a Group subject [published route; confirmed open on the pinned tree]",
+   "Project UPDATE on a project whose stored .spec.owner is nil: userIsOwner returns true for every requester, so member changes bypass the check and .spec.owner can be installed without manage-members [real, unmodified upstream code; confirmed open on the pinned tree]",
+   "A group subject named with a service-account form (system:serviceaccounts:*, system:serviceaccount:*:*) is a group, not a service account [real; confirmed open at the pinned commit; the published fix already protects it, so this trap only catches classifiers that exempt it]",
+   "Project UPDATE issued by a service-account requester skips the member check [injected; confirmed open on the pinned+injected tree]",
+   "The project RBAC renderer merges subjects from a ConfigMap in the project namespace into the access bindings, which the admission check never sees [injected; confirmed open on the pinned+injected tree]"
+  ],
+  "variants": [
+   "group added to .spec.members on UPDATE",
+   "group removed from .spec.members on UPDATE",
+   "group roles changed on UPDATE",
+   "group added on CREATE when the creator is not the owner",
+   "ownerless project: group added, user added, owner installed, owner and group installed together",
+   "groups named system:serviceaccounts, system:serviceaccounts:<namespace>, system:serviceaccount:<namespace>:<name>",
+   "member change requested by a service-account identity",
+   "authorization decision taken for another resource",
+   "stored access configuration naming a group and a service account"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./plugin/pkg/global/customverbauthorizer/... ./pkg/component/garden/projectrbac/... pass offline in the image at the pinned+injected commit (local Go 1.26.3 container, GOWORK=off). The functional group restores the project's own projectrbac tests verbatim and a copy of the customverbauthorizer admission tests whose subject fixtures carry the RBAC API group that the API server's defaulting always supplies; the pinned file's fixtures omit it, and the upstream fix commit itself rewrote them.",
+  "no_leaked_regression_tests": "the published fix is the direct child of the pinned commit; its new tests (group add/remove cases and the corrected subject fixtures in admission_test.go) are absent at the pinned commit and are not in the environment image.",
+  "gate": "static: every builder-owned check passes (the only failure is the externally-wired blind pass patch, which the pipeline writes after the builder); nop: PASS (16/16 security cases fail on the vulnerable tree, 14/14 functional pass); oracle: PASS 3/3 runs reward 1.0 with identical results; patches: PASS, all 11 check patches behave as declared (miss_nil_owner/miss_sa_groups/miss_overlay/miss_sa_requester/published_fix_only are security_fail with functional 14/14 passing; refuse_all/crash_on_denied/wrong_resource/additions_only are functional_fail; hardening and alt_fix score 1.0)."
+ },
+ "leak_terms": [
+  "isHumanUser",
+  "isServiceAccountSubject",
+  "findNonServiceAccountsWithRoles",
+  "findHumanUsersWithRoles",
+  "humanMemberKey",
+  "memberSubjectKey",
+  "mustCheckProjectMembers",
+  "mustCheckProjectOwner",
+  "userIsOwner",
+  "customverbauthorizer",
+  "admission.go",
+  "projectrbac",
+  "projectRBAC",
+  "accessOverlay",
+  "accessoverlay",
+  "gardener-project-access",
+  "isAutomationRequest",
+  "compat.go",
+  "reconcileResources",
+  "ProjectMemberProperties",
+  "ProjectMemberId"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_nil_owner.patch",
+   "expect": "security_fail",
+   "lever": "T1",
+   "why": "the ownerless-project routes stay open while every other lever is closed"
+  },
+  {
+   "patch": "miss_sa_groups.patch",
+   "expect": "security_fail",
+   "lever": "T2",
+   "why": "the classifier exempts group subjects whose name has a service-account form"
+  },
+  {
+   "patch": "miss_overlay.patch",
+   "expect": "security_fail",
+   "lever": "T3",
+   "why": "the project RBAC renderer keeps merging stored access subjects"
+  },
+  {
+   "patch": "miss_sa_requester.patch",
+   "expect": "security_fail",
+   "lever": "T4",
+   "why": "service-account requesters keep skipping the member check"
+  },
+  {
+   "patch": "published_fix_only.patch",
+   "expect": "security_fail",
+   "why": "the upstream fix as published: ownerless projects, service-account requesters and the stored access configuration stay open"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "why": "refuses every project change, including creation and ordinary updates"
+  },
+  {
+   "patch": "crash_on_denied.patch",
+   "expect": "functional_fail",
+   "why": "panics instead of returning a clean refusal"
+  },
+  {
+   "patch": "wrong_resource.patch",
+   "expect": "functional_fail",
+   "why": "authorizes another resource; the project's own admission tests and the security test both catch it"
+  },
+  {
+   "patch": "additions_only.patch",
+   "expect": "functional_fail",
+   "why": "only detects added members, so removals are admitted; the project's own tests and the security removal test catch it"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "oracle plus a full subject-identity key and refusal of unsupported member kinds"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "different design: the ownerless-project update is authorized up front instead of making the owner helpers operation-aware"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_on_denied.patch",
+  "wrong_resource": "wrong_resource.patch",
+  "one_role_or_direction": "additions_only.patch",
+  "reads_only": "n/a: the plugin guards writes to project membership; no read path returns or changes member data, so a reads-only fix cannot pass the security tests",
+  "check_after_adjustment": "n/a: the check compares the stored member list with the incoming one before any normalising step that could hide a change; the mutating plugin runs first and the check sees its output",
+  "unlisted_route": "published_fix_only.patch",
+  "malformed_identity": "miss_sa_groups.patch",
+  "missing_authority": "n/a: no external authority or secret lookup feeds the decision; the authorizer returns an explicit decision and an error is propagated rather than treated as an allow",
+  "adjacent_api": "n/a: the fix changes no shared helper whose behaviour another API depends on; the classifier and the owner helpers are local to this plugin"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "B",
+   "shape": "uncovered route where the protection never existed: a stored project that records no owner",
+   "where": "plugin/pkg/global/customverbauthorizer/admission.go:270-306,359-362",
+   "reason_to_dismiss": "the comment says an absent owner means the creator will be defaulted to the owner, the field is documented as deprecated, and API validation refuses to reset a set owner, so a solver assumes the state cannot exist on update",
+   "security_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestSecZZOwnerlessProjectGroupAdded",
+    "plugin/pkg/global/customverbauthorizer::TestSecZZOwnerlessProjectUserAdded",
+    "plugin/pkg/global/customverbauthorizer::TestSecZZOwnerlessProjectOwnerInstalled",
+    "plugin/pkg/global/customverbauthorizer::TestSecZZOwnerlessProjectOwnerAndGroupInstalled"
+   ],
+   "coupled_functional_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZCreateWithUnrecordedOwner",
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZAuthorizedOwnerlessProjectChange",
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZOwnerTransferNeedsNoPermission"
+   ],
+   "security_fail_patch": "miss_nil_owner.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2",
+   "pattern": "B",
+   "shape": "shape trap: a group subject whose name has a service-account form",
+   "where": "plugin/pkg/global/customverbauthorizer/admission.go:343-353",
+   "reason_to_dismiss": "the documentation defines service-account subjects by the system:serviceaccount: name form, and a plausible one-line widening of the classifier hoists the name-prefix exemption out of the kind check; system:serviceaccounts is the real group of all service accounts",
+   "security_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestSecZZServiceAccountGroupSubject"
+   ],
+   "coupled_functional_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZServiceAccountMembersNeedNoPermission",
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZServiceAccountUserMembersNeedNoPermission"
+   ],
+   "security_fail_patch": "miss_sa_groups.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix protects every group"
+  },
+  {
+   "id": "T3",
+   "pattern": "injected",
+   "shape": "producer off the admission check's path: the project RBAC renderer merges subjects from stored configuration in the project namespace",
+   "where": "pkg/component/garden/projectrbac/accessoverlay.go and the merge in pkg/component/garden/projectrbac/projectrbac.go Deploy",
+   "reason_to_dismiss": "stored configuration is presentation input for extension integration, and the project's member list is the only input a reviewer inspects; the published fix never touches this package",
+   "security_tests": [
+    "pkg/component/garden/projectrbac::TestSecZZOverlayGroupGetsNoAccess",
+    "pkg/component/garden/projectrbac::TestSecZZOverlayServiceAccountGetsNoAccess"
+   ],
+   "coupled_functional_tests": [
+    "pkg/component/garden/projectrbac::TestFuncZZOrdinaryRenderingKeepsWorking",
+    "pkg/component/garden/projectrbac::TestProjectRBAC"
+   ],
+   "security_fail_patch": "miss_overlay.patch",
+   "realistic_because": "a namespace-scoped access contribution for extension controllers is ordinary integration code; no deceptive name or comment"
+  },
+  {
+   "id": "T4",
+   "pattern": "injected",
+   "shape": "requester/subject confusion: a request issued by a service account skips the member check",
+   "where": "plugin/pkg/global/customverbauthorizer/compat.go and the guard in admitProjects",
+   "reason_to_dismiss": "the documentation says service-account subjects are managed outside the user access management flow, and plugin/pkg/global/deletionconfirmation treats service-account requesters as automation, so the conflation reads as intended trust",
+   "security_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestSecZZServiceAccountRequester"
+   ],
+   "coupled_functional_tests": [
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZServiceAccountRequesterWithPermission",
+    "plugin/pkg/global/customverbauthorizer::TestFuncZZServiceAccountMembersNeedNoPermission"
+   ],
+   "security_fail_patch": "miss_sa_requester.patch",
+   "realistic_because": "mirrors the existing service-account requester handling in another admission plugin; no deceptive name or comment"
+  }
+ ],
+ "status": "built; strict gate run in order on 2026-10-29: static passes every builder-owned check (only the externally-wired blind pass patch is missing), nop PASS, oracle PASS 3/3, patches PASS (11/11). FAIRNESS.md and the blind patch are written after the builder."
+}

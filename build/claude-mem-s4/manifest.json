@@ -1,0 +1,272 @@
+{
+ "slug": "claude-mem-s4",
+ "candidate": {
+  "repo": "thedotmack/claude-mem",
+  "advisory_ids": [
+   "GHSA-5GVR-V6QV-H5MM",
+   "CVE-2026-11330"
+  ],
+  "pinned_commit": "4509da1409376afa77102031b12df74c0aea476a",
+  "fix_commits": [
+   "f32fda8b35e9fe9329f87da65c31149362a03f97"
+  ],
+  "cwe": "CWE-327",
+  "entry_id": "8722"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The manual-save HTTP handler the worker registers (POST /api/memory/save) is driven directly with fabricated Express request/response objects and a real SessionStore over an in-memory SQLite database; the search sync is stubbed. The observation store's exported functions and the SessionStore class method are driven directly for the library entry points. The restore route (POST /api/import) is driven the same way through DataRoutes. The housekeeping command is run as a real subprocess against a database created with the product's own schema and seeded with raw SQL. The hidden suites never use the network.",
+  "variants": [
+   "base (published fix): separation of session/title/narrative in the observation content hash; the published fix does not cover values containing the delimiter, the other content fields, or any of the other identity sites",
+   "uncovered route (real upstream): POST /api/import decides a duplicate from (memory_session_id,title,created_at_epoch) and inserts content_hash NULL; the exported bulk copy does the same and is untouched by this advisory's fix",
+   "uncovered route (real upstream): bin cleanup-duplicates groups observations by (memory_session_id,title,subtitle,type) and deletes the rest, so entries differing in narrative/facts/concepts/files are removed",
+   "injected sibling S1: a content-hash dedup for session summaries using an unseparated concatenation of every summary field, wired into the summary write path and the summary schema",
+   "injected sibling S2: an observation's search documents are keyed by a content-derived id (session+title+narrative, truncated) instead of the row id, so a different observation upserts onto the same document"
+  ],
+  "services": [],
+  "project_tests_run": "tests/sqlite/data-integrity.test.ts (includes the content-hash dedup suite), tests/sqlite/observations.test.ts, tests/sqlite/summaries.test.ts and tests/services/sqlite/migration-runner.test.ts, restored pristine from /tests at grade time. They pass on the pinned+injected tree and on the oracle."
+ },
+ "traps": [
+  {
+   "id": "base_identity",
+   "pattern": "A",
+   "shape": "the published fix's site: an observation identity formed by concatenating session, title and narrative with no field boundary, hashed and truncated, and used as an exact dedup key; the identity also ignores the observation's other content fields",
+   "where": "src/services/sqlite/observations/store.ts:19-28 (pinned); call sites at store.ts:68, transactions.ts:77,183 and SessionStore.ts:1527,1674,1803",
+   "reason_to_dismiss": "none needed - the advisory names this function; it is the obvious lever",
+   "security_tests": [
+    "security/obs_identity.test.ts::keeps both entries when the title/body boundary moves",
+    "security/obs_identity.test.ts::keeps both entries when the session/title boundary moves"
+   ],
+   "coupled_functional_tests": [
+    "functional/observation_behavior.test.ts::collapses an exact repeat sent through the save route",
+    "functional/observation_behavior.test.ts::stores a repeat after the dedup window",
+    "functional/observation_behavior.test.ts::keeps a 16-character content hash on stored observations"
+   ],
+   "security_fail_patch": "sec_miss_base.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "delimiter_values",
+   "pattern": "A",
+   "shape": "shape trap: a field value containing the delimiter, placed so that shifting the field boundary across the delimiter reproduces the same joined string; a delimiter join (including the published fix) merges two different entries whenever a value contains that delimiter",
+   "where": "src/services/sqlite/observations/store.ts:24-27 (pinned); the same join defect exists in the summary identity and in the search-copy key",
+   "reason_to_dismiss": "a separator between fields looks unambiguous, so a fix that joins with one is believed to be complete",
+   "security_tests": [
+    "security/obs_identity.test.ts::keeps both entries when a field value contains separator characters",
+    "security/summary_identity.test.ts::keeps both summaries when a value contains separator characters"
+   ],
+   "coupled_functional_tests": [
+    "functional/observation_behavior.test.ts::collapses an exact repeat sent through the save route",
+    "functional/summary_behavior.test.ts::collapses an exact repeat within the window"
+   ],
+   "security_fail_patch": "sec_miss_delimiter.patch",
+   "realistic_because": "real, unmodified upstream shape; the published fix itself uses a single delimiter"
+  },
+  {
+   "id": "field_set",
+   "pattern": "A",
+   "shape": "shape trap: the identity covers only session, title and narrative, so observations that differ in facts, concepts, file lists, type or subtitle are treated as the same entry",
+   "where": "src/services/sqlite/observations/store.ts:24-27 and all its call sites (pinned)",
+   "reason_to_dismiss": "the function documents session/title/narrative as the semantic identity of an observation, so extending it to every content field is a larger change than the report's example suggests",
+   "security_tests": [
+    "security/obs_identity.test.ts::keeps both entries when only the facts differ",
+    "security/obs_identity.test.ts::keeps both entries when only the file lists differ",
+    "security/obs_identity.test.ts::keeps both entries through the store used by the save route when only facts differ",
+    "security/vector_identity.test.ts::keeps a distinct search document when only the facts differ"
+   ],
+   "coupled_functional_tests": [
+    "functional/observation_behavior.test.ts::collapses exact repeats inside one batch",
+    "functional/observation_behavior.test.ts::accepts empty optional fields",
+    "functional/vector_behavior.test.ts::reuses the same search documents when the same observation is synced twice"
+   ],
+   "security_fail_patch": "sec_miss_fields.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "uncovered_import",
+   "pattern": "B",
+   "shape": "uncovered route: the restore path decides that an observation was already imported from (memory_session_id,title,created_at_epoch) alone and inserts rows with no content identity; the exported bulk helper is a second copy of the same decision",
+   "where": "src/services/worker/http/routes/DataRoutes.ts:62,358 -> src/services/sqlite/SessionStore.ts:2364-2397 (pinned); duplicate at src/services/sqlite/import/bulk.ts:126-189",
+   "reason_to_dismiss": "a restore path for an external export, with an exact-millisecond key of its own, not the live save path the advisory names",
+   "security_tests": [
+    "security/import_identity.test.ts::keeps both restored entries when only the narrative differs",
+    "security/import_identity.test.ts::keeps both restored entries when only the facts differ",
+    "security/import_identity.test.ts::keeps both entries through the exported bulk restore when only the narrative differs"
+   ],
+   "coupled_functional_tests": [
+    "functional/import_behavior.test.ts::skips an exact replay sent twice through the restore route",
+    "functional/import_behavior.test.ts::skips an exact replay through the exported bulk restore"
+   ],
+   "security_fail_patch": "sec_miss_import.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "uncovered_cleanup",
+   "pattern": "B",
+   "shape": "uncovered route: the housekeeping command groups observations by session/type/title/subtitle and deletes every row but the oldest, so entries that differ in narrative, facts, concepts or file lists are removed as duplicates",
+   "where": "src/bin/cleanup-duplicates.ts:17-22,52-57 (pinned)",
+   "reason_to_dismiss": "a manual maintenance command, not the save path, and it prints every deletion, so the loss does not look silent",
+   "security_tests": [
+    "security/cleanup_identity.test.ts::keeps entries that differ only in the narrative",
+    "security/cleanup_identity.test.ts::keeps entries that differ only in the facts",
+    "security/cleanup_identity.test.ts::keeps entries that differ only in the concept list"
+   ],
+   "coupled_functional_tests": [
+    "functional/cleanup_behavior.test.ts::removes entries whose content is identical"
+   ],
+   "security_fail_patch": "sec_miss_cleanup.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "sibling_summary",
+   "pattern": "injected",
+   "shape": "injected sibling: a content-hash dedup for session summaries, built like the observation one (unseparated concatenation of every summary field, truncated to 16 hex) and wired into the summary write path and the summary schema",
+   "where": "src/services/sqlite/summaries/store.ts:16-44,70-75; src/services/sqlite/transactions.ts:104-114,210-220; src/services/sqlite/SessionStore.ts:1601,1701,1817; src/services/sqlite/migrations/runner.ts:899 (added by inject.patch)",
+   "reason_to_dismiss": "a different record kind with its own storage module; the reported example is an observation, so summaries read as out of scope",
+   "security_tests": [
+    "security/summary_identity.test.ts::keeps both summaries when the field boundary moves",
+    "security/summary_identity.test.ts::keeps both summaries through the store used by the worker when the field boundary moves"
+   ],
+   "coupled_functional_tests": [
+    "functional/summary_behavior.test.ts::collapses an exact repeat within the window",
+    "functional/summary_behavior.test.ts::stores a repeat after the window",
+    "functional/summary_behavior.test.ts::stores clearly different summaries at the same time"
+   ],
+   "security_fail_patch": "sec_miss_summary.patch",
+   "realistic_because": "a maintainer adding duplicate protection to summaries would copy the observation helper and inherit its identity shape; INJECTED into our copy only, registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "sibling_vectors",
+   "pattern": "injected",
+   "shape": "injected sibling: an observation's search documents are keyed by a content-derived id (session, title and narrative, truncated) instead of the row id, so a different observation upserts onto and replaces the first one's documents",
+   "where": "src/services/sync/ChromaSync.ts:124-137 (added by inject.patch)",
+   "reason_to_dismiss": "the search copy is derived, best-effort data and the stored entry is the source of truth, so overwriting a document looks harmless",
+   "security_tests": [
+    "security/vector_identity.test.ts::keeps a distinct search document when the title/narrative boundary moves",
+    "security/vector_identity.test.ts::keeps a distinct search document when only the facts differ"
+   ],
+   "coupled_functional_tests": [
+    "functional/vector_behavior.test.ts::reuses the same search documents when the same observation is synced twice",
+    "functional/vector_behavior.test.ts::stores separate search documents for clearly different observations"
+   ],
+   "security_fail_patch": "sec_miss_chroma.patch",
+   "realistic_because": "a maintainer making re-syncs idempotent would key documents on content; INJECTED into our copy only, registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "computeObservationContentHash",
+  "computeSummaryContentHash",
+  "findDuplicateObservation",
+  "findDuplicateSummary",
+  "observationContentId",
+  "content_hash",
+  "contentHash",
+  "storeObservation",
+  "storeObservations",
+  "storeSummary",
+  "importObservation",
+  "cleanup-duplicates",
+  "import-xml-observations",
+  "SessionStore",
+  "ChromaSync",
+  "session_summaries",
+  "MemoryRoutes",
+  "DataRoutes",
+  "transactions",
+  "dedup",
+  "sha256",
+  "createHash",
+  "DEDUP_WINDOW_MS",
+  "SUMMARY_DEDUP_WINDOW_MS",
+  "separator",
+  "delimiter",
+  "/api/import",
+  "/api/memory/save",
+  "GROUP BY",
+  "bulk.ts",
+  "runner.ts",
+  "store.ts"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_base.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_delimiter.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_fields.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_published_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_import.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_cleanup.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_summary.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_chroma.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_wrong_resource.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "sec_crash.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent, report + repo only"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "sec_crash.patch",
+  "wrong_resource": "sec_wrong_resource.patch",
+  "one_role_or_direction": "n/a: there are no roles, peers or directions; a single content identity protects a single write sink",
+  "reads_only": "n/a: the flaw is in write-time identity and duplicate replacement; there is no read path that can be fixed separately",
+  "check_after_adjustment": "n/a: identities are computed directly from the stored fields; no normalising, clamping or unit conversion sits between the submitted value and the check",
+  "unlisted_route": "sec_published_only.patch",
+  "malformed_identity": "sec_miss_delimiter.patch",
+  "missing_authority": "n/a: no authority, role or secret resolution is involved; the identity is self-contained content",
+  "adjacent_api": "n/a: no shared helper whose change would alter a sibling API's stated behaviour"
+ },
+ "status": "built",
+ "notes": "Injected track. environment/inject.patch adds (1) a content-hash dedup for session summaries, its schema column and migration, and wires the summary write path through it, and (2) a content-derived document id for an observation's search documents. Oracle = inject + the published separator change plus injective encodings over every content field in the observation store, the summary store and the search copy, a full-content replay match in both copies of the import path, full-content grouping in the housekeeping command, and removal of the coarse pre-checks in the XML import bin. Out of scope and not built: the stale minified plugin/scripts bundles (a build artifact of older sources) and the random content_hash backfill in migration 22 (it causes missed dedup, not a merge of different entries)."
+}

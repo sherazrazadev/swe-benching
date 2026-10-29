@@ -1,0 +1,122 @@
+diff --git a/pkg/component/garden/projectrbac/accessoverlay.go b/pkg/component/garden/projectrbac/accessoverlay.go
+new file mode 100644
+index 000000000..4ae498752
+--- /dev/null
++++ b/pkg/component/garden/projectrbac/accessoverlay.go
+@@ -0,0 +1,53 @@
++// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
++//
++// SPDX-License-Identifier: Apache-2.0
++
++package projectrbac
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++
++	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++const accessOverlayConfigMapName = "gardener-project-access"
++
++// projectAccessOverlay contains additional project subjects contributed through the project
++// namespace. Extension controllers use it to render project access for the service accounts they
++// manage without requiring the manage-members verb on the Project itself.
++type projectAccessOverlay struct {
++	Admin                 []rbacv1.Subject `json:"admin,omitempty"`
++	Member                []rbacv1.Subject `json:"member,omitempty"`
++	UserAccessManager     []rbacv1.Subject `json:"uam,omitempty"`
++	Viewer                []rbacv1.Subject `json:"viewer,omitempty"`
++	ServiceAccountManager []rbacv1.Subject `json:"serviceAccountManager,omitempty"`
++}
++
++// accessOverlay reads the project access overlay from the project namespace. It returns nil when no
++// overlay is present.
++func (p *projectRBAC) accessOverlay(ctx context.Context) (*projectAccessOverlay, error) {
++	configMap := &corev1.ConfigMap{}
++	if err := p.client.Get(ctx, client.ObjectKey{Namespace: *p.project.Spec.Namespace, Name: accessOverlayConfigMapName}, configMap); err != nil {
++		if apierrors.IsNotFound(err) {
++			return nil, nil
++		}
++		return nil, err
++	}
++
++	data, ok := configMap.Data["subjects"]
++	if !ok || len(data) == 0 {
++		return nil, nil
++	}
++
++	overlay := &projectAccessOverlay{}
++	if err := json.Unmarshal([]byte(data), overlay); err != nil {
++		return nil, fmt.Errorf("failed parsing the project access overlay: %w", err)
++	}
++
++	return overlay, nil
++}
+diff --git a/pkg/component/garden/projectrbac/projectrbac.go b/pkg/component/garden/projectrbac/projectrbac.go
+index 7eb21fec6..c900bbd0b 100644
+--- a/pkg/component/garden/projectrbac/projectrbac.go
++++ b/pkg/component/garden/projectrbac/projectrbac.go
+@@ -99,6 +99,18 @@ func (p *projectRBAC) Deploy(ctx context.Context) error {
+ 		}
+ 	}
+ 
++	overlay, err := p.accessOverlay(ctx)
++	if err != nil {
++		return err
++	}
++	if overlay != nil {
++		admins = append(admins, overlay.Admin...)
++		members = append(members, overlay.Member...)
++		uams = append(uams, overlay.UserAccessManager...)
++		viewers = append(viewers, overlay.Viewer...)
++		serviceAccountManagers = append(serviceAccountManagers, overlay.ServiceAccountManager...)
++	}
++
+ 	fns := []flow.TaskFn{
+ 		// project admin resources
+ 		func(ctx context.Context) error {
+diff --git a/plugin/pkg/global/customverbauthorizer/admission.go b/plugin/pkg/global/customverbauthorizer/admission.go
+index fa431c730..f5dc5d464 100644
+--- a/plugin/pkg/global/customverbauthorizer/admission.go
++++ b/plugin/pkg/global/customverbauthorizer/admission.go
+@@ -159,7 +159,9 @@ func (c *CustomVerbAuthorizer) admitProjects(ctx context.Context, a admission.At
+ 		return c.authorize(ctx, a, CustomVerbModifyProjectTolerationsWhitelist, "modify .spec.tolerations.whitelist")
+ 	}
+ 
+-	if mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, obj.Spec.Owner, a.GetUserInfo()) {
++	// Service account requests come from automation which is authorized separately and manages
++	// project members outside of the user access management flow.
++	if !isAutomationRequest(a.GetUserInfo()) && mustCheckProjectMembers(oldObj.Spec.Members, obj.Spec.Members, obj.Spec.Owner, a.GetUserInfo()) {
+ 		return c.authorize(ctx, a, CustomVerbProjectManageMembers, "manage human users or groups in .spec.members")
+ 	}
+ 
+diff --git a/plugin/pkg/global/customverbauthorizer/compat.go b/plugin/pkg/global/customverbauthorizer/compat.go
+new file mode 100644
+index 000000000..74298a845
+--- /dev/null
++++ b/plugin/pkg/global/customverbauthorizer/compat.go
+@@ -0,0 +1,19 @@
++// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and Gardener contributors
++//
++// SPDX-License-Identifier: Apache-2.0
++
++package customverbauthorizer
++
++import (
++	"strings"
++
++	"k8s.io/apiserver/pkg/authentication/serviceaccount"
++	"k8s.io/apiserver/pkg/authentication/user"
++)
++
++// isAutomationRequest reports whether an admission request is issued by a service account.
++// Service accounts are provisioned and authorized by the operator for automation purposes and
++// manage project members outside of the user access management flow.
++func isAutomationRequest(info user.Info) bool {
++	return info != nil && strings.HasPrefix(info.GetName(), serviceaccount.ServiceAccountUsernamePrefix)
++}
