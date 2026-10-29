@@ -8,5 +8,5 @@ Started 2026-10-29T05:11Z. [run 40821904116](https://github.com/sherazrazadev/sw
 | `authlib-s4` | sound | 1 | 1 | **REJECTED** |
 | `smarty-s4` | sound | 0.75 0.75 1 | 0 0.75 | **REJECTED** |
 | `ironic-s4` | sound | 0 | 1 | **REJECTED** |
-| `ts-stack-s4` | sound | 0.8667 0.8667 0.8667 | 0 0 0.8667 | **in final checks** |
+| `ts-stack-s4` | sound | 1 | 0 | **REJECTED** |
 | `kotlin-s4` | sound | 1 | 1 | **REJECTED** |
