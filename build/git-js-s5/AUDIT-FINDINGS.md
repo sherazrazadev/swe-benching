@@ -15,3 +15,7 @@ The abbreviation test (`rebase --exe /bin/sh`) runs with `unsafe: {}`. simple-gi
 Required: run that test with `unsafe: { allowAbbreviatedOptions: true }` (so git really accepts the abbreviation), or remove it.
 
 Re-gate after the changes; oracle and pass_alt must still reach 1.0.
+
+## Instruction tone (owner rule, applies to every change above)
+Write instruction.md as an issue report from the project: "In this codebase, <the exact bug and its impact>. Please fix it." State the bug, what must stop happening and what must keep working, plainly and completely, so a careful maintainer knows exactly WHAT to fix.
+Never say WHERE: no file names, paths, directories, modules, class/function/method/variable names, line numbers, test names, lists of routes or variants, or counts. Describe behaviour only. Any new sentence must follow this rule; if an existing sentence breaks it, rewrite it to behaviour.
