@@ -1,0 +1,313 @@
+{
+ "slug": "swc-s4",
+ "candidate": {
+  "repo": "swc-project/swc",
+  "advisory": "GHSA-5QR2-V392-M9G8",
+  "cve": "CVE-2026-72925",
+  "cwe": "CWE-116",
+  "vulnerable_commit": "ad0e3b49bca3a61bc8f5ac90e15dc263b9cc674c",
+  "fix_commits": [
+   "e1877b44bdac8abc9fd51e984d584f40f6999832"
+  ],
+  "family": "output escaping / HTML script-element breakout (CWE-116, CWE-79, mutation XSS)"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "Rust library API swc_html_minifier::minify_document and minify_document_fragment (the @swc/html Node and WebAssembly bindings call the same visitor). Tests parse an HTML document with swc_html_parser, minify it through the crate's public API, serialize it with swc_html_codegen exactly as a user does, parse the serialized output again, and assert on the resulting tree.",
+  "sites": [
+   "crates/swc_html_minifier/src/lib.rs:2827-2851 (injected tree) visit_mut_text, MinifierType::Json arm: serde_json re-serialization writes a literal '<' into the script text [published landing, L1]",
+   "crates/swc_html_minifier/src/lib.rs:2159 (injected tree) minify_js: the exact-case .replace(\"</script>\", \"<\\\\/script>\") misses the other end-tag spellings HTML accepts, and the minifying code generator normalizes \\u003C escapes to a literal '<' before the replace runs [real upstream, untouched by the published fix, L2]",
+   "crates/swc_html_minifier/src/lib.rs:2736-2745 (injected tree) specialized importmap/speculationrules arm calling minify_structured_script (lib.rs:1852) [injected, S1]",
+   "crates/swc_html_minifier/src/lib.rs:1369-1425,2624 (injected tree) merge_json_data_blocks/merge_json_blocks post-pass over already-minified children, re-serializing adjacent application/json arrays with serde_json [injected, S2]",
+   "crates/swc_html_minifier/src/lib.rs:2835-2843 (injected tree) text_type Css arm: the stylesheet minifier's output is written into the element's text with no terminator escape; the arm serves a style element (lib.rs:2800) and a script element whose type the caller maps to css (lib.rs:2767-2773) [real upstream, untouched by the published fix]",
+   "crates/swc_html_minifier/src/lib.rs:2800-2816 (injected tree) style element branch selects the Css arm; the CSS serializer decodes a hex escape for '<' and writes it literally, so the stylesheet data can end the element (HTML raw text: '</style'; foreign content: any '<') [real upstream]",
+   "crates/swc_html_minifier/src/lib.rs:2844-2855 + 2208 (injected tree) Html arm: the nested HTML minifier's serialization is written into a script element's text with no check for an end tag, so an entity-decoded '</script' in the nested output terminates the outer script [real upstream]"
+  ],
+  "routes": [
+   "JSON in an HTML script element (application/json, application/ld+json, importmap, speculationrules, a custom type mapped to json), in nested object/array/scalar shapes, as an object key or string value",
+   "JSON written with the pretty option",
+   "JSON script inside an SVG-namespace script element (foreign content parses the text as markup, so every '<' must be escaped)",
+   "JSON script inside template content and inside a document fragment minified through minify_document_fragment",
+   "JavaScript text whose minified form contains an end tag in a form the exact-case replace misses (</SCRIPT>, </script >): produced from \\u003C escapes or constant-folded concatenation; also type=module",
+   "Adjacent application/json array blocks combined after the main pass, then re-serialized by the combining producer",
+   "importmap/speculationrules rewritten by their own serializer",
+   "A stylesheet the minifier rewrites: a CSS string, a CSS url() and an SVG-namespace style element, whose hex escapes decode to '<' and to '</style'",
+   "A script element whose content type the caller maps to the stylesheet minifier (minifyAdditionalScriptsContent)",
+   "A script element whose content type the caller maps to the HTML minifier, whose nested output can carry an entity-decoded '</script'"
+  ],
+  "services": "none; the library has no network, GPU or GUI dependency and the suites run offline",
+  "project_tests_run": "cargo test -p swc_html_minifier at the pinned commit: 249 fixture/recovery tests pass. On the pinned+injected tree the same 249 pass; on the reference fix 249 pass; the verifier runs the fixture test target as its project functional group.",
+  "no_leaked_regression_tests": "The fix commit e1877b44 is the direct child of the pinned commit ad0e3b49. Its only test change is the new fixture element/script-json-escaping/{input,output.min}.html, which is absent at the pinned commit (git diff between the two commits).",
+  "gate": {
+   "static": "PASSED (2026-10-29, v2): conforming; no instruction leaks; no hidden-test content in environment/; 13 non-blind checks/ patches present and listed; blind patch (removed as stale) and FAIRNESS.md pending (written later by the pipeline)",
+   "nop": "PASSED (2026-10-29, v2): 18/18 security tests fail on the pinned+injected tree, 261/261 functional pass (12 hidden + 249 project fixture/recovery); reward 0.0",
+   "oracle": "PASSED (2026-10-29, v2): 3/3 runs reward 1.0 with identical security (18/18) and functional (261/261) results",
+   "patches": "PASSED (2026-10-29, v2): 13/13 checks behaved as declared - security_fail: sf_no_json_escape 12, sf_no_js_escape 8, sf_no_merge_escape 6, sf_no_structured_escape 7, sf_crash 15, sf_input_check 12, sf_no_style_escape 3, sf_no_custom_css_escape 1, sf_no_custom_html_guard 1 (all functional pass in every case); functional_fail: ff_overbroad (4 hidden + project fixtures), ff_refuse_all; pass: pass_hardening 1.0, pass_alternative 1.0. The round-1 blind.patch was removed (stale: pre-dates the three new traps); the pipeline's blind fix writes v2."
+  },
+  "round2_traps": {
+   "style_raw_text": "real code, default options",
+   "custom_css_script": "real code, caller option",
+   "custom_html_script": "real code, caller option"
+  },
+  "round2_counts": {
+   "security_tests": 18,
+   "hidden_functional_tests": 12,
+   "project_fixture_tests": 249
+  }
+ },
+ "leak_terms": [
+  "escape_json_for_html_script",
+  "escape_script_end_tags",
+  "minify_json",
+  "minify_structured_script",
+  "normalize_structured_json",
+  "merge_json_data_blocks",
+  "merge_json_blocks",
+  "json_data_text",
+  "serialize_json_for_html",
+  "replace_close_inline_script",
+  "MinifierType",
+  "serde_json",
+  "minify_additional_scripts_content",
+  "minifyAdditionalScriptsContent",
+  "merge_metadata_elements",
+  "application/json",
+  "ld+json",
+  "importmap",
+  "speculationrules",
+  "text/custom-json",
+  "u003C",
+  "</script",
+  "GHSA-5QR2-V392-M9G8",
+  "CVE-2026-72925",
+  "ad0e3b49",
+  "e1877b44",
+  "escape_end_tags",
+  "escape_stylesheet_for_raw_text",
+  "escape_css_markup_starts",
+  "contains_end_tag",
+  "contains_markup_start",
+  "is_end_tag_terminator",
+  "minifyAdditionalScriptsContent",
+  "minify_additional_scripts_content",
+  "text/x-css",
+  "text/x-template",
+  "foreign content",
+  "stylesheet",
+  "css",
+  "svg"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_no_json_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_js_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_merge_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_structured_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_input_check.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_style_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_custom_css_escape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_custom_html_guard.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the protected outcome is the serialized document itself, so there is no neighbouring object or proxy resource a check could authorise instead",
+  "one_role_or_direction": "n/a: one sink (a script element's text) and no roles or directions; every entry point shares the same visitor",
+  "reads_only": "n/a: minification has no read/write or verb split; every path produces the document that is checked",
+  "check_after_adjustment": "sf_input_check.patch",
+  "unlisted_route": "sf_no_js_escape.patch",
+  "malformed_identity": "n/a: no name, spelling or identity parsing is involved; the attacker value is document data",
+  "missing_authority": "n/a: there is no authority, role or secret lookup that could fail open",
+  "adjacent_api": "ff_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "json_script_text",
+   "pattern": "B",
+   "shape": "the reported sink: JSON script text is parsed and re-serialized with serde_json, which normalizes a unicode escape for '<' back to a literal character, so the serialized data can spell the element's end tag",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2827-2851"
+   ],
+   "security_tests": [
+    "json_application_json_breakout_is_blocked",
+    "json_ld_nested_breakout_is_blocked",
+    "json_pretty_output_breakout_is_blocked",
+    "json_custom_script_type_breakout_is_blocked",
+    "json_svg_namespace_breakout_is_blocked",
+    "json_template_content_breakout_is_blocked",
+    "json_document_fragment_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "json_values_and_types_are_preserved",
+    "json_pretty_output_stays_pretty_and_valid"
+   ],
+   "security_fail_patch": "sf_no_json_escape.patch",
+   "realistic_because": "this is the advisory's own landing point; the baseline lever"
+  },
+  {
+   "id": "js_end_tag_spellings",
+   "pattern": "B",
+   "shape": "shape trap on the JavaScript arm: the existing guard replaces only the exact lowercase spelling '</script>', while HTML ends the element on a case-insensitive tag name terminated by '>', '/' or whitespace; the minifying code generator decodes \\u003C escapes and folds concatenation, so it synthesizes those spellings from text the parser never saw as a terminator",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2159"
+   ],
+   "security_tests": [
+    "js_uppercase_end_tag_breakout_is_blocked",
+    "js_whitespace_end_tag_breakout_is_blocked",
+    "js_module_uppercase_end_tag_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "javascript_comparisons_and_markup_text_keep_working",
+    "javascript_end_tag_spelling_inside_source_keeps_working"
+   ],
+   "security_fail_patch": "sf_no_js_escape.patch",
+   "realistic_because": "real, unmodified upstream code; the JS path already carries a guard and a TODO, so it reads as a different, already-handled feature"
+  },
+  {
+   "id": "structured_json_serializer",
+   "pattern": "B",
+   "shape": "second serializer: importmap and speculationrules have their own normalization helper that calls serde_json directly, so the generic JSON arm's escaping never runs for them",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2736-2745",
+    "crates/swc_html_minifier/src/lib.rs:1852"
+   ],
+   "security_tests": [
+    "json_import_map_breakout_is_blocked",
+    "json_speculation_rules_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "structured_data_normalization_keeps_meaning"
+   ],
+   "security_fail_patch": "sf_no_structured_escape.patch",
+   "realistic_because": "injected sibling: a specialized fast path written as its own serializer for two fixed-shape script types, placed where the published fix never touches"
+  },
+  {
+   "id": "combined_data_blocks",
+   "pattern": "B",
+   "shape": "producer off the check's path: after the main pass has escaped every script text, a post-pass combines adjacent application/json array blocks and re-serializes the combined value with serde_json, reintroducing the literal characters",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:1369-1425",
+    "crates/swc_html_minifier/src/lib.rs:2624"
+   ],
+   "security_tests": [
+    "json_combined_data_blocks_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "combined_json_data_blocks_are_combined_and_valid",
+    "json_object_blocks_are_not_combined"
+   ],
+   "security_fail_patch": "sf_no_merge_escape.patch",
+   "realistic_because": "injected sibling: the metadata-merge optimization the minifier already performs for script and style elements, extended to structured data blocks after the main pass"
+  },
+  {
+   "id": "style_raw_text",
+   "pattern": "B",
+   "shape": "feature-absent sibling on the other raw-text element: the stylesheet arm writes the CSS minifier's output into the element's text with no terminator escape, so a CSS hex escape for '<' decodes to a literal character that ends the element (or, in foreign content, starts markup)",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2835-2843",
+    "crates/swc_html_minifier/src/lib.rs:2800-2816"
+   ],
+   "security_tests": [
+    "style_string_escape_breakout_is_blocked",
+    "style_url_escape_breakout_is_blocked",
+    "style_svg_namespace_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "stylesheet_minification_keeps_its_output",
+    "stylesheet_strings_and_media_queries_keep_their_value",
+    "style_and_media_attributes_keep_their_output"
+   ],
+   "security_fail_patch": "sf_no_style_escape.patch",
+   "realistic_because": "real upstream code: the same function that guards the script arms writes the stylesheet arm's output unguarded; the report is about script data, so the stylesheet arm reads as a different feature"
+  },
+  {
+   "id": "custom_css_script",
+   "pattern": "B",
+   "shape": "shared helper with divergent contracts: the stylesheet minifier also serves a script element whose type the caller maps to css, and the terminator that matters there is the script's, not the style element's; a fix that escapes for a style element, or inside the shared serializer, leaves this route open",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2767-2773",
+    "crates/swc_html_minifier/src/lib.rs:2835-2843",
+    "crates/swc_html_minifier/src/lib.rs:1806"
+   ],
+   "security_tests": [
+    "custom_css_script_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "custom_css_script_keeps_being_minified"
+   ],
+   "security_fail_patch": "sf_no_custom_css_escape.patch",
+   "realistic_because": "real upstream code: the additional-content option maps any type to any minifier, and the stylesheet arm is shared with style elements; the caller's option makes the route reachable without any injected code"
+  },
+  {
+   "id": "custom_html_script",
+   "pattern": "B",
+   "shape": "data producer off the check's path: the nested HTML minifier parses and re-serializes the script's text; entity-decoded data in the nested output becomes a literal '</script', which ends the outer script when the document is parsed again",
+   "where": [
+    "crates/swc_html_minifier/src/lib.rs:2844-2855",
+    "crates/swc_html_minifier/src/lib.rs:2208"
+   ],
+   "security_tests": [
+    "custom_html_script_breakout_is_blocked"
+   ],
+   "coupled_functional_tests": [
+    "custom_html_script_keeps_being_minified"
+   ],
+   "security_fail_patch": "sf_no_custom_html_guard.patch",
+   "realistic_because": "real upstream code: the option's own documentation gives '<script type=\"text/html\"><div>...' as the use case, and the nested serializer has no knowledge of the context it is embedded in"
+  }
+ ],
+ "status": "round 2: all four gate stages pass (static, nop, oracle 3/3, patches 13/13); blind patch and FAIRNESS.md pending (written later by the pipeline)",
+ "notes": "Round 2 added three real-code traps of different kinds (style_raw_text, custom_css_script, custom_html_script) on top of the four round-1 traps. The reference fix, both pass controls, the wrong-fix catalogue patches and the hidden suites were re-verified on the host; the gate stages were re-run for v2. blind.patch from round 1 was removed because the new tests make it stale; the pipeline's blind fix writes a new one."
+}
