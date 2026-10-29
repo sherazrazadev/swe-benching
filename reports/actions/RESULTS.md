@@ -12,6 +12,7 @@ These tasks passed every step of the cwe-bench pipeline on GitHub Actions:
 | [`jenkins-s3`](#jenkins-s3) | CWE-502 (deserialization of untrusted data) | Java | [jenkinsci/jenkins](https://github.com/jenkinsci/jenkins) | 0.6, 0.6, 0.6 | 0, 0, 0, 0 (+1 excluded) | **ACCEPTED** |
 | [`winter-s4`](#winter-s4) | CWE-693 (protection mechanism failure) | PHP | [wintercms/winter](https://github.com/wintercms/winter) | 0, 0, 0 | 0, 0, 0 | **ACCEPTED** |
 | [`git-js-s5`](#git-js-s5) | CWE-184 (incomplete list of disallowed inputs) | TypeScript | [steveukx/git-js](https://github.com/steveukx/git-js) | 0.5185, 0.3704, 0.2593 | 0.3704, 0.2593, 0, 0 (+1 excluded) | **ACCEPTED** |
+| [`izpack-zip-path-inj`](#izpack-zip-path-inj) | CWE-22 (path traversal) | Java | [izpack/izpack](https://github.com/izpack/izpack) | 0, 0.5882, 0.7059 | 0.4118, 0.4706, 0.4706 (+1 cut by rate limit, re-run) | **ACCEPTED** |
 
 ---
 
@@ -543,3 +544,277 @@ row.
   and, with the MiMo run 4 and run 5 records merged in, branches [`runs/40839074746`](https://github.com/sherazrazadev/swe-benching/tree/runs/40839074746) and
   [`runs/40797199325`](https://github.com/sherazrazadev/swe-benching/tree/runs/40797199325), `build/git-js-s5/`
   (`gate_report.json`, `gate_verdict.json`, `manifest.json`, `notes.md`, `FAIRNESS.md`, `trial_detail_*.json`, `audits/`)
+
+---
+
+## `izpack-zip-path-inj`
+
+### Where the task is
+
+The task is in Harbor format in [`tasks/izpack-zip-path-inj/`](../../tasks/izpack-zip-path-inj/). The final version and
+its results and logs are on branch
+[`runs/40833539592`](https://github.com/sherazrazadev/swe-benching/tree/runs/40833539592) (repair run 2). That branch also
+keeps the audits and fairness reviews of the two earlier rounds under `build/izpack-zip-path-inj/round0/` and `round1/`.
+The first build and its trials are on branch
+[`runs/40647352109`](https://github.com/sherazrazadev/swe-benching/tree/runs/40647352109) (batch 10).
+
+| Path | What it is |
+|---|---|
+| `task.toml` | Harbor task definition: separate-container verifier, no network for the agent or the verifier, 2 CPU / 4 GB, agent limit 7200 s (run at 3 h in the trials, see below) |
+| `instruction.md` | The only text the model sees |
+| `environment/Dockerfile`, `environment/injection.patch` | IzPack at the vulnerable commit with its Maven cache warmed, plus the two added sibling code paths described below |
+| `solution/fix.patch`, `solution/solve.sh` | Reference fix (10 files in `izpack-api`, `izpack-installer`, `izpack-tools` and `izpack-util`) |
+| `tests/` (`test.sh`, `score.py`, `security/`, `functional/`, `project/`, `support/`, `harness/`, `Dockerfile`) | Hidden verifier: JUnit suites run with Maven offline as the unprivileged `agent` user. They drive the real installer classes over crafted installer metadata, plus the project's own unpacker tests |
+
+The task was built in batch 10 with sibling injection (`source = "injected"`). Model trials then made it harder in two
+steps, described under "How it was made harder" below.
+
+### The vulnerability
+
+- **Advisory:** GHSA-F63G-88CJ-HJF9 / CVE-2026-54550 (CWE-22, path traversal).
+- **Code:** vulnerable commit `e431c89`, upstream fix `4233ba3`. The pinned commit is the fix's direct parent.
+
+IzPack builds self-contained Java installers. A project description lists packs, and each entry in a pack declares the
+location it is installed to. The compiler packs that information into the installer as serialised metadata
+(`packs.info`). When the installer runs on a user's machine, it reads the metadata, substitutes configured values
+(`${VAR}`) into each location, then creates directories and writes files there. The flaw: a location containing a
+parent-directory segment (`..`) is used as it is, so a crafted installer writes outside the installation directory the
+user chose.
+
+The upstream fix adds one check, used in two places: the install-time write (`UnpackerBase`) and the public file-entry
+constructor (`PackFile`). Other code paths that take a location from the same metadata stay open. **The task asks for
+the general property instead:** no location value the toolkit accepts, however it arrives, may be used to create,
+write, move, rename, rewrite or delete anything if it contains `..`.
+
+### What the model is asked to do (`instruction.md`)
+
+The instruction describes the observed impact (a file created outside the chosen installation directory) and states
+three properties:
+
+1. **No traversing location.** "No target location value the toolkit accepts, however it enters the toolkit, may be
+   retained or used to create, write, move, rename, rewrite or delete anything if it contains a parent-directory
+   segment (".."), including any location ultimately used."
+2. **Refuse one entry, keep the rest.** A refused location is surfaced as an installation failure, has no side effect
+   for that entry, and does not stop other legitimate entries from installing.
+3. **Legitimate locations keep working.** Absolute locations with no `..`, including targets outside the installation
+   directory, and ordinary nested targets install exactly as they do today.
+
+**What the model must not do:** look up the upstream advisory or fix, or special-case the example. The instruction also
+asks for a fix of "the problem and its close variants", and says the examples are "not the complete set". It names no
+route, file or function.
+
+### What makes it hard: nine routes, four modules
+
+The report leads to one install-time write. The published upstream fix closes only L1 and L2 below. The over-broad
+repairs (refuse every absolute or outside location, or refuse any name containing `..`) break locations that the
+functional tests require.
+
+| Route | Where | Real or added | Security test(s) |
+|---|---|---|---|
+| L1 Install-time write of the translated entry location: the reported case | `izpack-installer/.../unpacker/UnpackerBase.java:617-658` | Real upstream code, unmodified | 4 tests in `UnpackerTargetSecurityTest` (plain, introduced by a `${VAR}`, a directory, and one refused entry followed by a legitimate one) |
+| L2 Public file-entry constructor in a separate module: the install-time check makes it look redundant | `izpack-api/.../api/data/PackFile.java:164-177` | Real upstream code, unmodified | `FileEntryApiSecurityTest` (`/` and `\` forms) |
+| B1 Override rename: the rename destination is joined to the target's parent, and an existing file there is moved | `UnpackerBase.java:1322-1345` (`handleOverrideRename`) | Real upstream code, unmodified | `existingFileOutsideInstallDirectoryIsNotTouched` |
+| B2 Parsable files: a file named by the metadata is translated and rewritten | `UnpackerBase.java:1361-1374` | Real upstream code, unmodified | `fileOutsideInstallDirectoryIsNotRewritten` |
+| S1 Loose-file relocation: the destination is recomputed from an `installTarget` value | `izpack-installer/.../unpacker/LooseFileUnpacker.java:104-128` | Added to the product (`injection.patch`) | `relocatedEntryDoesNotEscapeInstallDirectory` |
+| S2 Multi-volume unpacker: its own copy of the per-file step | `izpack-installer/.../multiunpacker/MultiVolumeUnpacker.java:174-200` | Added to the product (`injection.patch`) | `multiVolumeEntryDoesNotEscapeInstallDirectory` |
+| N1 Removal-data step run after unpacking: the output directory and the file name both come from the metadata | `izpack-installer/.../data/UninstallDataWriter.java:521-531` | Real upstream code, unmodified | `uninstallerDirectoryDoesNotEscape`, `uninstallerFileNameDoesNotEscape` |
+| N2 External install log: its location comes from a variable, and the value `default` is replaced by a location derived from N1's directory | `UninstallDataWriter.java:154-189` | Real upstream code, unmodified | `logFileDoesNotEscape`, `derivedLogFileDoesNotEscape` |
+| N3 Configuration steps in another module: they write an output file (creating parents) and remove a patch file at declared locations | `izpack-util/.../config/ConfigFileTask.java:94-97`, `SingleXmlFileMergeTask.java:113-129` | Real upstream code, unmodified | `configurationFileDoesNotEscape`, `patchFileOutsideIsNotDeleted`, `xmlMergeOutputFileDoesNotEscape` |
+
+S1 and S2 are two code paths added to IzPack in the style of the classes they sit in. Everything else is unmodified
+upstream code. The build notes record that current upstream master still checks only L1 and L2 (read, not executed).
+N1 to N3 were added in round 2 (see below).
+
+### How it was made harder
+
+The task went through three rounds of trials. Only the final round counts. The earlier rounds used different tests or
+a different instruction, so their scores are not comparable with it.
+
+| Round | Run | Tests (security / functional) | DeepSeek | MiMo | Outcome |
+|---|---|---|---|---|---|
+| 1. First build, batch 10 | [40647352109](https://github.com/sherazrazadev/swe-benching/actions/runs/40647352109) | 9 / 23 | 0.7778, 0.5556, 0.6667 | 0.7778, 0.7778, **1.0** | MiMo solved run 3 |
+| 2. Trap stacking (`repair.yml`, mode `stack`) | [40755540825](https://github.com/sherazrazadev/swe-benching/actions/runs/40755540825) | 15 / 31 | 0.4667, 0.8667, 0.7333 | 0.3333, 0.4667, 0.6 | All failed; 2 audits found test faults |
+| 3. Repair 1 | [40797405206](https://github.com/sherazrazadev/swe-benching/actions/runs/40797405206) | 17 / 33 | 0.5882, 0.7059, 0.5882 | 0.7059 (4 other attempts cut by API rate limits) | All failed; 2 audits found an instruction gap |
+| 4. Repair 2: final | [40833539592](https://github.com/sherazrazadev/swe-benching/actions/runs/40833539592) | 17 / 33 | 0, 0.5882, 0.7059 | 0.4118, 0.4706, 0.4706 | All failed; 6 of 6 audits model-failed |
+
+1. **Round 1.** The task had the six routes L1, L2, B1, B2, S1 and S2. DeepSeek missed B1 and S1 in every run (and B2
+   and L2 once each). MiMo missed only L2, in runs 1 and 2, and solved run 3 (`ROUND1-MISSES.md`). So MiMo was the model
+   to beat.
+2. **Round 2, trap stacking** (`common/builder/BRIEF-trap-stack.md`). The six routes were kept as they were. Three new
+   routes were added, chosen from the kinds the brief lists for a model like MiMo, which probes the code before it
+   edits. All three are real upstream code:
+   - N1, a far site in another installation step;
+   - N2, a defaults route whose value is replaced by a keyword;
+   - N3, a different feature family in another module, with a write form and a removal form.
+
+   The instruction changed in one place: the list of forbidden side effects now includes "removed". Both models failed
+   all six runs. However, the audits of DeepSeek run 1 and MiMo run 1 found a **test fault**. Two tests built their
+   attack metadata through the public file-entry API (`PackFile` / `PackInfo.addFile`). A fix that also hardened that
+   API made the test setup throw before the installer ran, so the test reported an error instead of a pass.
+3. **Repair 1.** The changes:
+   - The three affected tests (`LooseRelocation`, `OverrideRename`, `Parsable`) now build benign metadata and then
+     insert the bad value by reflection. This is how deserialised metadata bypasses constructors, and how the main
+     fixture already worked.
+   - Two security tests were added: a refused entry must be reported while a later legitimate entry still installs,
+     and the XML-merge form of N3.
+   - Two functional controls were added to keep `a..b.txt` legal.
+   - The reference fix now discards a refused entry's data and continues.
+   - Three wrong-fix checks were added: abort the install, drop the entry silently, and refuse any `..` substring.
+   - The instruction was reworded following that round's fairness review. This removed the sentence naming the public
+     file-entry interface and the phrase "whichever installation step would use it".
+
+   The audits of DeepSeek runs 1 and 3 then found an **instruction gap**. The rewording had narrowed the property to
+   pack-entry locations, so N1 to N3 read as out of scope. DeepSeek run 3 passed every pack-entry test.
+4. **Repair 2.** This changed the instruction only. Property 1 was widened to its current wording ("however it enters
+   the toolkit, may be retained or used … including any location ultimately used"), the System section was reworded,
+   and the sentence "The location came from the installer's own metadata." was removed. No test, route, reference fix or
+   check patch changed: `tests/`, `solution/` and `environment/` are identical on branches `runs/40797405206` and
+   `runs/40833539592`. The gate was re-run, and then the final trials.
+
+### Tests and scoring
+
+- **Security: 17 tests in 9 files.** Each test builds attack metadata containing `..`, serialises it where the installer
+  reads serialised metadata, and drives the real code: the unpacker run, the public constructor, the removal-data
+  writer or the shipped configuration task. It then checks that nothing was created, changed or deleted outside the
+  installation directory. Refusal tests catch any exception and demand no exception class or message. The
+  one-refused-entry test also checks that the next legitimate entry installs and that the unpacker reports failure.
+- **Functional: 33 tests.** These are 20 hidden tests for legitimate use, plus 13 of the project's own tests
+  (`DefaultFileUnpackerTest`, `LooseFileUnpackerTest`, `Pack200FileUnpackerTest`, `ScriptParserTest`,
+  `MultiVolumeFileUnpackerTest`), run from pristine copies. The hidden tests cover:
+  - nested and absolute targets, including targets outside the installation directory;
+  - directory targets and `a..b` names;
+  - renames and rewrites inside the directory;
+  - relative and absolute loose relocation and a multi-volume entry;
+  - removal data, the install log (declared, derived and outside) and the configuration steps.
+- **Reward.** The reward is 1.0 only when every security and functional test passes. If any functional test fails,
+  the reward is 0. Otherwise it is the share of security tests passed, capped at 0.99 (`tests/score.py`).
+
+### Validation before any model ran (the gate)
+
+These are the results of the final gate, after repair 2.
+
+| Check | Expected | Result |
+|---|---|---|
+| Vulnerable code (no fix) | Every security test fails, every functional test passes | ✅ 17 fail / 33 pass |
+| Reference fix (3 runs) | Everything passes | ✅ 50/50 each |
+| Independent alternative fix (`pass-alt.patch`) | Everything passes | ✅ 1.0 |
+| Hardening patch (`pass-hardening.patch`) | Everything passes | ✅ 1.0 |
+| 11 fixes that each miss one route, or check before `${VAR}` substitution (`sf-miss-L1` … `sf-miss-N3`, `sf-after-translation`) | Each is caught by a security test | ✅ rewards 0.76–0.88 |
+| Upstream fix sites only (`sf-published-only`) | Caught by security tests | ✅ 12 security failures (0.2941) |
+| Abort the whole install, or drop the entry without reporting failure (`sf-abort-install`, `sf-silent-skip`) | Caught by the refused-entry test | ✅ 0.9412 each |
+| 2 over-broad fixes: refuse any `..` substring, refuse outside or absolute locations | Each is caught by a functional test | ✅ 2 and 18 functional failures |
+
+The gate verdict is pass (2026-10-29T08:00:16Z). No fresh-agent ("blind") fix was checked against this version; see
+Caveats.
+
+### Model results
+
+The final trials were run on GitHub Actions in repair run 2,
+[run 40833539592](https://github.com/sherazrazadev/swe-benching/actions/runs/40833539592). The agent limit was 3 h
+(`CWE_AGENT_TIMEOUT_MULT=1.5`). Every counted run finished on its own; none hit the limit.
+
+| Model | Run | Reward | Agent time | Counted? | Why it failed (Opus audit) |
+|---|---|---|---|---|---|
+| DeepSeek | 1 | 0 | 24 min | ✅ | Broke legitimate loose-file relocation. It moved the `installTarget` lookup after the entry is rebuilt, so both relocation functional tests error and the reward is 0. It also left the public constructor (L2), the removal data (N1), the log (N2) and the configuration steps (N3) unguarded (8 of 17 security) |
+| DeepSeek | 2 | 0.5882 | 18 min | ✅ | Passed 10 of 17 and all functional tests. It closed every pack-entry route, including the constructor. It read `UninstallDataWriter` and left it unguarded, and it never touched N1, N2 or N3 |
+| DeepSeek | 3 | 0.7059 | 22 min | ✅ | Passed 12 of 17. It also guarded the removal data and the log, but missed the public constructor (L2) and the configuration steps (N3) |
+| MiMo | 1 | 0.4118 | 119 min | ✅ | Passed 7 of 17. It guarded only the base per-file step, so the multi-volume copy (S2) stayed open. It also missed L2, N1, N2 and N3 |
+| MiMo | 2 | 0.4706 | 50 s recorded (see Caveats) | ✅ | Passed 8 of 17. All pack-entry routes were closed at install time. Its plan never considered the constructor, the removal data, the log or the configuration steps |
+| MiMo | 3 | 0.4706 | 167 min | ✅ | Passed 8 of 17, with the same 9 misses as run 2. It decided that "nothing is validated at compile time or in constructors, since deserialization bypasses those". An earlier attempt was cut after 31 min by an API rate limit (HTTP 429) and re-run; that attempt is not counted |
+
+Agent time is `duration_s` from `trial_detail_*.json`.
+
+**The common failure:** the routes away from the unpacker. No run changed the configuration steps (N3). Its 3 tests
+failed in all six runs. The public constructor (L2) failed in five runs; only DeepSeek run 2 guarded it. The removal
+data and log (N1, N2) also failed in five runs; only DeepSeek run 3 guarded them. Every run closed the reported write
+(L1), including the refuse-one-entry-and-continue rule, as well as B1, B2 and S1. In round 1, DeepSeek had missed B1
+and S1 in every run. So the difficulty now lies in locations that the installer uses outside the per-entry unpack loop.
+
+### Why this is fair
+
+- **Fairness review: READY.** Every security test falls under property 1 read literally. "However it enters the
+  toolkit", "retained or used" and "including any location ultimately used" reach the constructor, the removal-data
+  and log locations, and the configuration steps. Three fixes reach 1.0: the reference, `pass-alt` and
+  `pass-hardening`. The tests check effects, not the layer of the fix, and accept any refusal form. The full review is
+  in [`verdicts/izpack-zip-path-inj-FAIRNESS.md`](verdicts/izpack-zip-path-inj-FAIRNESS.md).
+- **The review left one question open for a human, in three parts.**
+  1. Is the widened property meant to cover the removal-data, install-log and configuration-step locations (N1–N3)?
+  2. Must a backslash-spelled `..` be refused on the Linux verifier?
+  3. Is the unpacker's `getResult() == false` the intended "surfaced as an installation failure"?
+
+  The audits answered all three:
+  - **(1)** Five of six audits mark every N1–N3 test as stated in the instruction and fair. The MiMo run 1 audit marks
+    the 3 configuration-step tests as instruction ambiguity, but keeps the run a model failure, because the
+    multi-volume route and the constructor are clearly in scope and also fail. All six audits give medium confidence
+    for this reason. The answer matters for one run: see Caveats.
+  - **(2)** No run failed only the backslash form. Every run that failed the constructor test failed both forms.
+  - **(3)** All six runs passed the refused-entry test.
+- **Audits: 6 of 6 failing runs are trustworthy model failures** (all medium confidence). No audit found a harness
+  error or a test that fails a correct fix. No run read the hidden tests, looked up the upstream fix, or made tool calls
+  during grading. Three runs tried to download Maven with `wget`, which failed. The audits treat this as build tooling,
+  not a lookup.
+- **The task is real and solvable.** Seven of the nine routes are unmodified upstream code. Three different fixes reach
+  1.0, and every miss above is a location that property 1 covers.
+
+### Caveats
+
+- **The N1–N3 scope question alone decides one run.** All 7 security failures of DeepSeek run 2 are N1–N3 tests. If
+  those tests were taken out of scope, that run would pass 10 of 10 and score 1.0. The other five runs fail regardless:
+  - DeepSeek run 1 has a functional regression;
+  - DeepSeek run 3 and all three MiMo runs miss the constructor (L2);
+  - MiMo run 1 also misses the multi-volume route (S2).
+
+  The audit of DeepSeek run 2 judges N1–N3 covered "literally" by property 1 and the run a fair failure. It notes
+  that the System section talks about per-entry locations, which leaves some ambiguity. The 3 configuration-step tests
+  fail in every run and are the least explicit. The MiMo run 1 audit counts them as instruction ambiguity. The verdict
+  page's wording that no audit "found a fault" is true at run level, but not for those 3 tests in that one audit.
+- **Repeated repairs.** The task needed two repairs after audits found faults. The round-2 repair fixed tests that
+  under-scored good fixes, and the final repair widened the instruction. Both changes make the task fairer, not
+  harder. Repair 1 did also add two security tests (refused-entry reporting, and XML merge). Every final run passed the
+  first of these. The second is one of the three N3 tests, which every run failed together. The intermediate scores
+  are not comparable with the final ones.
+- **The instruction no longer names the public file-entry interface.** Rounds 1 and 2 stated outright that a
+  traversing target must be refused in the public file-entry interface. Repair 1 removed that sentence, and property 1
+  now covers the interface only through "however it enters the toolkit, may be retained". L2 then failed in five of
+  six final runs. Even when the sentence was there, MiMo missed L2 in two of three round-1 runs.
+- **The review's "Required: generalize" notes were not applied.** The review asked to reword three phrases that point
+  at the compile stage and the metadata channel ("compiles that description into an installer archive" and two uses
+  of "packaged metadata"). The instruction the models saw still has them. That makes the task slightly easier, not
+  harder.
+- **No fresh-agent fix on the final version.** The only "blind" fix (a DeepSeek agent given the instruction, tree,
+  tests, reference and route list) was made on 2026-10-28 for round 1 and passed then. It was deleted in round 2 because
+  it predates the new routes. The manifest still declares it, but the final gate ran 17 checks without it. Solvability
+  rests on the reference fix and the builder's `pass-alt` and `pass-hardening`, which are not independent agents.
+- **The configuration-step tests call the task classes directly.** In the product, a listener in `izpack-event` runs
+  these steps, and the verifier does not build that module. So the tests call the shipped task classes as the
+  project's own `SingleConfigurableTaskTest` does, setting a `../` file through their setters. A round-3 audit
+  questioned whether that is a value "from packaged metadata". The final review treats the setters as an accepted
+  entry path.
+- **MiMo run 2's agent time is not reliable.** `trial_detail_mimo.json` records 50 s and 3 turns, but the job took
+  102 min of wall time (`wall_s` 6126), and the audit describes a full transcript with a plan and an install-time fix.
+  The record probably covers only the last session segment. This was not verified.
+- **The tests are lenient in places.** Refusal tests accept any exception, so an unrelated crash would count as a
+  refusal. The review also lists cases no test catches:
+  - a refused location written into the removal data or log;
+  - the configuration copy tasks;
+  - executable paths;
+  - the uninstaller's deletions.
+
+  None of this can lower a score.
+- **MiMo was rate-limited.** In the final round, one MiMo attempt was cut by HTTP 429 and re-run. In repair 1, four
+  MiMo attempts were cut, which left one scored MiMo run in that round.
+
+### Evidence
+
+- Final verdict page: [`verdicts/izpack-zip-path-inj.md`](verdicts/izpack-zip-path-inj.md). It lists the batch-10 run
+  as the results branch; the final trial records are on `runs/40833539592`.
+- Fairness review: [`verdicts/izpack-zip-path-inj-FAIRNESS.md`](verdicts/izpack-zip-path-inj-FAIRNESS.md)
+- Audit of each failing run: [`audits/izpack-zip-path-inj-*/POSTMORTEM.md`](audits/)
+- Final build, gate and trial records: branch [`runs/40833539592`](https://github.com/sherazrazadev/swe-benching/tree/runs/40833539592),
+  `build/izpack-zip-path-inj/`:
+  - `notes.md`, including the "Round 2", "Fairness revision" and "Audit revision" sections;
+  - `gate_report.json`, `gate_verdict.json`, `gate-summary.md`, `manifest.json`, `FAIRNESS.md`, `ROUND1-MISSES.md`;
+  - `trial_detail_*.json` and `audits/`;
+  - the earlier rounds' audits, `AUDIT-FINDINGS.md` and `FAIRNESS.md` in `round0/` (round 2) and `round1/` (repair 1).
+- First build and round-1 trials: branch [`runs/40647352109`](https://github.com/sherazrazadev/swe-benching/tree/runs/40647352109).
+  The intermediate runs are on branches `runs/40755540825` (round 2) and `runs/40797405206` (repair 1).
