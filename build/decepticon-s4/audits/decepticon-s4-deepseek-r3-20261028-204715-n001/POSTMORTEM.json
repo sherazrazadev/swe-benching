@@ -1,0 +1,216 @@
+{
+ "trial": "decepticon-s4__3vG5W5M",
+ "task": "decepticon-s4",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-28T21:28:00+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T00:01:54+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "instruction-ambiguity",
+  "confidence": "medium",
+  "summary": "Reward 0.7195 = 59/82 security tests passed with all 249 functional tests passing (score.py threshold rule). There are 23 security failures in two groups. (a) 6 failures come from the mixed-width forms '<|im_start\\uff5c>' and '<\\uff5cim_end|>' across the command, envelope and shield suites. The model's neutralizer is an exact-literal catalog that covers the all-ASCII and all-fullwidth forms but not mixed forms. The instruction asks the agent to 'Fix the problem and its close variants', and NFKC folds U+FF5C to '|'. These are genuine model failures. (b) 17 failures are in the KG-summary suite (7) and the notification suite (10). These tests call KGMiddleware.wrap_model_call with an identity handler, or SandboxNotificationMiddleware.before_model, directly, and they inspect that one hook's output. The model chose not to neutralize at those composition sites. Instead it neutralized the whole request in UntrustedOutputMiddleware/PromptInjectionShield wrap_model_call and appended a new innermost ChatTemplateGuardMiddleware in build_middleware. That guard neutralizes the system message and every message immediately before the main model call. In the real stack this plausibly makes the KG summary and the completion reminder inert before the main model reads them. The hidden tests cannot observe that, because they isolate one layer. The guard has real coverage gaps: it is installed only for roles that have the UNTRUSTED_OUTPUT or PROMPT_INJECTION_SHIELD slot, the raw reminder stays in persisted state, and LLM calls outside the wrap_model_call chain (for example summarization) would see it. So the model's design is not clearly complete, and the tests are not clearly unfair. The instruction says 'Wherever such content is composed into a model-visible message, every such literal must be made inert before the model sees it'. That supports both a composition-site reading (the tests and the reference fix) and a before-the-model-call reading (the model). Because of this, 17 of the 23 failures, worth about 0.21 of reward, depend on how that sentence is read and not clearly on the model's competence. Under the model's reading security would be about 76/82 (\u22480.93); under the tests' reading it is 0.72. No contamination, no grading-window activity and no harness errors were found. The only gap is an empty test-stdout tail; results.json is complete with 331 cases.",
+  "items": [
+   {
+    "test": "security.test_command_tool_output::test_command_report_cannot_carry_a_control_literal[<|im_start\\uff5c>]",
+    "outcome": "fail",
+    "model_behaviour": "_chat_template.CONTROL_LITERALS lists '<|im_start|>' and '<\uff5cim_start\uff5c>' (case-insensitive for pipe-delimited forms) but no mixed ASCII/fullwidth-bar form, so '<|im_start\uff5c>' is not matched (changes.patch:219-367, 395-400).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_command_tool_output::test_command_report_cannot_carry_a_control_literal[<\\uff5cim_end|>]",
+    "outcome": "fail",
+    "model_behaviour": "Same exact-catalog gap: '<\uff5cim_end|>' (mixed bars) is not in the catalog. The reference regex accepts [|\uff5c] independently on each side (fix.patch:29-31).",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_envelope_special_tokens::test_web_fetch_output_cannot_carry_a_control_literal[<|im_start\\uff5c>]",
+    "outcome": "fail",
+    "model_behaviour": "Envelope body is neutralized with the same catalog; the mixed-width variant is not matched.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_envelope_special_tokens::test_web_fetch_output_cannot_carry_a_control_literal[<\\uff5cim_end|>]",
+    "outcome": "fail",
+    "model_behaviour": "Same mixed-width catalog gap.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_shield_body_special_tokens::test_external_tool_output_cannot_carry_a_control_literal[<|im_start\\uff5c>]",
+    "outcome": "fail",
+    "model_behaviour": "Shield _wrap_untrusted calls neutralize_chat_template_tokens; the mixed-width variant is not matched.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_shield_body_special_tokens::test_external_tool_output_cannot_carry_a_control_literal[<\\uff5cim_end|>]",
+    "outcome": "fail",
+    "model_behaviour": "Same mixed-width catalog gap.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_label_cannot_carry_a_control_literal[<|im_start|>]",
+    "outcome": "fail",
+    "model_behaviour": "kg.py was not modified. The model relied on an innermost ChatTemplateGuardMiddleware (build.py hunk, changes.patch:51-59) plus whole-request neutralization in the UntrustedOutput/shield wrap_model_call hooks to neutralize the KG system block before the main model call. The test calls KGMiddleware.wrap_model_call with an identity handler (test_kg_summary_special_tokens.py:44-49), so the guard is never in the path.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_label_cannot_carry_a_control_literal[<|im_end|>]",
+    "outcome": "fail",
+    "model_behaviour": "As above: neutralization happens in a separate innermost guard middleware, not in KGMiddleware.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_label_cannot_carry_a_control_literal[[INST]]",
+    "outcome": "fail",
+    "model_behaviour": "As above (layer-isolated test; '[INST]' is in the model's catalog, so the guard would neutralize it in the real stack).",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_label_cannot_carry_a_control_literal[<start_of_turn>]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_label_cannot_carry_a_control_literal[<|eot_id|>]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_summary_literal_is_defanged_without_an_existing_system_message",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_kg_summary_special_tokens::test_entrypoint_label_cannot_carry_a_control_literal",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[<|im_start|>]",
+    "outcome": "fail",
+    "model_behaviour": "The model read notifications.py (transcript.md:324) but left it unchanged. It relied on the innermost guard to neutralize the appended HumanMessage at model-call time. The test inspects the raw before_model state update (test_notification_special_tokens.py:26-36). Real gap in the model's design: the raw reminder persists in state, and any LLM consumer outside the wrap_model_call chain (for example summarization) would still see it.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[<|im_end|>]",
+    "outcome": "fail",
+    "model_behaviour": "As above: notification reminder not neutralized at composition; only the model-call guard applies.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[<|endoftext|>]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[<start_of_turn>]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[<end_of_turn>]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[[INST]]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_completion_output_cannot_carry_a_control_literal[[/INST]]",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_ansi_wrapped_literal_is_defanged",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_two_completed_sessions_cannot_each_carry_a_literal",
+    "outcome": "fail",
+    "model_behaviour": "As above.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   },
+   {
+    "test": "security.test_notification_special_tokens::test_async_completion_output_cannot_carry_a_control_literal",
+    "outcome": "fail",
+    "model_behaviour": "As above (abefore_model path).",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "instruction-ambiguity"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows the agent reading only /workspace source and its own repository tests, with no access to hidden tests, the solution, /logs, or any network fetch (no network; DNS failures are visible in its runs). No netguard.log is present. run.json shows tool_calls_during_grading=[] and agent_events_after_end=0.",
+  "evidence": [
+   "evidence/grading/results.json: 59/82 security pass, 249/249 functional pass, reward 0.7195 = 59/82 (score.py:64)",
+   "evidence/tests/support/helpers.py:85 FULLWIDTH = ['<\uff5cim_start\uff5c>', '<|im_start\uff5c>', '<\uff5cim_end|>']; the model passes the first and fails the two mixed forms",
+   "evidence/final-code/changes.patch:219-400 exact-literal CONTROL_LITERALS catalog with no mixed-width entries; fix.patch:29-31 reference regex '< [|\uff5c] ... [|\uff5c] >'",
+   "evidence/instruction.md:45-46 'The example above is one example, not the full set. Fix the problem and its close variants'",
+   "evidence/instruction.md:21-28 'Wherever such content is composed into a model-visible message, every such literal must be made inert before the model sees it' (supports both composition-site and model-boundary readings)",
+   "evidence/tests/security/test_kg_summary_special_tokens.py:44-49 calls KGMiddleware.wrap_model_call with identity handler (layer-isolated)",
+   "evidence/tests/security/test_notification_special_tokens.py:26-36 inspects SandboxNotificationMiddleware.before_model output directly",
+   "evidence/final-code/changes.patch:51-59 ChatTemplateGuardMiddleware appended innermost in build_middleware (conditional on UNTRUSTED_OUTPUT or PROMPT_INJECTION_SHIELD slot); changes.patch:615-624 guard neutralizes the full request",
+   "evidence/transcript.md:324 the model inspected notifications.py; transcript.md:550 the model claims the guard covers 'summaries, notifications, derived system blocks'",
+   "evidence/solution/fix.patch:63-107 the reference fix neutralizes at kg.py and notifications.py composition sites",
+   "evidence/build-notes.md:116-120 the alternative-pass check used 'a different reminder composition point', still inside the notification middleware; a model-boundary guard design was never validated against the tests",
+   "evidence/run.json: tool_calls_during_grading=[], exception_info=null; evidence/grading/test-stdout.tail.txt is empty (minor logging gap; results.json is complete with 331 cases)"
+  ],
+  "recommended_action": "Do not report 0.7195 as a clean measure of the model. The 6 mixed-width failures are genuine model shortfalls. The 17 KG and notification failures depend on whether neutralization must happen at the composition hook or may happen at a final model-call guard. Either (1) state in the instruction that each composing component must emit inert text, including state updates such as before_model reminders, or (2) add an end-to-end test that runs the KG summary and completion reminder through the assembled build_middleware stack to the model handler, plus a check of persisted-state/summarizer exposure, so that model-boundary designs are judged on actual coverage. Then re-grade this trial. Under the model's reading security would be about 76/82 (\u22480.93); under the tests' reading it stays 0.72."
+ }
+}
