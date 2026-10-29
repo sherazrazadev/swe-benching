@@ -1,0 +1,14 @@
+# Round 1 trial evidence: wakaru-mm
+
+Which hidden tests each graded round-1 run FAILED.
+
+| Run | Reward | Failed tests |
+|---|---|---|
+| deepseek-r1 | 0.6667 | security 4/12: extract_does_not_follow_existing_directory_link_out_of_output_dir, unpack_absolute_module_id_does_not_overwrite_file_outside_output_dir, unpack_does_not_follow_existing_directory_link_out_of_output_dir, unpack_overlapping_dot_module_id_does_not_overwrite_file_outside_output_dir |
+| deepseek-r2 | 0.6667 | security 4/12: extract_does_not_follow_existing_directory_link_out_of_output_dir, unpack_absolute_module_id_does_not_overwrite_file_outside_output_dir, unpack_does_not_follow_existing_directory_link_out_of_output_dir, unpack_overlapping_dot_module_id_does_not_overwrite_file_outside_output_dir |
+| deepseek-r3 | 0.6667 | security 4/12: extract_does_not_follow_existing_directory_link_out_of_output_dir, unpack_absolute_module_id_does_not_overwrite_file_outside_output_dir, unpack_does_not_follow_existing_directory_link_out_of_output_dir, unpack_overlapping_dot_module_id_does_not_overwrite_file_outside_output_dir |
+| mimo-r1 | 0.0 | security 12/12: browserify_string_module_id_is_not_reported_as_parent_path, esbuild_mid_path_parent_component_is_not_reported, multi_file_unpack_keeps_module_names_relative, sourcemap_derived_module_name_is_not_reported_as_parent_path, systemjs_overlapping_dot_register_name_is_not_reported_as_parent_path, webpack4_overlapping_dot_module_id_is_not_reported_as_parent_path, webpack5_absolute_module_id_is_not_reported_as_absolute_path, webpack5_overlapping_dot_module_id_is_not_reported_as_parent_path, extract_does_not_follow_existing_directory_link_out_of_output_dir, unpack_absolute_module_id_does_not_overwrite_file_outside_output_dir, unpack_does_not_follow_existing_directory_link_out_of_output_dir, unpack_overlapping_dot_module_id_does_not_overwrite_file_outside_output_dir |
+| mimo-r2 | 0.6667 | security 4/12: extract_does_not_follow_existing_directory_link_out_of_output_dir, unpack_absolute_module_id_does_not_overwrite_file_outside_output_dir, unpack_does_not_follow_existing_directory_link_out_of_output_dir, unpack_overlapping_dot_module_id_does_not_overwrite_file_outside_output_dir |
+| mimo-r3 | 1.0 | none (solved) |
+
+Keep the traps the model that failed every run keeps missing; add 2-3 new real traps of the kinds common/builder/BRIEF-trap-stack.md lists for the model that solved it.
