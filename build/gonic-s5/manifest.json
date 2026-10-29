@@ -1,0 +1,337 @@
+{
+ "slug": "gonic-s5",
+ "candidate": {
+  "repo": "sentriz/gonic",
+  "advisory_ids": [
+   "GHSA-2FP4-5V5C-4448",
+   "CVE-2026-49339",
+   "GO-2026-5825"
+  ],
+  "pinned_commit": "37090aa71c5e0bb7a322313fc8622c828fd9916b",
+  "fix_commits": [
+   "6dd71e6a3c966867ef8c900d359a7df75789f410",
+   "0824bed88f6bbc490ba28bf09d28e5dfeb07b445"
+  ],
+  "cwe": "CWE-22 / CWE-639",
+  "entry_id": "15195"
+ },
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "37090aa71c5e0bb7a322313fc8622c828fd9916b (parent of 6dd71e6a; 0824bed8 is its child). Neither fix commit's regression tests are present in the pinned tree.",
+  "entry_point": "The Subsonic HTTP API through the real ctrlsubsonic.New mux and its login middleware. Tests drive the mux with authenticated requests; nothing is stubbed. The attacker input is the playlist identifier carried in `id`/`playlistId`, or (for the injected duplicate operation) the playlist name carried in `name`.",
+  "sites": [
+   "playlist/playlist.go:95,153,206 \u2014 Store Read/Write/Delete join the caller's relative path with no containment",
+   "playlist/playlist.go:108,209-220 \u2014 owner identity parsed from the raw relative path, not the resolved location",
+   "server/ctrlsubsonic/handlers_playlist.go:79 \u2014 create/update ownership load is inverted, so the guard sees a zero playlist",
+   "server/ctrlsubsonic/handlers_playlist.go:51-60 \u2014 getPlaylist has no ownership decision",
+   "server/ctrlsubsonic/handlers_playlist.go:177-187 \u2014 deletePlaylist hands the decoded id to the store with no ownership decision",
+   "server/ctrlsubsonic/handlers_raw.go:243-270 \u2014 playlist cover-art lookup rebuilds the playlist directory outside the store (real uncovered upstream route)",
+   "server/ctrlsubsonic/handlers_playlist_cover.go (injected) \u2014 playlist cover upload builds the playlist directory from the raw decoded identifier and writes there",
+   "playlist/duplicate.go (injected) \u2014 playlist duplicate joins the client-supplied name into the destination path with no containment"
+  ],
+  "routes": [
+   "T1 confirmed on the pinned+injected tree through /getCoverArt with an escaping playlist identifier: the served bytes are the outside image",
+   "T3 confirmed through getPlaylist, createPlaylist and deletePlaylist with identifiers whose cleaned path leaves the storage area",
+   "T4 confirmed through updatePlaylist with an aliased identifier whose first element names the caller while the path resolves into another user's directory",
+   "T2, T5, T6 confirmed through createPlaylist/updatePlaylist, getPlaylist and deletePlaylist respectively",
+   "S1 confirmed through the injected /setPlaylistCover route: an escaping identifier makes the server create the cover outside the storage area",
+   "S2 confirmed through the injected /duplicatePlaylist route: a name containing .. makes the server create the copy outside the storage area"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./playlist ./fileutil ./server/ctrlsubsonic passes on the pinned+injected tree, on the reference fix and on every variant. Hidden suites: 11 security tests and 7 functional tests; pristine project tests are restored from tests/project at grade time (164 project cases).",
+  "local_runs": "Local matrix on the pinned+injected source (Go 1.26.3, module go 1.26): nop security 0/11, functional 7/7; oracle 11/11, 7/7; miss_cover 10/11 (cover art); miss_create_load 10/11 (foreign replacement); miss_containment 8/11 (read/create/delete outside); miss_identity 10/11 (aliased); miss_read_owner 10/11 (foreign read); sf_reads_only 9/11 (foreign replacement + foreign delete); miss_injected_cover 10/11 (cover upload); miss_injected_duplicate 10/11 (duplicate name); upstream_fix 8/11 (cover art + both injected); ff_refuse_all functional fails; ff_nested functional fails (nested paths); pass_alt 11/11, 7/7; pass_hardening 11/11, 7/7. Project tests pass on nop and oracle."
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "B",
+   "origin": "uncovered_upstream",
+   "shape": "route where the protection never existed: the playlist cover-art lookup rebuilds the playlist directory from the raw decoded identifier and reads there, outside the store the published fix guards",
+   "where": "server/ctrlsubsonic/handlers_raw.go:243-270",
+   "reason_to_dismiss": "it is the image endpoint, not a playlist read, it only lists a directory, and the published fix never touches it",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecCoverArtOutsideStorageRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncNestedDottedPathReadableAndCoverServed"
+   ],
+   "security_fail_patch": "miss_cover.patch",
+   "realistic_because": "real, unmodified upstream code; neither published fix commit touches it"
+  },
+  {
+   "id": "T2",
+   "pattern": "A",
+   "origin": "published_fix_far_site",
+   "shape": "shape trap: the create/update ownership load condition is inverted, so the guard at the next line sees a zero-valued playlist and never fires",
+   "where": "server/ctrlsubsonic/handlers_playlist.go:79",
+   "reason_to_dismiss": "the ownership guard is visibly present on the next line, so the route looks protected",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecForeignReplacementRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncCreateWithoutIDCreatesCallersPlaylist",
+    "tests/functional/playlist_functional_test.go::TestFuncOwnerUpdatesAndDeletesOwnPlaylist"
+   ],
+   "security_fail_patch": "miss_create_load.patch",
+   "realistic_because": "real, unmodified pinned code"
+  },
+  {
+   "id": "T3",
+   "pattern": "A",
+   "origin": "published_fix_far_site",
+   "shape": "how-type with a coupled must-keep-working value: the lower-level store joins whatever relative path it is handed; a containment rule that accepts only <user>/<name> closes it but breaks the documented nested layout",
+   "where": "playlist/playlist.go:95, playlist/playlist.go:153, playlist/playlist.go:206",
+   "reason_to_dismiss": "a handler-level denial looks sufficient; the store reads as a dumb filesystem API",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecReadOutsideStorageRefused",
+    "tests/security/playlist_security_test.go::TestSecCreateOutsideStorageRefused",
+    "tests/security/playlist_security_test.go::TestSecDeleteOutsideStorageRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncNestedDottedPathReadableAndCoverServed"
+   ],
+   "security_fail_patch": "miss_containment.patch",
+   "realistic_because": "real, unmodified pinned code"
+  },
+  {
+   "id": "T4",
+   "pattern": "A",
+   "origin": "published_fix_far_site",
+   "shape": "shape trap: owner identity parsed from the caller's raw relative path while the operation uses the cleaned path, so an aliased identifier reports the caller's own id for a playlist stored elsewhere",
+   "where": "playlist/playlist.go:108, playlist/playlist.go:209-220",
+   "reason_to_dismiss": "the first path element is the user id for ordinary identifiers, and a correct-looking containment check accepts the aliased form",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecAliasedPathCannotChangeForeignPlaylist"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncOwnerUpdatesAndDeletesOwnPlaylist"
+   ],
+   "security_fail_patch": "miss_identity.patch",
+   "realistic_because": "real, unmodified pinned code"
+  },
+  {
+   "id": "T5",
+   "pattern": "A",
+   "origin": "advisory_route",
+   "shape": "coupled must-keep-working value: the read route has no ownership decision, and the obvious owner-only rule breaks the shared playlists the neighbouring list route already admits",
+   "where": "server/ctrlsubsonic/handlers_playlist.go:51-60",
+   "reason_to_dismiss": "the advisory's own route",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecForeignReadRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncOtherListenerReadsPublicPlaylist"
+   ],
+   "security_fail_patch": "miss_read_owner.patch",
+   "realistic_because": "the advisory's own route"
+  },
+  {
+   "id": "T6",
+   "pattern": "A",
+   "origin": "advisory_route",
+   "shape": "the delete route hands the decoded identifier to the store after no ownership decision at all",
+   "where": "server/ctrlsubsonic/handlers_playlist.go:177-187",
+   "reason_to_dismiss": "the advisory's own delete half, easy once the read half is seen",
+   "security_tests": [
+    "tests/security/playlist_security_test.go::TestSecForeignDeleteRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/playlist_functional_test.go::TestFuncOwnerUpdatesAndDeletesOwnPlaylist"
+   ],
+   "security_fail_patch": "sf_reads_only.patch",
+   "realistic_because": "the advisory's own route"
+  },
+  {
+   "id": "S1",
+   "pattern": "injected",
+   "origin": "injected_sibling",
+   "shape": "write-side second implementation: the playlist cover upload builds the playlist directory from the raw decoded identifier and writes an image there, never going through the store",
+   "where": "server/ctrlsubsonic/handlers_playlist_cover.go (added by environment/inject.patch; route registered in server/ctrlsubsonic/ctrl.go)",
+   "reason_to_dismiss": "it is an image operation, not playlist data, and fixing the cover-art read does not cover the write",
+   "security_tests": [
+    "tests/security/injected_security_test.go::TestSecUploadCoverOutsideStorageRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/injected_functional_test.go::TestFuncOwnerUploadsPlaylistCover"
+   ],
+   "security_fail_patch": "miss_injected_cover.patch",
+   "realistic_because": "a maintainer adding a cover upload would reuse the directory construction the real cover-art lookup already performs; injected into our copy only, registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "S2",
+   "pattern": "injected",
+   "origin": "injected_sibling",
+   "shape": "shape trap on a second value: the playlist duplicate joins the client-supplied playlist name into the destination path, so an in-storage identifier still puts the copy outside the storage area",
+   "where": "playlist/duplicate.go (added by environment/inject.patch; route registered in server/ctrlsubsonic/ctrl.go)",
+   "reason_to_dismiss": "the source playlist was already read and authorised, and the new name reads as a display label",
+   "security_tests": [
+    "tests/security/injected_security_test.go::TestSecDuplicateNameOutsideStorageRefused",
+    "tests/security/injected_security_test.go::TestSecDuplicateSourceOutsideStorageRefused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/injected_functional_test.go::TestFuncOwnerDuplicatesPlaylist"
+   ],
+   "security_fail_patch": "miss_injected_duplicate.patch",
+   "realistic_because": "a duplicate/copy operation is the natural companion of create and would reuse the store's path spelling; injected into our copy only, registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "SafeJoin",
+  "ErrEscapesBase",
+  "HasPrefix",
+  "coverForPlaylist",
+  "coverFor",
+  "userIDFromPath",
+  "cleanRel",
+  "firstPathEl",
+  "playlistStore",
+  "Store.Read",
+  "Store.Write",
+  "Store.Delete",
+  "Store.Duplicate",
+  "handlers_playlist.go",
+  "handlers_raw.go",
+  "playlist.go",
+  "fileutil.go",
+  "ctrl.go",
+  "duplicate.go",
+  "handlers_playlist_cover.go",
+  "handlers_playlist_duplicate.go",
+  "IsPublic",
+  "base64",
+  "getCoverArt",
+  "getPlaylists",
+  "createPlaylist",
+  "updatePlaylist",
+  "deletePlaylist",
+  "setPlaylistCover",
+  "duplicatePlaylist",
+  "uploadPlaylistCover",
+  "ServeSetPlaylistCover",
+  "ServeDuplicatePlaylist",
+  "GHSA-2FP4-5V5C-4448",
+  "CVE-2026-49339",
+  "GO-2026-5825",
+  "37090aa7",
+  "6dd71e6a",
+  "0824bed8",
+  "server/ctrlsubsonic",
+  "playlist/playlist",
+  "fileutil"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_cover.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ]
+  },
+  {
+   "patch": "miss_create_load.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2"
+   ]
+  },
+  {
+   "patch": "miss_containment.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T3"
+   ]
+  },
+  {
+   "patch": "miss_identity.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T4"
+   ]
+  },
+  {
+   "patch": "miss_read_owner.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T5"
+   ]
+  },
+  {
+   "patch": "sf_reads_only.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2",
+    "T6"
+   ]
+  },
+  {
+   "patch": "miss_injected_cover.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "S1"
+   ]
+  },
+  {
+   "patch": "miss_injected_duplicate.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "S2"
+   ]
+  },
+  {
+   "patch": "upstream_fix.patch",
+   "expect": "security_fail",
+   "note": "both published fix commits as shipped; misses T1 and both injected siblings"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_nested.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "kind": "pass",
+   "expect": "pass",
+   "note": "independent design: store resolve/Abs helper, shared visibility predicates, cover-art route asks the store for the location, inline containment for the injected siblings"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "kind": "hardening",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: every refusal in this product is an ordinary Subsonic error response; a Go panic aborts the test binary and cannot be a plausible fix shape",
+  "wrong_resource": "miss_identity.patch",
+  "one_role_or_direction": "n/a: each request is one authenticated client acting on one playlist; there is no second role, peer or direction",
+  "reads_only": "sf_reads_only.patch",
+  "check_after_adjustment": "n/a: the reference contains the path before use; the aliased-path shape is a wrong-object identity error, covered by miss_identity.patch, not an ordering error",
+  "unlisted_route": "miss_cover.patch",
+  "malformed_identity": "miss_identity.patch",
+  "missing_authority": "n/a: callers are authenticated by the server's own session middleware before any handler runs; there is no authority lookup whose empty answer could fail open",
+  "adjacent_api": "ff_nested.patch"
+ },
+ "status": "built; gate passed"
+}

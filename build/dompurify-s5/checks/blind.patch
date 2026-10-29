@@ -1,0 +1,103 @@
+diff -ruN a/src/purify.ts b/src/purify.ts
+--- a/src/purify.ts	2026-10-28 20:53:31.000000000 +0000
++++ b/src/purify.ts	2026-10-28 21:09:12.073320491 +0000
+@@ -1659,25 +1659,17 @@
+   };
+ 
+   /**
+-   * Handle a node whose tag is forbidden or not allowlisted: keep
+-   * allowed custom elements (false return exits _sanitizeElements
+-   * early - namespace/fallback checks and the afterSanitizeElements
+-   * hook are intentionally skipped for kept custom elements), else
+-   * hoist content per KEEP_CONTENT and remove.
++   * Remove a node whose tag is forbidden or not allowlisted. Callers have
++   * already established that the configuration does not keep it: hoist its
++   * content per KEEP_CONTENT and detach it.
+    *
+    * @param currentNode the disallowed node
+    * @param tagName the node's transformCaseFunc'd tag name
+-   * @return true if the node was removed, false if kept
+    */
+   const _sanitizeDisallowedNode = function (
+     currentNode: any,
+     tagName: string
+-  ): boolean {
+-    /* Check if we have a custom element to handle */
+-    if (_isKeptCustomElement(tagName)) {
+-      return false;
+-    }
+-
++  ): void {
+     /* Keep content except for bad-listed elements.
+          Use the cached prototype getters exclusively — the previous code
+          had `|| currentNode.parentNode` / `|| currentNode.childNodes`
+@@ -1724,7 +1716,6 @@
+     }
+ 
+     _forceRemove(currentNode);
+-    return true;
+   };
+ 
+   /**
+@@ -1772,16 +1763,28 @@
+       ) &&
+         !ALLOWED_TAGS[tagName])
+     ) {
+-      return _sanitizeDisallowedNode(currentNode, tagName);
++      /* A custom element the configuration keeps is not removed. It survives
++         by the same rule as an allowlisted element, so it must reach the
++         shared element tail below — in particular the afterSanitizeElements
++         hook. Nodes that are actually removed never run the hook. */
++      if (!_isKeptCustomElement(tagName)) {
++        _sanitizeDisallowedNode(currentNode, tagName);
++        return true;
++      }
++
++      _executeHooks(hooks.afterSanitizeElements, currentNode, null);
++      return false;
+     }
+ 
+     /* A tag approved by a caller-supplied predicate is kept by name; the
+-       allow-list path has nothing to add for it. */
++       allow-list path has nothing to add for it, but it is a survivor, so it
++       gets the same afterSanitizeElements hook as any allowlisted element. */
+     if (
+       !FORBID_TAGS[tagName] &&
+       EXTRA_ELEMENT_HANDLING.tagCheck instanceof Function &&
+       EXTRA_ELEMENT_HANDLING.tagCheck(tagName)
+     ) {
++      _executeHooks(hooks.afterSanitizeElements, currentNode, null);
+       return false;
+     }
+ 
+@@ -1966,8 +1969,7 @@
+    *
+    * The configured custom-element keep decision: a basic custom element that
+    * is not forbidden and that matches CUSTOM_ELEMENT_HANDLING.tagNameCheck.
+-   * Shared by the element pass and the shadow-tree pass so both apply the
+-   * same rule.
++   * Consulted by the element pass, which every walked region shares.
+    *
+    * @param tagName name of the tag of the node to check
+    * @return true if the configuration keeps this custom element
+@@ -2204,15 +2206,11 @@
+       /* Execute a hook if present */
+       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
+ 
+-      /* Custom elements that the configuration keeps are preserved by name;
+-         only their attributes need the pass below. */
+-      const shadowNodeName = transformCaseFunc(
+-        getNodeName ? getNodeName(shadowNode) : shadowNode.nodeName
+-      );
+-      if (!_isKeptCustomElement(shadowNodeName)) {
+-        /* Sanitize tags and elements */
+-        _sanitizeElements(shadowNode);
+-      }
++      /* Sanitize tags and elements. Nodes reached through template content
++         or an attached shadow root go through the very same element pass as
++         the main walk: skipping it for configured custom elements also
++         skipped their keep decision and the afterSanitizeElements hook. */
++      _sanitizeElements(shadowNode);
+ 
+       /* Check attributes next */
+       _sanitizeAttributes(shadowNode);

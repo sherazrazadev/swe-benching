@@ -1,0 +1,408 @@
+{
+ "slug": "aqua-s5",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18379",
+  "advisory_ids": [
+   "GHSA-MF5C-HW34-4HPP",
+   "CVE-2026-55569",
+   "GO-2026-6314"
+  ],
+  "repo": "aquaproj/aqua",
+  "pinned_commit": "d6b9448fc421c58d83ae2fa372e61122f14620f5",
+  "fix_commits": [
+   "d5b02b220188de376a661b3aabfa912202a1a59a"
+  ],
+  "trust_decision": {
+   "summary": "Extraction trusted the archive: the destination path was built with filepath.Join(dest, entry) and written with no check that it stayed under dest, and any symlink entry target was created verbatim, so a later entry at the same path wrote through the planted link outside the install directory. The whole decision lives in handler.HandleFile in pkg/unarchive/archives.go; the fix adds a lexical withinDest check on both the entry destination and the resolved symlink target."
+  },
+  "landing_point": {
+   "where": "pkg/unarchive/archives.go:25",
+   "why": "HandleFile is the single callback that maps archive entry names to paths inside the install directory"
+  },
+  "fix_sites": [
+   {
+    "where": "pkg/unarchive/archives.go:33",
+    "entry_point": "aqua install / aqua exec lazy install / aqua cp -> installpackage.Installer.download -> unarchive.Unarchiver.Unarchive -> handler.HandleFile"
+   },
+   {
+    "where": "pkg/unarchive/archives.go:42",
+    "entry_point": "same path; the symlink branch of HandleFile"
+   }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+   "kind": "second_implementation",
+   "where": "pkg/unarchive/dmg.go:56"
+  },
+  "O3_reason_to_dismiss": "DMG extraction copies a mounted volume with osfile.Copy instead of going through HandleFile, so a solver can argue the advisory is about tar/zip archive entries and that a macOS-only hdiutil path is a different, unsupported combination.",
+  "O4_distance": {
+   "files": 2,
+   "packages": 0,
+   "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+   "what": "Packages legitimately ship symlinks inside the install directory, including dangling and relative ones (e.g. libfoo.so.1 -> libfoo.so.1.2.3). The symlink branch must keep creating them; an over-broad fix that rejects every symlink entry, or that resolves targets with filepath.EvalSymlinks (which errors on dangling links), breaks normal packages.",
+   "where": "pkg/unarchive/archives.go:41-49"
+  },
+  "O6_input_shapes": [
+   "regular-file entry name containing '..' (path traversal)",
+   "entry name that is an absolute path (neutralised by filepath.Join, but the check must not regress)",
+   "Windows-style backslash-separated entry name, rewritten by normalizePath before the check",
+   "symlink entry with an absolute target outside the install directory",
+   "symlink entry with a relative target escaping the install directory via '..' (resolved against the link's own directory)",
+   "symlink entry whose target is the install directory itself or inside it (must still be created)",
+   "both tar and zip style extractors"
+  ],
+  "O7_producer": {
+   "kind": "handler",
+   "where": "pkg/unarchive/archives.go:109",
+   "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+   {
+    "route": "PKG extraction delegates to `pkgutil --expand-full <file> <dest>` with no withinDest check on any entry or link",
+    "where": "pkg/unarchive/pkg.go:32",
+    "reason_to_dismiss": "macOS-only, delegated to an external tool, and the published fix targeted the archives handler",
+    "distance": "same package, one file from the landing point",
+    "present_in_latest": "yes",
+    "latest_where": "pkg/unarchive/pkg.go:41"
+   },
+   {
+    "route": "DMG extraction copies the mounted volume into the install directory, reproducing a link without any target check",
+    "where": "pkg/unarchive/dmg.go:56",
+    "reason_to_dismiss": "macOS-only and needs a mountable image",
+    "distance": "same package, one file from the landing point",
+    "present_in_latest": "yes",
+    "latest_where": "pkg/unarchive/dmg.go:56"
+   }
+  ],
+  "O8b_injection_room": [
+   {
+    "where": "pkg/unarchive/archives.go:41-49",
+    "sibling": "A hardlink branch beside the symlink branch, without the withinDest check"
+   },
+   {
+    "where": "pkg/unarchive/archives.go:120-138",
+    "sibling": "A second decompressor writer that joins a non-base'd name into dest"
+   },
+   {
+    "where": "pkg/installpackage/check_file.go:79",
+    "sibling": "The aqua cp copy step that writes extracted files to an arbitrary --dest"
+   }
+  ],
+  "O9_family": "path traversal / symlink following leading to arbitrary file write (CWE-22, CWE-59)",
+  "O9_dos": false,
+  "O10_build": {
+   "language": "Go",
+   "toolchain": "go 1.26.4 (go.mod:3), module github.com/aquaproj/aqua/v2, standard go build/test; no code generation",
+   "services": [],
+   "offline_after_build": true,
+   "project_tests": "pkg/unarchive/unarchive_test.go holds TestIsUnarchived and TestUnarchiver_Unarchive only; two subtests fetch tarballs from github.com, so only the raw subtest is offline"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+   "j_multi_site": 1,
+   "j_sites_touched": "pkg/unarchive/archives.go",
+   "j_sibling_sites": "yes",
+   "j_cause_other_layer": 1,
+   "j_defence_ineffective": 0,
+   "j_overbroad_breaks_legit": 1,
+   "j_tempting_wrong_fix": "Reject entry names containing '..' at the top of HandleFile (or refuse all symlink entries) and stop there, leaving the planted-symlink chain, the relative-target resolution base and the backslash-normalised names unhandled."
+  },
+  "out_of_scope_notes": [
+   "pkg/installpackage/check_file.go stats and chmods a path inside the installed package dir, so a link planted there is followed; that is a consequence of the same planted link, and the extraction fix removes the planting step."
+  ],
+  "unverified": [
+   "repo size in MB not measured",
+   "whether the pkg/dmg routes lack the check at today's HEAD was checked read-only (they do)",
+   "otiai10/copy Shallow behaviour inferred from the dependency source, not from a run",
+   "no build was run during screening"
+  ]
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "d6b9448fc421c58d83ae2fa372e61122f14620f5 (the parent of published fix d5b02b220188de376a661b3aabfa912202a1a59a)",
+  "entry_points": [
+   "unarchive.New(executor, fs).Unarchive(ctx, logger, src, dest) \u2014 the public extractor the installer calls for every downloaded release asset (pkg/installpackage/download.go:152)"
+  ],
+  "sites": [
+   "pkg/unarchive/archives.go:27-28 \u2014 destination path built from the normalised entry name and joined to dest, with no containment check (T1)",
+   "pkg/unarchive/archives.go:43-50 \u2014 a link entry's target is created verbatim; a later entry at the same path is written through it (T2)",
+   "pkg/unarchive/archives.go:51-53 \u2014 injected hard-link branch resolves the target from the archive root with no containment check (T3)",
+   "pkg/unarchive/zip.go:61-97 and pkg/unarchive/unarchive.go:80-85,99-103 \u2014 injected zip extractor duplicates the write path and never goes through the shared handler (T4)",
+   "pkg/unarchive/archives.go:27,78-95 \u2014 injected error-path cleanup of recorded entry names removes recorded paths without containment (T5)"
+  ],
+  "routes": [
+   "Regular-file entry named ../outside/target \u2014 confirmed writes outside and returns nil on the pinned+injected tree (T1)",
+   "Regular-file entry named ..\\outside\\target \u2014 normalised to ../outside/target and writes outside (T1)",
+   "Entry named ../dest-sibling/evil \u2014 a bare string-prefix guard accepts it (T1)",
+   "Entry named ../newdir/evil \u2014 the guard must run before the first outside effect (T1)",
+   "Symlink entry sub/link -> outside file, then a regular entry at sub/link \u2014 writes through the link, absolute and relative targets both confirmed (T2)",
+   "Hard-link entry sub/h -> ../outside/target, then a regular entry at sub/h \u2014 writes through the hard link; the symlink-relative rule leaves it escaping (T3)",
+   "Zip entry ../outside/target and zip symlink sub/link -> ../../outside/target followed by a zip entry at sub/link \u2014 both confirmed outside the shared handler (T4)",
+   "Entry ../outside/target refused by the containment check, then the error-path cleanup deletes the outside file the entry named (T5)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "go test ./pkg/unarchive -run '^(TestIsUnarchived|TestUnarchiver_Unarchive/raw)$' \u2014 passes at the pinned tree, on the injected tree, on the reference fix and on every check variant; the other upstream cases download fixtures over the network and are excluded from the offline verifier"
+  ],
+  "local_runs": "Local matrix on the pinned+injected tree (Go 1.26.4, offline; hidden functional + the two project tests restored from pristine): nop security 0/9 + hidden functional 6/6 + project ok; reference fix 9/9 + 6/6 + project ok; miss_entry 5/9 (entry tests) + 6/6; miss_symlink 7/9 (two symlink tests) + 6/6; miss_hardlink 8/9 (hard-link test) + 6/6; miss_zip 7/9 (two zip tests) + 6/6; miss_cleanup 7/9 (two entry tests whose outside sentinel the cleanup deletes) + 6/6; upstream_fix (published fix rebased) 4/9 + 6/6; sf_raw_name 8/9 (backslash) + 6/6; sf_prefix 8/9 (sibling prefix) + 6/6; sf_crash 0/1 reported (the panic aborts the runner) + 6/6; ff_reject_links security 9/9 + functional 3/6; ff_dangling_strict 9/9 + 5/6; ff_reject_backslash 9/9 + 5/6; pass_alt 9/9 + 6/6; pass_hardening 9/9 + 6/6. score.py over the same JUnit directories: nop reward 0.0 (security 0/9, functional 13/13), oracle reward 1.0 (9/9, 13/13), each security_fail patch reward <1 with functional 13/13, each functional_fail patch reward 0.0. A fix that deletes the dedicated zip extractor and lets the shared format handling cover zip also scores 9/9 + 6/6.",
+  "pattern_b_register": "no real upstream route was built: the pkgutil and DMG leads are real but not reproducibly fixable in-repo/offline, and the decompress and raw writers cannot escape because the written name is base'd. Rows for all investigated routes are in build/audit/uncovered-routes.tsv; the three injected siblings are recorded there as injected.",
+  "gate_2026_10_28": {
+   "static": "PASS (build/aqua-s5/gate_report.partial.static.json)",
+   "nop": "PASS \u2014 security 0/9, functional 13/13, reward 0.0 (build/aqua-s5/gate-nop.log)",
+   "oracle": "PASS \u2014 3 identical runs, reward 1.0, security 9/9, functional 13/13 (build/aqua-s5/gate-oracle.log)",
+   "patches": "PASS \u2014 14 checks: miss_entry/miss_symlink/miss_hardlink/miss_zip/miss_cleanup/upstream_fix/sf_raw_name/sf_prefix/sf_crash security_fail; ff_reject_links/ff_dangling_strict/ff_reject_backslash functional_fail; pass_alt and pass_hardening reward 1.0 (build/aqua-s5/gate-patches.log, gate_report.partial.patches.json)",
+   "left_for_post_build": "blind.patch (kind=blind) and FAIRNESS.md, as instructed"
+  }
+ },
+ "leak_terms": [
+  "archives.go",
+  "zip.go",
+  "unarchive",
+  "HandleFile",
+  "NameInArchive",
+  "LinkTarget",
+  "Linkname",
+  "withinDest",
+  "normalizePath",
+  "symlinkTargetWithinDest",
+  "zipUnarchiver",
+  "normalizeZipPath",
+  "removeEntries",
+  "filepath.Join",
+  "os.Symlink",
+  "os.Link",
+  "hard link",
+  "hardlink",
+  "symbolic link",
+  "symlink",
+  "pkg/unarchive",
+  "mholt/archives",
+  "Unarchiver",
+  "GHSA-MF5C-HW34-4HPP",
+  "CVE-2026-55569",
+  "GO-2026-6314",
+  "d6b9448",
+  "d5b02b2"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_entry.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "link, zip, cleanup and hard-link containment are correct; the destination itself is never checked against the install directory"
+  },
+  {
+   "patch": "miss_symlink.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2"
+   ],
+   "note": "entry, hard-link, zip and cleanup containment are correct; the symlink branch still creates the target verbatim"
+  },
+  {
+   "patch": "miss_hardlink.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T3"
+   ],
+   "note": "entry, symlink, zip and cleanup containment are correct; the hard-link target is still resolved without a containment check"
+  },
+  {
+   "patch": "miss_zip.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T4"
+   ],
+   "note": "the shared archive handler is fixed; the separate zip extractor still writes entries and link targets without a check"
+  },
+  {
+   "patch": "miss_cleanup.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T5"
+   ],
+   "note": "every entry is refused correctly, but the error-path cleanup still removes the recorded escaping path outside the install directory"
+  },
+  {
+   "patch": "upstream_fix.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "note": "the published fix rebased onto the injected tree (entry and symlink containment only): hard-link, zip and cleanup routes still write outside"
+  },
+  {
+   "patch": "sf_raw_name.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "containment is decided on the raw entry name before the product rewrites backslash separators, so the backslash shape still escapes"
+  },
+  {
+   "patch": "sf_prefix.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "containment uses a bare string prefix, so a sibling directory whose name starts with the destination's name is accepted"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "note": "panics instead of returning a refusal, so the stated error contract is broken"
+  },
+  {
+   "patch": "ff_reject_links.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "refuses every link entry, breaking legitimate in-package links"
+  },
+  {
+   "patch": "ff_dangling_strict.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "requires a relative link target to exist when the link entry is processed, which rejects a target created later in the same package"
+  },
+  {
+   "patch": "ff_reject_backslash.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "refuses backslash-separated names, breaking legitimate Windows-written packages"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "kind": "pass",
+   "expect": "pass",
+   "note": "independent design: containment decided with filepath.Rel, and only validated entry names are recorded for cleanup"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "note": "reference fix plus defensive checks on the containment helper and empty entry names"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_reject_links.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "miss_symlink.patch",
+  "one_role_or_direction": "n/a: extraction has no peer, role or direction; one archive stream is handled",
+  "reads_only": "n/a: extraction is a single write operation with no read/write pair to guard separately",
+  "check_after_adjustment": "sf_raw_name.patch",
+  "unlisted_route": "miss_zip.patch",
+  "malformed_identity": "sf_prefix.patch",
+  "missing_authority": "n/a: containment uses only the entry and the destination; there is no external authority whose empty answer could fail open",
+  "adjacent_api": "ff_reject_backslash.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "how-type (shape + ordering): the entry destination is joined from the normalised entry name and used with no containment decision; the guard has to decide on the joined/cleaned value after the separator rewrite and before the first outside effect, with a real path boundary",
+   "where": "pkg/unarchive/archives.go:27-28,98-105",
+   "security_tests": [
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntryDotDot",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntryBackslash",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntrySiblingPrefix",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntryCreatesNoOutsideDirectory"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_NestedTreeAndDotNames",
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_BackslashSeparatedNames"
+   ],
+   "security_fail_patch": "miss_entry.patch",
+   "realistic_because": "the advisory's own route, in the shapes the product's path normalisation and a plausible guard produce"
+  },
+  {
+   "id": "T2",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "how-type (coupled must-keep-working): a link entry's target is created verbatim, so a later entry at the same path writes through it; relative targets resolve against the link's own directory, lexically and without requiring the target to exist, while ordinary relative and dangling links must keep being created",
+   "where": "pkg/unarchive/archives.go:43-50",
+   "security_tests": [
+    "tests/security/zz_sec_unarchive_test.go::TestSec_SymlinkAbsoluteTarget",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_SymlinkRelativeTarget"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_RelativeDanglingSymlink",
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_AbsoluteSymlinkInsideDest"
+   ],
+   "security_fail_patch": "miss_symlink.patch",
+   "realistic_because": "the advisory's own coupled value: packages ship relative and dangling links whose target appears later in the same archive"
+  },
+  {
+   "id": "T3",
+   "type": "deepseek",
+   "origin": "injection_room",
+   "shape": "how-type: hard-link entries are created beside the symlink branch and their targets are named from the archive root, so a guard that reuses the symlink-relative rule lets a nested target escape",
+   "where": "pkg/unarchive/archives.go:51-53",
+   "security_tests": [
+    "tests/security/zz_sec_unarchive_test.go::TestSec_HardlinkNestedTarget"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_HardlinkInsideDest"
+   ],
+   "security_fail_patch": "miss_hardlink.patch",
+   "realistic_because": "injected sibling: mholt/archives reports non-symlink link entries on the same field, the pinned tree silently skips them, and a maintainer adding support would copy the symlink branch and resolve the target from the archive root"
+  },
+  {
+   "id": "T4",
+   "type": "mimo",
+   "origin": "injection_room",
+   "shape": "where-type extra (second implementation): a separate zip extractor duplicates the directory/file/link write path, is selected before the shared handler, and contains no containment decision",
+   "where": "pkg/unarchive/zip.go:61-97; pkg/unarchive/unarchive.go:80-85,99-103",
+   "security_tests": [
+    "tests/security/zz_sec_unarchive_test.go::TestSec_ZipEntryDotDot",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_ZipSymlinkRelativeTarget"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/zz_func_unarchive_test.go::TestFunc_ZipTreeAndSymlink"
+   ],
+   "security_fail_patch": "miss_zip.patch",
+   "realistic_because": "injected sibling: a dedicated zip reader that preserves Unix modes and symlink entries is ordinary maintainer code, and it does not pass through the shared archive handler"
+  },
+  {
+   "id": "T5",
+   "type": "mimo",
+   "origin": "injection_room",
+   "shape": "how-type (ordering / side effect on the refusal path): the handler records every entry name as it arrives and removes the recorded paths when extraction returns an error; the record is taken before the containment decision, so the refusal itself deletes the outside path the entry named",
+   "where": "pkg/unarchive/archives.go:27,78-95",
+   "security_tests": [
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntryDotDot",
+    "tests/security/zz_sec_unarchive_test.go::TestSec_EntryBackslash"
+   ],
+   "coupled_functional_tests": [],
+   "security_fail_patch": "miss_cleanup.patch",
+   "realistic_because": "injected sibling: cleaning up a partially extracted package on failure is ordinary maintainer code; the entries are already refused, so the cleanup looks confined to the install directory",
+   "coupled_note": "no functional test: the cleanup only runs on the error path, so a fix that disables it or skips outside paths is accepted; a partner functional test would force one particular repair"
+  }
+ ],
+ "status": "built; gate PASSED on 2026-10-28 (static, nop, oracle x3, patches). Reference oracle reward 1.0; nop security 0/9 and functional 13/13. blind.patch and FAIRNESS.md are left for the post-build steps, as instructed."
+}

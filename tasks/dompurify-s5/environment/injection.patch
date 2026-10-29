@@ -1,0 +1,91 @@
+diff --git a/src/purify.ts b/src/purify.ts
+index 46e46dd..3aef3af 100644
+--- a/src/purify.ts
++++ b/src/purify.ts
+@@ -1674,20 +1674,8 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+     tagName: string
+   ): boolean {
+     /* Check if we have a custom element to handle */
+-    if (!FORBID_TAGS[tagName] && _isBasicCustomElement(tagName)) {
+-      if (
+-        CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
+-        regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)
+-      ) {
+-        return false;
+-      }
+-
+-      if (
+-        CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
+-        CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)
+-      ) {
+-        return false;
+-      }
++    if (_isKeptCustomElement(tagName)) {
++      return false;
+     }
+ 
+     /* Keep content except for bad-listed elements.
+@@ -1787,6 +1775,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+       return _sanitizeDisallowedNode(currentNode, tagName);
+     }
+ 
++    /* A tag approved by a caller-supplied predicate is kept by name; the
++       allow-list path has nothing to add for it. */
++    if (
++      !FORBID_TAGS[tagName] &&
++      EXTRA_ELEMENT_HANDLING.tagCheck instanceof Function &&
++      EXTRA_ELEMENT_HANDLING.tagCheck(tagName)
++    ) {
++      return false;
++    }
++
+     /* Check whether element has a valid namespace.
+        Realm-safe check (GHSA-hpcv-96wg-7vj8): use the cached Node.prototype
+        nodeType getter rather than `instanceof Element`, which is realm-
+@@ -1963,6 +1961,28 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+     );
+   };
+ 
++  /**
++   * _isKeptCustomElement
++   *
++   * The configured custom-element keep decision: a basic custom element that
++   * is not forbidden and that matches CUSTOM_ELEMENT_HANDLING.tagNameCheck.
++   * Shared by the element pass and the shadow-tree pass so both apply the
++   * same rule.
++   *
++   * @param tagName name of the tag of the node to check
++   * @return true if the configuration keeps this custom element
++   */
++  const _isKeptCustomElement = function (tagName: string): boolean {
++    return (
++      !FORBID_TAGS[tagName] &&
++      _isBasicCustomElement(tagName) &&
++      ((CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
++        regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)) ||
++        (CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
++          CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)))
++    );
++  };
++
+   /**
+    * Wrap an attribute value in the matching Trusted Types object when
+    * the active policy requires it. Namespaced attributes pass through
+@@ -2184,8 +2204,15 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+       /* Execute a hook if present */
+       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
+ 
+-      /* Sanitize tags and elements */
+-      _sanitizeElements(shadowNode);
++      /* Custom elements that the configuration keeps are preserved by name;
++         only their attributes need the pass below. */
++      const shadowNodeName = transformCaseFunc(
++        getNodeName ? getNodeName(shadowNode) : shadowNode.nodeName
++      );
++      if (!_isKeptCustomElement(shadowNodeName)) {
++        /* Sanitize tags and elements */
++        _sanitizeElements(shadowNode);
++      }
+ 
+       /* Check attributes next */
+       _sanitizeAttributes(shadowNode);

@@ -1,0 +1,194 @@
+{
+ "slug": "ansible-s5",
+ "candidate": {
+  "advisory_ids": [
+   "GHSA-W8P5-MX5W-CPQJ",
+   "CVE-2026-11332",
+   "PYSEC-2026-3458"
+  ],
+  "repo": "ansible/ansible",
+  "pinned_commit": "31b3cc35e6b35fdb80feecd1d4b3422f400fa07a",
+  "fix_commit": "edee59aa15abcc74d920bb3e9c3835ab8db05a2f",
+  "cwe": "CWE-88",
+  "screener_entry": "6039"
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "31b3cc35e6b35fdb80feecd1d4b3422f400fa07a (the fix commit edee59aa changes only lib/ansible/utils/galaxy.py and upstream tests; the pinned commit contains no regression test for the advisory)",
+  "entry_points": [
+   "CLI: ansible-galaxy role install with a requirements file (dict and string forms)",
+   "CLI: ansible-galaxy role install with a direct git+URL argument",
+   "CLI: ansible-galaxy role install dependencies declared by an installed role's meta/main.yml",
+   "CLI: ansible-galaxy role install with a role kept in a repository subdirectory (injected subdir path)",
+   "CLI: ansible-galaxy collection install with a git source and a pinned revision (injected revision fetch)"
+  ],
+  "sites": [
+   "lib/ansible/utils/galaxy.py:75 (scm_archive_resource clone; published fix site)",
+   "lib/ansible/galaxy/collection/concrete_artifact_manager.py:440-447 (collection clone, still without '--' upstream; fixed by the oracle, no security test: see notes)",
+   "lib/ansible/galaxy/collection/concrete_artifact_manager.py:459-466 (injected revision fetch; T3)",
+   "lib/ansible/galaxy/scm.py:32 (injected subdirectory clone; T4), called from lib/ansible/galaxy/role.py:249-252"
+  ],
+  "routes": [
+   "role requirement source value (dict form) -> shared clone",
+   "role requirement destination value (dict form) -> shared clone",
+   "role requirement string form 'git+src,version,name' -> shared clone",
+   "role dependency declared in meta/main.yml -> shared clone",
+   "collection requirement revision value -> injected fetch",
+   "role subdirectory requirement source/destination values -> injected clone helper"
+  ],
+  "services": [],
+  "project_tests_run": "test/units/galaxy/test_role_requirements.py and test/units/galaxy/test_role_install.py (18 tests) pass on the pinned+injected tree and after the reference fix; test/units/galaxy/test_collection_install.py is excluded because its argv-pinning tests assert the exact pre-fix clone argv (and the file has one pre-existing order-dependent failure under this toolchain)."
+ },
+ "leak_terms": [
+  "scm_archive_resource",
+  "scm_archive_role",
+  "archive_scm_subdir",
+  "concrete_artifact_manager",
+  "_extract_collection_from_git",
+  "role_yaml_parse",
+  "subdir",
+  "upload-pack",
+  "sshCommand",
+  "core.sshCommand",
+  "GHSA-W8P5-MX5W-CPQJ",
+  "CVE-2026-11332",
+  "PYSEC-2026-3458",
+  "31b3cc35",
+  "edee59aa",
+  "utils/galaxy",
+  "galaxy/role.py"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_name.patch",
+   "expect": "security_fail",
+   "note": "fixes the source value only; destination/string-form security tests still fail, all functional pass"
+  },
+  {
+   "patch": "sf_miss_collection.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the collection revision fetch guard"
+  },
+  {
+   "patch": "sf_miss_subdir.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the subdirectory clone guard"
+  },
+  {
+   "patch": "sf_check_after.patch",
+   "expect": "security_fail",
+   "note": "validates the shared role values after the clone has already run"
+  },
+  {
+   "patch": "ff_dash_reject.patch",
+   "expect": "functional_fail",
+   "note": "refuses any requirement value containing a dash; legitimate names and paths stop installing"
+  },
+  {
+   "patch": "ff_drop_ignore_certs.patch",
+   "expect": "functional_fail",
+   "note": "drops the certificate-skipping option entirely"
+  },
+  {
+   "patch": "ff_checkout_dashdash.patch",
+   "expect": "functional_fail",
+   "note": "adds the end-of-options marker to the revision checkout too; pinned installs break"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus producer/entry-side rejection of dash-prefixed requirement values"
+  },
+  {
+   "patch": "pass_alt_validate.patch",
+   "expect": "pass",
+   "note": "second valid design: validate requirement values in the parsers and at the collection entry, no end-of-options marker anywhere"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_dash_reject.patch",
+  "crash_as_refusal": "n/a: the protected path is a batch CLI exit; a crash that still prevents the side effect satisfies the tested property, and no test can distinguish it from an ordinary error without asserting a message shape",
+  "wrong_resource": "n/a: there is no neighbouring or proxy object; the protected values belong to the requirement being installed",
+  "one_role_or_direction": "sf_miss_name.patch",
+  "reads_only": "n/a: installs are writes only; there is no read verb on the guarded path",
+  "check_after_adjustment": "sf_check_after.patch",
+  "unlisted_route": "sf_miss_collection.patch",
+  "malformed_identity": "n/a: each value is a plain string handed straight to the SCM client; no parsed identity or spelling decides the guard",
+  "missing_authority": "n/a: no external authority or secret lookup; the decision is local",
+  "adjacent_api": "ff_checkout_dashdash.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_destination_operand",
+   "pattern": "B (real code: shape a plausible check mishandles, plus a real second entry point)",
+   "shape": "the destination value is a second positional handed to the SCM client; a check that validates only the source value leaves the destination to be read as an option; the same value travels through string requirements and through dependencies declared in role metadata",
+   "where": "lib/ansible/utils/galaxy.py:75",
+   "security_tests": [
+    "security/test_role_clone_values.py::test_source_value_is_not_an_option",
+    "security/test_role_clone_values.py::test_destination_value_is_not_an_option",
+    "security/test_role_clone_values.py::test_string_requirement_destination_is_not_an_option",
+    "security/test_role_dependency_value.py::test_declared_dependency_value_is_not_an_option"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_role_installs.py::test_install_role_with_dashes_and_dots_in_its_name",
+    "functional/test_role_dependencies.py::test_declared_dependency_installs"
+   ],
+   "security_fail_patch": "sf_miss_name.patch",
+   "realistic_because": "real, unmodified upstream code: the published flaw is exactly this argv, and the destination is a requirement value too"
+  },
+  {
+   "id": "T2_certificate_option_coupled",
+   "pattern": "B (real code: coupled must-keep-working value)",
+   "shape": "the certificate-skipping setting added by the tool must remain a real option ahead of the end-of-options marker, on both the role and collection clone commands; placing the marker first or filtering every dash-prefixed argv element silently disables it",
+   "where": "lib/ansible/utils/galaxy.py:67-75 and lib/ansible/galaxy/collection/concrete_artifact_manager.py:445-447",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_tls_skip.py::test_role_install_keeps_the_certificate_setting",
+    "functional/test_tls_skip.py::test_collection_install_keeps_the_certificate_setting"
+   ],
+   "security_fail_patch": "n/a: must-keep-working lever; ff_drop_ignore_certs.patch is its functional_fail check",
+   "realistic_because": "real, unmodified upstream code: the setting is added by the tool itself next to the operands"
+  },
+  {
+   "id": "T3_collection_revision_fetch",
+   "pattern": "B (injected sibling: route where the protection never existed)",
+   "shape": "the collection SCM path fetches the requested revision before switching to it; the revision is a positional of the fetch command",
+   "where": "lib/ansible/galaxy/collection/concrete_artifact_manager.py:459-466",
+   "security_tests": [
+    "security/test_collection_revision_value.py::test_collection_revision_is_not_an_option"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_collection_installs.py::test_install_collection_at_default_revision",
+    "functional/test_collection_installs.py::test_install_collection_at_pinned_tag"
+   ],
+   "security_fail_patch": "sf_miss_collection.patch",
+   "realistic_because": "injected sibling, plausible maintainer code: a revision-aware collection install needs to fetch the revision; the surrounding code is ordinary and reachable through the real command"
+  },
+  {
+   "id": "T4_subdirectory_clone",
+   "pattern": "B (injected sibling: second implementation)",
+   "shape": "the subdirectory role install path clones the working tree with its own argv instead of using the shared archive helper, so fixing the shared helper leaves it open",
+   "where": "lib/ansible/galaxy/scm.py:32 (called from lib/ansible/galaxy/role.py:249-252)",
+   "security_tests": [
+    "security/test_role_subdir_values.py::test_subdirectory_destination_is_not_an_option",
+    "security/test_role_subdir_values.py::test_subdirectory_source_is_not_an_option"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_role_installs.py::test_install_role_from_subdirectory"
+   ],
+   "security_fail_patch": "sf_miss_subdir.patch",
+   "realistic_because": "injected sibling, plausible maintainer code: a role kept in a monorepo needs a working checkout rather than an archive of the repository root, so a separate helper is natural and easy to leave out of a fix aimed at the shared helper"
+  }
+ ],
+ "status": "built; full gate PASSED 2026-10-28T21:15:14Z (static PASS, no warnings; nop PASS: 7/7 security testcases fail on the pinned+injected tree and 28/28 functional pass; oracle PASS: 3 identical runs at reward 1.0; patches PASS: 9/9 declared checks behave as such - sf_miss_name 2 security failing/0 functional, sf_miss_collection 1/0, sf_miss_subdir 2/0, sf_check_after 4/0, ff_dash_reject 7 functional failing, ff_drop_ignore_certs 2, ff_checkout_dashdash 1, pass_hardening and pass_alt_validate reward 1.0). blind.patch and FAIRNESS.md are produced downstream."
+}

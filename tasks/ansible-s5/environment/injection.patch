@@ -1,0 +1,138 @@
+diff --git a/lib/ansible/galaxy/collection/concrete_artifact_manager.py b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+index c7240bb..490cb4e 100644
+--- a/lib/ansible/galaxy/collection/concrete_artifact_manager.py
++++ b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+@@ -453,6 +453,24 @@ def _extract_collection_from_git(repo_url, coll_ver, b_path):
+             format(repo_url=to_native(git_url)),
+         ) from proc_err
+ 
++    # Make sure the requested revision is available locally before switching to
++    # it: servers do not advertise every ref, and filtered clones may lack it.
++    if version != 'HEAD' and b_checkout_path:
++        git_fetch_cmd = [
++            git_executable, '-C', to_text(b_checkout_path),
++            'fetch', '--depth=1', 'origin', to_text(version),
++        ]
++        try:
++            subprocess.check_call(git_fetch_cmd)
++        except subprocess.CalledProcessError as proc_err:
++            raise AnsibleError(
++                'Failed to fetch revision `{revision!s}` from a Git repository `{repo_url!s}`.'.
++                format(
++                    revision=to_native(version),
++                    repo_url=to_native(git_url),
++                ),
++            ) from proc_err
++
+     if version == 'HEAD':
+         git_args = ()
+     else:
+diff --git a/lib/ansible/galaxy/role.py b/lib/ansible/galaxy/role.py
+index f83cdff..818c380 100644
+--- a/lib/ansible/galaxy/role.py
++++ b/lib/ansible/galaxy/role.py
+@@ -38,6 +38,7 @@ from ansible.module_utils.common.text.converters import to_native, to_text
+ from ansible.module_utils.common.yaml import yaml_dump, yaml_load
+ from ansible.module_utils.compat.version import LooseVersion
+ from ansible.module_utils.urls import open_url
++from ansible.galaxy.scm import archive_scm_subdir
+ from ansible.playbook.role.requirement import RoleRequirement
+ from ansible.utils.display import Display
+ from ansible.utils.path import is_subpath, unfrackpath
+@@ -53,7 +54,7 @@ class GalaxyRole(object):
+     META_REQUIREMENTS = (os.path.join('meta', 'requirements.yml'), os.path.join('meta', 'requirements.yaml'))
+     ROLE_DIRS = ('defaults', 'files', 'handlers', 'meta', 'tasks', 'templates', 'vars', 'tests')
+ 
+-    def __init__(self, galaxy, api, name, src=None, version=None, scm=None, path=None):
++    def __init__(self, galaxy, api, name, src=None, version=None, scm=None, path=None, subdir=None):
+ 
+         self._metadata = None
+         self._metadata_dependencies = None
+@@ -71,6 +72,7 @@ class GalaxyRole(object):
+         self.src = src or name
+         self.download_url = None
+         self.scm = scm
++        self.subdir = subdir
+         self.paths = [os.path.join(x, self.name) for x in galaxy.roles_paths]
+ 
+         if path is not None:
+@@ -244,7 +246,12 @@ class GalaxyRole(object):
+ 
+         if self.scm:
+             # create tar file from scm url
+-            tmp_file = RoleRequirement.scm_archive_role(keep_scm_meta=context.CLIARGS['keep_scm_meta'], **self.spec)
++            if self.subdir:
++                # Roles kept in a subdirectory of a larger repository need the
++                # checkout itself, not the archive of the repository root.
++                tmp_file = archive_scm_subdir(self.src, self.name, self.subdir, self.scm)
++            else:
++                tmp_file = RoleRequirement.scm_archive_role(keep_scm_meta=context.CLIARGS['keep_scm_meta'], **self.spec)
+         elif self.src:
+             if os.path.isfile(self.src):
+                 tmp_file = self.src
+diff --git a/lib/ansible/galaxy/scm.py b/lib/ansible/galaxy/scm.py
+new file mode 100644
+index 0000000..9c4d71a
+--- /dev/null
++++ b/lib/ansible/galaxy/scm.py
+@@ -0,0 +1,48 @@
++# Copyright: (c) 2026, Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++"""Helpers for version-control sources that need a working checkout."""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import tarfile
++import tempfile
++
++import ansible.constants as C
++from ansible.errors import AnsibleError
++from ansible.module_utils.common.process import get_bin_path
++from ansible.module_utils.common.text.converters import to_native
++from ansible.utils.display import Display
++
++display = Display()
++
++
++def archive_scm_subdir(src, name, subdir, scm='git'):
++    """Clone *src* and pack *subdir* from the checkout into a role archive.
++
++    A role that lives in a subdirectory of a larger repository cannot be packed
++    by the plain SCM archive helper, which always packs the whole checkout, so
++    the repository is cloned and only the requested directory is archived.
++    """
++    scm_path = get_bin_path(scm)
++    tempdir = tempfile.mkdtemp(dir=C.DEFAULT_LOCAL_TMP)
++
++    display.vvv('cloning %s from %s' % (name, src))
++    clone_cmd = [scm_path, 'clone', src, name]
++    try:
++        subprocess.check_call(clone_cmd, cwd=tempdir)
++    except subprocess.CalledProcessError as exc:
++        raise AnsibleError(
++            '- command %s failed in directory %s (rc=%s) - %s' %
++            (' '.join(clone_cmd), tempdir, exc.returncode, to_native(exc))
++        ) from exc
++
++    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.tar', dir=C.DEFAULT_LOCAL_TMP)
++    try:
++        with tarfile.open(temp_file.name, 'w') as tar:
++            tar.add(os.path.join(tempdir, name, subdir), arcname=name)
++    except OSError as exc:
++        raise AnsibleError('could not archive role %s: %s' % (name, to_native(exc))) from exc
++
++    return temp_file.name
+diff --git a/lib/ansible/playbook/role/requirement.py b/lib/ansible/playbook/role/requirement.py
+index 716ad51..8828f94 100644
+--- a/lib/ansible/playbook/role/requirement.py
++++ b/lib/ansible/playbook/role/requirement.py
+@@ -29,6 +29,7 @@ VALID_SPEC_KEYS = [
+     'role',
+     'scm',
+     'src',
++    'subdir',
+     'version',
+ ]
+ 

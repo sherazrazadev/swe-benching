@@ -1,0 +1,161 @@
+diff -ruN base/playlist/duplicate.go inj/playlist/duplicate.go
+--- a/playlist/duplicate.go	1970-01-01 00:00:00.000000000 +0000
++++ b/playlist/duplicate.go	2026-10-28 20:40:26.204934966 +0000
+@@ -0,0 +1,43 @@
++package playlist
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// Duplicate copies the playlist at relPath to a new playlist with the given name in
++// the same directory, and returns the store-relative path of the copy.
++func (s *Store) Duplicate(relPath, name string) (string, error) {
++	defer lock(&s.mu)()
++
++	if err := sanityCheck(s.basePath); err != nil {
++		return "", err
++	}
++
++	src := filepath.Join(s.basePath, relPath)
++	body, err := os.ReadFile(src)
++	if err != nil {
++		return "", fmt.Errorf("read m3u: %w", err)
++	}
++
++	var lines []string
++	lines = append(lines, encodeAttr(attrName, name))
++	for _, line := range strings.Split(string(body), "\n") {
++		if strings.HasPrefix(line, attrPrefix+attrName+":") {
++			continue
++		}
++		lines = append(lines, line)
++	}
++
++	newRelPath := filepath.Join(filepath.Dir(relPath), name+extM3U)
++	dst := filepath.Join(s.basePath, newRelPath)
++	if err := os.MkdirAll(filepath.Dir(dst), 0o777); err != nil {
++		return "", fmt.Errorf("make m3u base dir: %w", err)
++	}
++	if err := os.WriteFile(dst, []byte(strings.Join(lines, "\n")), 0o666); err != nil {
++		return "", fmt.Errorf("write m3u: %w", err)
++	}
++	return newRelPath, nil
++}
+diff -ruN base/server/ctrlsubsonic/ctrl.go inj/server/ctrlsubsonic/ctrl.go
+--- a/server/ctrlsubsonic/ctrl.go	2026-10-28 20:34:53.000000000 +0000
++++ b/server/ctrlsubsonic/ctrl.go	2026-10-28 20:40:33.245911224 +0000
+@@ -120,6 +120,8 @@
+ 	c.Handle("/createPlaylist", chain(resp(c.ServeCreateOrUpdatePlaylist)))
+ 	c.Handle("/updatePlaylist", chain(resp(c.ServeUpdatePlaylist)))
+ 	c.Handle("/deletePlaylist", chain(resp(c.ServeDeletePlaylist)))
++	c.Handle("/setPlaylistCover", chain(resp(c.ServeSetPlaylistCover)))
++	c.Handle("/duplicatePlaylist", chain(resp(c.ServeDuplicatePlaylist)))
+ 	c.Handle("/savePlayQueue", chain(resp(c.ServeSavePlayQueue)))
+ 	c.Handle("/getPlayQueue", chain(resp(c.ServeGetPlayQueue)))
+ 	c.Handle("/getSong", chain(resp(c.ServeGetSong)))
+diff -ruN base/server/ctrlsubsonic/handlers_playlist_cover.go inj/server/ctrlsubsonic/handlers_playlist_cover.go
+--- a/server/ctrlsubsonic/handlers_playlist_cover.go	1970-01-01 00:00:00.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist_cover.go	2026-10-28 20:40:27.593930203 +0000
+@@ -0,0 +1,43 @@
++package ctrlsubsonic
++
++import (
++	"encoding/base64"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
++	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
++)
++
++// ServeSetPlaylistCover stores a client supplied image as the cover of a playlist.
++// The image is sent base64 encoded in the `data` parameter and written next to the
++// playlist so that getCoverArt can serve it later.
++func (c *Controller) ServeSetPlaylistCover(r *http.Request) *spec.Response {
++	p := r.Context().Value(CtxParams).(params.Params)
++	id, err := p.GetID("id")
++	if err != nil {
++		return spec.NewError(10, "please provide an `id` parameter")
++	}
++	encoded, err := p.Get("data")
++	if err != nil {
++		return spec.NewError(10, "please provide a `data` parameter")
++	}
++	image, err := base64.StdEncoding.DecodeString(encoded)
++	if err != nil {
++		return spec.NewError(0, "decode cover image: %v", err)
++	}
++
++	playlistPath := playlistIDDecode(id)
++	playlistDir := filepath.Join(c.playlistStore.BasePath(), filepath.Dir(playlistPath))
++	playlistName := strings.TrimSuffix(filepath.Base(playlistPath), filepath.Ext(playlistPath))
++
++	if err := os.MkdirAll(playlistDir, 0o755); err != nil {
++		return spec.NewError(0, "make playlist cover dir: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(playlistDir, playlistName+".png"), image, 0o644); err != nil {
++		return spec.NewError(0, "write playlist cover: %v", err)
++	}
++	return spec.NewResponse()
++}
+diff -ruN base/server/ctrlsubsonic/handlers_playlist_duplicate.go inj/server/ctrlsubsonic/handlers_playlist_duplicate.go
+--- a/server/ctrlsubsonic/handlers_playlist_duplicate.go	1970-01-01 00:00:00.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist_duplicate.go	2026-10-28 20:40:29.116924983 +0000
+@@ -0,0 +1,51 @@
++package ctrlsubsonic
++
++import (
++	"net/http"
++
++	"go.senan.xyz/gonic/db"
++	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
++	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
++)
++
++// ServeDuplicatePlaylist copies an existing playlist to a new playlist with the
++// name the client supplies. The copy is owned by the caller.
++func (c *Controller) ServeDuplicatePlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
++	p := r.Context().Value(CtxParams).(params.Params)
++
++	playlistID, err := p.GetFirstID("id", "playlistId")
++	if err != nil {
++		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
++	}
++	name, err := p.Get("name")
++	if err != nil {
++		return spec.NewError(10, "please provide a `name` parameter")
++	}
++
++	playlistPath := playlistIDDecode(playlistID)
++	playlist, err := c.playlistStore.Read(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", playlistID)
++	}
++	if playlist.UserID != user.ID && !playlist.IsPublic {
++		return spec.NewError(50, "you aren't allowed to read that user's playlist")
++	}
++
++	newPath, err := c.playlistStore.Duplicate(playlistPath, name)
++	if err != nil {
++		return spec.NewError(0, "duplicate playlist: %v", err)
++	}
++	duplicate, err := c.playlistStore.Read(newPath)
++	if err != nil {
++		return spec.NewError(0, "read duplicated playlist: %v", err)
++	}
++
++	sub := spec.NewResponse()
++	rendered, err := playlistRender(c, p, duplicate, playlistIDEncode(newPath), true)
++	if err != nil {
++		return spec.NewError(0, "error rendering playlist: %v", err)
++	}
++	sub.Playlist = rendered
++	return sub
++}

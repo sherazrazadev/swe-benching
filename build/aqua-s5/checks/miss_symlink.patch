@@ -1,0 +1,108 @@
+diff --git a/pkg/unarchive/archives.go b/pkg/unarchive/archives.go
+index cf8573f..d5943d0 100644
+--- a/pkg/unarchive/archives.go
++++ b/pkg/unarchive/archives.go
+@@ -2,6 +2,7 @@ package unarchive
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -15,6 +16,35 @@ import (
+ 	"github.com/suzuki-shunsuke/slog-error/slogerr"
+ )
+ 
++var (
++	errEscapeDest         = errors.New("the file path escapes the extraction directory")
++	errSymlinkEscapeDest  = errors.New("the symlink target escapes the extraction directory")
++	errHardlinkEscapeDest = errors.New("the hard link target escapes the extraction directory")
++)
++
++// withinDest reports whether the cleaned path is the extraction directory itself
++// or is located inside it.
++func withinDest(dest, p string) bool {
++	p = filepath.Clean(p)
++	dest = filepath.Clean(dest)
++	if p == dest {
++		return true
++	}
++	return strings.HasPrefix(p, dest+string(filepath.Separator))
++}
++
++// symlinkTargetWithinDest reports whether a symlink created at linkPath with the
++// given target resolves inside the extraction directory. A relative target is
++// resolved against the directory containing the link, the way the operating
++// system dereferences it; the target does not need to exist.
++func symlinkTargetWithinDest(dest, linkPath, target string) bool {
++	resolved := target
++	if !filepath.IsAbs(resolved) {
++		resolved = filepath.Join(filepath.Dir(linkPath), target)
++	}
++	return withinDest(dest, resolved)
++}
++
+ type handler struct {
+ 	fs       afero.Fs
+ 	dest     string
+@@ -26,6 +56,9 @@ type handler struct {
+ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
+ 	h.entries = append(h.entries, f.NameInArchive)
+ 	dstPath := filepath.Join(h.dest, h.normalizePath(f.NameInArchive))
++	if !withinDest(h.dest, dstPath) {
++		return fmt.Errorf("%w: %s", errEscapeDest, f.NameInArchive)
++	}
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
+ 		slogerr.WithError(h.logger, err).Warn("create a directory")
+@@ -48,7 +81,11 @@ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
+ 			}
+ 			return nil
+ 		}
+-		if err := os.Link(filepath.Join(h.dest, h.normalizePath(f.LinkTarget)), dstPath); err != nil {
++		oldPath := filepath.Join(h.dest, h.normalizePath(f.LinkTarget))
++		if !withinDest(h.dest, oldPath) {
++			return fmt.Errorf("%w: %s -> %s", errHardlinkEscapeDest, dstPath, f.LinkTarget)
++		}
++		if err := os.Link(oldPath, dstPath); err != nil {
+ 			slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", f.LinkTarget, "link_dest", dstPath)
+ 		}
+ 		return nil
+@@ -89,7 +126,11 @@ func (h *handler) Unarchive(ctx context.Context, _ *slog.Logger, src *File) erro
+ 
+ func (h *handler) removeEntries() {
+ 	for _, name := range h.entries {
+-		if err := h.fs.RemoveAll(filepath.Join(h.dest, h.normalizePath(name))); err != nil {
++		p := filepath.Join(h.dest, h.normalizePath(name))
++		if !withinDest(h.dest, p) {
++			continue
++		}
++		if err := h.fs.RemoveAll(p); err != nil {
+ 			slogerr.WithError(h.logger, err).Warn("remove a file extracted before the failure", "name", name)
+ 		}
+ 	}
+diff --git a/pkg/unarchive/zip.go b/pkg/unarchive/zip.go
+index 96c7a2d..e53176b 100644
+--- a/pkg/unarchive/zip.go
++++ b/pkg/unarchive/zip.go
+@@ -60,6 +60,9 @@ func (u *zipUnarchiver) Unarchive(_ context.Context, logger *slog.Logger, src *F
+ 
+ func (u *zipUnarchiver) extractFile(zf *zip.File, logger *slog.Logger) error {
+ 	dstPath := filepath.Join(u.dest, normalizeZipPath(zf.Name))
++	if !withinDest(u.dest, dstPath) {
++		return fmt.Errorf("%w: %s", errEscapeDest, zf.Name)
++	}
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(u.fs, parentDir); err != nil {
+ 		slogerr.WithError(logger, err).Warn("create a directory")
+@@ -87,6 +90,9 @@ func (u *zipUnarchiver) extractFile(zf *zip.File, logger *slog.Logger) error {
+ 			slogerr.WithError(logger, err).Warn("read a symlink target")
+ 			return nil
+ 		}
++		if !symlinkTargetWithinDest(u.dest, dstPath, string(target)) {
++			return fmt.Errorf("%w: %s -> %s", errSymlinkEscapeDest, dstPath, string(target))
++		}
+ 		if err := os.Symlink(string(target), dstPath); err != nil {
+ 			slogerr.WithError(logger, err).Warn("create a symlink", "link_target", string(target), "link_dest", dstPath)
+ 		}

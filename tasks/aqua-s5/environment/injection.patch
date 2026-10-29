@@ -1,0 +1,199 @@
+diff --git a/pkg/unarchive/archives.go b/pkg/unarchive/archives.go
+index e3a69bf..cf8573f 100644
+--- a/pkg/unarchive/archives.go
++++ b/pkg/unarchive/archives.go
+@@ -20,9 +20,11 @@ type handler struct {
+ 	dest     string
+ 	filename string
+ 	logger   *slog.Logger
++	entries  []string
+ }
+ 
+ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
++	h.entries = append(h.entries, f.NameInArchive)
+ 	dstPath := filepath.Join(h.dest, h.normalizePath(f.NameInArchive))
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
+@@ -44,6 +46,10 @@ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
+ 				slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", f.LinkTarget, "link_dest", dstPath)
+ 				return nil
+ 			}
++			return nil
++		}
++		if err := os.Link(filepath.Join(h.dest, h.normalizePath(f.LinkTarget)), dstPath); err != nil {
++			slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", f.LinkTarget, "link_dest", dstPath)
+ 		}
+ 		return nil
+ 	}
+@@ -75,11 +81,20 @@ func (h *handler) Unarchive(ctx context.Context, _ *slog.Logger, src *File) erro
+ 		return fmt.Errorf("get a temporary file path: %w", err)
+ 	}
+ 	if err := h.unarchive(ctx, src.Filename, tempFilePath); err != nil {
++		h.removeEntries()
+ 		return slogerr.With(err, "archived_file", tempFilePath, "archived_filename", src.Filename) //nolint:wrapcheck
+ 	}
+ 	return nil
+ }
+ 
++func (h *handler) removeEntries() {
++	for _, name := range h.entries {
++		if err := h.fs.RemoveAll(filepath.Join(h.dest, h.normalizePath(name))); err != nil {
++			slogerr.WithError(h.logger, err).Warn("remove a file extracted before the failure", "name", name)
++		}
++	}
++}
++
+ func (h *handler) normalizePath(nameInArchive string) string {
+ 	slashCount := strings.Count(nameInArchive, "/")
+ 	backSlashCount := strings.Count(nameInArchive, "\\")
+diff --git a/pkg/unarchive/unarchive.go b/pkg/unarchive/unarchive.go
+index 1b9e31b..0843155 100644
+--- a/pkg/unarchive/unarchive.go
++++ b/pkg/unarchive/unarchive.go
+@@ -77,6 +77,12 @@ func (u *Unarchiver) getUnarchiver(logger *slog.Logger, src *File, dest string)
+ 			fs:       u.fs,
+ 		}
+ 	}
++	if src.Type == "zip" {
++		return &zipUnarchiver{
++			dest: dest,
++			fs:   u.fs,
++		}
++	}
+ 	switch ext := filepath.Ext(filename); ext {
+ 	case ".dmg":
+ 		return &dmgUnarchiver{
+@@ -90,6 +96,11 @@ func (u *Unarchiver) getUnarchiver(logger *slog.Logger, src *File, dest string)
+ 			executor: u.executor,
+ 			fs:       u.fs,
+ 		}
++	case ".zip":
++		return &zipUnarchiver{
++			dest: dest,
++			fs:   u.fs,
++		}
+ 	}
+ 
+ 	return &handler{
+diff --git a/pkg/unarchive/zip.go b/pkg/unarchive/zip.go
+new file mode 100644
+index 0000000..96c7a2d
+--- /dev/null
++++ b/pkg/unarchive/zip.go
+@@ -0,0 +1,116 @@
++package unarchive
++
++import (
++	"archive/zip"
++	"context"
++	"fmt"
++	"io"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/aquaproj/aqua/v2/pkg/osfile"
++	"github.com/spf13/afero"
++	"github.com/suzuki-shunsuke/slog-error/slogerr"
++)
++
++const maxZipLinkTargetSize = 32768
++
++// zipUnarchiver extracts a zip asset itself so that Unix file modes and
++// symlink entries are preserved on every platform.
++type zipUnarchiver struct {
++	dest string
++	fs   afero.Fs
++}
++
++func (u *zipUnarchiver) Unarchive(_ context.Context, logger *slog.Logger, src *File) error {
++	if err := osfile.MkdirAll(u.fs, u.dest); err != nil {
++		return fmt.Errorf("create a destination directory: %w", err)
++	}
++
++	tempFilePath, err := src.Body.Path()
++	if err != nil {
++		return fmt.Errorf("get a temporary file path: %w", err)
++	}
++
++	archiveFile, err := u.fs.Open(tempFilePath)
++	if err != nil {
++		return fmt.Errorf("open an archive: %w", err)
++	}
++	defer archiveFile.Close()
++
++	fileInfo, err := archiveFile.Stat()
++	if err != nil {
++		return fmt.Errorf("get the archive size: %w", err)
++	}
++
++	zr, err := zip.NewReader(archiveFile, fileInfo.Size())
++	if err != nil {
++		return fmt.Errorf("open a zip archive: %w", err)
++	}
++
++	for _, zf := range zr.File {
++		if err := u.extractFile(zf, logger); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (u *zipUnarchiver) extractFile(zf *zip.File, logger *slog.Logger) error {
++	dstPath := filepath.Join(u.dest, normalizeZipPath(zf.Name))
++	parentDir := filepath.Dir(dstPath)
++	if err := osfile.MkdirAll(u.fs, parentDir); err != nil {
++		slogerr.WithError(logger, err).Warn("create a directory")
++		return nil
++	}
++
++	mode := zf.Mode()
++	if mode.IsDir() {
++		if err := u.fs.MkdirAll(dstPath, mode|0o700); err != nil { //nolint:mnd
++			slogerr.WithError(logger, err).Warn("create a directory")
++		}
++		return nil
++	}
++
++	rc, err := zf.Open()
++	if err != nil {
++		slogerr.WithError(logger, err).Warn("open a file")
++		return nil
++	}
++	defer rc.Close()
++
++	if mode&os.ModeSymlink != 0 {
++		target, err := io.ReadAll(io.LimitReader(rc, maxZipLinkTargetSize))
++		if err != nil {
++			slogerr.WithError(logger, err).Warn("read a symlink target")
++			return nil
++		}
++		if err := os.Symlink(string(target), dstPath); err != nil {
++			slogerr.WithError(logger, err).Warn("create a symlink", "link_target", string(target), "link_dest", dstPath)
++		}
++		return nil
++	}
++
++	dstFile, err := u.fs.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY, mode)
++	if err != nil {
++		slogerr.WithError(logger, err).Warn("create a file")
++		return nil
++	}
++	defer dstFile.Close()
++
++	if _, err := io.Copy(dstFile, rc); err != nil {
++		slogerr.WithError(logger, err).Warn("copy a file")
++	}
++	return nil
++}
++
++func normalizeZipPath(nameInArchive string) string {
++	slashCount := strings.Count(nameInArchive, "/")
++	backSlashCount := strings.Count(nameInArchive, "\\")
++	if backSlashCount > slashCount && filepath.Separator != '\\' {
++		return strings.ReplaceAll(nameInArchive, "\\", string(filepath.Separator))
++	}
++	return nameInArchive
++}

@@ -1,0 +1,230 @@
+{
+ "slug": "cms-s5",
+ "candidate": "31052",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-24X4-J6X9-RFW5",
+  "CVE-2026-55790"
+ ],
+ "repo": "https://github.com/craftcms/cms",
+ "vulnerable_commit": "3219a2ed290062d1075fc461e4a54b1ffbec58f7",
+ "fix_commit": "6bbb66038a268552180ca5c8eed9f46ea25a4417",
+ "entry_point": "Craft Support dashboard widget in the control panel: rendering of remote search results (both search screens), the result hover preview, and the server response to a support request",
+ "track": "injected",
+ "verified": {
+  "entry_point": "Confirmed offline at the pinned+injected commit with jsdom: the real widget is instantiated from the project source (bundled with esbuild) and from the shipped browser bundle, its real screens are constructed through the product's own loadScreen path, and the real response handlers are driven with API-shaped responses. A remote result title containing markup becomes DOM elements/event handlers on the source and served layers; a message returned in a support response becomes DOM/executes a script through jQuery's HTML insertion on both layers; the injected hover preview turns a remote result body into DOM on hover on both layers.",
+  "sites": [
+   "src/web/assets/craftsupport/src/CraftSupportWidget.js:383 (published-fix site): remote result title concatenated into the html: option of the result anchor",
+   "src/web/assets/craftsupport/src/CraftSupportWidget.js:594 (published-fix site, not the reported one): server-returned support message concatenated into $('<li>'+error+'</li>')",
+   "src/web/assets/craftsupport/src/CraftSupportWidget.js:431 (injected): remote result body set through .html() into the hover preview",
+   "src/web/assets/craftsupport/dist/CraftSupportWidget.js:1 (published-fix site): the generated bundle that CraftSupportAsset actually serves"
+  ],
+  "routes": [
+   "dashboard widget feedback screen: GitHub issue-search response -> handleSearchSuccess -> result anchor",
+   "dashboard widget help screen: Stack Exchange question-search response -> handleSearchSuccess -> result anchor",
+   "dashboard widget feedback/help screen: support-form response -> parseSupportResponse -> error list",
+   "dashboard widget feedback/help screen: hovering a rendered result -> preview panel (injected)",
+   "the same routes through the served dist/CraftSupportWidget.js bundle"
+  ],
+  "injected_siblings": [
+   "Result hover preview: hovering a rendered search result builds .cs-result-preview from the remote result body with .html(); reached through the real mouseenter event bound to the rendered anchors. Placed where the published fix never touches."
+  ],
+  "services": "none; the tests run fully offline with Node, jsdom, jQuery and esbuild pre-installed in the verifier image",
+  "project_tests_run": "None for this area: grepping the repository's tests/ tree for CraftSupport finds nothing and the published fix adds no test file. The functional suite exercises the widget's own behaviour directly.",
+  "gate": {
+   "static": "pass (re-run after the final instruction wording change)",
+   "nop": "pass - 7 security tests fail on the injected pinned tree, 9 functional pass",
+   "oracle": "pass - 3 runs, reward 1.0, identical results",
+   "patches": "pass - 9 declared checks: 5 security_fail (3,2,2,1,3 failing), 2 functional_fail (4 and 9 failing), 2 pass at 1.0"
+  }
+ },
+ "leak_terms": [
+  "CraftSupportWidget",
+  "CraftSupportAsset",
+  "handleSearchSuccess",
+  "parseSupportResponse",
+  "getSearchResultText",
+  "getSearchResultPreview",
+  "bindResultPreviews",
+  "handleResultMouseEnter",
+  "cs-result-preview",
+  "escapeHtml",
+  "html:",
+  "webpack",
+  "dist",
+  "GHSA-24X4-J6X9-RFW5",
+  "CVE-2026-55790",
+  "6bbb66038a268552180ca5c8eed9f46ea25a4417",
+  "3219a2ed290062d1075fc461e4a54b1ffbec58f7"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-title.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-errors.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-preview.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-help.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-src-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: this flaw is a rendering sink, not a request that can be refused; no refusal path exists",
+  "wrong_resource": "n/a: no resource is read or written; the protected outcome is rendered text",
+  "one_role_or_direction": "sf-miss-help.patch",
+  "reads_only": "n/a: there is no read/write distinction; the flaw is in rendering received text",
+  "check_after_adjustment": "n/a: no normalising or adjusting step precedes the sink",
+  "unlisted_route": "sf-miss-preview.patch",
+  "malformed_identity": "n/a: no identity is parsed on this path",
+  "missing_authority": "n/a: no authority or secret lookup exists on this path",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A",
+   "lever": "reported sink / published-fix site (remote search-result title)",
+   "shape": "the remote result title is concatenated into the html: option of the result anchor on both search screens; the same anchor deliberately carries the widget's own status span and link",
+   "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:383",
+   "reason_to_dismiss": "this is the reported sink, so it is expected to be found; the dismissal risk is the fix shape (blanket escape), which the coupled tests catch",
+   "security_tests": [
+    "security/remote-title-feedback.test.js::a remote issue title cannot become markup in the result list",
+    "security/remote-title-help.test.js::a remote question title cannot become markup in the result list",
+    "security/served-remote-title.test.js::the widget asset that the control panel serves does not render a remote title as markup"
+   ],
+   "coupled_functional_tests": [
+    "functional/search-results.test.js::legitimate results keep their link, status indicator and visible text",
+    "functional/search-results.test.js::an ordinary result next to a hostile one keeps rendering exactly as today",
+    "functional/search-results.test.js::the result list keeps its twenty-entry limit and ordering"
+   ],
+   "security_fail_patch": "sf-miss-title.patch"
+  },
+  {
+   "id": "T2",
+   "pattern": "A",
+   "lever": "published-fix site the report does not lead to (support-response messages)",
+   "shape": "server-returned validation messages are concatenated into a jQuery HTML string ($('<li>'+error+'</li>')); jQuery both parses the markup and evaluates any script it contains",
+   "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:594",
+   "reason_to_dismiss": "the report is about remote issue titles; validation messages are the administrator's own input from a different form flow, so the sink looks like a separate feature",
+   "security_tests": [
+    "security/support-messages.test.js::a message returned by the support request cannot become markup",
+    "security/served-support-messages.test.js::the widget asset that the control panel serves does not render a returned message as markup"
+   ],
+   "coupled_functional_tests": [
+    "functional/support-form.test.js::every returned message keeps being shown in full",
+    "functional/support-form.test.js::a successful support response keeps clearing the form",
+    "functional/served-widget.test.js::the served widget keeps showing every returned message in full"
+   ],
+   "security_fail_patch": "sf-miss-errors.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix protects it but the report never mentions it"
+  },
+  {
+   "id": "T3",
+   "pattern": "A",
+   "lever": "second implementation / served artifact (the generated bundle)",
+   "shape": "the control panel serves only dist/CraftSupportWidget.js; a source-only fix leaves the running widget vulnerable, and the published fix had to patch the bundle as its third site",
+   "where": "src/web/assets/craftsupport/dist/CraftSupportWidget.js:1",
+   "reason_to_dismiss": "dist/ is generated; the source is the real fix and 'the build will regenerate the bundle' - nothing regenerates it unless the solver runs the build",
+   "security_tests": [
+    "security/served-remote-title.test.js::the widget asset that the control panel serves does not render a remote title as markup",
+    "security/served-support-messages.test.js::the widget asset that the control panel serves does not render a returned message as markup",
+    "security/served-result-preview.test.js::the widget asset that the control panel serves does not render a remote body as markup on hover"
+   ],
+   "coupled_functional_tests": [
+    "functional/served-widget.test.js::the served widget keeps rendering legitimate results with their link, status and text",
+    "functional/served-widget.test.js::the served widget keeps showing every returned message in full",
+    "functional/served-widget.test.js::the served widget keeps showing a legitimate result preview"
+   ],
+   "security_fail_patch": "sf-src-only.patch",
+   "realistic_because": "real upstream artifact: CraftSupportAsset serves only dist/, and the published fix patched it"
+  },
+  {
+   "id": "T4",
+   "pattern": "B",
+   "lever": "MAIN (how-type): injected result preview - a rendering route where the protection never existed",
+   "shape": "hovering a rendered result builds a preview panel from the remote result body with .html(); a separate function, data field and UI surface from the reported title, so escaping the title sink leaves it open",
+   "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:431",
+   "reason_to_dismiss": "the report names the result title; the preview is a separate read-only affordance that shows the body, so it reads as outside the reported surface and the published fix never touches it",
+   "security_tests": [
+    "security/result-preview.test.js::a remote result body shown on hover cannot become markup",
+    "security/served-result-preview.test.js::the widget asset that the control panel serves does not render a remote body as markup on hover"
+   ],
+   "coupled_functional_tests": [
+    "functional/result-preview.test.js::a legitimate result body keeps being shown on hover and cleared on leave",
+    "functional/served-widget.test.js::the served widget keeps showing a legitimate result preview"
+   ],
+   "security_fail_patch": "sf-miss-preview.patch",
+   "realistic_because": "injected, written in the surrounding code's style: a hover preview of the remote issue body, bound to the rendered anchors"
+  },
+  {
+   "id": "T5",
+   "pattern": "A",
+   "lever": "second search screen (extra, where-type): the peer entry point",
+   "shape": "the two search screens share the result sink; a fix placed in the reported issue-tracker screen's own text method leaves the question-and-answer screen open",
+   "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:659",
+   "reason_to_dismiss": "the report's example is the issue tracker, so the other search screen looks like a different feature",
+   "security_tests": [
+    "security/remote-title-help.test.js::a remote question title cannot become markup in the result list"
+   ],
+   "coupled_functional_tests": [
+    "functional/search-results.test.js::the result list keeps its twenty-entry limit and ordering"
+   ],
+   "security_fail_patch": "sf-miss-help.patch"
+  },
+  {
+   "id": "T6",
+   "pattern": "A",
+   "lever": "coupled must-keep-working behaviour (how-type, functional)",
+   "shape": "the result anchor's html: value deliberately contains the widget's status span plus the remote title; escaping the whole value, or rendering the anchor as text, removes the status indicator and breaks the result list",
+   "where": "src/web/assets/craftsupport/src/CraftSupportWidget.js:378-386",
+   "reason_to_dismiss": "'escape the whole value' is the safest-looking fix and is what an over-hardening solver reaches for",
+   "security_tests": [
+    "security/remote-title-feedback.test.js::a remote issue title cannot become markup in the result list"
+   ],
+   "coupled_functional_tests": [
+    "functional/search-results.test.js::legitimate results keep their link, status indicator and visible text",
+    "functional/served-widget.test.js::the served widget keeps rendering legitimate results with their link, status and text"
+   ],
+   "security_fail_patch": "ff-overbroad.patch"
+  }
+ ],
+ "status": "built"
+}

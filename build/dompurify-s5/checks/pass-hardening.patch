@@ -1,0 +1,71 @@
+diff --git a/src/purify.ts b/src/purify.ts
+index 3aef3af..0a3994c 100644
+--- a/src/purify.ts
++++ b/src/purify.ts
+@@ -1605,7 +1605,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+     }
+ 
+     arrayForEach(hooks, (hook: T) => {
+-      hook.call(DOMPurify, currentNode, data, CONFIG);
++      if (typeof hook === 'function') {
++        hook.call(DOMPurify, currentNode, data, CONFIG);
++      }
+     });
+   }
+ 
+@@ -1772,17 +1774,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+       ) &&
+         !ALLOWED_TAGS[tagName])
+     ) {
+-      return _sanitizeDisallowedNode(currentNode, tagName);
+-    }
++      const removed = _sanitizeDisallowedNode(currentNode, tagName);
+ 
+-    /* A tag approved by a caller-supplied predicate is kept by name; the
+-       allow-list path has nothing to add for it. */
+-    if (
+-      !FORBID_TAGS[tagName] &&
+-      EXTRA_ELEMENT_HANDLING.tagCheck instanceof Function &&
+-      EXTRA_ELEMENT_HANDLING.tagCheck(tagName)
+-    ) {
+-      return false;
++      /* A false return means the configuration kept a custom element. Run
++         afterSanitizeElements on it so the element-hook lifecycle matches
++         normal allowlisted elements. */
++      if (removed === false) {
++        _executeHooks(hooks.afterSanitizeElements, currentNode, null);
++      }
++
++      return removed;
+     }
+ 
+     /* Check whether element has a valid namespace.
+@@ -1973,6 +1974,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+    * @return true if the configuration keeps this custom element
+    */
+   const _isKeptCustomElement = function (tagName: string): boolean {
++    if (typeof tagName !== 'string' || tagName.length === 0) {
++      return false;
++    }
++
+     return (
+       !FORBID_TAGS[tagName] &&
+       _isBasicCustomElement(tagName) &&
+@@ -2204,15 +2209,8 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
+       /* Execute a hook if present */
+       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
+ 
+-      /* Custom elements that the configuration keeps are preserved by name;
+-         only their attributes need the pass below. */
+-      const shadowNodeName = transformCaseFunc(
+-        getNodeName ? getNodeName(shadowNode) : shadowNode.nodeName
+-      );
+-      if (!_isKeptCustomElement(shadowNodeName)) {
+-        /* Sanitize tags and elements */
+-        _sanitizeElements(shadowNode);
+-      }
++      /* Sanitize tags and elements */
++      _sanitizeElements(shadowNode);
+ 
+       /* Check attributes next */
+       _sanitizeAttributes(shadowNode);

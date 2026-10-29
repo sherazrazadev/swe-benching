@@ -1,0 +1,315 @@
+diff -ruN a/playlist/duplicate.go b/playlist/duplicate.go
+--- a/playlist/duplicate.go	2026-10-28 20:47:13.000000000 +0000
++++ b/playlist/duplicate.go	2026-10-28 21:09:03.518351669 +0000
+@@ -16,7 +16,10 @@
+ 		return "", err
+ 	}
+ 
+-	src := filepath.Join(s.basePath, relPath)
++	src, srcRel, err := s.Resolve(relPath)
++	if err != nil {
++		return "", err
++	}
+ 	body, err := os.ReadFile(src)
+ 	if err != nil {
+ 		return "", fmt.Errorf("read m3u: %w", err)
+@@ -31,8 +34,17 @@
+ 		lines = append(lines, line)
+ 	}
+ 
+-	newRelPath := filepath.Join(filepath.Dir(relPath), name+extM3U)
+-	dst := filepath.Join(s.basePath, newRelPath)
++	// the name is a display label, but it still decides where the copy lands. It
++	// may point into a sub directory, as long as the copy stays in the same
++	// listener's area as the playlist it came from.
++	newRelPath := filepath.Join(filepath.Dir(srcRel), name+extM3U)
++	if firstPathEl(newRelPath) != firstPathEl(srcRel) {
++		return "", fmt.Errorf("%w: playlist name %q leaves the playlist's area", ErrInvalidPathFormat, name)
++	}
++	dst, _, err := s.Resolve(newRelPath)
++	if err != nil {
++		return "", err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(dst), 0o777); err != nil {
+ 		return "", fmt.Errorf("make m3u base dir: %w", err)
+ 	}
+diff -ruN a/playlist/playlist.go b/playlist/playlist.go
+--- a/playlist/playlist.go	2026-10-28 20:47:10.000000000 +0000
++++ b/playlist/playlist.go	2026-10-28 21:06:03.896800968 +0000
+@@ -57,6 +57,36 @@
+ 	return s.basePath
+ }
+ 
++// Resolve maps a caller supplied playlist path into the storage directory. It
++// returns the absolute path and the cleaned path relative to the storage
++// directory that the operation will actually touch. A path that would leave the
++// storage directory is refused with no effect.
++func (s *Store) Resolve(relPath string) (absPath, cleanRel string, err error) {
++	if filepath.IsAbs(relPath) {
++		return "", "", fmt.Errorf("%w: %q is absolute", ErrInvalidPathFormat, relPath)
++	}
++	absPath = filepath.Join(s.basePath, relPath)
++	cleanRel, err = filepath.Rel(s.basePath, absPath)
++	if err != nil {
++		return "", "", fmt.Errorf("%w: %q: %v", ErrInvalidPathFormat, relPath, err)
++	}
++	if cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) {
++		return "", "", fmt.Errorf("%w: %q leaves the playlist directory", ErrInvalidPathFormat, relPath)
++	}
++	return absPath, cleanRel, nil
++}
++
++// OwnerOf reports the user a playlist path is filed under. The owner is read
++// from the resolved path, so a caller cannot spell a path that aliases another
++// listener's directory.
++func (s *Store) OwnerOf(relPath string) (int, error) {
++	_, cleanRel, err := s.Resolve(relPath)
++	if err != nil {
++		return 0, err
++	}
++	return userIDFromPath(cleanRel)
++}
++
+ // List finds playlist items in s.basePath.
+ // the expected format is <base path>/<user id>/**/<playlist name>.m3u
+ func (s *Store) List() ([]string, error) {
+@@ -92,7 +122,10 @@
+ 		return nil, err
+ 	}
+ 
+-	absPath := filepath.Join(s.basePath, relPath)
++	absPath, cleanRel, err := s.Resolve(relPath)
++	if err != nil {
++		return nil, err
++	}
+ 	stat, err := os.Stat(absPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("stat m3u: %w", err)
+@@ -105,12 +138,12 @@
+ 	var playlist Playlist
+ 	playlist.UpdatedAt = stat.ModTime()
+ 
+-	playlist.UserID, err = userIDFromPath(relPath)
++	playlist.UserID, err = userIDFromPath(cleanRel)
+ 	if err != nil {
+ 		playlist.UserID = 1
+ 	}
+ 
+-	playlist.Name = strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
++	playlist.Name = strings.TrimSuffix(filepath.Base(cleanRel), filepath.Ext(cleanRel))
+ 
+ 	file, err := os.Open(absPath)
+ 	if err != nil {
+@@ -150,7 +183,10 @@
+ 		return err
+ 	}
+ 
+-	absPath := filepath.Join(s.basePath, relPath)
++	absPath, _, err := s.Resolve(relPath)
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0o777); err != nil {
+ 		return fmt.Errorf("make m3u base dir: %w", err)
+ 	}
+@@ -203,7 +239,11 @@
+ 		return err
+ 	}
+ 
+-	return os.Remove(filepath.Join(s.basePath, relPath))
++	absPath, _, err := s.Resolve(relPath)
++	if err != nil {
++		return err
++	}
++	return os.Remove(absPath)
+ }
+ 
+ func firstPathEl(path string) string {
+diff -ruN a/server/ctrlsubsonic/handlers_playlist.go b/server/ctrlsubsonic/handlers_playlist.go
+--- a/server/ctrlsubsonic/handlers_playlist.go	2026-10-28 20:47:10.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist.go	2026-10-28 21:06:15.513140535 +0000
+@@ -49,6 +49,7 @@
+ }
+ 
+ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+@@ -58,6 +59,9 @@
+ 	if err != nil {
+ 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+ 	}
++	if !playlistVisibleTo(playlist, user) {
++		return spec.NewError(50, "you aren't allowed to read that user's playlist")
++	}
+ 	sub := spec.NewResponse()
+ 	rendered, err := playlistRender(c, params, playlist, playlistID, true)
+ 	if err != nil {
+@@ -76,15 +80,21 @@
+ 
+ 	var playlist playlistp.Playlist
+ 	if playlistPath != "" {
+-		if pl, err := c.playlistStore.Read(playlistPath); err != nil && pl != nil {
++		// The owner of a playlist is its location in the storage area, resolved
++		// from the identifier the caller sent. A listener may only write under
++		// their own area, whether the playlist exists yet or not.
++		owner, err := c.playlistStore.OwnerOf(playlistPath)
++		if err != nil {
++			return spec.NewError(70, "playlist with id %s not found", playlistID)
++		}
++		if owner != user.ID {
++			return spec.NewError(50, "you aren't allowed update that user's playlist")
++		}
++		if pl, err := c.playlistStore.Read(playlistPath); err == nil {
+ 			playlist = *pl
+ 		}
+ 	}
+ 
+-	if playlist.UserID != 0 && playlist.UserID != user.ID {
+-		return spec.NewError(50, "you aren't allowed update that user's playlist")
+-	}
+-
+ 	playlist.UserID = user.ID
+ 	playlist.UpdatedAt = time.Now()
+ 
+@@ -135,8 +145,8 @@
+ 	}
+ 
+ 	// update meta info
+-	if playlist.UserID != 0 && playlist.UserID != user.ID {
+-		return spec.NewResponse()
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed update that user's playlist")
+ 	}
+ 
+ 	if val, err := params.Get("name"); err == nil {
+@@ -175,17 +185,32 @@
+ }
+ 
+ func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+ 		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+ 	}
+-	if err := c.playlistStore.Delete(playlistIDDecode(playlistID)); err != nil {
++	playlistPath := playlistIDDecode(playlistID)
++	playlist, err := c.playlistStore.Read(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", playlistID)
++	}
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed to delete that user's playlist")
++	}
++	if err := c.playlistStore.Delete(playlistPath); err != nil {
+ 		return spec.NewError(0, "delete playlist: %v", err)
+ 	}
+ 	return spec.NewResponse()
+ }
+ 
++// playlistVisibleTo reports whether user may see the playlist, following the
++// same sharing rules as the playlist listing.
++func playlistVisibleTo(playlist *playlistp.Playlist, user *db.User) bool {
++	return playlist.UserID == user.ID || playlist.IsPublic
++}
++
+ func playlistIDEncode(path string) specid.ID {
+ 	return specid.ID{
+ 		Type:        specid.Playlist,
+diff -ruN a/server/ctrlsubsonic/handlers_playlist_cover.go b/server/ctrlsubsonic/handlers_playlist_cover.go
+--- a/server/ctrlsubsonic/handlers_playlist_cover.go	2026-10-28 20:47:13.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist_cover.go	2026-10-28 21:06:18.725632298 +0000
+@@ -7,6 +7,7 @@
+ 	"path/filepath"
+ 	"strings"
+ 
++	"go.senan.xyz/gonic/db"
+ 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
+ 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+ )
+@@ -15,6 +16,7 @@
+ // The image is sent base64 encoded in the `data` parameter and written next to the
+ // playlist so that getCoverArt can serve it later.
+ func (c *Controller) ServeSetPlaylistCover(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	p := r.Context().Value(CtxParams).(params.Params)
+ 	id, err := p.GetID("id")
+ 	if err != nil {
+@@ -30,8 +32,20 @@
+ 	}
+ 
+ 	playlistPath := playlistIDDecode(id)
+-	playlistDir := filepath.Join(c.playlistStore.BasePath(), filepath.Dir(playlistPath))
+-	playlistName := strings.TrimSuffix(filepath.Base(playlistPath), filepath.Ext(playlistPath))
++	playlist, err := c.playlistStore.Read(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", id)
++	}
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed to change that user's playlist")
++	}
++
++	absPlaylistPath, _, err := c.playlistStore.Resolve(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", id)
++	}
++	playlistDir := filepath.Dir(absPlaylistPath)
++	playlistName := strings.TrimSuffix(filepath.Base(absPlaylistPath), filepath.Ext(absPlaylistPath))
+ 
+ 	if err := os.MkdirAll(playlistDir, 0o755); err != nil {
+ 		return spec.NewError(0, "make playlist cover dir: %v", err)
+diff -ruN a/server/ctrlsubsonic/handlers_playlist_duplicate.go b/server/ctrlsubsonic/handlers_playlist_duplicate.go
+--- a/server/ctrlsubsonic/handlers_playlist_duplicate.go	2026-10-28 20:47:13.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist_duplicate.go	2026-10-28 21:06:26.455555693 +0000
+@@ -28,8 +28,10 @@
+ 	if err != nil {
+ 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+ 	}
+-	if playlist.UserID != user.ID && !playlist.IsPublic {
+-		return spec.NewError(50, "you aren't allowed to read that user's playlist")
++	// a duplicate is a new playlist filed beside its source, so only the source's
++	// owner may create one without landing in another listener's area
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed to duplicate that user's playlist")
+ 	}
+ 
+ 	newPath, err := c.playlistStore.Duplicate(playlistPath, name)
+diff -ruN a/server/ctrlsubsonic/handlers_raw.go b/server/ctrlsubsonic/handlers_raw.go
+--- a/server/ctrlsubsonic/handlers_raw.go	2026-10-28 20:47:10.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_raw.go	2026-10-28 21:06:24.042578912 +0000
+@@ -63,6 +63,18 @@
+ 		return spec.NewError(0, "invalid size")
+ 	}
+ 
++	// a playlist cover is part of that playlist, so the identifier must resolve
++	// inside the playlist storage and the caller must be allowed to see it
++	if id.Type == specid.Playlist {
++		playlist, err := c.playlistStore.Read(playlistIDDecode(id))
++		if err != nil {
++			return spec.NewError(70, "couldn't find cover %q: %v", id, err)
++		}
++		if !playlistVisibleTo(playlist, r.Context().Value(CtxUser).(*db.User)) {
++			return spec.NewError(50, "you aren't allowed to read that user's playlist")
++		}
++	}
++
+ 	c.coverCache.RLock()
+ 	defer c.coverCache.RUnlock()
+ 
+@@ -242,8 +254,12 @@
+ 
+ func coverForPlaylist(playlistStore *playlist.Store, id specid.ID) (*os.File, error) {
+ 	playlistPath := playlistIDDecode(id)
+-	playlistDir := filepath.Join(playlistStore.BasePath(), filepath.Dir(playlistPath))
+-	playlistBase := strings.TrimSuffix(filepath.Base(playlistPath), filepath.Ext(playlistPath))
++	absPlaylistPath, _, err := playlistStore.Resolve(playlistPath)
++	if err != nil {
++		return nil, fmt.Errorf("contain playlist path: %w", err)
++	}
++	playlistDir := filepath.Dir(absPlaylistPath)
++	playlistBase := strings.TrimSuffix(filepath.Base(absPlaylistPath), filepath.Ext(absPlaylistPath))
+ 
+ 	entries, err := os.ReadDir(playlistDir)
+ 	if err != nil {

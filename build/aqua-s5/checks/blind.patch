@@ -1,0 +1,158 @@
+diff -ruN pristine/pkg/unarchive/archives.go app/pkg/unarchive/archives.go
+--- a/pkg/unarchive/archives.go	2026-10-28 20:51:07.000000000 +0000
++++ b/pkg/unarchive/archives.go	2026-10-28 21:04:01.560690783 +0000
+@@ -24,8 +24,14 @@
+ }
+ 
+ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
++	dstPath, err := newDestDir(h.dest).resolve(h.normalizePath(f.NameInArchive))
++	if err != nil {
++		return err
++	}
++	// Record the entry only after the destination is known to be inside the
++	// package directory. Recorded names are removed again when extraction
++	// fails, and that cleanup must never reach outside the package directory.
+ 	h.entries = append(h.entries, f.NameInArchive)
+-	dstPath := filepath.Join(h.dest, h.normalizePath(f.NameInArchive))
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
+ 		slogerr.WithError(h.logger, err).Warn("create a directory")
+@@ -42,13 +48,22 @@
+ 
+ 	if f.LinkTarget != "" {
+ 		if f.Mode()&os.ModeSymlink != 0 {
++			if err := newDestDir(h.dest).checkLink(dstPath, f.LinkTarget); err != nil {
++				return err
++			}
+ 			if err := os.Symlink(f.LinkTarget, dstPath); err != nil {
+ 				slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", f.LinkTarget, "link_dest", dstPath)
+ 				return nil
+ 			}
+ 			return nil
+ 		}
+-		if err := os.Link(filepath.Join(h.dest, h.normalizePath(f.LinkTarget)), dstPath); err != nil {
++		// A hard link's target is an archive name: it is resolved from the
++		// extraction directory, not from the directory holding the link.
++		oldPath, err := newDestDir(h.dest).resolve(h.normalizePath(f.LinkTarget))
++		if err != nil {
++			return err
++		}
++		if err := os.Link(oldPath, dstPath); err != nil {
+ 			slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", f.LinkTarget, "link_dest", dstPath)
+ 		}
+ 		return nil
+@@ -88,8 +103,15 @@
+ }
+ 
+ func (h *handler) removeEntries() {
++	dir := newDestDir(h.dest)
+ 	for _, name := range h.entries {
+-		if err := h.fs.RemoveAll(filepath.Join(h.dest, h.normalizePath(name))); err != nil {
++		p, err := dir.resolve(h.normalizePath(name))
++		if err != nil {
++			// The entry was refused before it touched the filesystem, so
++			// nothing was written for it and nothing may be removed for it.
++			continue
++		}
++		if err := h.fs.RemoveAll(p); err != nil {
+ 			slogerr.WithError(h.logger, err).Warn("remove a file extracted before the failure", "name", name)
+ 		}
+ 	}
+diff -ruN pristine/pkg/unarchive/destdir.go app/pkg/unarchive/destdir.go
+--- a/pkg/unarchive/destdir.go	1970-01-01 00:00:00.000000000 +0000
++++ b/pkg/unarchive/destdir.go	2026-10-28 21:03:54.562526506 +0000
+@@ -0,0 +1,68 @@
++package unarchive
++
++import (
++	"errors"
++	"fmt"
++	"path/filepath"
++	"strings"
++)
++
++// The directory a package is extracted into is a boundary. No archive entry may
++// create, modify or remove anything outside it, whether through the entry's own
++// path or through the target of a link the entry creates.
++
++var (
++	errEntryOutsideDest = errors.New("a package entry would be extracted outside the package directory")
++	errLinkOutsideDest  = errors.New("a package link would point outside the package directory")
++)
++
++// destDir is an extraction destination. It resolves archive-provided names
++// against that directory and rejects any resolution that leaves it.
++type destDir struct {
++	root string
++}
++
++func newDestDir(dest string) destDir {
++	return destDir{root: filepath.Clean(dest)}
++}
++
++// resolve joins an already normalised archive name (any separator rewriting is
++// the caller's job, done before this call) to the destination. The returned
++// path is usable as-is only when err is nil.
++func (d destDir) resolve(name string) (string, error) {
++	p := filepath.Join(d.root, name)
++	if !d.contains(p) {
++		return p, fmt.Errorf("%w: %s", errEntryOutsideDest, name)
++	}
++	return p, nil
++}
++
++// checkLink rejects a link that would be created at linkPath pointing to
++// target, when that target resolves outside the destination. A relative target
++// is resolved lexically from the directory holding the link, which is how the
++// operating system dereferences it, so a target that is not created yet is
++// still judged by the path it names.
++func (d destDir) checkLink(linkPath, target string) error {
++	pointed := target
++	if !filepath.IsAbs(pointed) {
++		pointed = filepath.Join(filepath.Dir(linkPath), target)
++	}
++	if !d.contains(pointed) {
++		return fmt.Errorf("%w: %s -> %s", errLinkOutsideDest, linkPath, target)
++	}
++	return nil
++}
++
++// contains reports whether p is the destination itself or lies below it. The
++// decision is made per path element, so a sibling directory whose name merely
++// begins with the destination's name is correctly treated as outside.
++func (d destDir) contains(p string) bool {
++	rel, err := filepath.Rel(d.root, filepath.Clean(p))
++	if err != nil {
++		return false
++	}
++	if rel == "." {
++		return true
++	}
++	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
++}
+diff -ruN pristine/pkg/unarchive/zip.go app/pkg/unarchive/zip.go
+--- a/pkg/unarchive/zip.go	2026-10-28 20:51:07.000000000 +0000
++++ b/pkg/unarchive/zip.go	2026-10-28 21:04:05.377780334 +0000
+@@ -59,7 +59,11 @@
+ }
+ 
+ func (u *zipUnarchiver) extractFile(zf *zip.File, logger *slog.Logger) error {
+-	dstPath := filepath.Join(u.dest, normalizeZipPath(zf.Name))
++	dir := newDestDir(u.dest)
++	dstPath, err := dir.resolve(normalizeZipPath(zf.Name))
++	if err != nil {
++		return err
++	}
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(u.fs, parentDir); err != nil {
+ 		slogerr.WithError(logger, err).Warn("create a directory")
+@@ -87,6 +91,9 @@
+ 			slogerr.WithError(logger, err).Warn("read a symlink target")
+ 			return nil
+ 		}
++		if err := dir.checkLink(dstPath, string(target)); err != nil {
++			return err
++		}
+ 		if err := os.Symlink(string(target), dstPath); err != nil {
+ 			slogerr.WithError(logger, err).Warn("create a symlink", "link_target", string(target), "link_dest", dstPath)
+ 		}
