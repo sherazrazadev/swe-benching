@@ -8,5 +8,5 @@ Started 2026-10-29T11:41Z. [run 40867286825](https://github.com/sherazrazadev/sw
 | `jupyterlab-git-s4` | sound | 1 | 1 | **REJECTED** |
 | `spring-graphql-s4` | sound | 1 | 1 | **REJECTED** |
 | `kestra-s4` | sound | 0 | 1 | **REJECTED** |
-| `anubis-s4` | sound | 0.2222 0 0 | 1 0.2222 | **REJECTED** |
+| `anubis-s4` | sound | 1 | 1 | **REJECTED** |
 | `jodit-s4` | sound | 1 | 0.7778 | **REJECTED** |
