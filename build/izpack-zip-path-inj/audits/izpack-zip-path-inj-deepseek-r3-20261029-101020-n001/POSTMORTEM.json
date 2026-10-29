@@ -1,0 +1,69 @@
+{
+ "trial": "izpack-zip-path-inj__WFcs4Dx",
+ "task": "izpack-zip-path-inj",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-29T10:35:56+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T13:46:50+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.7059 = 12/17 security passed, 33/33 functional passed. The model made a solid install-time fix: a segment-aware '..' check in FileUtil, applied before and after variable translation in UnpackerBase and MultiVolumeUnpacker, plus checks on overrideRenameTo, the loose installTarget, parsables/executables, and the uninstaller dir/name and install log. Refused entries skip their stream bytes and are reported as a failure. It missed two input routes: (1) the public PackFile constructor in izpack-api (the compile-time entry point). It read PackFile.java and CompilerConfig but added no check there, even though the instruction says no such value may be 'retained ... however it enters the toolkit'. (2) The configuration-task family in izpack-util (SingleOptionFileTask / SingleXmlFileMergeTask toFile/oldFile), which writes, creates parent dirs and deletes at declared locations. Both are covered by the broad invariant. The model itself read that invariant broadly (it hardened the uninstaller and log outputs), so these misses look like incomplete discovery, not a misreading. The tests are fair: they assert only that nothing is written or deleted outside and accept any exception as a refusal. They demand no exact type, message or layer. The reference fix covers both routes, and any correct fix that validates those values would pass. No harness problems: there were no tool calls during the grading window and no exception. The test-stdout tail is empty, but results.json is complete. I found no contamination. Remaining doubt (hence medium): the config-task tests drive a different feature family that the instruction (titled 'packaged locations') never names. Earlier audit rounds called that instruction scope, though the wording has since been widened to cover it.",
+  "items": [
+   {
+    "test": "com.izforge.izpack.installer.bench.security.FileEntryApiSecurityTest::refusesForwardSlashTraversal",
+    "outcome": "fail",
+    "model_behaviour": "Read izpack-api PackFile.java (transcript lines 15, 109) and the compiler, but enforced only at install time. The PackFile constructor still accepts 'sub/../escape.txt'.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.FileEntryApiSecurityTest::refusesBackslashTraversal",
+    "outcome": "fail",
+    "model_behaviour": "Same as above. No validation in the PackFile constructor, so 'sub\\..\\escape.txt' is accepted and retained.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::configurationFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "Did not touch izpack-util config tasks (ConfigFileTask/SingleOptionFileTask). The task creates escape/ and writes app.properties outside the declared directory.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::patchFileOutsideIsNotDeleted",
+    "outcome": "fail",
+    "model_behaviour": "No check on oldFile in ConfigFileTask. With cleanup=true the task deletes or changes ../escape/victim.properties.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "com.izforge.izpack.installer.bench.security.ConfigTaskSecurityTest::xmlMergeOutputFileDoesNotEscape",
+    "outcome": "fail",
+    "model_behaviour": "No check in SingleXmlFileMergeTask. The merged output is written to ../escape/merged.xml.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   }
+  ],
+  "lookup_or_leak": "None found. The only network attempt was a failed wget of a Maven distribution (transcript line 116). The model did not read the hidden bench tests (evidence/tests packages com.izforge.izpack.installer.bench.*). The tests it worked with were its own (UnpackerParentDirectoryTargetTest, FileUtilTest, InstallLogTest) and an izpack-test integration test it inspected. There was no upstream fix lookup.",
+  "evidence": [
+   "evidence/grading/results.json: 5 security fails (3 ConfigTaskSecurityTest, 2 FileEntryApiSecurityTest); all 33 functional tests pass",
+   "evidence/instruction.md:22-25 'No target location value the toolkit accepts, however it enters the toolkit, may be retained or used to create, write, move, rename, rewrite or delete anything if it contains ... (\"..\")'",
+   "evidence/final-code/changes.patch: no change to izpack-api PackFile.java or to izpack-util config tasks; changes are in FileUtil, UnpackerBase, MultiVolumeUnpacker, UninstallDataWriter, UninstallData, InstallerFrame, InstallLog, Destroyer",
+   "evidence/transcript.md:15,109 model read PackFile.java; :428-445 final summary lists only install-time and uninstaller defences",
+   "evidence/tests/security/.../FileEntryApiSecurityTest.java:38-49 accepts any Exception as refusal",
+   "evidence/tests/security/.../ConfigTaskSecurityTest.java:40-52,77-88,123-133 catch any exception; assert only that nothing exists or changed outside",
+   "evidence/solution/fix.patch: PackFile.validateTargetPath in constructor; ConfigFileTask.checkAttributes and SingleXmlFileMergeTask validate locations",
+   "evidence/build-notes.md:306-321 instruction widened after audits found the N3 scope issue",
+   "evidence/run.json: tool_calls_during_grading empty, exception_info null"
+  ],
+  "recommended_action": "Accept the reward as a fair measure (model-failed on the PackFile constructor and config-task routes). Optionally, keep tracking the config-task tests across trials: if correct-looking fixes keep missing them, consider whether 'packaged locations' framing still under-signals non-pack feature families."
+ }
+}
