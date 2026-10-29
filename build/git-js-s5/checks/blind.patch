@@ -1,0 +1,210 @@
+diff -ruN a/packages/argv-parser/src/args/parse-argv.ts b/packages/argv-parser/src/args/parse-argv.ts
+--- a/packages/argv-parser/src/args/parse-argv.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/args/parse-argv.ts	2026-10-28 21:06:13.105365915 +0000
+@@ -24,7 +24,9 @@
+       flags: flags.map(toParsedFlag),
+       paths: pathspecs,
+       config,
+-      vulnerabilities: vulnerabilityList(vulnerabilityAnalysis(task, flags, config)),
++      vulnerabilities: vulnerabilityList(
++         vulnerabilityAnalysis(task, flags, config, positionals)
++      ),
+    };
+ }
+ 
+diff -ruN a/packages/argv-parser/src/config/detect-config-action.ts b/packages/argv-parser/src/config/detect-config-action.ts
+--- a/packages/argv-parser/src/config/detect-config-action.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/config/detect-config-action.ts	2026-10-28 21:06:01.178068423 +0000
+@@ -10,6 +10,9 @@
+ 
+ export function detectConfigAction(flags: Flag[], positionals: string[]): ConfigOperation | null {
+    for (const { name } of scopedFlags(flags, 'task')) {
++      if (name === '--rename-section') {
++         return configOperation(true, destinationSection(positionals));
++      }
+       if (CONFIG_WRITE_FLAGS.has(name)) {
+          return configOperation(true, positionals);
+       }
+@@ -24,6 +27,10 @@
+       return null;
+    }
+ 
++   if (verb === 'rename-section') {
++      return configOperation(true, destinationSection(positionals.slice(1)));
++   }
++
+    if (CONFIG_WRITE_VERBS.has(verb)) {
+       return configOperation(true, positionals.slice(1));
+    }
+@@ -39,6 +46,15 @@
+    return configOperation(true, positionals);
+ }
+ 
++/**
++ * A rename takes `<old-section> <new-section>` and creates the new section, so the
++ * destination - not the source the parser would otherwise report - is the key being
++ * written and the one that has to be classified.
++ */
++function destinationSection(operands: string[]): string[] {
++   return operands.slice(-1);
++}
++
+ function configOperation(isWrite = false, positionals: string[] = []): ConfigOperation | null {
+    const key = positionals.at(0)?.toLowerCase();
+ 
+diff -ruN a/packages/argv-parser/src/env/parse-env.ts b/packages/argv-parser/src/env/parse-env.ts
+--- a/packages/argv-parser/src/env/parse-env.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/env/parse-env.ts	2026-10-28 21:06:17.967485555 +0000
+@@ -26,8 +26,30 @@
+ 
+ type GitEnv = Record<string, string> & {
+    git_config_count?: string;
++   git_config_parameters?: string;
+ };
+ 
++const packedParameter = /'((?:[^'\\]|\\.)*)'='((?:[^'\\]|\\.)*)'/g;
++
++function unescapeQuoted(value: string): string {
++   return value.replace(/\\(.)/g, '$1');
++}
++
++/**
++ * `GIT_CONFIG_PARAMETERS` carries configuration for the invocation as a list of
++ * shell-quoted `'key'='value'` pairs. Those keys set configuration exactly like the
++ * numbered `GIT_CONFIG_KEY_n` variables, so both go through the same checks.
++ */
++function* collectConfigByParameters(env: GitEnv): Generator<ConfigWrite> {
++   for (const match of (env.git_config_parameters ?? '').matchAll(packedParameter)) {
++      const key = unescapeQuoted(match[1]).toLowerCase().trim();
++
++      if (key) {
++         yield { key, value: unescapeQuoted(match[2]), scope: 'env' };
++      }
++   }
++}
++
+ function* collectConfigByCount(env: GitEnv): Generator<ConfigWrite> {
+    const count = parseInt(env.git_config_count ?? '0', 10);
+    for (let index = 0; index < count; index++) {
+@@ -71,7 +93,7 @@
+    const env = prepareEnv(raw);
+    const config: ParsedConfigActivity = {
+       read: [],
+-      write: [...collectConfigByCount(env)],
++      write: [...collectConfigByCount(env), ...collectConfigByParameters(env)],
+    };
+    const vulnerabilities = [
+       ...collectConfigVulnerabilities(env),
+diff -ruN a/packages/argv-parser/src/tokens/flag-specs.ts b/packages/argv-parser/src/tokens/flag-specs.ts
+--- a/packages/argv-parser/src/tokens/flag-specs.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/tokens/flag-specs.ts	2026-10-28 21:06:03.779132584 +0000
+@@ -88,6 +88,22 @@
+       short: new Map(),
+       long: new Set(['exec', 'receive-pack']),
+    },
++   rebase: {
++      short: new Map([
++         ['X', true], // -X <option>   strategy option
++         ['f', false], // -f force-rebase
++         ['i', false], // -i interactive
++         ['k', false], // -k keep-base
++         ['m', false], // -m merge
++         ['n', false], // -n no-stat
++         ['q', false], // -q quiet
++         ['r', false], // -r rebase-merges
++         ['s', true], //  -s <strategy>
++         ['v', false], // -v verbose
++         ['x', true], //  -x <command>  exec
++      ]),
++      long: new Set(['exec', 'onto', 'strategy', 'strategy-option']),
++   },
+ };
+ 
+ const EMPTY: FlagSpec = { short: new Map(), long: new Set() };
+diff -ruN a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts	2026-10-28 21:06:08.699255948 +0000
+@@ -68,5 +68,9 @@
+    preventConfigBuilder('sequence.editor', 'allowUnsafeEditor'),
+    preventExpandedConfigBuilder('submodule.update', 'allowUnsafeSubmodule'),
+    preventExpandedConfigBuilder('tar.command', 'allowUnsafeCommandBinaries'),
++   // `trailer.<token>.cmd|command` names a program that later history-reading
++   // operations run, so it belongs with the other command-binary settings.
++   preventExpandedConfigBuilder('trailer.cmd', 'allowUnsafeCommandBinaries'),
++   preventExpandedConfigBuilder('trailer.command', 'allowUnsafeCommandBinaries'),
+    preventExpandedConfigBuilder('url.insteadOf', 'allowUnsafeUrlRewrite'),
+ ];
+diff -ruN a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts	2026-10-28 21:06:05.919186209 +0000
+@@ -69,6 +69,18 @@
+    preventFlagBuilder('clone', /^-\w*u/, 'allowUnsafePack'),
+    preventFlagBuilder('clone', '--u', 'allowUnsafePack'),
+    preventFlagBuilder('push', /^--exec$/, 'allowUnsafePack', { name: '--exec' }),
++   // `rebase` runs a program for each commit it rewrites; git resolves unambiguous
++   // long-option abbreviations, so `--ex` and `--exe` are `--exec` too.
++   preventFlagBuilder('rebase', /^(-x|--ex(ec?)?)$/, 'allowUnsafeExec', {
++      name: '-x or --exec',
++   }),
++   // `filter-branch`'s deprecated per-purpose filters each name a program to run.
++   preventFlagBuilder(
++      'filter-branch',
++      /^--(tree|index|msg|commit|env|parent|tag-name)-filter$/,
++      'allowUnsafeExec',
++      { name: '--*-filter' }
++   ),
+    preventFlagBuilder(null, '--template', 'allowUnsafeTemplateDir'),
+    preventFlagBuilder(null, '--exec-path', 'allowUnsafeExec', pathTakingGlobal),
+    // `git` reads the configuration of whichever repository these name, so the
+diff -ruN a/packages/argv-parser/src/vulnerabilities/vulnerability-analysis.ts b/packages/argv-parser/src/vulnerabilities/vulnerability-analysis.ts
+--- a/packages/argv-parser/src/vulnerabilities/vulnerability-analysis.ts	2026-10-28 20:50:30.000000000 +0000
++++ b/packages/argv-parser/src/vulnerabilities/vulnerability-analysis.ts	2026-10-28 21:06:11.521326741 +0000
+@@ -7,7 +7,46 @@
+ export function vulnerabilityAnalysis(
+    task: null | string,
+    flags: Flag[],
+-   config: ParsedConfigActivity
++   config: ParsedConfigActivity,
++   positionals: readonly string[] = []
+ ): Vulnerability[] {
+-   return [...detectVulnerableFlags(task, flags), ...detectVulnerableConfigWrites(config)];
++   return [
++      ...detectVulnerableFlags(task, flags),
++      ...detectVulnerablePositionals(task, positionals),
++      ...detectVulnerableConfigWrites(config),
++   ];
++}
++
++/**
++ * A few git commands run a program supplied as a positional operand rather than as a
++ * switch or a configuration value. Operands do not pass through either of the other
++ * detectors, so they are checked here against the command that consumes them.
++ */
++function* detectVulnerablePositionals(
++   task: null | string,
++   positionals: readonly string[]
++): Generator<Vulnerability> {
++   const verb = (positionals.at(0) ?? '').toLowerCase();
++   const operand = positionals.at(1);
++
++   if (operand === undefined) {
++      return;
++   }
++
++   if (task === 'submodule' && verb === 'foreach') {
++      yield {
++         category: 'allowUnsafeExec',
++         message:
++            'Use of submodule with command foreach is not permitted without enabling allowUnsafeExec',
++      };
++      return;
++   }
++
++   if (task === 'bisect' && verb === 'run') {
++      yield {
++         category: 'allowUnsafeExec',
++         message:
++            'Use of bisect with command run is not permitted without enabling allowUnsafeExec',
++      };
++   }
+ }
