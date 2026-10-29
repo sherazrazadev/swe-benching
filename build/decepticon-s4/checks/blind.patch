@@ -1,0 +1,360 @@
+diff -ruN pristine/packages/decepticon/decepticon/middleware/_chat_control.py app/packages/decepticon/decepticon/middleware/_chat_control.py
+--- a/packages/decepticon/decepticon/middleware/_chat_control.py	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/decepticon/decepticon/middleware/_chat_control.py	2026-10-28 16:59:52.164009229 +0000
+@@ -0,0 +1,56 @@
++"""Make chat-template control literals inert in untrusted text.
++
++Detection (``_injection_detector``) only annotates risk; it leaves the bytes
++alone. Control literals are a different problem: when a tokenizer preserves
++special-token vocabulary (self-hosted / OpenAI-compatible BYOK backends), a
++plain substring such as ``<|im_start|>`` planted in attacker-controlled tool
++output is parsed into a *structural* role or turn delimiter. The model then
++treats whatever follows as an authoritative system turn, which is exactly the
++quarantine bypass described in the advisory.
++
++The remedy here is deliberately conservative: insert one zero-width word
++joiner (U+2060) immediately after the literal's opening character. That breaks
++the contiguous byte sequence the tokenizer matches while adding no visible
++glyph, so the operator audit trail and everything a human reads stay identical.
++"""
++
++from __future__ import annotations
++
++import re
++
++#: A non-printing character that survives the product's visible-text checks.
++_INERT = "\N{WORD JOINER}"
++
++# Token families in use by models the product supports:
++#   * ChatML / Qwen / DeepSeek / Llama-3 style ``<|name|>`` families. Either
++#     vertical bar may be ASCII ``|`` or fullwidth ``｜`` (U+FF5C), so mixing
++#     them cannot slip a literal past the pattern.
++#   * Gemma turn delimiters ``<start_of_turn>`` / ``<end_of_turn>``.
++#   * Mistral instruction and tool delimiters in square brackets.
++#   * Llama-2 system markers ``<<SYS>>`` / ``<</SYS>>``.
++_CONTROL_LITERAL_RE = re.compile(
++    r"""
++      < [|｜] [A-Za-z0-9_]{1,64} [|｜] >            # <|im_start|>, <｜eot_id｜>
++    | </? (?:start|end) _of_turn >                  # <start_of_turn>
++    | \[ /? (?:INST|AVAILABLE_TOOLS|TOOL_CALLS|TOOL_RESULTS) \]
++    | << /? SYS >>                                  # <<SYS>>, <</SYS>>
++    """,
++    re.IGNORECASE | re.VERBOSE,
++)
++
++
++def _split_literal(match: re.Match[str]) -> str:
++    """Re-emit a matched literal with an inert character after its first glyph."""
++    literal = match.group(0)
++    return literal[0] + _INERT + literal[1:]
++
++
++def defang_control_literals(text: str) -> str:
++    """Return ``text`` with every chat-template control literal made inert.
++
++    The visible content is preserved exactly: only a zero-width joiner is
++    inserted. Text without a candidate opening bracket is returned unchanged.
++    """
++    if not text or ("<" not in text and "[" not in text):
++        return text
++    return _CONTROL_LITERAL_RE.sub(_split_literal, text)
+diff -ruN pristine/packages/decepticon/decepticon/middleware/kg.py app/packages/decepticon/decepticon/middleware/kg.py
+--- a/packages/decepticon/decepticon/middleware/kg.py	2026-10-28 16:40:53.000000000 +0000
++++ b/packages/decepticon/decepticon/middleware/kg.py	2026-10-28 16:58:09.693747971 +0000
+@@ -38,6 +38,7 @@
+ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+ from typing_extensions import override
+ 
++from decepticon.middleware._chat_control import defang_control_literals
+ from decepticon.middleware.kg_internal.state import KGState
+ from decepticon.middleware.kg_internal.store import KGStore
+ from decepticon.middleware.kg_internal.summary import build_summary
+@@ -163,7 +164,11 @@
+         ``middleware/opplan.py:350``)."""
+         state = request.state or {}
+         get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
+-        summary = str(get("kg_summary") or "")
++        # The stored summary is rendered from scanner-ingested node labels
++        # (vulnerability and entrypoint text taken from the target), so it is
++        # untrusted even though it lives in the product's own memory. Defang
++        # control literals before the system-prompt block is composed.
++        summary = defang_control_literals(str(get("kg_summary") or ""))
+ 
+         # No engagement / no summary yet — pass the request through.
+         if not get("kg_engagement"):
+diff -ruN pristine/packages/decepticon/decepticon/middleware/notifications.py app/packages/decepticon/decepticon/middleware/notifications.py
+--- a/packages/decepticon/decepticon/middleware/notifications.py	2026-10-28 16:40:53.000000000 +0000
++++ b/packages/decepticon/decepticon/middleware/notifications.py	2026-10-28 16:58:04.205589113 +0000
+@@ -37,6 +37,7 @@
+ from langchain_core.messages import HumanMessage
+ 
+ from decepticon.backends.http_sandbox import HTTPSandbox
++from decepticon.middleware._chat_control import defang_control_literals
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -192,14 +193,21 @@
+             log.warning("failed to emit background_complete stream event: %s", exc)
+ 
+     def _format_block(self, job, output: str) -> str:
+-        """One ``●`` entry for the system-reminder body."""
++        """One ``●`` entry for the system-reminder body.
++
++        Captured terminal output is attacker-influenceable, and this block is
++        composed straight into a user-role message. Defang chat-template
++        control literals across the whole model-visible block; the stream event
++        keeps the raw captured bytes for operator display.
++        """
+         command = job.command or ""
+-        return (
++        block = (
+             f'● Background command "{command}" completed '
+             f"(exit code {job.exit_code}) — session={job.session} "
+             f"elapsed={job.elapsed:.1f}s\n"
+             f"```\n{output}\n```"
+         )
++        return defang_control_literals(block)
+ 
+     def _build_message(self) -> dict | None:
+         """Inject completions + emit per-job stream events. Returns the
+diff -ruN pristine/packages/decepticon/decepticon/middleware/prompt_injection_shield.py app/packages/decepticon/decepticon/middleware/prompt_injection_shield.py
+--- a/packages/decepticon/decepticon/middleware/prompt_injection_shield.py	2026-10-28 16:40:56.000000000 +0000
++++ b/packages/decepticon/decepticon/middleware/prompt_injection_shield.py	2026-10-28 16:57:59.287448123 +0000
+@@ -47,6 +47,7 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ import logging
+ import re
+ from functools import lru_cache
+@@ -57,6 +58,8 @@
+ from langgraph.types import Command
+ from typing_extensions import override
+ 
++from decepticon.middleware._chat_control import defang_control_literals
++
+ log = logging.getLogger(__name__)
+ 
+ 
+@@ -192,12 +195,14 @@
+         lines.append(f"  • {len(high)} high-severity pattern(s):")
+         for cat, _, sample in high[:3]:
+             cleaned = sample.replace("\n", " ").replace("\r", " ")
+-            lines.append(f"      - {cat}: {cleaned!r}")
++            # The sample is attacker bytes quoted back at the model; defang it
++            # here so the banner cannot reintroduce the literal it flags.
++            lines.append(f"      - {cat}: {defang_control_literals(cleaned)!r}")
+     if medium:
+         lines.append(f"  • {len(medium)} medium-severity pattern(s):")
+         for cat, _, sample in medium[:2]:
+             cleaned = sample.replace("\n", " ").replace("\r", " ")
+-            lines.append(f"      - {cat}: {cleaned!r}")
++            lines.append(f"      - {cat}: {defang_control_literals(cleaned)!r}")
+     if low:
+         lines.append(f"  • {len(low)} low-severity heuristic(s) (informational)")
+     return "\n".join(lines)
+@@ -205,10 +210,14 @@
+ 
+ def _wrap_untrusted(content: str, banner: str | None) -> str:
+     """Wrap content in ``<untrusted_tool_output>…</untrusted_tool_output>`` markers."""
+-    # Neutralize any marker embedded in attacker-controlled tool output so it
+-    # cannot forge or close the quarantine boundary and break out of the wrap.
++    # Make chat-template control literals inert (tokenizer-level role forgery),
++    # then neutralize any wrap marker embedded in attacker-controlled tool
++    # output so it cannot forge or close the quarantine boundary.
+     safe = re.sub(
+-        r"untrusted_tool_output", "untrusted_tool\u200boutput", content, flags=re.IGNORECASE
++        r"untrusted_tool_output",
++        "untrusted_tool\u200boutput",
++        defang_control_literals(content),
++        flags=re.IGNORECASE,
+     )
+     body = f"<untrusted_tool_output>\n{safe}\n</untrusted_tool_output>"
+     if banner:
+@@ -233,6 +242,39 @@
+     return ""
+ 
+ 
++def _defang_command_messages(result: Command) -> Command:
++    """Defang control literals carried by a ``Command``'s ``messages`` update.
++
++    Some tools report their result through a state update rather than a direct
++    ``ToolMessage`` return. Those messages reach the model all the same, so
++    their text is defanged in place; the command's other state keys and shape
++    are preserved.
++    """
++    update = getattr(result, "update", None)
++    if not isinstance(update, dict):
++        return result
++    messages = update.get("messages")
++    if not isinstance(messages, (list, tuple)) or not messages:
++        return result
++
++    changed = False
++    rewritten: list[Any] = []
++    for message in messages:
++        if isinstance(message, ToolMessage):
++            text = _extract_text(message.content)
++            safe = defang_control_literals(text)
++            if safe != text:
++                message = message.model_copy(update={"content": safe})
++                changed = True
++        rewritten.append(message)
++    if not changed:
++        return result
++
++    new_update = dict(update)
++    new_update["messages"] = rewritten
++    return dataclasses.replace(result, update=new_update)
++
++
+ def _emit_stream_event(category_counts: dict[str, int], tool_name: str) -> None:
+     """Emit a ``prompt_injection_detected`` custom stream event for the dashboard."""
+     try:
+@@ -406,11 +448,23 @@
+         return self._maybe_wrap(request, result)
+ 
+     def _maybe_wrap(self, request, result):
++        tool = getattr(request, "tool", None)
++        tool_name = getattr(tool, "name", "") if tool else ""
++
++        # A ``Command`` is not wrapped (there is no ToolMessage to rewrite), but
++        # any ToolMessage it carries is still model-visible. Unknown external
++        # tools get their carried text defanged here; trusted tools and tools
++        # the UNTRUSTED_OUTPUT slot owns are left to their own handling.
++        if isinstance(result, Command):
++            if _is_trusted_internal_tool(tool_name):
++                return result
++            if tool_name in _untrusted_tool_names():
++                return result
++            return _defang_command_messages(result)
++
+         if not isinstance(result, ToolMessage):
+             return result
+ 
+-        tool = getattr(request, "tool", None)
+-        tool_name = getattr(tool, "name", "") if tool else ""
+         if _is_trusted_internal_tool(tool_name):
+             return result
+         # UNTRUSTED_OUTPUT slot already envelopes these; avoid double-wrap.
+diff -ruN pristine/packages/decepticon/decepticon/middleware/untrusted_output.py app/packages/decepticon/decepticon/middleware/untrusted_output.py
+--- a/packages/decepticon/decepticon/middleware/untrusted_output.py	2026-10-28 16:40:53.000000000 +0000
++++ b/packages/decepticon/decepticon/middleware/untrusted_output.py	2026-10-28 16:57:33.468590310 +0000
+@@ -36,6 +36,7 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ import json
+ import logging
+ import re
+@@ -47,6 +48,7 @@
+ from langgraph.types import Command
+ from typing_extensions import override
+ 
++from decepticon.middleware._chat_control import defang_control_literals
+ from decepticon.middleware._injection_detector import (
+     InjectionVerdict,
+     detect_injection,
+@@ -144,9 +146,12 @@
+     body: str,
+ ) -> str:
+     cats_attr = f' categories="{",".join(categories)}"' if categories else ""
+-    # Neutralize any envelope marker embedded in attacker-controlled tool
+-    # output so it cannot forge or close the quarantine boundary and break out.
+-    safe_body = _MARKER_RE.sub("UNTRUSTED_TOOL\u200bOUTPUT", body)
++    # Two separate break-outs to prevent: a chat-template control literal that
++    # the model's tokenizer would turn into a structural role boundary, and an
++    # envelope marker that would forge or close the quarantine boundary.
++    safe_body = _MARKER_RE.sub(
++        "UNTRUSTED_TOOL\u200bOUTPUT", defang_control_literals(body)
++    )
+     return (
+         f'<UNTRUSTED_TOOL_OUTPUT origin="{origin}" '
+         f'tool_call_id="{tool_call_id}" risk="{risk}"{cats_attr}>\n'
+@@ -225,10 +230,18 @@
+         request,
+         result: ToolMessage | Command,
+     ) -> ToolMessage | Command:
+-        if not isinstance(result, ToolMessage):
+-            return result
+         tool = getattr(request, "tool", None)
+         tool_name = getattr(tool, "name", "unknown") if tool else "unknown"
++        if isinstance(result, Command):
++            # A tool may report its output through a ``Command`` state update
++            # instead of returning a ``ToolMessage``. For the tools we
++            # quarantine, those carried messages are model-visible too, so the
++            # literal still has to be defanged (the command shape is kept).
++            if tool_name in self._tool_names:
++                return _defang_command_messages(result)
++            return result
++        if not isinstance(result, ToolMessage):
++            return result
+         if tool_name not in self._tool_names:
+             return result
+ 
+@@ -296,6 +309,39 @@
+             )
+ 
+ 
++def _defang_command_messages(result: Command) -> Command:
++    """Defang control literals in ``ToolMessage`` objects carried by a ``Command``.
++
++    A ``Command`` update is framework state plumbing, but the messages it
++    carries are exactly as model-visible as a directly returned ``ToolMessage``.
++    Only the text changes; the update's other keys, and the command itself, are
++    left untouched.
++    """
++    update = getattr(result, "update", None)
++    if not isinstance(update, dict):
++        return result
++    messages = update.get("messages")
++    if not isinstance(messages, (list, tuple)) or not messages:
++        return result
++
++    changed = False
++    rewritten: list[Any] = []
++    for message in messages:
++        if isinstance(message, ToolMessage):
++            text = _to_text(message.content)
++            safe = defang_control_literals(text)
++            if safe != text:
++                message = message.model_copy(update={"content": safe})
++                changed = True
++        rewritten.append(message)
++    if not changed:
++        return result
++
++    new_update = dict(update)
++    new_update["messages"] = rewritten
++    return dataclasses.replace(result, update=new_update)
++
++
+ def _to_text(content: Any) -> str:
+     if isinstance(content, str):
+         return content
+diff -ruN pristine/packages/decepticon/decepticon/tools/evidence/quarantine.py app/packages/decepticon/decepticon/tools/evidence/quarantine.py
+--- a/packages/decepticon/decepticon/tools/evidence/quarantine.py	2026-10-28 16:40:56.000000000 +0000
++++ b/packages/decepticon/decepticon/tools/evidence/quarantine.py	2026-10-28 16:58:14.412880341 +0000
+@@ -15,6 +15,8 @@
+ 
+ from langchain_core.tools import tool
+ 
++from decepticon.middleware._chat_control import defang_control_literals
++
+ DEFAULT_LEDGER_PATH = "/workspace/audit/untrusted-quarantine.jsonl"
+ 
+ _MAX_EXCERPT = 400
+@@ -55,7 +57,10 @@
+                 continue
+             excerpt = str(match.get("excerpt") or "").replace("\n", " ").replace("\r", " ")
+             lines.append(f"    {match.get('category', '?')}: {excerpt[:_MAX_EXCERPT]}")
+-    return "\n".join(lines)
++    # The excerpts are recorded attacker bytes replayed back to the model. The
++    # ledger file itself is never modified, but the rendered digest must not
++    # hand the model a live chat-template control literal.
++    return defang_control_literals("\n".join(lines))
+ 
+ 
+ @tool
