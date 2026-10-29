@@ -6,9 +6,9 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 
 ## Totals (83 tasks)
 
-| ACCEPTED | REJECTED | unsound | running |
-|---|---|---|---|
-| 3 | 57 | 5 | 18 |
+| ACCEPTED | REJECTED | in final checks | unsound | running |
+|---|---|---|---|---|
+| 3 | 62 | 1 | 5 | 12 |
 
 ## Batches
 
@@ -30,7 +30,7 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 | [14](batch-14.md) | 2026-10-28T23:48Z | 6 | 0 | 5 | 0 | 1 | 0 | [40789876505](https://github.com/sherazrazadev/swe-benching/actions/runs/40789876505) |
 | [15](batch-15.md) | 2026-10-29T00:45Z | 6 | 0 | 0 | 6 | 0 | 0 | [40796101408](https://github.com/sherazrazadev/swe-benching/actions/runs/40796101408) |
 | [16](batch-16.md) | 2026-10-29T01:42Z | 6 | 0 | 0 | 6 | 0 | 0 | [40802046889](https://github.com/sherazrazadev/swe-benching/actions/runs/40802046889) |
-| [17](batch-17.md) | 2026-10-29T05:11Z | 6 | 0 | 0 | 6 | 0 | 0 | [40821904116](https://github.com/sherazrazadev/swe-benching/actions/runs/40821904116) |
+| [17](batch-17.md) | 2026-10-29T05:11Z | 6 | 0 | 5 | 1 | 0 | 0 | [40821904116](https://github.com/sherazrazadev/swe-benching/actions/runs/40821904116) |
 
 ## Accepted tasks (3)
 
