@@ -1,0 +1,251 @@
+diff --git a/lib/anubis.go b/lib/anubis.go
+index 7b8dbe8..74768dc 100644
+--- a/lib/anubis.go
++++ b/lib/anubis.go
+@@ -721,14 +721,21 @@ func (s *Server) check(r *http.Request, lg *slog.Logger) (policy.CheckResult, *p
+ 		}
+ 	}
+ 
+-	if s.policy.DefaultPath != nil && s.policy.DefaultPath.MatchString(r.URL.Path) {
+-		return cr("defaults/path", s.policy.DefaultAction, weight), &policy.Bot{
+-			Challenge: &config.ChallengeRules{
+-				Difficulty: s.policy.DefaultDifficulty,
+-				Algorithm:  config.DefaultAlgorithm,
+-			},
+-			Rules: &checker.List{},
+-		}, nil
++	if s.policy.DefaultRule != nil {
++		match, err := s.policy.DefaultRule.Check(r)
++		if err != nil {
++			return decaymap.Zilch[policy.CheckResult](), nil, fmt.Errorf("can't run defaults rule: %w", err)
++		}
++
++		if match {
++			return cr("defaults/path", s.policy.DefaultAction, weight), &policy.Bot{
++				Challenge: &config.ChallengeRules{
++					Difficulty: s.policy.DefaultDifficulty,
++					Algorithm:  config.DefaultAlgorithm,
++				},
++				Rules: &checker.List{},
++			}, nil
++		}
+ 	}
+ 
+ 	return cr("default/allow", config.RuleAllow, weight), &policy.Bot{
+diff --git a/lib/policy/celchecker.go b/lib/policy/celchecker.go
+index adfcd28..33d7c85 100644
+--- a/lib/policy/celchecker.go
++++ b/lib/policy/celchecker.go
+@@ -3,6 +3,7 @@ package policy
+ import (
+ 	"fmt"
+ 	"net/http"
++	"net/url"
+ 
+ 	"github.com/TecharoHQ/anubis/internal"
+ 	"github.com/TecharoHQ/anubis/internal/dns"
+@@ -13,11 +14,12 @@ import (
+ )
+ 
+ type CELChecker struct {
+-	program cel.Program
+-	src     string
++	program        cel.Program
++	src            string
++	subRequestMode bool
+ }
+ 
+-func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns) (*CELChecker, error) {
++func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns, subrequestMode bool) (*CELChecker, error) {
+ 	env, err := expressions.BotEnvironment(dnsObj)
+ 	if err != nil {
+ 		return nil, err
+@@ -29,8 +31,9 @@ func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns) (*CELChecker,
+ 	}
+ 
+ 	return &CELChecker{
+-		src:     cfg.String(),
+-		program: program,
++		src:            cfg.String(),
++		program:        program,
++		subRequestMode: subrequestMode,
+ 	}, nil
+ }
+ 
+@@ -39,7 +42,7 @@ func (cc *CELChecker) Hash() string {
+ }
+ 
+ func (cc *CELChecker) Check(r *http.Request) (bool, error) {
+-	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{r})
++	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{r, cc.subRequestMode})
+ 
+ 	if err != nil {
+ 		return false, err
+@@ -54,6 +57,7 @@ func (cc *CELChecker) Check(r *http.Request) (bool, error) {
+ 
+ type CELRequest struct {
+ 	*http.Request
++	subRequestMode bool
+ }
+ 
+ func (cr *CELRequest) Parent() cel.Activation { return nil }
+@@ -65,16 +69,44 @@ func (cr *CELRequest) ResolveName(name string) (any, bool) {
+ 	case "contentLength":
+ 		return cr.ContentLength, true
+ 	case "host":
++		if cr.subRequestMode {
++			if original := forwardedRequestURI(cr.Request); original != "" {
++				if u, err := url.ParseRequestURI(original); err == nil && u.Host != "" {
++					return u.Host, true
++				}
++			}
++			if host := cr.Header.Get("X-Forwarded-Host"); host != "" {
++				return host, true
++			}
++		}
+ 		return cr.Host, true
+ 	case "method":
+ 		return cr.Method, true
+ 	case "userAgent":
+ 		return cr.UserAgent(), true
+ 	case "path":
++		if cr.subRequestMode {
++			if original := forwardedRequestURI(cr.Request); original != "" {
++				path, _ := splitRequestTarget(original)
++				return path, true
++			}
++		}
+ 		return cr.URL.Path, true
+ 	case "requestUri":
++		if cr.subRequestMode {
++			if original := forwardedRequestURI(cr.Request); original != "" {
++				return original, true
++			}
++		}
+ 		return cr.URL.RequestURI(), true
+ 	case "query":
++		if cr.subRequestMode {
++			if original := forwardedRequestURI(cr.Request); original != "" {
++				_, rawQuery := splitRequestTarget(original)
++				values, _ := url.ParseQuery(rawQuery)
++				return expressions.URLValues{Values: values}, true
++			}
++		}
+ 		return expressions.URLValues{Values: cr.URL.Query()}, true
+ 	case "headers":
+ 		return expressions.HTTPHeaders{Header: cr.Header}, true
+diff --git a/lib/policy/checker.go b/lib/policy/checker.go
+index 3800316..8ad65d8 100644
+--- a/lib/policy/checker.go
++++ b/lib/policy/checker.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/netip"
++	"net/url"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -107,11 +108,34 @@ func NewPathChecker(rexStr string, subrequestMode bool) (checker.Impl, error) {
+ 	return &PathChecker{rex, internal.FastHash(rexStr), subrequestMode}, nil
+ }
+ 
++// forwardedRequestURI returns the request target the client sent when Anubis is
++// authorizing a request on behalf of a fronting proxy. Different proxies carry it
++// in different forwarding headers; X-Original-URI wins when both are present.
++func forwardedRequestURI(r *http.Request) string {
++	if original := r.Header.Get("X-Original-URI"); original != "" {
++		return original
++	}
++	return r.Header.Get("X-Forwarded-Uri")
++}
++
++// splitRequestTarget separates a forwarded request target into the path the client
++// asked for and the query string it carried. A request target is the whole URL
++// target, so path rules must match the path component alone.
++func splitRequestTarget(target string) (path, query string) {
++	if u, err := url.ParseRequestURI(target); err == nil {
++		return u.Path, u.RawQuery
++	}
++	if i := strings.IndexByte(target, '?'); i >= 0 {
++		return target[:i], target[i+1:]
++	}
++	return target, ""
++}
++
+ func (pc *PathChecker) Check(r *http.Request) (bool, error) {
+ 	if pc.subRequestMode {
+-		originalUrl := r.Header.Get("X-Original-URI")
+-		if originalUrl != "" {
+-			if pc.regexp.MatchString(originalUrl) {
++		if original := forwardedRequestURI(r); original != "" {
++			path, _ := splitRequestTarget(original)
++			if pc.regexp.MatchString(path) {
+ 				return true, nil
+ 			}
+ 		}
+diff --git a/lib/policy/policy.go b/lib/policy/policy.go
+index f6e35ec..28990df 100644
+--- a/lib/policy/policy.go
++++ b/lib/policy/policy.go
+@@ -7,8 +7,6 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"os"
+-	"regexp"
+-	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -44,7 +42,7 @@ type ParsedConfig struct {
+ 	Thresholds        []*Threshold
+ 	StatusCodes       config.StatusCodes
+ 	DefaultDifficulty int
+-	DefaultPath       *regexp.Regexp
++	DefaultRule       checker.Impl
+ 	DefaultAction     config.Rule
+ 	DNSBL             bool
+ 	DnsCache          *dns.DnsCache
+@@ -183,7 +181,7 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 		}
+ 
+ 		if b.Expression != nil {
+-			c, err := NewCELChecker(b.Expression, result.Dns)
++			c, err := NewCELChecker(b.Expression, result.Dns, subrequestMode)
+ 			if err != nil {
+ 				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s expressions: %w", b.Name, err))
+ 			} else {
+@@ -264,11 +262,11 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 	}
+ 
+ 	if c.Defaults != nil && c.Defaults.PathRegex != nil {
+-		rex, err := regexp.Compile(strings.TrimSpace(*c.Defaults.PathRegex))
++		rule, err := NewPathChecker(*c.Defaults.PathRegex, subrequestMode)
+ 		if err != nil {
+-			validationErrs = append(validationErrs, fmt.Errorf("can't compile defaults path regex: %w", err))
++			validationErrs = append(validationErrs, fmt.Errorf("while processing defaults path regex: %w", err))
+ 		} else {
+-			result.DefaultPath = rex
++			result.DefaultRule = rule
+ 			result.DefaultAction = c.Defaults.Action
+ 		}
+ 	}
+diff --git a/lib/policy/prefixchecker.go b/lib/policy/prefixchecker.go
+index e773987..9cbdc2f 100644
+--- a/lib/policy/prefixchecker.go
++++ b/lib/policy/prefixchecker.go
+@@ -21,9 +21,11 @@ func NewPrefixChecker(prefix string, subrequestMode bool) (checker.Impl, error)
+ 
+ func (pc *PrefixChecker) Check(r *http.Request) (bool, error) {
+ 	if pc.subRequestMode {
+-		original := r.Header.Get("X-Original-URI")
+-		if original != "" && strings.HasPrefix(original, pc.prefix) {
+-			return true, nil
++		if original := forwardedRequestURI(r); original != "" {
++			path, _ := splitRequestTarget(original)
++			if strings.HasPrefix(path, pc.prefix) {
++				return true, nil
++			}
+ 		}
+ 	}
+ 

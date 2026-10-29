@@ -1,0 +1,109 @@
+diff -ruN a/lib/anubis.go b/lib/anubis.go
+--- a/lib/anubis.go	2026-10-29 17:24:56.901459414 +0000
++++ b/lib/anubis.go	2026-10-29 17:28:38.213434721 +0000
+@@ -252,7 +252,7 @@
+ 		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+ 	}
+ 
+-	cr, rule, err := s.check(r, lg)
++	cr, rule, err := s.check(s.policy.RequestWithClientURL(r), lg)
+ 	if err != nil {
+ 		lg.Error("check failed", "err", err)
+ 		localizer := localization.GetLocalizer(r)
+@@ -434,7 +434,7 @@
+ 	r.URL.Path = redir
+ 
+ 	encoder := json.NewEncoder(w)
+-	cr, rule, err := s.check(r, lg)
++	cr, rule, err := s.check(s.policy.RequestWithClientURL(r), lg)
+ 	if err != nil {
+ 		lg.Error("check failed", "err", err)
+ 		w.WriteHeader(http.StatusInternalServerError)
+@@ -539,7 +539,7 @@
+ 		return
+ 	}
+ 
+-	cr, rule, err := s.check(r, lg)
++	cr, rule, err := s.check(s.policy.RequestWithClientURL(r), lg)
+ 	if err != nil {
+ 		lg.Error("check failed", "err", err)
+ 		s.respondWithError(w, r, fmt.Sprintf("%s \"passChallenge\"", localizer.T("internal_server_error")), makeCode(err))
+diff -ruN a/lib/policy/checker.go b/lib/policy/checker.go
+--- a/lib/policy/checker.go	2026-10-29 17:17:49.853663614 +0000
++++ b/lib/policy/checker.go	2026-10-29 17:28:38.227399168 +0000
+@@ -5,6 +5,7 @@
+ 	"fmt"
+ 	"net/http"
+ 	"net/netip"
++	"net/url"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -128,6 +129,48 @@
+ 	return pc.hash
+ }
+ 
++// RequestWithClientURL returns a request whose URL is the URL the client asked
++// for when Anubis is authorizing a request for a fronting proxy. Every policy
++// rule then evaluates the client's request target; the forwarding fields are
++// removed from the copy so that a rule cannot see them twice.
++func (pc *ParsedConfig) RequestWithClientURL(r *http.Request) *http.Request {
++	if !pc.SubrequestMode {
++		return r
++	}
++
++	original := r.Header.Get("X-Original-URI")
++	if original == "" {
++		original = r.Header.Get("X-Forwarded-Uri")
++	}
++	if original == "" {
++		return r
++	}
++
++	path := original
++	query := ""
++	host := ""
++	if u, err := url.ParseRequestURI(original); err == nil {
++		path, query = u.Path, u.RawQuery
++		host = u.Host
++	} else if i := strings.IndexByte(original, '?'); i >= 0 {
++		path, query = original[:i], original[i+1:]
++	}
++	if host == "" {
++		host = r.Header.Get("X-Forwarded-Host")
++	}
++
++	clone := r.Clone(r.Context())
++	u := *r.URL
++	u.Path, u.RawPath, u.RawQuery = path, "", query
++	clone.URL = &u
++	if host != "" {
++		clone.Host = host
++	}
++	clone.Header.Del("X-Original-URI")
++	clone.Header.Del("X-Forwarded-Uri")
++	return clone
++}
++
+ func NewHeaderExistsChecker(key string) checker.Impl {
+ 	return headerExistsChecker{strings.TrimSpace(key)}
+ }
+diff -ruN a/lib/policy/policy.go b/lib/policy/policy.go
+--- a/lib/policy/policy.go	2026-10-29 17:24:56.041467380 +0000
++++ b/lib/policy/policy.go	2026-10-29 17:28:38.212940926 +0000
+@@ -44,6 +44,7 @@
+ 	Thresholds        []*Threshold
+ 	StatusCodes       config.StatusCodes
+ 	DefaultDifficulty int
++	SubrequestMode    bool
+ 	DefaultPath       *regexp.Regexp
+ 	DefaultAction     config.Rule
+ 	DNSBL             bool
+@@ -76,6 +77,7 @@
+ 
+ 	result := newParsedConfig(c)
+ 	result.DefaultDifficulty = defaultDifficulty
++	result.SubrequestMode = subrequestMode
+ 	result.LogASN = c.Logging.LogASN
+ 	if hasThothClient {
+ 		result.ThothClient = tc

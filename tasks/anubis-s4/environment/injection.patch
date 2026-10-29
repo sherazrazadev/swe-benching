@@ -1,0 +1,248 @@
+diff --git a/lib/anubis.go b/lib/anubis.go
+index ac3481a..7b8dbe8 100644
+--- a/lib/anubis.go
++++ b/lib/anubis.go
+@@ -721,6 +721,16 @@ func (s *Server) check(r *http.Request, lg *slog.Logger) (policy.CheckResult, *p
+ 		}
+ 	}
+ 
++	if s.policy.DefaultPath != nil && s.policy.DefaultPath.MatchString(r.URL.Path) {
++		return cr("defaults/path", s.policy.DefaultAction, weight), &policy.Bot{
++			Challenge: &config.ChallengeRules{
++				Difficulty: s.policy.DefaultDifficulty,
++				Algorithm:  config.DefaultAlgorithm,
++			},
++			Rules: &checker.List{},
++		}, nil
++	}
++
+ 	return cr("default/allow", config.RuleAllow, weight), &policy.Bot{
+ 		Challenge: &config.ChallengeRules{
+ 			Difficulty: s.policy.DefaultDifficulty,
+diff --git a/lib/config/config.go b/lib/config/config.go
+index 7e3264a..de6ce70 100644
+--- a/lib/config/config.go
++++ b/lib/config/config.go
+@@ -58,6 +58,7 @@ const DefaultAlgorithm = "fast"
+ type BotConfig struct {
+ 	UserAgentRegex *string           `json:"user_agent_regex,omitempty" yaml:"user_agent_regex,omitempty"`
+ 	PathRegex      *string           `json:"path_regex,omitempty" yaml:"path_regex,omitempty"`
++	PathPrefix     *string           `json:"path_prefix,omitempty" yaml:"path_prefix,omitempty"`
+ 	HeadersRegex   map[string]string `json:"headers_regex,omitempty" yaml:"headers_regex,omitempty"`
+ 	Expression     *ExpressionOrList `json:"expression,omitempty" yaml:"expression,omitempty"`
+ 	Challenge      *ChallengeRules   `json:"challenge,omitempty" yaml:"challenge,omitempty"`
+@@ -77,6 +78,7 @@ func (b BotConfig) Zero() bool {
+ 		b.Name != "",
+ 		b.UserAgentRegex != nil,
+ 		b.PathRegex != nil,
++		b.PathPrefix != nil,
+ 		len(b.HeadersRegex) != 0,
+ 		b.Action != "",
+ 		len(b.RemoteAddr) != 0,
+@@ -101,6 +103,7 @@ func (b *BotConfig) Valid() error {
+ 
+ 	allFieldsEmpty := b.UserAgentRegex == nil &&
+ 		b.PathRegex == nil &&
++		b.PathPrefix == nil &&
+ 		len(b.RemoteAddr) == 0 &&
+ 		len(b.HeadersRegex) == 0 &&
+ 		b.ASNs == nil &&
+@@ -188,6 +191,40 @@ func (b *BotConfig) Valid() error {
+ 	return nil
+ }
+ 
++// DefaultRuleConfig is the fallback rule a deployment applies after every bot
++// rule and threshold has been considered. It lets an operator express one URL
++// condition for the whole policy instead of repeating it in each bot entry.
++type DefaultRuleConfig struct {
++	PathRegex *string `json:"path_regex,omitempty" yaml:"path_regex,omitempty"`
++	Action    Rule    `json:"action" yaml:"action"`
++}
++
++func (d DefaultRuleConfig) Valid() error {
++	var errs []error
++
++	if d.Action != RuleAllow && d.Action != RuleDeny {
++		errs = append(errs, fmt.Errorf("%w: %q", ErrUnknownAction, d.Action))
++	}
++
++	if d.PathRegex == nil {
++		errs = append(errs, ErrBotMustHaveUserAgentOrPath)
++	} else {
++		if strings.HasSuffix(*d.PathRegex, "\n") {
++			errs = append(errs, fmt.Errorf("%w: default path regex: %q", ErrRegexEndsWithNewline, *d.PathRegex))
++		}
++
++		if _, err := regexp.Compile(*d.PathRegex); err != nil {
++			errs = append(errs, ErrInvalidPathRegex, err)
++		}
++	}
++
++	if len(errs) != 0 {
++		return fmt.Errorf("config: defaults entry is not valid:\n%w", errors.Join(errs...))
++	}
++
++	return nil
++}
++
+ type ChallengeRules struct {
+ 	Algorithm  string `json:"algorithm,omitempty" yaml:"algorithm,omitempty"`
+ 	Difficulty int    `json:"difficulty,omitempty" yaml:"difficulty,omitempty"`
+@@ -330,6 +367,7 @@ type fileConfig struct {
+ 	Store       *Store              `json:"store"`
+ 	Bots        []BotOrImport       `json:"bots"`
+ 	Thresholds  []Threshold         `json:"thresholds"`
++	Defaults    *DefaultRuleConfig  `json:"defaults,omitempty" yaml:"defaults,omitempty"`
+ 	StatusCodes StatusCodes         `json:"status_codes"`
+ 	DNSBL       bool                `json:"dnsbl"`
+ 	DNSTTL      DnsTTL              `json:"dns_ttl"`
+@@ -356,6 +394,12 @@ func (c *fileConfig) Valid() error {
+ 		}
+ 	}
+ 
++	if c.Defaults != nil {
++		if err := c.Defaults.Valid(); err != nil {
++			errs = append(errs, err)
++		}
++	}
++
+ 	if err := c.StatusCodes.Valid(); err != nil {
+ 		errs = append(errs, err)
+ 	}
+@@ -423,6 +467,7 @@ func Load(fin io.Reader, fname string) (*Config, error) {
+ 		},
+ 		StatusCodes: c.StatusCodes,
+ 		Store:       c.Store,
++		Defaults:    c.Defaults,
+ 		Logging:     c.Logging,
+ 		Metrics:     c.Metrics,
+ 	}
+@@ -512,6 +557,7 @@ type Config struct {
+ 	OpenGraph   OpenGraph
+ 	Bots        []BotConfig
+ 	Thresholds  []Threshold
++	Defaults    *DefaultRuleConfig
+ 	StatusCodes StatusCodes
+ 	Logging     *Logging
+ 	DNSBL       bool
+diff --git a/lib/policy/celchecker.go b/lib/policy/celchecker.go
+index c313cd4..adfcd28 100644
+--- a/lib/policy/celchecker.go
++++ b/lib/policy/celchecker.go
+@@ -72,6 +72,8 @@ func (cr *CELRequest) ResolveName(name string) (any, bool) {
+ 		return cr.UserAgent(), true
+ 	case "path":
+ 		return cr.URL.Path, true
++	case "requestUri":
++		return cr.URL.RequestURI(), true
+ 	case "query":
+ 		return expressions.URLValues{Values: cr.URL.Query()}, true
+ 	case "headers":
+diff --git a/lib/policy/expressions/environment.go b/lib/policy/expressions/environment.go
+index 1e583a9..30a8fa9 100644
+--- a/lib/policy/expressions/environment.go
++++ b/lib/policy/expressions/environment.go
+@@ -25,6 +25,7 @@ func BotEnvironment(dnsObj *dns.Dns) (*cel.Env, error) {
+ 		cel.Variable("method", cel.StringType),
+ 		cel.Variable("userAgent", cel.StringType),
+ 		cel.Variable("path", cel.StringType),
++		cel.Variable("requestUri", cel.StringType),
+ 		cel.Variable("query", cel.MapType(cel.StringType, cel.StringType)),
+ 		cel.Variable("headers", cel.MapType(cel.StringType, cel.StringType)),
+ 		cel.Variable("load_1m", cel.DoubleType),
+diff --git a/lib/policy/policy.go b/lib/policy/policy.go
+index 3889dc8..f6e35ec 100644
+--- a/lib/policy/policy.go
++++ b/lib/policy/policy.go
+@@ -7,6 +7,8 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"os"
++	"regexp"
++	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -42,6 +44,8 @@ type ParsedConfig struct {
+ 	Thresholds        []*Threshold
+ 	StatusCodes       config.StatusCodes
+ 	DefaultDifficulty int
++	DefaultPath       *regexp.Regexp
++	DefaultAction     config.Rule
+ 	DNSBL             bool
+ 	DnsCache          *dns.DnsCache
+ 	Dns               *dns.Dns
+@@ -160,6 +164,15 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 			}
+ 		}
+ 
++		if b.PathPrefix != nil {
++			c, err := NewPrefixChecker(*b.PathPrefix, subrequestMode)
++			if err != nil {
++				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s path prefix: %w", b.Name, err))
++			} else {
++				cl = append(cl, c)
++			}
++		}
++
+ 		if len(b.HeadersRegex) > 0 {
+ 			c, err := NewHeadersChecker(b.HeadersRegex)
+ 			if err != nil {
+@@ -250,6 +263,16 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 		result.Thresholds = append(result.Thresholds, threshold)
+ 	}
+ 
++	if c.Defaults != nil && c.Defaults.PathRegex != nil {
++		rex, err := regexp.Compile(strings.TrimSpace(*c.Defaults.PathRegex))
++		if err != nil {
++			validationErrs = append(validationErrs, fmt.Errorf("can't compile defaults path regex: %w", err))
++		} else {
++			result.DefaultPath = rex
++			result.DefaultAction = c.Defaults.Action
++		}
++	}
++
+ 	if len(validationErrs) > 0 {
+ 		return nil, fmt.Errorf("errors validating policy config JSON %s: %w", fname, errors.Join(validationErrs...))
+ 	}
+diff --git a/lib/policy/prefixchecker.go b/lib/policy/prefixchecker.go
+new file mode 100644
+index 0000000..e773987
+--- /dev/null
++++ b/lib/policy/prefixchecker.go
+@@ -0,0 +1,35 @@
++package policy
++
++import (
++	"net/http"
++	"strings"
++
++	"github.com/TecharoHQ/anubis/internal"
++	"github.com/TecharoHQ/anubis/lib/policy/checker"
++)
++
++type PrefixChecker struct {
++	prefix         string
++	hash           string
++	subRequestMode bool
++}
++
++func NewPrefixChecker(prefix string, subrequestMode bool) (checker.Impl, error) {
++	prefix = strings.TrimSpace(prefix)
++	return &PrefixChecker{prefix, internal.FastHash(prefix), subrequestMode}, nil
++}
++
++func (pc *PrefixChecker) Check(r *http.Request) (bool, error) {
++	if pc.subRequestMode {
++		original := r.Header.Get("X-Original-URI")
++		if original != "" && strings.HasPrefix(original, pc.prefix) {
++			return true, nil
++		}
++	}
++
++	return strings.HasPrefix(r.URL.Path, pc.prefix), nil
++}
++
++func (pc *PrefixChecker) Hash() string {
++	return pc.hash
++}

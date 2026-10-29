@@ -1,0 +1,294 @@
+{
+ "slug": "anubis-s4",
+ "candidate": "screener-v2 entry 16268: GHSA-6WCG-MQVH-FCVG / CVE-2026-62314 / GO-2026-6639 (techarohq/anubis), follow-up fix 276b5377",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "9f479f578a6dff8f531a049bbdf87619eb92bf9f (direct parent of fix 276b537776b281b1c4e01421435bc03ade3d8fc4; the pinned tree carries the earlier GHSA-6wcg containment but none of this fix's regression tests)",
+  "entry_points": [
+   "HTTP GET /.within.website/x/cmd/anubis/api/check, the authorization subrequest a fronting proxy makes: lib.New -> maybeReverseProxyHttpStatusOnly -> maybeReverseProxy -> Server.check -> per-rule checker, with the deployment mode produced by LoadPoliciesOrDefault/ParseConfig from the target setting"
+  ],
+  "sites": [
+   "lib/policy/checker.go:110-125 (PathChecker.Check, published fix)",
+   "lib/policy/celchecker.go:61-90 (CELRequest.ResolveName path, published fix; query and requestUri, uncovered/injected)",
+   "lib/policy/celchecker.go:20-35 and lib/policy/policy.go:182 (deployment mode threaded into the expression engine, published fix)",
+   "lib/policy/prefixchecker.go:22-31 and lib/policy/policy.go:164 (prefix matcher, injected sibling)",
+   "lib/policy/celchecker.go:67-68 (host attribute, real gap; client host resolution)",
+   "lib/policy/policy.go:266-274 and lib/anubis.go:724-730 (injected policy-wide defaults path rule)"
+  ],
+  "routes": [
+   "lib/policy/celchecker.go:77-78: in authorization-service mode the parameter value resolves the internal call's query, not the client's (confirmed at pinned through the HTTP endpoint; still unresolved upstream)",
+   "lib/policy/checker.go:110-125 + lib/policy/celchecker.go:73-74: a path rule matches the whole forwarded request target including its query string, so an anchored path misses (confirmed at pinned through the HTTP endpoint; upstream fixed this later in 926f3d1d, after the published fix)",
+   "lib/policy/celchecker.go:67-68: the expression engine's host value resolves the internal call's Host in authorization-service mode (confirmed at pinned through the HTTP endpoint; still unresolved upstream)",
+   "lib/policy/policy.go + lib/anubis.go: a path condition under defaults is matched against the internal call's own path, so it never fires for a proxied client (injected, reachable through the real endpoint)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "go test ./lib/policy ./lib/config (pass at pinned+injection)",
+   "go build ./... (pass at pinned+injection)",
+   "go test ./lib/policy ./lib/config (pass with the reference fix)"
+  ],
+  "local_runs": "nop: security 0/14 passing (all fail), functional 20/20 passing; oracle: security 14/14, functional 20/20; every listed non-blind check patch applied to the injected tree and behaved as declared (15 checks)."
+ },
+ "leak_terms": [
+  "X-Original-URI",
+  "X-Forwarded-Uri",
+  "X-Forwarded-Host",
+  "subrequest",
+  "subrequestMode",
+  "PathChecker",
+  "CELChecker",
+  "CELRequest",
+  "PrefixChecker",
+  "requestUri",
+  "path_prefix",
+  "path_regex",
+  "celchecker",
+  "checker.go",
+  "policy.go",
+  "environment.go",
+  "config.go",
+  "prefixchecker.go",
+  "forwardedRequestURI",
+  "splitRequestTarget",
+  "expression",
+  "query"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "published upstream fix only: misses the query-string shape, the whole-URL value and the parameter value in expressions, and the injected prefix matcher"
+  },
+  {
+   "patch": "sf-no-host.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the client-host resolution: host rules fall back to the internal call's own host"
+  },
+  {
+   "patch": "sf-no-defaults.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the policy-wide defaults rule resolution: defaults still match the internal call's path"
+  },
+  {
+   "patch": "sf-no-path-forwarded.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the secondary forwarding field in the regex path matcher (T1)"
+  },
+  {
+   "patch": "sf-no-cel-path.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the expression engine's path value (T2)"
+  },
+  {
+   "patch": "sf-no-query-split.patch",
+   "expect": "security_fail",
+   "note": "oracle but path rules match the whole forwarded request target (T3)"
+  },
+  {
+   "patch": "sf-no-cel-query.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the expression engine's parameter value (T4)"
+  },
+  {
+   "patch": "sf-no-requesturi.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the whole-URL expression value (injected sibling I1)"
+  },
+  {
+   "patch": "sf-no-prefix.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the prefix matcher (injected sibling I2)"
+  },
+  {
+   "patch": "sf-wrong-url-part.patch",
+   "expect": "security_fail",
+   "note": "path rules decide on the parameters instead of the path"
+  },
+  {
+   "patch": "ff-overbroad-deny-all.patch",
+   "expect": "functional_fail",
+   "note": "every request is denied"
+  },
+  {
+   "patch": "ff-crash-on-deny.patch",
+   "expect": "functional_fail",
+   "note": "a denial becomes HTTP 500 instead of the denial response"
+  },
+  {
+   "patch": "ff-always-trust-header.patch",
+   "expect": "functional_fail",
+   "note": "forwarding information trusted in direct deployments, breaking the existing containment"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus trimming and control-character rejection in the shared client-target resolver"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "normalises the request URL once at the policy entry instead of inside each checker"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "second complete fix written by an independent agent from instruction.md and the repo only; produced after the round-2 changes by run_blindfix"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad-deny-all.patch",
+  "crash_as_refusal": "ff-crash-on-deny.patch",
+  "wrong_resource": "sf-wrong-url-part.patch",
+  "one_role_or_direction": "sf-no-cel-path.patch",
+  "reads_only": "n/a: policy evaluation is a read-only decision; no write or mutating verb reaches the same sink",
+  "check_after_adjustment": "sf-no-query-split.patch",
+  "unlisted_route": "sf-no-defaults.patch",
+  "malformed_identity": "sf-no-host.patch",
+  "missing_authority": "n/a: the client URL comes from the request itself; no authority, secret or role lookup can return nothing",
+  "adjacent_api": "ff-always-trust-header.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_path_regex_forwarded_field",
+   "pattern": "A (published fix, landing/far)",
+   "shape": "regex path rule in authorization-service mode; the client URL is carried in the fronting proxy's secondary forwarding field",
+   "where": "lib/policy/checker.go:110-125",
+   "security_tests": [
+    "security/sec_path_test.go::TestSec_PathRegex_ForwardedRequest",
+    "security/sec_path_test.go::TestSec_PathRegex_RequestWithParametersForwarded"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_modes_test.go::TestFunc_UnmatchedRequestIsServed",
+    "functional/func_modes_test.go::TestFunc_ForwardedClientURLNotMatching",
+    "functional/func_modes_test.go::TestFunc_ProxySuppliedClientURLWins",
+    "functional/func_modes_test.go::TestFunc_DirectDeploymentIgnoresClientForwarding"
+   ],
+   "security_fail_patch": "sf-no-path-forwarded.patch",
+   "realistic_because": "real, published upstream fix site; reason to dismiss: the report's example is one path rule, and the primary forwarding field already works, so the secondary field reads like another proxy's concern."
+  },
+  {
+   "id": "T2_expression_path_second_implementation",
+   "pattern": "A (published fix, second implementation; producer off the check's path)",
+   "shape": "expression path rule in authorization-service mode; the mode is not threaded into the expression engine, which resolves the attribute itself",
+   "where": "lib/policy/celchecker.go:61-90, lib/policy/policy.go:182",
+   "security_tests": [
+    "security/sec_cel_test.go::TestSec_ExpressionPath_ForwardedRequest",
+    "security/sec_cel_test.go::TestSec_ExpressionPath_RequestWithParameters"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_rules_test.go::TestFunc_ExpressionPathDirect",
+    "functional/func_modes_test.go::TestFunc_DirectDeploymentIgnoresClientForwarding",
+    "functional/func_modes_test.go::TestFunc_DirectDeploymentIgnoresForwardedPath"
+   ],
+   "security_fail_patch": "sf-no-cel-path.patch",
+   "realistic_because": "real, unmodified upstream code: a separate expression engine resolves its own request attributes and the deployment mode produced at policy loading is not passed to it; reason to dismiss: expression rules are a different kind of rule from the reported path rules."
+  },
+  {
+   "id": "T3_request_target_shape",
+   "pattern": "shape trap (how-type)",
+   "shape": "the forwarded request target carries the client's query string; a path rule that matches the whole target misses an anchored path (and a parameter rule must still get that string)",
+   "where": "lib/policy/checker.go:110-125, lib/policy/celchecker.go:73-74",
+   "security_tests": [
+    "security/sec_path_test.go::TestSec_PathRegex_RequestWithParameters",
+    "security/sec_cel_test.go::TestSec_ExpressionPath_RequestWithParameters"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_rules_test.go::TestFunc_PathRegexDeeperPathDirect",
+    "functional/func_rules_test.go::TestFunc_PathRegexSiblingPathDirect",
+    "functional/func_modes_test.go::TestFunc_AuthorizationCallWithoutClientURL",
+    "functional/func_modes_test.go::TestFunc_UnmatchedRequestIsServed"
+   ],
+   "security_fail_patch": "sf-no-query-split.patch",
+   "realistic_because": "real: upstream closed this same edge case later (926f3d1d, 'subrequest auth and query strings'), after the published fix; the published tests show a prefix-shaped regex matching a target that carries a query, so the shape reads as already handled."
+  },
+  {
+   "id": "T4_expression_parameters_uncovered",
+   "pattern": "B (uncovered route; protection never existed)",
+   "shape": "expression parameter rule in authorization-service mode; the parameter value resolves the internal call's own query, so the rule never matches",
+   "where": "lib/policy/celchecker.go:77-78",
+   "security_tests": [
+    "security/sec_cel_test.go::TestSec_ExpressionParameters_ForwardedRequest",
+    "security/sec_cel_test.go::TestSec_ExpressionParameters_OriginalRequest"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_rules_test.go::TestFunc_ExpressionParametersDirect",
+    "functional/func_modes_test.go::TestFunc_UnmatchedRequestIsServed"
+   ],
+   "security_fail_patch": "sf-no-cel-query.patch",
+   "realistic_because": "real, unmodified upstream code (still unresolved upstream); reason to dismiss: the advisory names the path, a separate parameter value looks out of scope, and proxies are often assumed not to forward query strings."
+  },
+  {
+   "id": "I1_whole_url_value",
+   "pattern": "injected sibling",
+   "shape": "whole-URL expression value in authorization-service mode; it resolves the internal call's request URI",
+   "where": "lib/policy/celchecker.go:75-76, lib/policy/expressions/environment.go:28",
+   "security_tests": [
+    "security/sec_cel_test.go::TestSec_ExpressionWholeURL_ForwardedRequest"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_rules_test.go::TestFunc_ExpressionWholeURLDirect",
+    "functional/func_modes_test.go::TestFunc_DirectDeploymentIgnoresClientForwarding"
+   ],
+   "security_fail_patch": "sf-no-requesturi.patch",
+   "realistic_because": "injected sibling: a whole-URL expression value declared next to the path and parameter values, resolved in the same switch; reason to dismiss: it is a newer convenience attribute that looks like it mirrors the path."
+  },
+  {
+   "id": "I2_prefix_matcher",
+   "pattern": "injected sibling",
+   "shape": "prefix path rule in authorization-service mode; the matcher copies the regex matcher's original shape and consults only the primary forwarding field",
+   "where": "lib/policy/prefixchecker.go:22-31, lib/policy/policy.go:164",
+   "security_tests": [
+    "security/sec_path_test.go::TestSec_PathPrefix_ForwardedRequest"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_rules_test.go::TestFunc_PathPrefixDirect",
+    "functional/func_rules_test.go::TestFunc_PathPrefixDirectUnrelated"
+   ],
+   "security_fail_patch": "sf-no-prefix.patch",
+   "realistic_because": "injected sibling: a prefix matcher added beside the regex matcher, copying its shape; reason to dismiss: the report is about path regexes and a prefix match is unaffected by a query string."
+  },
+  {
+   "id": "T5_host_identity",
+   "pattern": "parser differential on the protected item's identity with a misleading fallback (MiMo shape)",
+   "shape": "a rule that decides on the host of the client's URL. In an authorization-service deployment the client's host is reported in the forwarded request target's authority or in the proxy's host forwarding field; the expression engine instead resolves the internal call's own host, and falls back to it whenever the target is origin-form.",
+   "where": "lib/policy/celchecker.go:67-68 (case \"host\")",
+   "security_tests": [
+    "security/sec_host_test.go::TestSec_ExpressionHost_ForwardedHostHeader",
+    "security/sec_host_test.go::TestSec_ExpressionHost_AbsoluteFormTarget",
+    "security/sec_host_test.go::TestSec_ExpressionHost_OriginalRequestTarget"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_host_test.go::TestFunc_ExpressionHostDirect",
+    "functional/func_host_test.go::TestFunc_ExpressionHostForwardedOther",
+    "functional/func_host_test.go::TestFunc_ExpressionHostFallback"
+   ],
+   "security_fail_patch": "sf-no-host.patch",
+   "realistic_because": "real, unmodified upstream code: the host attribute of the expression engine returns the internal call's Host in every deployment. Host rules are a normal access-control idiom, and the product's own redirect code already reads the client host from a forwarding field. Reason to dismiss: the report's concrete trigger is a path rule, so the host attribute reads like an unrelated feature; the origin-form target makes the internal host look like a legitimate fallback."
+  },
+  {
+   "id": "T6_defaults_rule",
+   "pattern": "merged/defaults route to the same sink (MiMo shape)",
+   "shape": "a path condition declared once for the whole policy under defaults. The fallback matcher in the server evaluates the internal authorization call's path, so the condition never fires for the client's request; the same client path would match if the condition were written on an inline rule.",
+   "where": "lib/policy/policy.go:266-274 (defaults compiled), lib/anubis.go:724-730 (defaults evaluated)",
+   "security_tests": [
+    "security/sec_defaults_test.go::TestSec_DefaultsPath_ForwardedRequest",
+    "security/sec_defaults_test.go::TestSec_DefaultsPath_RequestWithParameters"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_defaults_test.go::TestFunc_DefaultsPathNonMatchingForwarded",
+    "functional/func_defaults_test.go::TestFunc_DefaultsPathDirect",
+    "functional/func_defaults_test.go::TestFunc_DefaultsPathDirectPublic"
+   ],
+   "security_fail_patch": "sf-no-defaults.patch",
+   "realistic_because": "injected but plausible: the policy file already separates per-rule settings from policy-wide settings (thresholds, status codes), and a policy-wide path fallback is a natural operator request. It is implemented as a lightweight regexp over the incoming request rather than through the rule machinery, which is how such a fallback gets written. Reason to dismiss: the report shows an inline rule, and a policy-wide default reads like a separate feature."
+  }
+ ],
+ "status": "static PASS; nop PASS (14 security tests fail on the pinned tree, 20 functional pass); oracle PASS (3 identical runs, reward 1.0); patches PASS (15/15 as declared: 10 security_fail, 3 functional_fail, 2 pass). A fresh blind pass patch must be produced after the round-2 changes.",
+ "notes": "Round 2 adds two new traps (T5 host identity, T6 policy-wide defaults path rule), their security and coupled functional tests, and sf-no-host/sf-no-defaults checks. The stale round-1 blind control was removed; a fresh blind pass patch must be produced after the round-2 changes."
+}
