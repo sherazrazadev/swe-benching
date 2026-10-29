@@ -1,0 +1,181 @@
+diff --git a/internal/hud/client/log_streamer.go b/internal/hud/client/log_streamer.go
+index 29950b6..983c537 100644
+--- a/internal/hud/client/log_streamer.go
++++ b/internal/hud/client/log_streamer.go
+@@ -3,11 +3,18 @@ package client
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
++	"net/http"
++	neturl "net/url"
++	"strings"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/pkg/errors"
+ 
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
++
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/pkg/logger"
+ 	"github.com/tilt-dev/tilt/pkg/model"
+@@ -33,10 +40,58 @@ func NewLogStreamer(follow FollowFlag, url model.WebURL, filter LogFilter, print
+ 	}
+ }
+ 
++// loadSessionToken reads the running session's credential from the Tilt data
++// directory. It is the same value the engine loads at startup.
++func loadSessionToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.GetOrCreateToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
++// fetchWebsocketToken obtains the short-lived CSRF token that the server
++// requires on the view websocket. The endpoint is gated by the session token.
++func fetchWebsocketToken(ctx context.Context, u model.WebURL) (string, error) {
++	httpURL := "http://" + u.Host + "/api/websocket_token"
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpURL, nil)
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("X-Tilt-Token", loadSessionToken())
++	res, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer func() { _ = res.Body.Close() }()
++	if res.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("websocket token request failed: %s", res.Status)
++	}
++	b, err := io.ReadAll(res.Body)
++	if err != nil {
++		return "", err
++	}
++	return strings.TrimSpace(string(b)), nil
++}
++
+ func (ls *LogStreamer) Stream(ctx context.Context) error {
+ 	url := ls.url
+-	url.Scheme = "ws"
+ 	url.Path = "/ws/view"
++	csrf, err := fetchWebsocketToken(ctx, url)
++	if err != nil {
++		return errors.Wrap(err, "fetching websocket token")
++	}
++	q, err := neturl.ParseQuery(url.RawQuery)
++	if err != nil {
++		return errors.Wrap(err, "parsing websocket URL")
++	}
++	q.Set("csrf", csrf)
++	url.RawQuery = q.Encode()
++	url.Scheme = "ws"
+ 	logger.Get(ctx).Debugf("connecting to %s", url.String())
+ 
+ 	conn, _, err := websocket.DefaultDialer.Dial(url.String(), nil)
+diff --git a/internal/hud/server/gorilla/origin.go b/internal/hud/server/gorilla/origin.go
+deleted file mode 100644
+index 3f0d506..0000000
+--- a/internal/hud/server/gorilla/origin.go
++++ /dev/null
+@@ -1,50 +0,0 @@
+-// Copyright 2013 The Gorilla WebSocket Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-//
+-// Used from github.com/gorilla/websocket
+-
+-package gorilla
+-
+-import (
+-	"net/http"
+-	"net/url"
+-	"unicode/utf8"
+-)
+-
+-// checkSameOrigin returns true if the origin is not set or is equal to the request host.
+-func CheckSameOrigin(r *http.Request) bool {
+-	origin := r.Header["Origin"]
+-	if len(origin) == 0 {
+-		return true
+-	}
+-	u, err := url.Parse(origin[0])
+-	if err != nil {
+-		return false
+-	}
+-	return equalASCIIFold(u.Host, r.Host)
+-}
+-
+-// equalASCIIFold returns true if s is equal to t with ASCII case folding as
+-// defined in RFC 4790.
+-func equalASCIIFold(s, t string) bool {
+-	for s != "" && t != "" {
+-		sr, size := utf8.DecodeRuneInString(s)
+-		s = s[size:]
+-		tr, size := utf8.DecodeRuneInString(t)
+-		t = t[size:]
+-		if sr == tr {
+-			continue
+-		}
+-		if 'A' <= sr && sr <= 'Z' {
+-			sr = sr + 'a' - 'A'
+-		}
+-		if 'A' <= tr && tr <= 'Z' {
+-			tr = tr + 'a' - 'A'
+-		}
+-		if sr != tr {
+-			return false
+-		}
+-	}
+-	return s == t
+-}
+diff --git a/internal/hud/server/websocket.go b/internal/hud/server/websocket.go
+index 2989876..d4f2dfe 100644
+--- a/internal/hud/server/websocket.go
++++ b/internal/hud/server/websocket.go
+@@ -15,7 +15,6 @@ import (
+ 	"k8s.io/client-go/util/workqueue"
+ 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+-	"github.com/tilt-dev/tilt/internal/hud/server/gorilla"
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/internal/store"
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -38,21 +37,16 @@ var upgrader = websocket.Upgrader{
+ 	// a mobile network.
+ 	EnableCompression: false,
+ 
+-	// Allow the connection if either:
++	// Only allow the upgrade when the client presents the CSRF token.
+ 	//
+-	// 1) The client has a CSRF token, or
+-	// 2) The origin matches what we expect.
+-	//
+-	// Once a few releases have gone by we should remove the origin check.
+-	// (since we know some tilt users expect tabs to stay open
+-	// across releases).
++	// The token is served exclusively by /api/websocket_token, which is gated
++	// behind requireToken, so only a caller already holding the session token
++	// can obtain it. We deliberately do NOT fall back to an origin check: the
++	// previous fallback accepted any request whose Origin header was absent
++	// (originCheck returns true on missing Origin), which let a non-browser
++	// client open this socket and read the full HUD stream with no token.
+ 	CheckOrigin: func(req *http.Request) bool {
+-		if websocketCSRFToken.String() == req.URL.Query().Get("csrf") {
+-			return true
+-		}
+-
+-		// If the CSRF check fails, fallback to an origin check.
+-		return gorilla.CheckSameOrigin(req)
++		return websocketCSRFToken.String() == req.URL.Query().Get("csrf")
+ 	},
+ }
+ 

@@ -1,0 +1,451 @@
+diff -ruN a/src/praisonai/praisonai/api/agent_invoke.py b/src/praisonai/praisonai/api/agent_invoke.py
+--- a/src/praisonai/praisonai/api/agent_invoke.py	2026-10-28 15:17:35.000000000 +0000
++++ b/src/praisonai/praisonai/api/agent_invoke.py	2026-10-28 15:35:16.502979883 +0000
+@@ -27,51 +27,149 @@
+ logger = logging.getLogger(__name__)
+ 
+ # Authentication
++import base64
++import hmac
++import ipaddress
+ import os
+-CALL_SERVER_TOKEN = os.getenv('CALL_SERVER_TOKEN')
+-_CALL_AUTH_DISABLED = os.getenv('PRAISONAI_CALL_AUTH', '').lower() == 'disabled'
++
++#: Set by a server's own start-up path to the address its listener was opened on.
++#: It is process state, written before any request is accepted, and is never read
++#: from a request, a header or a query string.
++BIND_HOST_ENV = "PRAISONAI_CALL_BIND_HOST"
++
++_LOOPBACK_NAMES = frozenset({"localhost"})
++
++
++def configured_token() -> Optional[str]:
++    """The deployment's credential, read when a request is handled."""
++    value = os.getenv("CALL_SERVER_TOKEN")
++    return value if value else None
++
++
++def server_bind_host() -> Optional[str]:
++    """The address this process's HTTP listener is bound to, or ``None`` if unknown.
++
++    ``None`` means the process cannot establish its own bind address; every caller
++    must treat that as "not local".
++    """
++    value = os.getenv(BIND_HOST_ENV)
++    if value is None:
++        return None
++    value = value.strip()
++    return value or None
++
++
++def is_loopback_bind(host: Optional[str]) -> bool:
++    """True only for a bind address that is reachable from this machine alone."""
++    if not host:
++        return False
++    candidate = str(host).strip().lower()
++    if candidate.startswith("[") and candidate.endswith("]"):
++        candidate = candidate[1:-1]
++    if candidate in _LOOPBACK_NAMES:
++        return True
++    try:
++        address = ipaddress.ip_address(candidate)
++    except ValueError:
++        return False
++    if address.is_loopback:
++        return True
++    mapped = getattr(address, "ipv4_mapped", None)
++    return mapped is not None and mapped.is_loopback
++
++
++def auth_opt_out_enabled() -> bool:
++    """Whether an operator asked to run a surface without credentials locally."""
++    for name in ("PRAISONAI_CALL_AUTH", "PRAISONAI_SERVE_AUTH"):
++        if os.getenv(name, "").strip().lower() == "disabled":
++            return True
++    return False
++
++
++def opt_out_covers_bind() -> bool:
++    """The opt-out is honoured only when this process is bound to loopback."""
++    return auth_opt_out_enabled() and is_loopback_bind(server_bind_host())
++
++
++def request_token(request: Any, authorization: Optional[str] = None) -> Optional[str]:
++    """Extract the credential a request presents in the forms the servers accept."""
++    if authorization is None:
++        headers = getattr(request, "headers", None)
++        if headers is not None:
++            authorization = headers.get("Authorization")
++    if authorization:
++        scheme, _, value = authorization.partition(" ")
++        value = value.strip()
++        if scheme.strip().lower() == "bearer":
++            return value or None
++        if scheme.strip().lower() == "basic":
++            try:
++                decoded = base64.b64decode(value).decode("utf-8")
++            except Exception:
++                decoded = None
++            if decoded is not None:
++                if ":" in decoded:
++                    return decoded.split(":", 1)[1] or None  # Use password as token
++                return decoded or None
++    params = getattr(request, "query_params", None)
++    if params is not None:
++        value = params.get("token")
++        if value:
++            return value
++    return None
++
++
++def token_matches(supplied: Optional[str], expected: Optional[str]) -> bool:
++    """Constant-time credential comparison; an unconfigured credential never matches."""
++    if not supplied or not expected:
++        return False
++    return hmac.compare_digest(str(supplied).encode("utf-8"), str(expected).encode("utf-8"))
+ 
+ 
+ async def verify_token(
+-    request: Request, 
++    request: Request,
+     authorization: Optional[str] = Header(None)
+ ) -> None:
+     """Verify API token for authentication."""
+     if not FASTAPI_AVAILABLE:
+         return
+-    if _CALL_AUTH_DISABLED:
++    if auth_opt_out_enabled():
++        # Credential-free local use is allowed only when this process can prove it
++        # is listening on loopback.  The bind address is recorded by the start-up
++        # path; the Host header a client sends is never consulted.
++        bind_host = server_bind_host()
++        if bind_host is None:
++            raise HTTPException(
++                status_code=503,
++                detail=(
++                    "Authentication opt-out refused: this server cannot establish "
++                    "its own bind address. Configure CALL_SERVER_TOKEN, or run the "
++                    "server through an entry point that records its bind address."
++                ),
++            )
++        if not is_loopback_bind(bind_host):
++            raise HTTPException(
++                status_code=403,
++                detail=(
++                    f"Authentication opt-out refused: server is bound to {bind_host!r}, "
++                    "which is not a loopback address. Configure CALL_SERVER_TOKEN to "
++                    "serve remote callers."
++                ),
++            )
+         return
+-    if not CALL_SERVER_TOKEN:
++
++    expected = configured_token()
++    if not expected:
+         raise HTTPException(
+             status_code=503,
+             detail=(
+-                "CALL_SERVER_TOKEN is not configured. Set CALL_SERVER_TOKEN or "
+-                "PRAISONAI_CALL_AUTH=disabled to run without authentication."
++                "CALL_SERVER_TOKEN is not configured. Set CALL_SERVER_TOKEN to accept "
++                "remote callers, or bind to loopback with PRAISONAI_CALL_AUTH=disabled "
++                "for local development."
+             ),
+         )
+-        
+-    token = None
+-    
+-    # Check Authorization header first (Bearer or Basic)
+-    if authorization:
+-        if authorization.startswith("Bearer "):
+-            token = authorization.split(" ")[1]
+-        elif authorization.startswith("Basic "):
+-            try:
+-                import base64
+-                decoded = base64.b64decode(authorization[6:]).decode("utf-8")
+-                if ":" in decoded:
+-                    token = decoded.split(":", 1)[1]  # Use password as token
+-                else:
+-                    token = decoded
+-            except Exception:
+-                pass
+-    
+-    # Check query param as fallback
+-    if not token:
+-        token = request.query_params.get("token")
+-    
+-    if token != CALL_SERVER_TOKEN:
++
++    if not token_matches(request_token(request, authorization), expected):
+         raise HTTPException(status_code=401, detail="Unauthorized")
+ 
+ # Request/Response Models
+diff -ruN a/src/praisonai/praisonai/api/call.py b/src/praisonai/praisonai/api/call.py
+--- a/src/praisonai/praisonai/api/call.py	2026-10-28 15:17:39.000000000 +0000
++++ b/src/praisonai/praisonai/api/call.py	2026-10-28 15:33:49.758737470 +0000
+@@ -1,6 +1,7 @@
+ import os
+ import json
+ import base64
++import hmac
+ import asyncio
+ import websockets
+ from fastapi import FastAPI, WebSocket, Request
+@@ -40,7 +41,6 @@
+ ]
+ 
+ # Security and Rate Limiting
+-CALL_SERVER_TOKEN = os.getenv('CALL_SERVER_TOKEN')
+ MAX_CONCURRENT_CONNECTIONS = int(os.getenv('MAX_CONCURRENT_CONNECTIONS', '5'))
+ MAX_REQUESTS_PER_WINDOW = int(os.getenv('MAX_REQUESTS_PER_WINDOW', '100'))
+ RATE_LIMIT_WINDOW = 3600
+@@ -131,27 +131,59 @@
+ 
+ from fastapi import HTTPException, status
+ 
++#: The address the listener is opened on.  Recorded for the shared agent auth
++#: dependency; it is what the server is actually reachable on, not what a
++#: caller claims.
++BIND_HOST = "0.0.0.0"
++
++
++def _configured_token():
++    """The telephony token this deployment configured, read per request."""
++    configured = os.getenv("CALL_SERVER_TOKEN")
++    return configured if configured else None
++
++
++def _presented_token(request):
++    """The credential a webhook or stream request presents."""
++    token = request.query_params.get("token")
++    if token:
++        return token
++    auth = request.headers.get("Authorization", "") or ""
++    scheme, _, value = auth.partition(" ")
++    value = value.strip()
++    if scheme.strip().lower() == "bearer":
++        return value or None
++    if scheme.strip().lower() == "basic":
++        try:
++            decoded = base64.b64decode(value).decode("utf-8")
++        except Exception:
++            return None
++        if ":" in decoded:
++            return decoded.split(":", 1)[1] or None  # Use Password as token
++        return decoded or None
++    return None
++
++
++def _token_matches(supplied, expected) -> bool:
++    """Constant-time comparison; an unconfigured token never matches anything."""
++    if not supplied or not expected:
++        return False
++    return hmac.compare_digest(str(supplied).encode("utf-8"), str(expected).encode("utf-8"))
++
++
+ @app.api_route("/", methods=["GET", "POST"])
+ async def handle_incoming_call(request: Request):
+     """Handle incoming call and return TwiML response to connect to Media Stream."""
+-    if CALL_SERVER_TOKEN:
+-        token = request.query_params.get("token")
+-        if not token:
+-            auth = request.headers.get("Authorization", "")
+-            if auth.startswith("Bearer "):
+-                token = auth.split(" ")[1]
+-            elif auth.startswith("Basic "):
+-                try:
+-                    import base64
+-                    decoded = base64.b64decode(auth[6:]).decode("utf-8")
+-                    if ":" in decoded:
+-                        token = decoded.split(":", 1)[1]  # Use Password as token
+-                    else:
+-                        token = decoded
+-                except Exception:
+-                    pass
+-        if token != CALL_SERVER_TOKEN:
+-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
++    # Fail closed: the webhook is only usable by a deployment that configured a
++    # token, and only for a request that presents it.
++    expected = _configured_token()
++    if not expected:
++        raise HTTPException(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            detail="CALL_SERVER_TOKEN is not configured; the telephony webhook is disabled",
++        )
++    if not _token_matches(_presented_token(request), expected):
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+ 
+     response = VoiceResponse()
+     response.say("")
+@@ -159,11 +191,9 @@
+     # response.say("")
+     host = request.url.hostname
+     connect = Connect()
+-    
+-    stream_url = f'wss://{host}/media-stream'
+-    if CALL_SERVER_TOKEN:
+-        stream_url += f'?token={CALL_SERVER_TOKEN}'
+-    
++
++    stream_url = f'wss://{host}/media-stream?token={expected}'
++
+     connect.stream(url=stream_url)
+     response.append(connect)
+     return HTMLResponse(content=str(response), media_type="application/xml")
+@@ -172,14 +202,17 @@
+ async def handle_media_stream(websocket: WebSocket):
+     """Handle WebSocket connections between Twilio and OpenAI."""
+     global active_connections
+-    
+-    # 1. Authentication
+-    if CALL_SERVER_TOKEN:
+-        token = websocket.query_params.get("token")
+-        if token != CALL_SERVER_TOKEN:
+-            await websocket.close(code=4003, reason="Unauthorized")
+-            return
+-            
++
++    # 1. Authentication - a stream is never opened without a configured token
++    # that the caller presents.
++    expected = _configured_token()
++    if not expected:
++        await websocket.close(code=4003, reason="CALL_SERVER_TOKEN not configured")
++        return
++    if not _token_matches(websocket.query_params.get("token"), expected):
++        await websocket.close(code=4003, reason="Unauthorized")
++        return
++
+     # 2. Rate Limiting Request Rate
+     client_ip = websocket.client.host if websocket.client else "unknown"
+     now = time.time()
+@@ -355,14 +388,15 @@
+     """Run the FastAPI server using uvicorn."""
+     if not OPENAI_API_KEY:
+         raise ValueError('Missing the OpenAI API key. Please set it in the .env file or configure it through the GUI.')
+-    
++
+     if use_public:
+         setup_public_url(port)
+-        os.environ["PRAISONAI_CALL_BIND_HOST"] = "0.0.0.0"
+     else:
+         print(f"Starting Praison AI Call Server on http://localhost:{port}")
+-        os.environ["PRAISONAI_CALL_BIND_HOST"] = "127.0.0.1"
+-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
++    # uvicorn opens the listener on every interface in both modes, so that is the
++    # address this process must report for itself.
++    os.environ["PRAISONAI_CALL_BIND_HOST"] = BIND_HOST
++    uvicorn.run(app, host=BIND_HOST, port=port, log_level="warning")
+ 
+ def main(args=None):
+     """Run the Praison AI Call Server."""
+diff -ruN a/src/praisonai/praisonai/cli/features/serve.py b/src/praisonai/praisonai/cli/features/serve.py
+--- a/src/praisonai/praisonai/cli/features/serve.py	2026-10-28 15:17:39.000000000 +0000
++++ b/src/praisonai/praisonai/cli/features/serve.py	2026-10-28 15:33:42.592733377 +0000
+@@ -19,6 +19,23 @@
+ from typing import Any, Dict, List, Optional
+ 
+ 
++def _agent_api():
++    """The agent API module, imported lazily so `serve` stays importable alone."""
++    from praisonai.api import agent_invoke
++
++    return agent_invoke
++
++
++def _local_optout_applies() -> bool:
++    """Whether credential-free local use is legitimate for this process.
++
++    The decision is taken from the bind address this process recorded at start-up,
++    never from the request: a client controls the Host it sends and the address it
++    dialled, but not what the server is listening on.
++    """
++    return _agent_api().opt_out_covers_bind()
++
++
+ def _install_api_key_middleware(
+     app: Any,
+     api_key: Optional[str],
+@@ -40,8 +57,9 @@
+             if path in public or path.startswith("/__praisonai__/"):
+                 return await call_next(request)
+             if os.environ.get("PRAISONAI_SERVE_AUTH", "").lower() == "disabled":
+-                # Same opt-out as the call API, for servers reached on loopback.
+-                if request.url.hostname in ("127.0.0.1", "localhost", "::1"):
++                # Same opt-out as the call API: it only counts for a server bound
++                # to loopback, not for a client that named itself "localhost".
++                if _local_optout_applies():
+                     return await call_next(request)
+             auth = request.headers.get("Authorization", "")
+             header_key = request.headers.get("X-API-Key", "")
+@@ -261,7 +279,7 @@
+     
+     def _create_agents_app(self, config: Dict[str, Any]) -> Any:
+         """Create FastAPI app for agents."""
+-        from fastapi import FastAPI, HTTPException, Request
++        from fastapi import Depends, FastAPI, HTTPException, Request
+         from fastapi.responses import JSONResponse
+         from pydantic import BaseModel
+         
+@@ -317,9 +335,31 @@
+         
+         # Create endpoint for agents
+         path = config["path"]
+-        
++        api_key_configured = bool(config.get("api_key"))
++
++        async def _require_agent_authority(request: Request) -> None:
++            """Require proof of authority before an agent route reads the registry.
++
++            Credential-free use survives only for the documented local opt-out on a
++            loopback bind.  When an API key is configured it is the middleware's
++            job to enforce it; otherwise the deployment's token must be presented.
++            """
++            if api_key_configured:
++                return
++            agent_invoke = _agent_api()
++            if agent_invoke.opt_out_covers_bind():
++                return
++            presented = agent_invoke.request_token(request) or request.headers.get("X-API-Key")
++            if agent_invoke.token_matches(presented, agent_invoke.configured_token()):
++                return
++            raise HTTPException(status_code=401, detail="Unauthorized")
++
+         @app.post(path)
+-        async def invoke_agents(request: Request, query_data: AgentQuery = None):
++        async def invoke_agents(
++            request: Request,
++            query_data: AgentQuery = None,
++            _authority: None = Depends(_require_agent_authority),
++        ):
+             """Invoke agents with a query."""
+             if query_data is None:
+                 try:
+@@ -378,7 +418,11 @@
+         
+         # Add simple /agents/{agent_name} endpoint for n8n compatibility
+         @app.post("/agents/{agent_name}")
+-        async def invoke_single_agent(agent_name: str, request: Request):
++        async def invoke_single_agent(
++            agent_name: str,
++            request: Request,
++            _authority: None = Depends(_require_agent_authority),
++        ):
+             """Invoke a specific agent by name (n8n compatibility endpoint)."""
+             try:
+                 body = await request.json()
+@@ -987,11 +1031,9 @@
+     def _run_server(self, app: Any, host: str, port: int, reload: bool) -> None:
+         """Run the server with uvicorn."""
+         import uvicorn
+-        if reload:
+-            # Reload mode is a local development workflow.
+-            os.environ["PRAISONAI_CALL_BIND_HOST"] = "127.0.0.1"
+-        else:
+-            os.environ["PRAISONAI_CALL_BIND_HOST"] = host
++        # Record the address the listener is opened on.  Reload mode is a client
++        # convenience, not a bind address: the socket is still wide open.
++        os.environ["PRAISONAI_CALL_BIND_HOST"] = host
+         uvicorn.run(app, host=host, port=port, reload=reload)
+ 
+ 

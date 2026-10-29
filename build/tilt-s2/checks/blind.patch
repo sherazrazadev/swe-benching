@@ -1,0 +1,572 @@
+diff -ruN a/internal/cli/status.go b/internal/cli/status.go
+--- a/internal/cli/status.go	2026-10-28 15:32:11.000000000 +0000
++++ b/internal/cli/status.go	2026-10-28 16:36:58.639982754 +0000
+@@ -4,7 +4,6 @@
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+-	"net/http"
+ 
+ 	"github.com/spf13/cobra"
+ 	"k8s.io/cli-runtime/pkg/genericclioptions"
+@@ -24,27 +23,19 @@
+ }
+ 
+ func statusRun(streams genericclioptions.IOStreams) {
+-	url := apiURL("view")
+-	res, err := http.Get(url)
+-	if err != nil {
+-		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+-	}
+-	defer func() { _ = res.Body.Close() }()
+-
+-	if res.StatusCode != http.StatusOK {
+-		failWithNonOKResponse(url, res)
+-	}
++	body := apiGet("view")
++	defer func() { _ = body.Close() }()
+ 
+-	body, err := io.ReadAll(res.Body)
++	data, err := io.ReadAll(body)
+ 	if err != nil {
+-		cmdFail(fmt.Errorf("Error reading response from %s: %v", url, err))
++		cmdFail(fmt.Errorf("Error reading response from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	var view struct {
+ 		Resources []json.RawMessage `json:"resources"`
+ 	}
+-	if err := json.Unmarshal(body, &view); err != nil {
+-		cmdFail(fmt.Errorf("Error parsing view from %s: %v", url, err))
++	if err := json.Unmarshal(data, &view); err != nil {
++		cmdFail(fmt.Errorf("Error parsing view from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	_, _ = fmt.Fprintf(streams.Out, "%d resources\n", len(view.Resources))
+diff -ruN a/internal/cli/utils.go b/internal/cli/utils.go
+--- a/internal/cli/utils.go	2026-10-28 15:31:59.000000000 +0000
++++ b/internal/cli/utils.go	2026-10-28 16:36:55.391979341 +0000
+@@ -7,6 +7,9 @@
+ 	"net/http"
+ 	"os"
+ 	"strings"
++
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
+ )
+ 
+ func apiHost() string {
+@@ -18,24 +21,54 @@
+ 	return fmt.Sprintf("http://%s:%d/api/%s", provideWebHost(), provideWebPort(), path)
+ }
+ 
+-func apiGet(path string) (body io.ReadCloser) {
++// sessionToken returns the credential of the running session on this machine,
++// if there is one. It is the same value the session loaded from its data
++// directory at startup.
++func sessionToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.LoadToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
++// newAPIRequest builds a request to the running session and presents its
++// credential when one is available.
++func newAPIRequest(method, path string, body io.Reader) *http.Request {
+ 	url := apiURL(path)
+-	res, err := http.Get(url)
++	req, err := http.NewRequest(method, url, body)
+ 	if err != nil {
+-		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
++		cmdFail(fmt.Errorf("Could not build request for %s: %v", url, err))
++	}
++	if tok := sessionToken(); tok != "" {
++		req.Header.Set(token.HeaderName, tok)
++	}
++	return req
++}
++
++func apiGet(path string) (body io.ReadCloser) {
++	req := newAPIRequest(http.MethodGet, path, nil)
++	res, err := http.DefaultClient.Do(req)
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", req.URL, err))
+ 	}
+ 
+ 	if res.StatusCode != http.StatusOK {
+-		failWithNonOKResponse(url, res)
++		failWithNonOKResponse(req.URL.String(), res)
+ 	}
+ 	return res.Body
+ }
+ 
+ func apiPostJson(path string, payload []byte) (body io.ReadCloser, status int) {
+-	url := apiURL(path)
+-	res, err := http.Post(url, "application/json", bytes.NewBuffer(payload))
++	req := newAPIRequest(http.MethodPost, path, bytes.NewBuffer(payload))
++	req.Header.Set("Content-Type", "application/json")
++	res, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+-		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
++		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", req.URL, err))
+ 	}
+ 
+ 	return res.Body, res.StatusCode
+diff -ruN a/internal/hud/client/log_streamer.go b/internal/hud/client/log_streamer.go
+--- a/internal/hud/client/log_streamer.go	2026-10-28 15:31:59.000000000 +0000
++++ b/internal/hud/client/log_streamer.go	2026-10-28 16:37:07.878992080 +0000
+@@ -3,16 +3,22 @@
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
++	"net/http"
++	neturl "net/url"
++	"strings"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/pkg/errors"
+ 
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
++	"github.com/tilt-dev/tilt/internal/token"
+ 	"github.com/tilt-dev/tilt/pkg/logger"
+ 	"github.com/tilt-dev/tilt/pkg/model"
+ 	"github.com/tilt-dev/tilt/pkg/model/logstore"
+ 	proto_webview "github.com/tilt-dev/tilt/pkg/webview"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
+ )
+ 
+ type FollowFlag bool
+@@ -33,15 +39,82 @@
+ 	}
+ }
+ 
++// sessionCredential reads the running session's credential from the Tilt data
++// directory. It never mints a new value: without a live session there is
++// nothing to authenticate to.
++func sessionCredential() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.LoadToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
++// fetchStreamCredential obtains the CSRF value that /ws/view requires. The
++// server issues it only from /api/websocket_token, which is itself gated by the
++// session credential, so we present the credential we loaded from disk.
++func (ls *LogStreamer) fetchStreamCredential(ctx context.Context) (string, error) {
++	credential := sessionCredential()
++	if credential == "" {
++		return "", errors.New("no session credential available; is Tilt running?")
++	}
++
++	tokenURL := ls.url
++	if tokenURL.Scheme == "" {
++		tokenURL.Scheme = "http"
++	}
++	tokenURL.Path = "/api/websocket_token"
++	tokenURL.RawQuery = ""
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL.String(), nil)
++	if err != nil {
++		return "", errors.Wrap(err, "building websocket token request")
++	}
++	req.Header.Set(token.HeaderName, credential)
++
++	res, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return "", errors.Wrapf(err, "requesting websocket token from %s", tokenURL.String())
++	}
++	defer func() { _ = res.Body.Close() }()
++	if res.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("websocket token request failed: %s", res.Status)
++	}
++	b, err := io.ReadAll(res.Body)
++	if err != nil {
++		return "", errors.Wrap(err, "reading websocket token")
++	}
++	return strings.TrimSpace(string(b)), nil
++}
++
+ func (ls *LogStreamer) Stream(ctx context.Context) error {
+-	url := ls.url
+-	url.Scheme = "ws"
+-	url.Path = "/ws/view"
+-	logger.Get(ctx).Debugf("connecting to %s", url.String())
++	csrf, err := ls.fetchStreamCredential(ctx)
++	if err != nil {
++		return err
++	}
++
++	streamURL := ls.url
++	streamURL.Path = "/ws/view"
++	query, err := neturl.ParseQuery(streamURL.RawQuery)
++	if err != nil {
++		return errors.Wrap(err, "parsing websocket URL")
++	}
++	query.Set("csrf", csrf)
++	streamURL.RawQuery = query.Encode()
++	switch streamURL.Scheme {
++	case "https", "wss":
++		streamURL.Scheme = "wss"
++	default:
++		streamURL.Scheme = "ws"
++	}
++	logger.Get(ctx).Debugf("connecting to %s", streamURL.String())
+ 
+-	conn, _, err := websocket.DefaultDialer.Dial(url.String(), nil)
++	conn, _, err := websocket.DefaultDialer.Dial(streamURL.String(), nil)
+ 	if err != nil {
+-		return errors.Wrapf(err, "dialing websocket %s", url.String())
++		return errors.Wrapf(err, "dialing websocket %s", streamURL.String())
+ 	}
+ 	defer conn.Close()
+ 
+diff -ruN a/internal/hud/server/compat.go b/internal/hud/server/compat.go
+--- a/internal/hud/server/compat.go	2026-10-28 15:32:11.000000000 +0000
++++ b/internal/hud/server/compat.go	2026-10-28 16:36:40.083964982 +0000
+@@ -7,15 +7,19 @@
+ )
+ 
+ // registerLegacyRoutes keeps the pre-0.20 API endpoints available for scripts
+-// and extensions that still use them.
++// and extensions that still use them. They expose the same session state, so
++// they get the same guards as the endpoints they alias.
+ func (s *HeadsUpServer) registerLegacyRoutes(r *mux.Router) {
+-	r.HandleFunc("/api/v0/view", s.LegacyViewJSON)
+-	r.HandleFunc("/api/v0/trigger", s.LegacyTrigger).Methods("POST")
++	r.Handle("/api/v0/view", s.guardState(s.LegacyViewJSON))
++	r.Handle("/api/v0/trigger", s.guardState(s.LegacyTrigger)).Methods("POST")
+ }
+ 
+ // LegacyViewJSON serves the current view on the old endpoint.
+ func (s *HeadsUpServer) LegacyViewJSON(w http.ResponseWriter, req *http.Request) {
+-	if req.Header.Get("X-Tilt-Token") == "" {
++	// Scripts using this endpoint present the credential as a header. By the
++	// time we get here guardState has already checked that it is the session's
++	// credential, not merely that a header exists.
++	if req.Header.Get(TiltTokenHeaderName) == "" {
+ 		http.Error(w, "session token required", http.StatusForbidden)
+ 		return
+ 	}
+diff -ruN a/internal/hud/server/controller.go b/internal/hud/server/controller.go
+--- a/internal/hud/server/controller.go	2026-10-28 15:32:11.000000000 +0000
++++ b/internal/hud/server/controller.go	2026-10-28 16:36:49.259973268 +0000
+@@ -6,6 +6,7 @@
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"net"
+ 	"net/http"
+ 	"regexp"
+ 
+@@ -144,7 +145,7 @@
+ 	apiRouter.PathPrefix("/readyz").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/swagger").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/version").Handler(apiserverHandler)
+-	apiRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	apiRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 
+ 	var apiTLSConfig *tls.Config
+ 	if serving.Cert != nil {
+@@ -165,11 +166,16 @@
+ 	}
+ 
+ 	webRouter := mux.NewRouter()
+-	webRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	webRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 	// the path prefix here must be kept in sync with the prefix configured in the proxy handler
+ 	// (it needs to know what to strip before forwarding the request)
+-	webRouter.PathPrefix(apiServerProxyPrefix).Handler(proxyHandler)
+-	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(legacyProxyHandler)
++	//
++	// The proxy exposes the session's Kubernetes API state over the same
++	// listener, so it needs the same credential and origin checks as the HUD
++	// router. Both mounts are wrapped: gating only one would leave the other
++	// open.
++	webRouter.PathPrefix(apiServerProxyPrefix).Handler(s.hudServer.guardedHandler(proxyHandler))
++	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(s.hudServer.guardedHandler(legacyProxyHandler))
+ 	webRouter.PathPrefix("/").Handler(s.hudServer.Router())
+ 
+ 	s.webServer = &http.Server{
+@@ -305,5 +311,24 @@
+ 	return proxy.NewProxyHandler(prefix, fs, config, 0, false)
+ }
+ 
++// loopbackOnly restricts a handler to requests that arrived from the local
++// machine. It is used for the profiling endpoints, whose output describes the
++// process but for which there is no session credential to present.
++func loopbackOnly(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		host, _, err := net.SplitHostPort(r.RemoteAddr)
++		if err != nil {
++			http.Error(w, "forbidden", http.StatusForbidden)
++			return
++		}
++		ip := net.ParseIP(host)
++		if ip == nil || !ip.IsLoopback() {
++			http.Error(w, "forbidden", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ var _ store.SetUpper = &HeadsUpServerController{}
+ var _ store.TearDowner = &HeadsUpServerController{}
+diff -ruN a/internal/hud/server/server.go b/internal/hud/server/server.go
+--- a/internal/hud/server/server.go	2026-10-28 15:32:11.000000000 +0000
++++ b/internal/hud/server/server.go	2026-10-28 16:36:33.739959017 +0000
+@@ -2,11 +2,14 @@
+ 
+ import (
+ 	"context"
++	"crypto/subtle"
+ 	"encoding/json"
+ 	"fmt"
+ 	"log"
+ 	"net/http"
+ 	_ "net/http/pprof"
++	"net/url"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -22,13 +25,21 @@
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/internal/store"
+ 	"github.com/tilt-dev/tilt/internal/store/tiltfiles"
++	"github.com/tilt-dev/tilt/internal/token"
+ 	"github.com/tilt-dev/tilt/pkg/assets"
+ 	"github.com/tilt-dev/tilt/pkg/model"
+ 	proto_webview "github.com/tilt-dev/tilt/pkg/webview"
+ 	"github.com/tilt-dev/wmclient/pkg/analytics"
+ )
+ 
+-const TiltTokenCookieName = "Tilt-Token"
++const (
++	// TiltTokenCookieName is the cookie through which a browser receives the
++	// running session's credential.
++	TiltTokenCookieName = "Tilt-Token"
++	// TiltTokenHeaderName is the header through which local tooling presents
++	// the same credential.
++	TiltTokenHeaderName = token.HeaderName
++)
+ 
+ // CSRF token to protect the websocket. See:
+ // https://dev.solita.fi/2018/11/07/securing-websocket-endpoints.html
+@@ -81,17 +92,23 @@
+ 		ctrlClient: ctrlClient,
+ 	}
+ 
+-	r.HandleFunc("/api/view", s.ViewJSON)
+-	r.HandleFunc("/api/dump/engine", s.DumpEngineJSON)
+-	r.HandleFunc("/api/analytics", s.HandleAnalytics)
+-	r.HandleFunc("/api/analytics_opt", s.HandleAnalyticsOpt)
+-	r.HandleFunc("/api/trigger", s.HandleTrigger)
+-	r.HandleFunc("/api/override/trigger_mode", s.HandleOverrideTriggerMode)
++	// Every endpoint here reads or mutates the running session's state, so each
++	// one is guarded. The only unguarded route is the asset handler at the
++	// bottom: it is the page that hands a browser its credential in the first
++	// place, and it is not part of the session's state.
++	r.Handle("/api/view", s.guardState(s.ViewJSON))
++	r.Handle("/api/dump/engine", s.guardState(s.DumpEngineJSON))
++	r.Handle("/api/analytics", s.guardState(s.HandleAnalytics))
++	r.Handle("/api/analytics_opt", s.guardState(s.HandleAnalyticsOpt))
++	r.Handle("/api/trigger", s.guardState(s.HandleTrigger))
++	r.Handle("/api/override/trigger_mode", s.guardState(s.HandleOverrideTriggerMode))
+ 	// this endpoint is only used for testing snapshots in development
+-	r.HandleFunc("/api/snapshot/{snapshot_id}", s.SnapshotJSON)
+-	r.HandleFunc("/api/websocket_token", s.WebsocketToken)
+-	r.HandleFunc("/ws/view", s.ViewWebsocket)
+-	r.HandleFunc("/api/set_tiltfile_args", s.HandleSetTiltfileArgs).Methods("POST")
++	r.Handle("/api/snapshot/{snapshot_id}", s.guardState(s.SnapshotJSON))
++	r.Handle("/api/websocket_token", s.guardState(s.WebsocketToken))
++	// The stream authenticates with the single-use CSRF value issued by
++	// /api/websocket_token; it still must not be opened from a foreign origin.
++	r.Handle("/ws/view", originCheck(http.HandlerFunc(s.ViewWebsocket)))
++	r.Handle("/api/set_tiltfile_args", s.guardState(s.HandleSetTiltfileArgs)).Methods("POST")
+ 	s.registerLegacyRoutes(r)
+ 
+ 	r.PathPrefix("/").Handler(s.cookieWrapper(assetServer))
+@@ -110,12 +127,100 @@
+ func (s *HeadsUpServer) cookieWrapper(handler http.Handler) http.Handler {
+ 	return funcHandler{f: func(w http.ResponseWriter, r *http.Request) {
+ 		state := s.store.RLockState()
+-		http.SetCookie(w, &http.Cookie{Name: TiltTokenCookieName, Value: string(state.Token), Path: "/"})
++		http.SetCookie(w, &http.Cookie{
++			Name:     TiltTokenCookieName,
++			Value:    string(state.Token),
++			Path:     "/",
++			SameSite: http.SameSiteStrictMode,
++		})
+ 		s.store.RUnlockState()
+ 		handler.ServeHTTP(w, r)
+ 	}}
+ }
+ 
++// guardState wraps a handler for an endpoint that reads or mutates session
++// state with both required checks: the request must not declare a foreign
++// origin, and it must present the running session's credential.
++func (s *HeadsUpServer) guardState(h http.HandlerFunc) http.Handler {
++	return s.guardedHandler(http.HandlerFunc(h))
++}
++
++// guardedHandler is guardState for an arbitrary http.Handler (e.g. the
++// Kubernetes API proxy mounted outside the HUD router).
++func (s *HeadsUpServer) guardedHandler(h http.Handler) http.Handler {
++	return originCheck(s.requireSessionToken(h))
++}
++
++// requireSessionToken refuses the request unless it carries the value the
++// running session holds as its credential. The value is accepted from the
++// X-Tilt-Token header (local tooling) or the Tilt-Token cookie (browser), and
++// must match exactly; a header is never treated as proof merely by being
++// present, and a forged value is not the credential.
++func (s *HeadsUpServer) requireSessionToken(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !s.holdsSessionToken(r) {
++			http.Error(w, "session token required", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++func (s *HeadsUpServer) holdsSessionToken(r *http.Request) bool {
++	state := s.store.RLockState()
++	expected := string(state.Token)
++	s.store.RUnlockState()
++
++	// An unset credential must never authorize anything: otherwise an empty
++	// candidate would match an empty session token.
++	if expected == "" {
++		return false
++	}
++
++	presented := r.Header.Get(TiltTokenHeaderName)
++	if presented == "" {
++		cookie, err := r.Cookie(TiltTokenCookieName)
++		if err != nil {
++			return false
++		}
++		presented = cookie.Value
++	}
++	if presented == "" {
++		return false
++	}
++	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
++}
++
++// originCheck rejects a request that declares an Origin other than the one it
++// was actually sent to. Browsers attach Origin to cross-origin requests, which
++// is what makes this a CSRF defence; the product's command-line clients send
++// no Origin at all and are unaffected.
++func originCheck(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !sameOrigin(r) {
++			http.Error(w, "cross-origin request refused", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++func sameOrigin(r *http.Request) bool {
++	declared := r.Header.Get("Origin")
++	if declared == "" {
++		return true
++	}
++	u, err := url.Parse(declared)
++	if err != nil || u.Host == "" {
++		return false
++	}
++	scheme := "http"
++	if r.TLS != nil {
++		scheme = "https"
++	}
++	return strings.EqualFold(u.Scheme, scheme) && strings.EqualFold(u.Host, r.Host)
++}
++
+ func (s *HeadsUpServer) Router() http.Handler {
+ 	return s.router
+ }
+diff -ruN a/internal/hud/server/websocket.go b/internal/hud/server/websocket.go
+--- a/internal/hud/server/websocket.go	2026-10-28 15:31:59.000000000 +0000
++++ b/internal/hud/server/websocket.go	2026-10-28 16:36:36.900962079 +0000
+@@ -15,7 +15,6 @@
+ 	"k8s.io/client-go/util/workqueue"
+ 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+-	"github.com/tilt-dev/tilt/internal/hud/server/gorilla"
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/internal/store"
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -38,21 +37,15 @@
+ 	// a mobile network.
+ 	EnableCompression: false,
+ 
+-	// Allow the connection if either:
++	// The stream is open only to a client that presents the CSRF value issued
++	// by /api/websocket_token. That endpoint itself requires the session
++	// credential, so the CSRF value is never handed out for free.
+ 	//
+-	// 1) The client has a CSRF token, or
+-	// 2) The origin matches what we expect.
+-	//
+-	// Once a few releases have gone by we should remove the origin check.
+-	// (since we know some tilt users expect tabs to stay open
+-	// across releases).
++	// There is deliberately no origin fallback: an absent Origin header used to
++	// count as success, which let any local process read the whole stream.
++	// Declaring the same origin is likewise not a credential.
+ 	CheckOrigin: func(req *http.Request) bool {
+-		if websocketCSRFToken.String() == req.URL.Query().Get("csrf") {
+-			return true
+-		}
+-
+-		// If the CSRF check fails, fallback to an origin check.
+-		return gorilla.CheckSameOrigin(req)
++		return req.URL.Query().Get("csrf") == websocketCSRFToken.String()
+ 	},
+ }
+ 
+diff -ruN a/internal/token/token.go b/internal/token/token.go
+--- a/internal/token/token.go	2026-10-28 15:31:59.000000000 +0000
++++ b/internal/token/token.go	2026-10-28 16:36:20.112945551 +0000
+@@ -10,6 +10,10 @@
+ 
+ const tokenFileName = "token"
+ 
++// HeaderName is the request header that local tooling uses to present the
++// running session's credential.
++const HeaderName = "X-Tilt-Token"
++
+ type Token string
+ 
+ func (t Token) String() string {
+@@ -33,6 +37,13 @@
+ 	return token, nil
+ }
+ 
++// LoadToken reads the credential a running session stored in dir. Unlike
++// GetOrCreateToken it never mints a new value, so a client with no session to
++// talk to simply has no credential to present.
++func LoadToken(dir *dirs.TiltDevDir) (Token, error) {
++	return getExistingToken(dir)
++}
++
+ func getExistingToken(dir *dirs.TiltDevDir) (Token, error) {
+ 	token, err := dir.ReadFile(tokenFileName)
+ 	if err != nil {

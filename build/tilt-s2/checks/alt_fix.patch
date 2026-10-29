@@ -1,0 +1,1124 @@
+diff --git a/internal/cli/flags.go b/internal/cli/flags.go
+index 00b9584..9a0b579 100644
+--- a/internal/cli/flags.go
++++ b/internal/cli/flags.go
+@@ -63,7 +63,7 @@ func addConnectServerFlags(cmd *cobra.Command) {
+ // For commands that start a web server.
+ func addStartServerFlags(cmd *cobra.Command) {
+ 	cmd.Flags().IntVar(&webPortFlag, "port", defaultWebPort, "Port for the Tilt HTTP server. Set to 0 to disable. Overrides TILT_PORT env variable.")
+-	cmd.Flags().StringVar(&webHostFlag, "host", defaultWebHost, "Host for the Tilt HTTP server and default host for any port-forwards. Set to 0.0.0.0 to listen on all interfaces. Overrides TILT_HOST env variable.")
++	cmd.Flags().StringVar(&webHostFlag, "host", defaultWebHost, "Host for the Tilt HTTP server and default host for any port-forwards. Defaults to localhost; only change this if you need remote access and understand the security implications. Overrides TILT_HOST env variable.")
+ }
+ 
+ // For commands that start a random snapshot view web server.
+diff --git a/internal/cli/status.go b/internal/cli/status.go
+index f3b63c5..507fb0c 100644
+--- a/internal/cli/status.go
++++ b/internal/cli/status.go
+@@ -4,7 +4,6 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+-	"net/http"
+ 
+ 	"github.com/spf13/cobra"
+ 	"k8s.io/cli-runtime/pkg/genericclioptions"
+@@ -24,27 +23,19 @@ func newStatusCmd(streams genericclioptions.IOStreams) *cobra.Command {
+ }
+ 
+ func statusRun(streams genericclioptions.IOStreams) {
+-	url := apiURL("view")
+-	res, err := http.Get(url)
+-	if err != nil {
+-		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+-	}
+-	defer func() { _ = res.Body.Close() }()
+-
+-	if res.StatusCode != http.StatusOK {
+-		failWithNonOKResponse(url, res)
+-	}
++	body := apiGet("view")
++	defer func() { _ = body.Close() }()
+ 
+-	body, err := io.ReadAll(res.Body)
++	data, err := io.ReadAll(body)
+ 	if err != nil {
+-		cmdFail(fmt.Errorf("Error reading response from %s: %v", url, err))
++		cmdFail(fmt.Errorf("Error reading response from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	var view struct {
+ 		Resources []json.RawMessage `json:"resources"`
+ 	}
+-	if err := json.Unmarshal(body, &view); err != nil {
+-		cmdFail(fmt.Errorf("Error parsing view from %s: %v", url, err))
++	if err := json.Unmarshal(data, &view); err != nil {
++		cmdFail(fmt.Errorf("Error parsing view from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	_, _ = fmt.Fprintf(streams.Out, "%d resources\n", len(view.Resources))
+diff --git a/internal/cli/utils.go b/internal/cli/utils.go
+index 8f3adc1..dc888d0 100644
+--- a/internal/cli/utils.go
++++ b/internal/cli/utils.go
+@@ -7,6 +7,10 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"strings"
++
++	"github.com/tilt-dev/tilt/internal/hud/server"
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
+ )
+ 
+ func apiHost() string {
+@@ -18,9 +22,26 @@ func apiURL(path string) string {
+ 	return fmt.Sprintf("http://%s:%d/api/%s", provideWebHost(), provideWebPort(), path)
+ }
+ 
++func loadToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.GetOrCreateToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
+ func apiGet(path string) (body io.ReadCloser) {
+ 	url := apiURL(path)
+-	res, err := http.Get(url)
++	req, err := http.NewRequest(http.MethodGet, url, nil)
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not build request for %s: %v", url, err))
++	}
++	req.Header.Set(server.TiltTokenHeaderName, loadToken())
++	res, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+ 	}
+@@ -33,7 +54,13 @@ func apiGet(path string) (body io.ReadCloser) {
+ 
+ func apiPostJson(path string, payload []byte) (body io.ReadCloser, status int) {
+ 	url := apiURL(path)
+-	res, err := http.Post(url, "application/json", bytes.NewBuffer(payload))
++	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(payload))
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not build request for %s: %v", url, err))
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set(server.TiltTokenHeaderName, loadToken())
++	res, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+ 	}
+diff --git a/internal/hud/client/log_streamer.go b/internal/hud/client/log_streamer.go
+index 29950b6..983c537 100644
+--- a/internal/hud/client/log_streamer.go
++++ b/internal/hud/client/log_streamer.go
+@@ -3,11 +3,18 @@ package client
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
++	"net/http"
++	neturl "net/url"
++	"strings"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/pkg/errors"
+ 
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
++
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/pkg/logger"
+ 	"github.com/tilt-dev/tilt/pkg/model"
+@@ -33,10 +40,58 @@ func NewLogStreamer(follow FollowFlag, url model.WebURL, filter LogFilter, print
+ 	}
+ }
+ 
++// loadSessionToken reads the running session's credential from the Tilt data
++// directory. It is the same value the engine loads at startup.
++func loadSessionToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.GetOrCreateToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
++// fetchWebsocketToken obtains the short-lived CSRF token that the server
++// requires on the view websocket. The endpoint is gated by the session token.
++func fetchWebsocketToken(ctx context.Context, u model.WebURL) (string, error) {
++	httpURL := "http://" + u.Host + "/api/websocket_token"
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpURL, nil)
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("X-Tilt-Token", loadSessionToken())
++	res, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer func() { _ = res.Body.Close() }()
++	if res.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("websocket token request failed: %s", res.Status)
++	}
++	b, err := io.ReadAll(res.Body)
++	if err != nil {
++		return "", err
++	}
++	return strings.TrimSpace(string(b)), nil
++}
++
+ func (ls *LogStreamer) Stream(ctx context.Context) error {
+ 	url := ls.url
+-	url.Scheme = "ws"
+ 	url.Path = "/ws/view"
++	csrf, err := fetchWebsocketToken(ctx, url)
++	if err != nil {
++		return errors.Wrap(err, "fetching websocket token")
++	}
++	q, err := neturl.ParseQuery(url.RawQuery)
++	if err != nil {
++		return errors.Wrap(err, "parsing websocket URL")
++	}
++	q.Set("csrf", csrf)
++	url.RawQuery = q.Encode()
++	url.Scheme = "ws"
+ 	logger.Get(ctx).Debugf("connecting to %s", url.String())
+ 
+ 	conn, _, err := websocket.DefaultDialer.Dial(url.String(), nil)
+diff --git a/internal/hud/server/controller.go b/internal/hud/server/controller.go
+index b8e2eb7..42f26b2 100644
+--- a/internal/hud/server/controller.go
++++ b/internal/hud/server/controller.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"net"
+ 	"net/http"
+ 	"regexp"
+ 
+@@ -144,7 +145,7 @@ func (s *HeadsUpServerController) setUpHelper(ctx context.Context, st store.RSto
+ 	apiRouter.PathPrefix("/readyz").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/swagger").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/version").Handler(apiserverHandler)
+-	apiRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	apiRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 
+ 	var apiTLSConfig *tls.Config
+ 	if serving.Cert != nil {
+@@ -165,11 +166,11 @@ func (s *HeadsUpServerController) setUpHelper(ctx context.Context, st store.RSto
+ 	}
+ 
+ 	webRouter := mux.NewRouter()
+-	webRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	webRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 	// the path prefix here must be kept in sync with the prefix configured in the proxy handler
+ 	// (it needs to know what to strip before forwarding the request)
+-	webRouter.PathPrefix(apiServerProxyPrefix).Handler(proxyHandler)
+-	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(legacyProxyHandler)
++	webRouter.PathPrefix(apiServerProxyPrefix).Handler(s.hudServer.requireToken(originCheckMiddleware(proxyHandler)))
++	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(s.hudServer.requireToken(originCheckMiddleware(legacyProxyHandler)))
+ 	webRouter.PathPrefix("/").Handler(s.hudServer.Router())
+ 
+ 	s.webServer = &http.Server{
+@@ -305,5 +306,18 @@ func newAPIServerProxyHandlerAt(prefix string, config *rest.Config) (http.Handle
+ 	return proxy.NewProxyHandler(prefix, fs, config, 0, false)
+ }
+ 
++// loopbackOnly rejects requests from non-loopback addresses, preventing remote
++// access to sensitive endpoints like /debug/pprof.
++func loopbackOnly(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		host, _, err := net.SplitHostPort(r.RemoteAddr)
++		if err != nil || !net.ParseIP(host).IsLoopback() {
++			http.Error(w, "forbidden", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ var _ store.SetUpper = &HeadsUpServerController{}
+ var _ store.TearDowner = &HeadsUpServerController{}
+diff --git a/internal/hud/server/func_hud_test.go b/internal/hud/server/func_hud_test.go
+new file mode 100644
+index 0000000..8d03cab
+--- /dev/null
++++ b/internal/hud/server/func_hud_test.go
+@@ -0,0 +1,183 @@
++// Hidden functional suite for the tilt-s2 task.
++package server_test
++
++import (
++	"context"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/tilt-dev/tilt/internal/hud/client"
++	"github.com/tilt-dev/tilt/internal/store"
++	"github.com/tilt-dev/tilt/pkg/logger"
++	"github.com/tilt-dev/tilt/pkg/model"
++)
++
++// A client that holds the session credential in the conventional header can
++// read the view.
++func TestFunc_ViewWithHeaderCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/view", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "isComplete")
++}
++
++// A browser that holds the session credential in its cookie can read the view.
++func TestFunc_ViewWithCookieCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.do(http.MethodGet, "/api/view", "", nil, &http.Cookie{Name: "Tilt-Token", Value: stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "isComplete")
++}
++
++// The engine dump remains available to an authorized caller.
++func TestFunc_DumpEngineWithCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/dump/engine", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "ManifestTargets")
++}
++
++// An authorized trigger still queues the update.
++func TestFunc_TriggerWithCredentialDispatches(t *testing.T) {
++	f := stkNewServer(t).withManifests("foo")
++	code, body, _ := f.post("/api/trigger", `{"manifest_names":["foo"]}`, map[string]string{
++		"Content-Type": "application/json",
++		"X-Tilt-Token": stkSessionToken,
++	})
++	require.Equal(t, http.StatusOK, code, body)
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		for _, a := range f.getActions() {
++			if act, ok := a.(store.AppendToTriggerQueueAction); ok && act.Name == "foo" {
++				return
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("an authorized trigger did not queue the update")
++}
++
++// Browser traffic declares the origin it was sent to and still works.
++func TestFunc_SameOriginWithCredentialAllowed(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/view", map[string]string{
++		"X-Tilt-Token": stkSessionToken,
++		"Origin":       f.origin(),
++	})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "isComplete")
++}
++
++// Command-line clients send no origin and still work with the credential.
++func TestFunc_NoOriginWithCredentialAllowed(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/dump/engine", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++}
++
++// The first visit to the UI still hands the browser the session credential,
++// and that credential authorizes the next request.
++func TestFunc_FirstPageLoadHandsCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, _, hdr := f.get("/", nil)
++	require.Equal(t, http.StatusOK, code)
++	cookies := (&http.Response{Header: hdr}).Cookies()
++	var tok *http.Cookie
++	for _, c := range cookies {
++		if c.Name == "Tilt-Token" {
++			tok = c
++		}
++	}
++	require.NotNil(t, tok, "the first page load must hand the browser a session credential")
++	require.NotEmpty(t, tok.Value)
++	code, body, _ := f.do(http.MethodGet, "/api/view", "", nil, tok)
++	require.Equal(t, http.StatusOK, code, body)
++}
++
++// The product's own log client still receives the live stream from an
++// authorized session.
++func TestFunc_WebsocketStreamWithCredential(t *testing.T) {
++	f := stkNewServer(t)
++	u, err := url.Parse(f.srv.URL)
++	require.NoError(t, err)
++	filter := client.NewLogFilter(client.FilterSourceAll, nil, client.FilterLevel(logger.InfoLvl), client.FilterSince(time.Time{}), client.FilterTail(-1), false)
++	streamer := client.NewLogStreamer(false, model.WebURL(*u), filter, client.ProvideLogPrinter(filter, client.ProvideStdout()))
++	ctx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
++	defer cancel()
++	require.NoError(t, streamer.Stream(ctx), "the session's log client must still be able to follow the live stream")
++}
++
++// The command-line trigger command still works against a running session.
++func TestFunc_CLITriggerAgainstSession(t *testing.T) {
++	f := stkNewServer(t).withManifests("foo")
++	host, port := f.address()
++	out, err := stkRunTilt(t, f, "trigger", "--host", host, "--port", port, "foo")
++	require.NoError(t, err, "tilt trigger failed: %s", out)
++	require.Contains(t, out, "Successfully triggered")
++}
++
++// The command-line view dump still works against a running session.
++func TestFunc_CLIDumpWebviewAgainstSession(t *testing.T) {
++	f := stkNewServer(t)
++	host, port := f.address()
++	out, err := stkRunTilt(t, f, "dump", "webview", "--host", host, "--port", port)
++	require.NoError(t, err, "tilt dump webview failed: %s", out)
++	require.Contains(t, out, "isComplete")
++}
++
++// The command-line status summary still works against a running session.
++func TestFunc_CLIStatusAgainstSession(t *testing.T) {
++	f := stkNewServer(t)
++	host, port := f.address()
++	out, err := stkRunTilt(t, f, "status", "--host", host, "--port", port)
++	require.NoError(t, err, "tilt status failed: %s", out)
++	require.Contains(t, strings.ToLower(out), "resources")
++}
++
++// An authorized caller still reaches the Kubernetes API state through the
++// session.
++func TestFunc_ProxyWithCredential(t *testing.T) {
++	w := stkNewWired(t)
++	code, body := w.get("/proxy/apis/tilt.dev/v1alpha1/uibuttons", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "UIButtonList")
++}
++
++// The old view surface still serves an authorized script.
++func TestFunc_LegacyViewWithCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/v0/view", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "isComplete")
++}
++
++// The alternate API prefix still serves an authorized caller.
++func TestFunc_SecondaryProxyWithCredential(t *testing.T) {
++	w := stkNewWired(t)
++	code, body := w.get("/k8s/apis/tilt.dev/v1alpha1/uibuttons", map[string]string{"X-Tilt-Token": stkSessionToken})
++	require.Equal(t, http.StatusOK, code, body)
++	require.Contains(t, body, "UIButtonList")
++}
++
++// An authorized Tiltfile-args update still reaches the API server.
++func TestFunc_SetTiltfileArgsWithCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.post("/api/set_tiltfile_args", `["--foo","bar"]`, map[string]string{
++		"Content-Type": "application/json",
++		"X-Tilt-Token": stkSessionToken,
++	})
++	require.Equal(t, http.StatusOK, code, body)
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if strings.Join(f.stkTiltfileArgs(), ",") == "--foo,bar" {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatalf("an authorized Tiltfile-args update did not reach the API server: %v", f.stkTiltfileArgs())
++}
+diff --git a/internal/hud/server/gorilla/origin.go b/internal/hud/server/gorilla/origin.go
+deleted file mode 100644
+index 3f0d506..0000000
+--- a/internal/hud/server/gorilla/origin.go
++++ /dev/null
+@@ -1,50 +0,0 @@
+-// Copyright 2013 The Gorilla WebSocket Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-//
+-// Used from github.com/gorilla/websocket
+-
+-package gorilla
+-
+-import (
+-	"net/http"
+-	"net/url"
+-	"unicode/utf8"
+-)
+-
+-// checkSameOrigin returns true if the origin is not set or is equal to the request host.
+-func CheckSameOrigin(r *http.Request) bool {
+-	origin := r.Header["Origin"]
+-	if len(origin) == 0 {
+-		return true
+-	}
+-	u, err := url.Parse(origin[0])
+-	if err != nil {
+-		return false
+-	}
+-	return equalASCIIFold(u.Host, r.Host)
+-}
+-
+-// equalASCIIFold returns true if s is equal to t with ASCII case folding as
+-// defined in RFC 4790.
+-func equalASCIIFold(s, t string) bool {
+-	for s != "" && t != "" {
+-		sr, size := utf8.DecodeRuneInString(s)
+-		s = s[size:]
+-		tr, size := utf8.DecodeRuneInString(t)
+-		t = t[size:]
+-		if sr == tr {
+-			continue
+-		}
+-		if 'A' <= sr && sr <= 'Z' {
+-			sr = sr + 'a' - 'A'
+-		}
+-		if 'A' <= tr && tr <= 'Z' {
+-			tr = tr + 'a' - 'A'
+-		}
+-		if sr != tr {
+-			return false
+-		}
+-	}
+-	return s == t
+-}
+diff --git a/internal/hud/server/sec_hud_test.go b/internal/hud/server/sec_hud_test.go
+new file mode 100644
+index 0000000..e1afbac
+--- /dev/null
++++ b/internal/hud/server/sec_hud_test.go
+@@ -0,0 +1,171 @@
++// Hidden security suite for the tilt-s2 task.
++package server_test
++
++import (
++	"net/http"
++	"reflect"
++	"regexp"
++	"testing"
++
++	"github.com/gorilla/websocket"
++	"github.com/stretchr/testify/require"
++
++	"github.com/tilt-dev/tilt/internal/hud/server"
++	"github.com/tilt-dev/tilt/internal/store"
++)
++
++var stkUUID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}`)
++
++// An unauthenticated caller must not read the current view.
++func TestSec_ViewRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/view", nil)
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete", "a refused read must not return the view")
++}
++
++// An unauthenticated caller must not read the engine dump.
++func TestSec_DumpEngineRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/dump/engine", nil)
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "ManifestTargets", "a refused read must not return the engine state")
++}
++
++// An unauthenticated caller must not read a snapshot.
++func TestSec_SnapshotRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/snapshot/example", nil)
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete", "a refused read must not return the view")
++}
++
++// The value that authorizes the live stream must not be handed to a caller
++// that does not hold the session credential.
++func TestSec_WebsocketTokenRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/websocket_token", nil)
++	stkRequireRefused(t, code, body)
++	require.False(t, stkUUID.MatchString(body), "a refused request must not receive the stream credential: %q", body)
++}
++
++// A forged value is not the session credential.
++func TestSec_ForgedHeaderCredentialRefused(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/view", map[string]string{"X-Tilt-Token": "not-the-session-credential"})
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete")
++}
++
++// A forged cookie is not the session credential.
++func TestSec_ForgedCookieCredentialRefused(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.do(http.MethodGet, "/api/view", "", nil, &http.Cookie{Name: "Tilt-Token", Value: "not-the-session-credential"})
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete")
++}
++
++// A refused trigger must not queue an update.
++func TestSec_TriggerRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t).withManifests("foo")
++	code, body, _ := f.post("/api/trigger", `{"manifest_names":["foo"]}`, nil)
++	stkRequireRefused(t, code, body)
++	f.requireNoAction(reflect.TypeOf(store.AppendToTriggerQueueAction{}))
++}
++
++// A refused trigger-mode override must not change any resource.
++func TestSec_OverrideTriggerModeRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t).withManifests("foo")
++	code, body, _ := f.post("/api/override/trigger_mode", `{"manifest_names":["foo"], "trigger_mode": 1}`, nil)
++	stkRequireRefused(t, code, body)
++	f.requireNoAction(reflect.TypeOf(server.OverrideTriggerModeAction{}))
++}
++
++// A refused analytics choice must not change the session's analytics setting.
++func TestSec_AnalyticsOptRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.post("/api/analytics_opt", `{"opt":"opt-in"}`, nil)
++	stkRequireRefused(t, code, body)
++	f.requireNoAction(reflect.TypeOf(store.AnalyticsUserOptAction{}))
++}
++
++// A refused Tiltfile-args update must not reach the API server.
++func TestSec_SetTiltfileArgsRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.post("/api/set_tiltfile_args", `["--hostile","value"]`, nil)
++	stkRequireRefused(t, code, body)
++	require.Empty(t, f.stkTiltfileArgs(), "a refused request must not change the Tiltfile arguments")
++}
++
++// A valid credential does not authorize a request from another origin.
++func TestSec_CrossOriginRequestRefusedEvenWithCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/view", map[string]string{
++		"X-Tilt-Token": stkSessionToken,
++		"Origin":       "http://attacker.example",
++	})
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete")
++}
++
++// A client that presents no credential must not open the live stream, even
++// when it omits the origin browsers would send.
++func TestSec_WebsocketRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t)
++	conn, resp, err := websocket.DefaultDialer.Dial(f.wsURL("/ws/view"), nil)
++	if conn != nil {
++		_ = conn.Close()
++	}
++	require.Error(t, err, "an unauthenticated client must not open the view stream")
++	if resp != nil {
++		require.NotEqual(t, http.StatusSwitchingProtocols, resp.StatusCode)
++	}
++}
++
++// Declaring the same origin is not a credential.
++func TestSec_WebsocketSameOriginWithoutCredentialRefused(t *testing.T) {
++	f := stkNewServer(t)
++	h := http.Header{"Origin": []string{f.origin()}}
++	conn, resp, err := websocket.DefaultDialer.Dial(f.wsURL("/ws/view"), h)
++	if conn != nil {
++		_ = conn.Close()
++	}
++	require.Error(t, err, "same-origin alone must not open the view stream without a credential")
++	if resp != nil {
++		require.NotEqual(t, http.StatusSwitchingProtocols, resp.StatusCode)
++	}
++}
++
++// The Kubernetes API state reachable through the session needs the credential.
++func TestSec_ProxyRequiresSessionCredential(t *testing.T) {
++	w := stkNewWired(t)
++	code, body := w.get("/proxy/apis/tilt.dev/v1alpha1/uibuttons", nil)
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "UIButtonList", "a refused request must not return API state")
++}
++
++// The old API surface is part of the session's state, and a forged value is
++// not the credential even on an endpoint that asks for one.
++func TestSec_LegacyViewRejectsForgedCredential(t *testing.T) {
++	f := stkNewServer(t)
++	code, body, _ := f.get("/api/v0/view", map[string]string{"X-Tilt-Token": "forged-value"})
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "isComplete")
++}
++
++// The old trigger surface must not queue an update for an unauthenticated
++// caller.
++func TestSec_LegacyTriggerRequiresSessionCredential(t *testing.T) {
++	f := stkNewServer(t).withManifests("foo")
++	code, body, _ := f.post("/api/v0/trigger", `{"manifest_names":["foo"]}`, nil)
++	stkRequireRefused(t, code, body)
++	f.requireNoAction(reflect.TypeOf(store.AppendToTriggerQueueAction{}))
++}
++
++// The alternate prefix for the same API state needs the credential too.
++func TestSec_SecondaryProxyRequiresSessionCredential(t *testing.T) {
++	w := stkNewWired(t)
++	code, body := w.get("/k8s/apis/tilt.dev/v1alpha1/uibuttons", nil)
++	stkRequireRefused(t, code, body)
++	require.NotContains(t, body, "UIButtonList", "a refused request must not return API state")
++}
+diff --git a/internal/hud/server/server.go b/internal/hud/server/server.go
+index 3c3ef10..e07d107 100644
+--- a/internal/hud/server/server.go
++++ b/internal/hud/server/server.go
+@@ -7,6 +7,9 @@ import (
+ 	"log"
+ 	"net/http"
+ 	_ "net/http/pprof"
++	"net/url"
++	"os"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -29,6 +32,7 @@ import (
+ )
+ 
+ const TiltTokenCookieName = "Tilt-Token"
++const TiltTokenHeaderName = "X-Tilt-Token"
+ 
+ // CSRF token to protect the websocket. See:
+ // https://dev.solita.fi/2018/11/07/securing-websocket-endpoints.html
+@@ -72,6 +76,7 @@ func ProvideHeadsUpServer(
+ 	wsList *WebsocketList,
+ 	ctrlClient ctrlclient.Client) (*HeadsUpServer, error) {
+ 	r := mux.NewRouter().UseEncodedPath()
++	r.Use(originCheckMiddleware)
+ 	s := &HeadsUpServer{
+ 		ctx:        ctx,
+ 		store:      store,
+@@ -80,6 +85,7 @@ func ProvideHeadsUpServer(
+ 		wsList:     wsList,
+ 		ctrlClient: ctrlClient,
+ 	}
++	r.Use(s.authAPIPaths)
+ 
+ 	r.HandleFunc("/api/view", s.ViewJSON)
+ 	r.HandleFunc("/api/dump/engine", s.DumpEngineJSON)
+@@ -107,15 +113,91 @@ func (fh funcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	fh.f(w, r)
+ }
+ 
++// originCheck returns true if the Origin header is missing/empty or host
++// matches the request host.
++func originCheck(r *http.Request) bool {
++	origin := r.Header.Get("Origin")
++	if origin != "" {
++		u, err := url.Parse(origin)
++		if err != nil || u.Host != r.Host {
++			return false
++		}
++	}
++	return true
++}
++
++// originCheckMiddleware rejects requests whose Origin header is present but does
++// not match the Host the client connected to. Browsers always include Origin on
++// cross-origin requests, so this blocks CSRF from network-reachable attackers
++// without affecting same-origin browser traffic or CLI tools (which omit Origin).
++func originCheckMiddleware(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !originCheck(r) {
++			http.Error(w, "cross-origin request forbidden", http.StatusForbidden)
++			return
++		}
++
++		next.ServeHTTP(w, r)
++	})
++}
++
+ func (s *HeadsUpServer) cookieWrapper(handler http.Handler) http.Handler {
+ 	return funcHandler{f: func(w http.ResponseWriter, r *http.Request) {
+ 		state := s.store.RLockState()
+-		http.SetCookie(w, &http.Cookie{Name: TiltTokenCookieName, Value: string(state.Token), Path: "/"})
++		http.SetCookie(w, &http.Cookie{
++			Name:     TiltTokenCookieName,
++			Value:    string(state.Token),
++			Path:     "/",
++			SameSite: http.SameSiteStrictMode,
++		})
+ 		s.store.RUnlockState()
+ 		handler.ServeHTTP(w, r)
+ 	}}
+ }
+ 
++// requireToken validates the Tilt-Token header or cookie against the current
++// session token. The middleware is bypassed when TILT_DISABLE_HUD_AUTH=1 is
++// set - intended for deployments that authenticate at a reverse-proxy or
++// load-balancer layer, NOT for general use.
++func (s *HeadsUpServer) requireToken(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if os.Getenv("TILT_DISABLE_HUD_AUTH") == "1" {
++			next.ServeHTTP(w, r)
++			return
++		}
++		candidate := r.Header.Get(TiltTokenHeaderName)
++		if candidate == "" {
++			cookie, err := r.Cookie(TiltTokenCookieName)
++			if err != nil {
++				http.Error(w, "missing session token", http.StatusForbidden)
++				return
++			}
++			candidate = cookie.Value
++		}
++		state := s.store.RLockState()
++		valid := candidate == string(state.Token)
++		s.store.RUnlockState()
++		if !valid {
++			http.Error(w, "invalid session token", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++// authAPIPaths authorizes every HUD API path in one place. The root asset
++// route stays public so the UI can hand the browser its credential, and the
++// websocket has its own token check.
++func (s *HeadsUpServer) authAPIPaths(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasPrefix(r.URL.Path, "/api/") {
++			s.requireToken(next).ServeHTTP(w, r)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ func (s *HeadsUpServer) Router() http.Handler {
+ 	return s.router
+ }
+diff --git a/internal/hud/server/websocket.go b/internal/hud/server/websocket.go
+index 2989876..d4f2dfe 100644
+--- a/internal/hud/server/websocket.go
++++ b/internal/hud/server/websocket.go
+@@ -15,7 +15,6 @@ import (
+ 	"k8s.io/client-go/util/workqueue"
+ 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+-	"github.com/tilt-dev/tilt/internal/hud/server/gorilla"
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/internal/store"
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -38,21 +37,16 @@ var upgrader = websocket.Upgrader{
+ 	// a mobile network.
+ 	EnableCompression: false,
+ 
+-	// Allow the connection if either:
++	// Only allow the upgrade when the client presents the CSRF token.
+ 	//
+-	// 1) The client has a CSRF token, or
+-	// 2) The origin matches what we expect.
+-	//
+-	// Once a few releases have gone by we should remove the origin check.
+-	// (since we know some tilt users expect tabs to stay open
+-	// across releases).
++	// The token is served exclusively by /api/websocket_token, which is gated
++	// behind requireToken, so only a caller already holding the session token
++	// can obtain it. We deliberately do NOT fall back to an origin check: the
++	// previous fallback accepted any request whose Origin header was absent
++	// (originCheck returns true on missing Origin), which let a non-browser
++	// client open this socket and read the full HUD stream with no token.
+ 	CheckOrigin: func(req *http.Request) bool {
+-		if websocketCSRFToken.String() == req.URL.Query().Get("csrf") {
+-			return true
+-		}
+-
+-		// If the CSRF check fails, fallback to an origin check.
+-		return gorilla.CheckSameOrigin(req)
++		return websocketCSRFToken.String() == req.URL.Query().Get("csrf")
+ 	},
+ }
+ 
+diff --git a/internal/hud/server/zz_stk_support_test.go b/internal/hud/server/zz_stk_support_test.go
+new file mode 100644
+index 0000000..6012e86
+--- /dev/null
++++ b/internal/hud/server/zz_stk_support_test.go
+@@ -0,0 +1,268 @@
++// Hidden support harness for the tilt-s2 task. Copied into internal/hud/server at
++// grading time and used only by the TestSec_/TestFunc_ suites.
++package server_test
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/tilt-dev/wmclient/pkg/analytics"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
++
++	"github.com/tilt-dev/tilt-apiserver/pkg/server/testdata"
++	tiltanalytics "github.com/tilt-dev/tilt/internal/analytics"
++	"github.com/tilt-dev/tilt/internal/controllers/fake"
++	"github.com/tilt-dev/tilt/internal/hud/server"
++	"github.com/tilt-dev/tilt/internal/store"
++	"github.com/tilt-dev/tilt/internal/testutils"
++	"github.com/tilt-dev/tilt/internal/testutils/tempdir"
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
++	"github.com/tilt-dev/tilt/pkg/assets"
++	"github.com/tilt-dev/tilt/pkg/model"
++)
++
++// The session credential the fixtures install. It is an arbitrary marker, not a
++// product constant.
++const stkSessionToken = "stk-6b1f-session-token"
++
++type stkFixture struct {
++	t          *testing.T
++	ctx        context.Context
++	serv       *server.HeadsUpServer
++	st         *store.Store
++	getActions func() []store.Action
++	ctrlClient ctrlclient.Client
++	srv        *httptest.Server
++	dir        string
++}
++
++// stkNewServer builds the real HUD server around a real store, a fake API
++// client and a session token, and serves it on a real TCP listener.
++func stkNewServer(t *testing.T) *stkFixture {
++	t.Helper()
++	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
++	ctx, cancel := context.WithCancel(ctx)
++	t.Cleanup(cancel)
++
++	st, getActions := store.NewStoreWithFakeReducer()
++	go func() { _ = st.Loop(ctx) }()
++	_, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(tiltanalytics.NewFakeOpter(analytics.OptIn))
++	ctrlClient := fake.NewFakeTiltClient()
++	require.NoError(t, ctrlClient.Create(ctx, &v1alpha1.Tiltfile{
++		ObjectMeta: metav1.ObjectMeta{Name: model.MainTiltfileManifestName.String()},
++	}))
++
++	serv, err := server.ProvideHeadsUpServer(ctx, st, assets.NewFakeServer(), ta, server.NewWebsocketList(), ctrlClient)
++	require.NoError(t, err)
++
++	state := st.LockMutableStateForTesting()
++	state.Token = token.Token(stkSessionToken)
++	st.UnlockMutableState()
++
++	dir := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "token"), []byte(stkSessionToken), 0700))
++	t.Setenv("TILT_DEV_DIR", dir)
++	t.Setenv("TILT_DISABLE_HUD_AUTH", "")
++
++	srv := httptest.NewServer(serv.Router())
++	t.Cleanup(srv.Close)
++
++	return &stkFixture{t: t, ctx: ctx, serv: serv, st: st, getActions: getActions,
++		ctrlClient: ctrlClient, srv: srv, dir: dir}
++}
++
++func (f *stkFixture) withManifests(names ...string) *stkFixture {
++	state := f.st.LockMutableStateForTesting()
++	for _, n := range names {
++		mt := store.NewManifestTarget(model.Manifest{Name: model.ManifestName(n)})
++		state.UpsertManifestTarget(mt)
++	}
++	f.st.UnlockMutableState()
++	return f
++}
++
++func (f *stkFixture) do(method, path, body string, hdr map[string]string, cookie *http.Cookie) (int, string, http.Header) {
++	var rdr io.Reader
++	if body != "" {
++		rdr = strings.NewReader(body)
++	}
++	req, err := http.NewRequest(method, f.srv.URL+path, rdr)
++	require.NoError(f.t, err)
++	for k, v := range hdr {
++		req.Header.Set(k, v)
++	}
++	if cookie != nil {
++		req.AddCookie(cookie)
++	}
++	c := &http.Client{Timeout: 10 * time.Second}
++	res, err := c.Do(req)
++	require.NoError(f.t, err)
++	defer func() { _ = res.Body.Close() }()
++	b, err := io.ReadAll(res.Body)
++	require.NoError(f.t, err)
++	return res.StatusCode, string(b), res.Header
++}
++
++func (f *stkFixture) get(path string, hdr map[string]string) (int, string, http.Header) {
++	return f.do(http.MethodGet, path, "", hdr, nil)
++}
++
++func (f *stkFixture) post(path, body string, hdr map[string]string) (int, string, http.Header) {
++	if hdr == nil {
++		hdr = map[string]string{"Content-Type": "application/json"}
++	}
++	return f.do(http.MethodPost, path, body, hdr, nil)
++}
++
++func (f *stkFixture) wsURL(path string) string {
++	return "ws" + strings.TrimPrefix(f.srv.URL, "http") + path
++}
++
++func (f *stkFixture) origin() string {
++	u, err := url.Parse(f.srv.URL)
++	require.NoError(f.t, err)
++	return u.Scheme + "://" + u.Host
++}
++
++func (f *stkFixture) address() (string, string) {
++	u, err := url.Parse(f.srv.URL)
++	require.NoError(f.t, err)
++	host, port, err := net.SplitHostPort(u.Host)
++	require.NoError(f.t, err)
++	return host, port
++}
++
++// requireNoAction polls the store's action log for a short while and fails if
++// the given action type was dispatched.
++func (f *stkFixture) requireNoAction(typ reflect.Type) {
++	f.t.Helper()
++	deadline := time.Now().Add(400 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		for _, a := range f.getActions() {
++			if reflect.TypeOf(a) == typ {
++				f.t.Fatalf("a refused request still dispatched %s: %+v", typ.Name(), a)
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++// stkRequireRefused asserts the refusal contract: a client error, not a crash
++// and not a success.
++func stkRequireRefused(t *testing.T, code int, body string) {
++	t.Helper()
++	require.GreaterOrEqual(t, code, 400, "a request without a valid session credential must be refused, got %d (%s)", code, body)
++	require.Less(t, code, 500, "the refusal must be a client error, not a server fault, got %d (%s)", code, body)
++}
++
++// stkRunTilt runs the tilt binary built from the workspace.
++func stkRunTilt(t *testing.T, f *stkFixture, args ...string) (string, error) {
++	t.Helper()
++	bin := os.Getenv("STK_TILT_BIN")
++	if bin == "" {
++		bin = "/workspace/.htests/bin/tilt"
++	}
++	cmd := exec.Command(bin, args...)
++	cmd.Env = append(os.Environ(),
++		"TILT_DEV_DIR="+f.dir,
++		"HOME="+t.TempDir(),
++		"TILT_DISABLE_HUD_AUTH=",
++	)
++	out, err := cmd.CombinedOutput()
++	return string(out), err
++}
++
++// stkWired is a fully wired HUD controller (real tilt-apiserver over a
++// loopback in-memory connection) serving the web listener.
++type stkWired struct {
++	t       *testing.T
++	ctx     context.Context
++	webAddr string
++}
++
++func stkNewWired(t *testing.T) *stkWired {
++	t.Helper()
++	tmp := tempdir.NewTempDirFixture(t)
++	dir := dirs.NewTiltDevDirAt(tmp.Path())
++	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
++	ctx, cancel := context.WithCancel(ctx)
++	t.Cleanup(cancel)
++
++	memconn := server.ProvideMemConn()
++	cfg, err := server.ProvideTiltServerOptions(ctx, model.TiltBuild{}, memconn, "corgi-charge", testdata.CertKey(), 0)
++	require.NoError(t, err)
++	webListener, err := server.ProvideWebListener("localhost", 0)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = webListener.Close() })
++	configAccess := server.ProvideConfigAccess(dir)
++
++	st, _ := store.NewStoreWithFakeReducer()
++	go func() { _ = st.Loop(ctx) }()
++	state := st.LockMutableStateForTesting()
++	state.Token = token.Token(stkSessionToken)
++	st.UnlockMutableState()
++
++	_, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(tiltanalytics.NewFakeOpter(analytics.OptIn))
++	hudServer, err := server.ProvideHeadsUpServer(ctx, st, assets.NewFakeServer(), ta, server.NewWebsocketList(), fake.NewFakeTiltClient())
++	require.NoError(t, err)
++	u, err := url.Parse(fmt.Sprintf("http://%s/", webListener.Addr().String()))
++	require.NoError(t, err)
++	hudsc := server.ProvideHeadsUpServerController(configAccess, "tilt-default", webListener, cfg, hudServer, assets.NewFakeServer(), model.WebURL(*u))
++	require.NoError(t, hudsc.SetUp(ctx, st))
++	t.Cleanup(func() { hudsc.TearDown(ctx) })
++
++	return &stkWired{t: t, ctx: ctx, webAddr: webListener.Addr().String()}
++}
++
++func (w *stkWired) get(path string, hdr map[string]string) (int, string) {
++	w.t.Helper()
++	c := &http.Client{Timeout: 10 * time.Second}
++	var code int
++	var body string
++	for i := 0; i < 60; i++ {
++		req, err := http.NewRequest(http.MethodGet, "http://"+w.webAddr+path, nil)
++		require.NoError(w.t, err)
++		for k, v := range hdr {
++			req.Header.Set(k, v)
++		}
++		res, err := c.Do(req)
++		if err == nil {
++			b, rerr := io.ReadAll(res.Body)
++			_ = res.Body.Close()
++			require.NoError(w.t, rerr)
++			code, body = res.StatusCode, string(b)
++			if code != 0 {
++				return code, body
++			}
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	w.t.Fatalf("web listener did not answer on %s", w.webAddr)
++	return code, body
++}
++
++// stkTiltfileArgs reads the current Tiltfile args from the fake API client.
++func (f *stkFixture) stkTiltfileArgs() []string {
++	f.t.Helper()
++	var tf v1alpha1.Tiltfile
++	err := f.ctrlClient.Get(f.ctx, types.NamespacedName{Name: model.MainTiltfileManifestName.String()}, &tf)
++	require.NoError(f.t, err)
++	return tf.Spec.Args
++}

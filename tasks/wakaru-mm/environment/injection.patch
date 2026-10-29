@@ -1,0 +1,212 @@
+diff --git a/crates/core/src/driver/unpack.rs b/crates/core/src/driver/unpack.rs
+index c2ba2d7..7fbcb4a 100644
+--- a/crates/core/src/driver/unpack.rs
++++ b/crates/core/src/driver/unpack.rs
+@@ -139,18 +139,50 @@ pub fn unpack_raw(source: &str, options: &DecompileOptions) -> Result<UnpackOutp
+         }
+     });
+     match result {
+-        Some(result) => Ok(UnpackOutput {
+-            modules: result
+-                .modules
+-                .into_iter()
+-                .map(|module| (module.filename, module.code))
+-                .collect(),
+-            warnings: Vec::new(),
+-        }),
+-        None => Ok(UnpackOutput {
+-            modules: vec![("module.js".to_string(), source.to_string())],
+-            warnings: Vec::new(),
+-        }),
++        Some(result) => Ok(with_sourcemap_module_names(
++            UnpackOutput {
++                modules: result
++                    .modules
++                    .into_iter()
++                    .map(|module| (module.filename, module.code))
++                    .collect(),
++                warnings: Vec::new(),
++            },
++            options.sourcemap.as_deref(),
++        )),
++        None => Ok(with_sourcemap_module_names(
++            UnpackOutput {
++                modules: vec![("module.js".to_string(), source.to_string())],
++                warnings: Vec::new(),
++            },
++            options.sourcemap.as_deref(),
++        )),
++    }
++}
++
++/// Recover the original module filenames from a supplied source map.
++///
++/// The map lists its original sources in the same order as the modules they
++/// produced, so when it covers every module the listed paths are used as the
++/// module filenames.
++fn with_sourcemap_module_names(mut output: UnpackOutput, sourcemap: Option<&[u8]>) -> UnpackOutput {
++    let Some(bytes) = sourcemap else {
++        return output;
++    };
++    let Ok(sm) = parse_sourcemap(bytes) else {
++        return output;
++    };
++    apply_sourcemap_module_names(&mut output, &sm);
++    output
++}
++
++fn apply_sourcemap_module_names(output: &mut UnpackOutput, sm: &sourcemap::SourceMap) {
++    let names = crate::sourcemap_rename::sourcemap_module_filenames(sm);
++    if names.len() < output.modules.len() {
++        return;
++    }
++    for ((slot, _), name) in output.modules.iter_mut().zip(names) {
++        *slot = name;
+     }
+ }
+ 
+@@ -203,6 +235,7 @@ pub fn unpack_files_raw(
+ 
+     let (modules, numeric_rewrite_plan) = prepare_multi_source_modules(modules);
+     emit_raw_modules_with_numeric_rewrites(modules, numeric_rewrite_plan)
++        .map(|output| with_sourcemap_module_names(output, options.sourcemap.as_deref()))
+ }
+ 
+ fn filename_for_fallback_input(filename: &str) -> String {
+@@ -1080,7 +1113,11 @@ fn unpack_multi_module_with_plan(
+         warnings.extend(module_warnings);
+     }
+ 
+-    Ok(UnpackOutput { modules, warnings })
++    let mut output = UnpackOutput { modules, warnings };
++    if let Some(sm) = parsed_sourcemap.as_ref() {
++        apply_sourcemap_module_names(&mut output, sm);
++    }
++    Ok(output)
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/core/src/sourcemap_rename.rs b/crates/core/src/sourcemap_rename.rs
+index 5611af0..e24f8ff 100644
+--- a/crates/core/src/sourcemap_rename.rs
++++ b/crates/core/src/sourcemap_rename.rs
+@@ -87,6 +87,32 @@ pub fn resolve_source_path(out_dir: &Path, source: &str) -> PathBuf {
+     result
+ }
+ 
++/// Best-effort recovery of the original module filenames from a source map's
++/// `sources` list. Entries are returned in the order the map lists them.
++pub fn sourcemap_module_filenames(sm: &SourceMap) -> Vec<String> {
++    (0..sm.get_source_count())
++        .filter_map(|i| sm.get_source(i))
++        .map(sanitize_module_source_name)
++        .collect()
++}
++
++fn sanitize_module_source_name(raw: &str) -> String {
++    let stripped = raw
++        .trim_start_matches("webpack://")
++        .trim_start_matches("webpack:///")
++        .trim_start_matches('/');
++    let sanitized = stripped.replace("../", "").replace("..\\", "");
++    let sanitized = sanitized
++        .trim_matches('/')
++        .trim_matches('\\')
++        .replace('\\', "/");
++    if sanitized.is_empty() {
++        "module.js".to_string()
++    } else {
++        sanitized
++    }
++}
++
+ /// Apply source-map-driven identifier renaming to `module`.
+ ///
+ /// Strategy:
+diff --git a/crates/core/src/unpacker/browserify.rs b/crates/core/src/unpacker/browserify.rs
+index 8ce82a1..1639f6a 100644
+--- a/crates/core/src/unpacker/browserify.rs
++++ b/crates/core/src/unpacker/browserify.rs
+@@ -74,8 +74,10 @@ fn extract_browserify_modules(
+             swc_core::ecma::ast::PropName::Num(Number { value, .. })
+                 if value.fract() == 0.0 && *value >= 0.0 =>
+             {
+-                *value as usize
++                format!("{}", *value as usize)
+             }
++            swc_core::ecma::ast::PropName::Str(value) => value.value.as_str()?.to_string(),
++            swc_core::ecma::ast::PropName::Ident(value) => value.sym.to_string(),
+             _ => return None,
+         };
+ 
+@@ -85,17 +87,21 @@ fn extract_browserify_modules(
+         let (factory, body_stmts) = extract_factory(module_parts)?;
+ 
+         let code = emit_browserify_module(&factory, body_stmts, cm.clone())?;
+-        let is_entry = entry_ids.contains(&module_id);
++        let is_entry = entry_ids.iter().any(|id| id == &module_id);
+         let filename = if is_entry && entry_ids.len() == 1 {
+             "entry.js".to_string()
+-        } else if is_entry {
+-            format!("entry-{module_id}.js")
++        } else if let Some(numeric_id) = module_id.parse::<usize>().ok() {
++            if is_entry {
++                format!("entry-{numeric_id}.js")
++            } else {
++                format!("module-{numeric_id}.js")
++            }
+         } else {
+-            format!("module-{module_id}.js")
++            sanitize_module_name(&module_id)
+         };
+ 
+         modules.push(UnpackedModule {
+-            id: module_id.to_string(),
++            id: module_id,
+             is_entry,
+             code,
+             filename,
+@@ -109,19 +115,36 @@ fn extract_browserify_modules(
+     Some(UnpackResult { modules })
+ }
+ 
+-fn extract_entry_ids(entry_array: &ArrayLit) -> Option<Vec<usize>> {
++/// Convert a module id that names a file into a relative output path.
++fn sanitize_module_name(raw: &str) -> String {
++    let stripped = raw.trim_start_matches("./");
++    let sanitized = stripped.replace("../", "").replace("..\\", "");
++    let sanitized = sanitized
++        .trim_matches('/')
++        .trim_matches('\\')
++        .replace('\\', "/");
++    if sanitized.is_empty() {
++        "module.js".to_string()
++    } else {
++        sanitized
++    }
++}
++
++fn extract_entry_ids(entry_array: &ArrayLit) -> Option<Vec<String>> {
+     let mut ids = Vec::new();
+     for elem in &entry_array.elems {
+         let Some(ExprOrSpread { expr, .. }) = elem else {
+             return None;
+         };
+-        let Expr::Lit(Lit::Num(Number { value, .. })) = &**expr else {
+-            return None;
+-        };
+-        if value.fract() != 0.0 || *value < 0.0 {
+-            return None;
++        match &**expr {
++            Expr::Lit(Lit::Num(Number { value, .. }))
++                if value.fract() == 0.0 && *value >= 0.0 =>
++            {
++                ids.push(format!("{}", *value as usize));
++            }
++            Expr::Lit(Lit::Str(value)) => ids.push(value.value.as_str()?.to_string()),
++            _ => return None,
+         }
+-        ids.push(*value as usize);
+     }
+     Some(ids)
+ }

@@ -1,0 +1,146 @@
+diff --git a/api/user/passkey.go b/api/user/passkey.go
+index d33a85f..12582f7 100644
+--- a/api/user/passkey.go
++++ b/api/user/passkey.go
+@@ -3,6 +3,7 @@ package user
+ import (
+ 	"encoding/base64"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/0xJacky/Nginx-UI/internal/user"
+ 	"github.com/0xJacky/Nginx-UI/model"
+ 	"github.com/0xJacky/Nginx-UI/query"
++	"github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/go-webauthn/webauthn/webauthn"
+ 	"github.com/google/uuid"
+@@ -63,6 +65,13 @@ func beginPasskeyPreAuthentication(c *gin.Context, currentUser *model.User) {
+ }
+ 
+ func FinishPasskeyPreAuthentication(c *gin.Context) {
++	if passkeyAttemptBlocked(c) {
++		c.JSON(http.StatusTooManyRequests, LoginResponse{
++			Message: "Max attempts",
++			Code:    ErrMaxAttempts,
++		})
++		return
++	}
+ 	if !passkey.Enabled() {
+ 		cosy.ErrHandler(c, user.ErrWebAuthnNotConfigured)
+ 		return
+@@ -70,6 +79,7 @@ func FinishPasskeyPreAuthentication(c *gin.Context) {
+ 	preAuthID := strings.TrimSpace(c.GetHeader("X-Passkey-Pre-Auth-ID"))
+ 	session, ok := takePasskeyPreAuthSession(preAuthID)
+ 	if !ok {
++		recordFailedPasskeyAttempt(c)
+ 		cosy.ErrHandler(c, user.ErrSessionNotFound)
+ 		return
+ 	}
+@@ -81,6 +91,7 @@ func FinishPasskeyPreAuthentication(c *gin.Context) {
+ 	}
+ 	credential, err := passkey.GetInstance().FinishLogin(currentUser, *session.SessionData, c.Request)
+ 	if err != nil {
++		recordFailedPasskeyAttempt(c)
+ 		cosy.ErrHandler(c, err)
+ 		return
+ 	}
+@@ -109,6 +120,29 @@ func FinishPasskeyPreAuthentication(c *gin.Context) {
+ 	})
+ }
+ 
++// passkeyAttemptAddress returns the address a passkey attempt is attributed to.
++func passkeyAttemptAddress(c *gin.Context) string {
++	host, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr))
++	if err != nil {
++		return strings.TrimSpace(c.Request.RemoteAddr)
++	}
++	return host
++}
++
++func passkeyAttemptBlocked(c *gin.Context) bool {
++	clientIP := passkeyAttemptAddress(c)
++	b := query.BanIP
++	banIP, _ := b.Where(b.IP.Eq(clientIP),
++		b.ExpiredAt.Gte(time.Now().Unix()),
++		b.Attempts.Gte(settings.AuthSettings.MaxAttempts),
++	).Count()
++	return banIP > 0
++}
++
++func recordFailedPasskeyAttempt(c *gin.Context) {
++	user.BanIP(passkeyAttemptAddress(c))
++}
++
+ func takePasskeyPreAuthSession(preAuthID string) (*passkeyPreAuthSession, bool) {
+ 	if preAuthID == "" {
+ 		return nil, false
+diff --git a/mcp/router.go b/mcp/router.go
+index fc8c087..d51f68c 100644
+--- a/mcp/router.go
++++ b/mcp/router.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/0xJacky/Nginx-UI/model"
+ 	"github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
++	"github.com/samber/lo"
+ )
+ 
+ var sensitiveMCPTools = map[string]struct{}{
+@@ -36,16 +37,51 @@ type mcpToolCallProbe struct {
+ }
+ 
+ func InitRouter(r *gin.Engine) {
+-	r.Any("/mcp", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+-	r.Any("/mcp_message", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp_message", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+ }
+ 
++// mcpIPWhiteList keeps the MCP endpoints on the same address allowlist as the
++// rest of the API.
++func mcpIPWhiteList() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		if len(settings.AuthSettings.IPWhiteList) == 0 {
++			c.Next()
++			return
++		}
++
++		clientIP := c.ClientIP()
++		if forwarded := forwardedClientIP(c.GetHeader("X-Forwarded-For")); forwarded != "" {
++			clientIP = forwarded
++		} else if realIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); realIP != "" {
++			clientIP = realIP
++		}
++
++		if clientIP == "127.0.0.1" || clientIP == "::1" ||
++			lo.Contains(settings.AuthSettings.IPWhiteList, clientIP) {
++			c.Next()
++			return
++		}
++
++		c.AbortWithStatus(http.StatusForbidden)
++	}
++}
++
++func forwardedClientIP(header string) string {
++	for _, part := range strings.Split(header, ",") {
++		if ip := strings.TrimSpace(part); ip != "" {
++			return ip
++		}
++	}
++	return ""
++}
++
+ func mcpAuthRequired() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		if c.Request.URL.Query().Has("node_secret") {

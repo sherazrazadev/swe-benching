@@ -1,0 +1,302 @@
+{
+ "slug": "praisonai-authn-inj",
+ "candidate": "screener-v2 entry 155: GHSA-2GPF-2492-Q9JH / CVE-2026-61435 (mervinpraison/praisonai)",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "d51073710a65c39a17e0cf85eb33d116599b9ef3 (direct parent of the published fix 2a855c470077c7d2e2479a575f7ef7f548d51c33); the pinned tree contains no test for this advisory; the fix commit adds tests/unit/test_security_outstanding_ghsas.py",
+  "entry_points": [
+   "call server (call.py): GET|POST / telephony webhook; WebSocket /media-stream; mounted agent router GET /api/v1/agents, POST /api/v1/agents/{id}/invoke, POST register, DELETE, GET info",
+   "`praisonai serve agents` (ServeHandler.cmd_agents -> _create_agents_app): mounted agent router on the same paths; POST {path} workflow route; POST /agents/{agent_name} compatibility route",
+   "start-up paths: call.run_server and ServeHandler._run_server"
+  ],
+  "sites": [
+   "src/praisonai/praisonai/api/agent_invoke.py:32,42-43 (landing, published)",
+   "src/praisonai/praisonai/api/call.py:137-154 (published)",
+   "src/praisonai/praisonai/api/call.py:177-181 (published)",
+   "src/praisonai/praisonai/cli/features/serve.py:294-302 (B, real upstream)",
+   "src/praisonai/praisonai/cli/features/serve.py:333-360,376-400 (B, real upstream)",
+   "src/praisonai/praisonai/cli/features/serve.py:39-46 (injected T5)",
+   "src/praisonai/praisonai/cli/features/serve.py:_run_server (injected T6)",
+   "src/praisonai/praisonai/api/call.py:run_server (injected T7)"
+  ],
+  "routes": [
+   "serve agents mounted router: confirmed reachable and bypassed at the pinned+injected tree (security test fails on nop)",
+   "serve agents compatibility routes: confirmed reachable and unauthenticated at the pinned tree when no API key is configured",
+   "telephony webhook/audio stream: confirmed fail-open at the pinned tree when no token is configured"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "src/praisonai/tests/unit/test_call_server_auth.py at the pinned commit: 2 passed (local venv, no network)",
+   "src/praisonai/tests/test_n8n_agent_invoke.py at the pinned commit: 9 passed; 7 pre-existing failures in TestAgentInvokeFastAPI, whose client assumes unauthenticated endpoint access while the pinned dependency already answers 503. The shipped project functional copy keeps the 7 tests that pass (registry/standalone/smoke) plus the project's token-required unit case."
+  ],
+  "local_runs": "pinned+injected: security 0/16, functional 21/21; oracle: security 16/16, functional 21/21; the full checks/*.patch matrix was run locally",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS (security 0/16 fail-on-vulnerable, functional 21/21 on pinned+injected)",
+   "oracle": "PASS (3 runs, reward 1.0 each, identical security/functional maps)",
+   "patches": "PASS (16/16 checks behaved as declared: 12 security_fail, 2 functional_fail, hardening and alternative pass at 1.0; blind patch written later by the blind-fix stage)"
+  }
+ },
+ "leak_terms": [
+  "verify_token",
+  "agent_invoke",
+  "CALL_SERVER_TOKEN",
+  "PRAISONAI_CALL_AUTH",
+  "PRAISONAI_CALL_BIND_HOST",
+  "PRAISONAI_SERVE_AUTH",
+  "_call_auth_disabled",
+  "_configured_bind_host",
+  "_install_api_key_middleware",
+  "_require_remote_authority",
+  "api_key",
+  "X-API-Key",
+  "n8n",
+  "media-stream",
+  "TwiML",
+  "Twilio",
+  "wss://",
+  "handle_incoming_call",
+  "handle_media_stream",
+  "run_server",
+  "_run_server",
+  "127.0.0.1",
+  "::1",
+  "localhost",
+  "serve agents",
+  "praisonai-call",
+  "Host header",
+  "X-Forwarded-Host",
+  "serve.py",
+  "call.py",
+  "agent_invoke.py"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-verify-host-header.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: decide locality from the request's host name (client controlled)"
+  },
+  {
+   "patch": "sf-bind-unset-allow.patch",
+   "expect": "security_fail",
+   "note": "treats an unknown bind address as loopback (fail open)"
+  },
+  {
+   "patch": "sf-no-call-handlers.patch",
+   "expect": "security_fail",
+   "note": "leaves the telephony webhook and audio stream fail-open when no token is configured"
+  },
+  {
+   "patch": "sf-serve-legacy-optout.patch",
+   "expect": "security_fail",
+   "note": "fixes the call server, keeps the old opt-out on the serve server's mounted router"
+  },
+  {
+   "patch": "sf-no-serve-n8n.patch",
+   "expect": "security_fail",
+   "note": "leaves the serve server's compatibility routes unprotected when no API key is configured"
+  },
+  {
+   "patch": "sf-no-serve-middleware-optout.patch",
+   "expect": "security_fail",
+   "note": "keeps the API-key opt-out reading the request's host name"
+  },
+  {
+   "patch": "sf-reload-producer.patch",
+   "expect": "security_fail",
+   "note": "keeps the reload start-up path claiming loopback on a wide bind"
+  },
+  {
+   "patch": "sf-call-producer.patch",
+   "expect": "security_fail",
+   "note": "keeps the non-public call start-up path claiming loopback on a wide bind"
+  },
+  {
+   "patch": "sf-crash-as-refusal.patch",
+   "expect": "security_fail",
+   "note": "crashes instead of a clean refusal"
+  },
+  {
+   "patch": "sf-one-verb.patch",
+   "expect": "security_fail",
+   "note": "applies the locality rule only to read requests; writes bypass it"
+  },
+  {
+   "patch": "sf-reads-only.patch",
+   "expect": "security_fail",
+   "note": "protects the single-agent compatibility route but not the workflow route"
+  },
+  {
+   "patch": "sf-listing-only.patch",
+   "expect": "security_fail",
+   "note": "guards the listing route only; invoke and unregister still bypass"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every agent request, including legitimate loopback use"
+  },
+  {
+   "patch": "ff-stream-url.patch",
+   "expect": "functional_fail",
+   "note": "drops the token from the telephony stream URL (adjacent behaviour)"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus constant-time credential comparison and normalised bind values"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "records the bind address in a module-level start-up context instead of the environment"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written later by the blind-fix stage"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "sf-crash-as-refusal.patch",
+  "wrong_resource": "sf-listing-only.patch",
+  "one_role_or_direction": "sf-one-verb.patch",
+  "reads_only": "sf-reads-only.patch",
+  "check_after_adjustment": "sf-verify-host-header.patch",
+  "unlisted_route": "sf-serve-legacy-optout.patch",
+  "malformed_identity": "sf-bind-unset-allow.patch",
+  "missing_authority": "sf-no-serve-n8n.patch",
+  "adjacent_api": "ff-stream-url.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_optout_locality",
+   "pattern": "A (landing)",
+   "shape": "authentication opt-out with a wide or unknown bind, plus a client-supplied local host name",
+   "where": "src/praisonai/praisonai/api/agent_invoke.py:32-43 (pinned); the fix is at src/praisonai/praisonai/api/agent_invoke.py:31-51",
+   "security_tests": [
+    "security/test_agent_router.py::test_opted_out_listing_refused_when_bind_is_unknown",
+    "security/test_agent_router.py::test_opted_out_listing_refused_on_non_local_bind",
+    "security/test_agent_router.py::test_opted_out_invoke_refused_and_agent_not_run",
+    "security/test_agent_router.py::test_opted_out_unregister_refused_and_registration_kept"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_serve_legit.py::test_loopback_optout_still_allows_listing",
+    "functional/test_call_legit.py::test_agent_router_with_token_works_on_public_bind"
+   ],
+   "security_fail_patch": "sf-bind-unset-allow.patch",
+   "realistic_because": "the reported site and the published upstream change"
+  },
+  {
+   "id": "T2_telephony_failopen",
+   "pattern": "A (far sites)",
+   "shape": "telephony token not configured: HTTP webhook GET and POST, and the audio-stream WebSocket",
+   "where": "src/praisonai/praisonai/api/call.py:137-154 and :177-181 (pinned); published fix sites",
+   "security_tests": [
+    "security/test_telephony.py::test_webhook_refused_when_no_token_is_configured",
+    "security/test_telephony.py::test_webhook_post_refused_when_no_token_is_configured",
+    "security/test_telephony.py::test_media_stream_refused_when_no_token_is_configured"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_call_legit.py::test_webhook_with_token_returns_stream_url_for_reached_host",
+    "functional/test_call_legit.py::test_webhook_accepts_bearer_token",
+    "functional/test_call_legit.py::test_webhook_accepts_post_with_token",
+    "functional/test_serve_legit.py::test_public_tunnel_still_serves_the_webhook_with_token"
+   ],
+   "security_fail_patch": "sf-no-call-handlers.patch",
+   "realistic_because": "published upstream fix sites; the webhook token was optional so a local demo works without configuration"
+  },
+  {
+   "id": "T3_serve_mount",
+   "pattern": "B (uncovered route)",
+   "shape": "`praisonai serve agents` on a wide bind with the opt-out; the same auth dependency, but the serving process never records its bind address",
+   "where": "src/praisonai/praisonai/cli/features/serve.py:294-302 (pinned, real upstream)",
+   "security_tests": [
+    "security/test_serve_router.py::test_serve_agents_listing_refused_on_public_bind",
+    "security/test_serve_router.py::test_serve_agents_invoke_refused_on_public_bind",
+    "security/test_serve_router.py::test_serve_agents_unregister_refused_on_public_bind"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_serve_legit.py::test_loopback_optout_still_allows_listing",
+    "functional/test_serve_legit.py::test_loopback_optout_still_allows_single_agent_invoke"
+   ],
+   "security_fail_patch": "sf-serve-legacy-optout.patch",
+   "realistic_because": "real, unmodified upstream code; a different server with its own optional API key and a loopback default, so a fixer can argue the Call API advisory does not cover it"
+  },
+  {
+   "id": "T4_serve_compat_routes",
+   "pattern": "B (uncovered route)",
+   "shape": "`praisonai serve agents` workflow and single-agent compatibility routes, no optional API key configured, wide bind",
+   "where": "src/praisonai/praisonai/cli/features/serve.py:317-374 and :376-400 (pinned, real upstream)",
+   "security_tests": [
+    "security/test_serve_n8n.py::test_single_agent_route_refused_on_public_bind",
+    "security/test_serve_n8n.py::test_workflow_route_refused_on_public_bind"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_serve_legit.py::test_loopback_optout_still_allows_single_agent_invoke",
+    "functional/test_serve_legit.py::test_loopback_optout_still_allows_workflow_route",
+    "functional/test_serve_legit.py::test_public_bind_with_api_key_allows_authenticated_call"
+   ],
+   "security_fail_patch": "sf-no-serve-n8n.patch",
+   "realistic_because": "real, unmodified upstream code; labelled as workflow-tool compatibility and guarded only by the optional API-key middleware, so a fixer can call it a different feature"
+  },
+  {
+   "id": "T5_api_key_optout",
+   "pattern": "injected sibling",
+   "shape": "API-key middleware opt-out with a key configured, wide bind, and a client-supplied local host name",
+   "where": "src/praisonai/praisonai/cli/features/serve.py:39-46 (injected copy)",
+   "security_tests": [
+    "security/test_serve_optout.py::test_optout_not_taken_from_local_host_name",
+    "security/test_serve_optout.py::test_optout_not_taken_from_loopback_ip_host_name"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_serve_legit.py::test_loopback_api_key_optout_still_skips_the_key",
+    "functional/test_serve_legit.py::test_public_bind_with_api_key_allows_authenticated_call"
+   ],
+   "security_fail_patch": "sf-no-serve-middleware-optout.patch",
+   "realistic_because": "mirrors the call API's documented opt-out in a neighbouring auth layer; the middleware only exists when an optional key is configured, so it looks like a legacy compatibility path"
+  },
+  {
+   "id": "T6_reload_bind",
+   "pattern": "injected sibling (producer off the check's path)",
+   "shape": "wide bind with the auto-reload development flag; the start-up path records loopback",
+   "where": "src/praisonai/praisonai/cli/features/serve.py:_run_server (injected copy)",
+   "security_tests": [
+    "security/test_startup_bind.py::test_reload_mode_does_not_claim_loopback"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_serve_legit.py::test_loopback_reload_optout_still_allows_listing"
+   ],
+   "security_fail_patch": "sf-reload-producer.patch",
+   "realistic_because": "auto-reload is a local development workflow, so recording loopback for it looks harmless"
+  },
+  {
+   "id": "T7_call_startup_bind",
+   "pattern": "injected sibling (producer off the check's path)",
+   "shape": "telephony server started without the public/tunnel flag; the start-up path records loopback while binding every interface",
+   "where": "src/praisonai/praisonai/api/call.py:run_server (injected copy)",
+   "security_tests": [
+    "security/test_startup_bind.py::test_telephony_server_does_not_claim_loopback"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_call_legit.py::test_started_call_server_with_token_serves_webhook"
+   ],
+   "security_fail_patch": "sf-call-producer.patch",
+   "realistic_because": "without the public/tunnel flag the server is only meant for local development, so assuming loopback reads as a safe default"
+  }
+ ],
+ "status": "built; static PASS, nop PASS, oracle PASS (3x identical), patches PASS (16/16); blind patch and FAIRNESS.md remain for the later stages"
+}

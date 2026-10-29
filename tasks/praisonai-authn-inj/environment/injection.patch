@@ -1,0 +1,42 @@
+diff --git a/src/praisonai/praisonai/api/call.py b/src/praisonai/praisonai/api/call.py
+index cc8839a..ab5d40d 100644
+--- a/src/praisonai/praisonai/api/call.py
++++ b/src/praisonai/praisonai/api/call.py
+@@ -358,8 +358,10 @@ def run_server(port: int, use_public: bool = False):
+     
+     if use_public:
+         setup_public_url(port)
++        os.environ["PRAISONAI_CALL_BIND_HOST"] = "0.0.0.0"
+     else:
+         print(f"Starting Praison AI Call Server on http://localhost:{port}")
++        os.environ["PRAISONAI_CALL_BIND_HOST"] = "127.0.0.1"
+     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+ 
+ def main(args=None):
+diff --git a/src/praisonai/praisonai/cli/features/serve.py b/src/praisonai/praisonai/cli/features/serve.py
+index fe7e637..5b1be09 100644
+--- a/src/praisonai/praisonai/cli/features/serve.py
++++ b/src/praisonai/praisonai/cli/features/serve.py
+@@ -39,6 +39,10 @@ def _install_api_key_middleware(
+             path = request.url.path
+             if path in public or path.startswith("/__praisonai__/"):
+                 return await call_next(request)
++            if os.environ.get("PRAISONAI_SERVE_AUTH", "").lower() == "disabled":
++                # Same opt-out as the call API, for servers reached on loopback.
++                if request.url.hostname in ("127.0.0.1", "localhost", "::1"):
++                    return await call_next(request)
+             auth = request.headers.get("Authorization", "")
+             header_key = request.headers.get("X-API-Key", "")
+             token = auth[7:] if auth.startswith("Bearer ") else header_key
+@@ -983,6 +987,11 @@ Launch PraisonAI servers with unified discovery support.
+     def _run_server(self, app: Any, host: str, port: int, reload: bool) -> None:
+         """Run the server with uvicorn."""
+         import uvicorn
++        if reload:
++            # Reload mode is a local development workflow.
++            os.environ["PRAISONAI_CALL_BIND_HOST"] = "127.0.0.1"
++        else:
++            os.environ["PRAISONAI_CALL_BIND_HOST"] = host
+         uvicorn.run(app, host=host, port=port, reload=reload)
+ 
+ 

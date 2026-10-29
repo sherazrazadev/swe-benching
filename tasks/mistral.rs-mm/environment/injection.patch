@@ -1,0 +1,100 @@
+diff --git a/mistralrs-server-core/src/chat_completion.rs b/mistralrs-server-core/src/chat_completion.rs
+index 2b19bc6..9e84cb2 100644
+--- a/mistralrs-server-core/src/chat_completion.rs
++++ b/mistralrs-server-core/src/chat_completion.rs
+@@ -727,18 +727,31 @@ pub async fn parse_request(
+                                     });
+                                 }
+                                 Some(MessageInnerContent(Either::Left(x))) if x == "image_url" => {
+-                                    items.push(ContentPart::Image {
+-                                        image_url: image_message
+-                                            .get("image_url")
+-                                            .as_ref()
+-                                            .context("Image sub-content must have `image_url` key.")?
+-                                            .as_ref()
+-                                            .right()
+-                                            .context("Image sub-content `image_url` key must be an object.")?
+-                                            .get("url")
+-                                            .context("Image sub-content `image_url` object must have a `url` key.")?
+-                                            .clone(),
+-                                    });
++                                    let image_object = image_message
++                                        .get("image_url")
++                                        .as_ref()
++                                        .context("Image sub-content must have `image_url` key.")?
++                                        .as_ref()
++                                        .right()
++                                        .context("Image sub-content `image_url` key must be an object.")?;
++                                    let source = if let Some(url) = image_object.get("url") {
++                                        url.clone()
++                                    } else if let Some(path) = image_object.get("path") {
++                                        // Mounted media can be named by path; inline it so the media
++                                        // loader receives a URL.
++                                        let bytes = tokio::fs::read(path).await.with_context(|| {
++                                            format!("Failed to read image path `{path}`")
++                                        })?;
++                                        format!(
++                                            "data:application/octet-stream;base64,{}",
++                                            STANDARD.encode(bytes)
++                                        )
++                                    } else {
++                                        anyhow::bail!(
++                                            "Image sub-content `image_url` object must have a `url` or `path` key."
++                                        )
++                                    };
++                                    items.push(ContentPart::Image { image_url: source });
+                                 }
+                                 Some(MessageInnerContent(Either::Left(x))) if x == "audio_url" => {
+                                     items.push(ContentPart::Audio {
+@@ -780,6 +793,7 @@ pub async fn parse_request(
+                                         file_id: file.get("file_id").cloned(),
+                                         file_data: file.get("file_data").cloned(),
+                                         file_url: file.get("file_url").cloned(),
++                                        file_path: file.get("file_path").cloned(),
+                                         filename: file.get("filename").cloned(),
+                                     };
+                                     if spec.file_url.is_some()
+diff --git a/mistralrs-server-core/src/input_files.rs b/mistralrs-server-core/src/input_files.rs
+index 76efe4b..b879da2 100644
+--- a/mistralrs-server-core/src/input_files.rs
++++ b/mistralrs-server-core/src/input_files.rs
+@@ -16,6 +16,8 @@ pub struct InputFileSpec {
+     pub file_id: Option<String>,
+     pub file_data: Option<String>,
+     pub file_url: Option<String>,
++    /// Server-local path to request material, for deployments that mount it on disk.
++    pub file_path: Option<String>,
+     pub filename: Option<String>,
+ }
+ 
+@@ -37,6 +39,21 @@ pub async fn resolve_input_file(
+         return Ok(file_from_bytes(filename, mime_type, source, bytes));
+     }
+ 
++    if let Some(file_path) = spec.file_path {
++        let bytes = tokio::fs::read(&file_path)
++            .await
++            .with_context(|| format!("Failed to read input_file.file_path `{file_path}`"))?;
++        let (bytes, mime_type) = ensure_size(bytes, None)?;
++        let filename = spec.filename.unwrap_or_else(|| {
++            std::path::Path::new(&file_path)
++                .file_name()
++                .and_then(|name| name.to_str())
++                .unwrap_or("input_file")
++                .to_string()
++        });
++        return Ok(file_from_bytes(filename, mime_type, source, bytes));
++    }
++
+     if let Some(file_url) = spec.file_url {
+         let (bytes, mime_type, filename) = fetch_file_url(&file_url).await?;
+         let filename = spec
+@@ -47,7 +64,7 @@ pub async fn resolve_input_file(
+     }
+ 
+     Err(anyhow::anyhow!(
+-        "Input file requires one of `file_id`, `file_data`, or `file_url`."
++        "Input file requires one of `file_id`, `file_data`, `file_url`, or `file_path`."
+     ))
+ }
+ 

@@ -1,0 +1,367 @@
+--- a/crates/cli/src/main.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/cli/src/main.rs	2026-10-28 15:58:31.921428551 +0000
+@@ -1,6 +1,6 @@
+ use std::fs;
+ use std::io::{self, IsTerminal, Read};
+-use std::path::{Path, PathBuf};
++use std::path::{Component, Path, PathBuf};
+ 
+ use anyhow::{bail, Context, Result};
+ use clap::{Args, Parser, Subcommand, ValueEnum};
+@@ -212,6 +212,8 @@
+ 
+         let out_dir = cli.output.expect("checked above");
+         ensure_output_dir(&out_dir, cli.force)?;
++        // Resolve the chosen root once; every path below is checked against it.
++        let out_dir = canonical_output_dir(&out_dir)?;
+ 
+         let output = if inputs.len() == 1 {
+             let input = inputs.into_iter().next().expect("checked input length");
+@@ -236,24 +238,14 @@
+         let resolved: Vec<(PathBuf, &str)> = pairs
+             .iter()
+             .map(|(filename, code)| {
+-                let out_path = deduplicate_path(&out_dir.join(filename), &mut seen);
+-                (out_path, code.as_str())
++                let relative = relative_module_path(filename)?;
++                let relative = deduplicate_path(&relative, &mut seen);
++                let out_path = resolve_beneath(&out_dir, &relative, "module name")?;
++                Ok((out_path, code.as_str()))
+             })
+-            .collect();
++            .collect::<Result<_>>()?;
+ 
+-        // Batch-create all unique parent directories.
+-        let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+-        for (path, _) in &resolved {
+-            if let Some(parent) = path.parent() {
+-                if dirs.insert(parent.to_path_buf()) {
+-                    fs::create_dir_all(parent).with_context(|| {
+-                        format!("failed to create output directory {}", parent.display())
+-                    })?;
+-                }
+-            }
+-        }
+-
+-        // Write files in parallel.
++        // Write files in parallel (parent directories were created above).
+         resolved.par_iter().try_for_each(|(path, code)| {
+             fs::write(path, code).with_context(|| format!("failed to write {}", path.display()))
+         })?;
+@@ -330,16 +322,20 @@
+         .with_context(|| format!("failed to read source map {}", args.map.display()))?;
+     let sm = parse_sourcemap(&map_bytes)?;
+     ensure_output_dir(&args.output, force)?;
++    let out_dir = canonical_output_dir(&args.output)?;
+ 
+-    let entries = extract_source_entries(&sm, &args.output);
++    let entries = extract_source_entries(&sm, &out_dir);
+     let mut written = 0;
+     for (out_path, content) in &entries {
+-        if let Some(parent) = out_path.parent() {
+-            fs::create_dir_all(parent)
+-                .with_context(|| format!("failed to create {}", parent.display()))?;
+-        }
+-        fs::write(out_path, content)
+-            .with_context(|| format!("failed to write {}", out_path.display()))?;
++        let relative = out_path.strip_prefix(&out_dir).with_context(|| {
++            format!(
++                "refusing source map entry {}: it is outside the output directory",
++                out_path.display()
++            )
++        })?;
++        let target = resolve_beneath(&out_dir, relative, "source map entry")?;
++        fs::write(&target, content)
++            .with_context(|| format!("failed to write {}", target.display()))?;
+         written += 1;
+     }
+ 
+@@ -587,6 +583,85 @@
+     Ok(())
+ }
+ 
++/// Resolve the output directory chosen with `-o` to a canonical absolute path.
++fn canonical_output_dir(path: &Path) -> Result<PathBuf> {
++    path.canonicalize()
++        .with_context(|| format!("failed to resolve output directory {}", path.display()))
++}
++
++/// Rebuild an untrusted module name as a relative path of ordinary components.
++///
++/// A name containing a parent, root or drive component is refused outright;
++/// the caller never has to inspect the returned path.
++fn relative_module_path(name: &str) -> Result<PathBuf> {
++    let mut relative = PathBuf::new();
++    for component in Path::new(name).components() {
++        match component {
++            Component::Normal(segment) => relative.push(segment),
++            Component::CurDir => {}
++            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
++                bail!("refusing module name {name:?}: it is not a relative path");
++            }
++        }
++    }
++    if relative.as_os_str().is_empty() {
++        bail!("refusing module name {name:?}: empty output path");
++    }
++    Ok(relative)
++}
++
++/// Resolve `relative` beneath the canonical `root` and return the file to write.
++///
++/// Intermediate directories are created one component at a time, and each one
++/// is canonicalised before the next is created, so a pre-existing directory
++/// link is followed only when it still points inside `root`.  A final path that
++/// already exists is checked the same way, which also covers a link in place of
++/// the output file itself.
++fn resolve_beneath(root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
++    let Some(file_name) = relative.file_name() else {
++        bail!("refusing {label} {relative:?}: empty output path");
++    };
++
++    let mut directory = root.to_path_buf();
++    if let Some(parent) = relative.parent() {
++        for component in parent.components() {
++            let Component::Normal(segment) = component else {
++                bail!("refusing {label} {relative:?}: path leaves the output directory");
++            };
++            directory.push(segment);
++            if fs::symlink_metadata(&directory).is_err() {
++                fs::create_dir(&directory)
++                    .with_context(|| format!("failed to create {}", directory.display()))?;
++            }
++            let resolved = directory.canonicalize().with_context(|| {
++                format!("failed to resolve output directory {}", directory.display())
++            })?;
++            if !resolved.starts_with(root) {
++                bail!("refusing {label} {relative:?}: path leaves the output directory");
++            }
++            if !resolved.is_dir() {
++                bail!(
++                    "refusing {label} {relative:?}: {} is not a directory",
++                    directory.display()
++                );
++            }
++            directory = resolved;
++        }
++    }
++
++    let candidate = directory.join(file_name);
++    if fs::symlink_metadata(&candidate).is_ok() {
++        let resolved = candidate
++            .canonicalize()
++            .with_context(|| format!("failed to resolve output path {}", candidate.display()))?;
++        if !resolved.starts_with(root) {
++            bail!("refusing {label} {relative:?}: path leaves the output directory");
++        }
++        return Ok(resolved);
++    }
++    Ok(candidate)
++}
++
+ /// Return a path that hasn't been used yet, disambiguating case collisions.
+ ///
+ /// `seen` stores the lowercased string representation of every path already
+--- a/crates/core/src/sourcemap_rename.rs	2026-10-28 15:27:05.000000000 +0000
++++ b/crates/core/src/sourcemap_rename.rs	2026-10-28 15:58:18.488390184 +0000
+@@ -101,16 +101,7 @@
+         .trim_start_matches("webpack://")
+         .trim_start_matches("webpack:///")
+         .trim_start_matches('/');
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    if sanitized.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    crate::unpacker::safe_path::sanitize(stripped, "module.js")
+ }
+ 
+ /// Apply source-map-driven identifier renaming to `module`.
+--- a/crates/core/src/unpacker/browserify.rs	2026-10-28 15:27:05.000000000 +0000
++++ b/crates/core/src/unpacker/browserify.rs	2026-10-28 15:58:17.730388043 +0000
+@@ -117,17 +117,7 @@
+ 
+ /// Convert a module id that names a file into a relative output path.
+ fn sanitize_module_name(raw: &str) -> String {
+-    let stripped = raw.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    if sanitized.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    super::safe_path::sanitize(raw, "module.js")
+ }
+ 
+ fn extract_entry_ids(entry_array: &ArrayLit) -> Option<Vec<String>> {
+--- a/crates/core/src/unpacker/esbuild.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/core/src/unpacker/esbuild.rs	2026-10-28 15:58:15.935382974 +0000
+@@ -581,13 +581,7 @@
+         .trim_start_matches("webpack://")
+         .trim_start_matches("webpack:///")
+         .trim_start_matches('/');
+-    // Strip leading `../` segments so the path doesn't escape the output directory.
+-    let s = s.trim_start_matches("../");
+-    if s.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        s.to_string()
+-    }
++    super::safe_path::sanitize(s, "module.js")
+ }
+ 
+ // ---------------------------------------------------------------------------
+--- a/crates/core/src/unpacker/mod.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/core/src/unpacker/mod.rs	2026-10-28 15:58:10.684367837 +0000
+@@ -1,5 +1,6 @@
+ pub mod browserify;
+ pub mod esbuild;
++pub(crate) mod safe_path;
+ pub mod scope_hoist;
+ pub mod systemjs;
+ pub mod webpack4;
+--- a/crates/core/src/unpacker/safe_path.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/core/src/unpacker/safe_path.rs	2026-10-28 15:59:39.843626713 +0000
+@@ -0,0 +1,78 @@
++//! Turn bundler-supplied module ids into safe relative output paths.
++//!
++//! Every module id an unpacker reads comes from the input document and is
++//! therefore untrusted.  A bundler may use either slash as a separator, may
++//! include `.`/`..` segments, and may spell a path with a root or Windows
++//! drive prefix.  The result of this module is built component by component,
++//! so a string such as `....//foo` (which a single replacement pass would
++//! collapse into `../foo`) can never produce a parent component.
++
++/// Return `raw` rewritten as a relative path made only of ordinary components.
++///
++/// Empty, `.` and `..` components are dropped, a leading Windows drive
++/// designator is dropped, and both `/` and `\` count as separators.  Anything
++/// else — including components that merely contain dots, such as `..cache` or
++/// `....` — is an ordinary name and is kept.  When nothing usable remains,
++/// `fallback` is returned.
++pub(crate) fn sanitize(raw: &str, fallback: &str) -> String {
++    let mut kept: Vec<&str> = Vec::new();
++    let normalized = raw.replace('\\', "/");
++
++    for component in normalized.split('/') {
++        if component.is_empty() || component == "." || component == ".." {
++            continue;
++        }
++        if kept.is_empty() && is_windows_drive(component) {
++            continue;
++        }
++        kept.push(component);
++    }
++
++    if kept.is_empty() {
++        fallback.to_owned()
++    } else {
++        kept.join("/")
++    }
++}
++
++/// True for a Windows drive designator such as `C:` (the colon itself is not a
++/// separator after normalisation, but the prefix must still not be treated as
++/// an ordinary first path component).
++fn is_windows_drive(component: &str) -> bool {
++    let bytes = component.as_bytes();
++    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
++}
++
++#[cfg(test)]
++mod tests {
++    use super::sanitize;
++
++    #[test]
++    fn keeps_nested_and_dot_containing_components() {
++        assert_eq!(sanitize("src/index.js", "x"), "src/index.js");
++        assert_eq!(sanitize("./src/utils.js", "x"), "src/utils.js");
++        assert_eq!(sanitize("lib/..cache/data.js", "x"), "lib/..cache/data.js");
++        assert_eq!(sanitize("a/..../b.js", "x"), "a/..../b.js");
++    }
++
++    #[test]
++    fn drops_parent_and_current_components() {
++        assert_eq!(sanitize("../a/b.js", "x"), "a/b.js");
++        assert_eq!(sanitize("a/../../b.js", "x"), "a/b.js");
++        assert_eq!(sanitize("....//evil/marker.js", "x"), "..../evil/marker.js");
++    }
++
++    #[test]
++    fn drops_roots_and_drive_prefixes() {
++        assert_eq!(sanitize("/tmp/escape/marker.js", "x"), "tmp/escape/marker.js");
++        assert_eq!(sanitize("C:/escape/marker.js", "x"), "escape/marker.js");
++        assert_eq!(sanitize(r"C:\escape\marker.js", "x"), "escape/marker.js");
++    }
++
++    #[test]
++    fn falls_back_when_nothing_remains() {
++        assert_eq!(sanitize("", "fallback.js"), "fallback.js");
++        assert_eq!(sanitize("..", "fallback.js"), "fallback.js");
++        assert_eq!(sanitize("./", "fallback.js"), "fallback.js");
++    }
++}
+--- a/crates/core/src/unpacker/systemjs.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/core/src/unpacker/systemjs.rs	2026-10-28 15:58:15.280381125 +0000
+@@ -808,17 +808,7 @@
+ }
+ 
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    let mut filename = if sanitized.is_empty() {
+-        "unknown".to_string()
+-    } else {
+-        sanitized
+-    };
++    let mut filename = super::safe_path::sanitize(module_id, "unknown");
+     if !filename
+         .rsplit('/')
+         .next()
+--- a/crates/core/src/unpacker/webpack4.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/core/src/unpacker/webpack4.rs	2026-10-28 15:58:12.938374490 +0000
+@@ -838,13 +838,7 @@
+ /// Strips leading `./`, removes path traversal (`../`, `..\`), and falls back
+ /// to `"unknown.js"` when the result would be empty.
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    if sanitized.is_empty() {
+-        "unknown.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    super::safe_path::sanitize(module_id, "unknown.js")
+ }
+ 
+ /// Scan the bootstrap function body for `n.s = <number>` or `n(n.s = <number>)` patterns
+--- a/crates/core/src/unpacker/webpack5.rs	2026-10-28 15:27:02.000000000 +0000
++++ b/crates/core/src/unpacker/webpack5.rs	2026-10-28 15:58:12.521373259 +0000
+@@ -1154,13 +1154,7 @@
+ }
+ 
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    if sanitized.is_empty() {
+-        "unknown.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    super::safe_path::sanitize(module_id, "unknown.js")
+ }
+ 
+ /// Scan the bootstrap body for `__webpack_require__(__webpack_require__.s = <id>)` and return

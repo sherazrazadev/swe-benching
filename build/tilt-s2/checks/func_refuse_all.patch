@@ -1,0 +1,508 @@
+diff --git a/internal/cli/flags.go b/internal/cli/flags.go
+index 00b9584..9a0b579 100644
+--- a/internal/cli/flags.go
++++ b/internal/cli/flags.go
+@@ -63,7 +63,7 @@ func addConnectServerFlags(cmd *cobra.Command) {
+ // For commands that start a web server.
+ func addStartServerFlags(cmd *cobra.Command) {
+ 	cmd.Flags().IntVar(&webPortFlag, "port", defaultWebPort, "Port for the Tilt HTTP server. Set to 0 to disable. Overrides TILT_PORT env variable.")
+-	cmd.Flags().StringVar(&webHostFlag, "host", defaultWebHost, "Host for the Tilt HTTP server and default host for any port-forwards. Set to 0.0.0.0 to listen on all interfaces. Overrides TILT_HOST env variable.")
++	cmd.Flags().StringVar(&webHostFlag, "host", defaultWebHost, "Host for the Tilt HTTP server and default host for any port-forwards. Defaults to localhost; only change this if you need remote access and understand the security implications. Overrides TILT_HOST env variable.")
+ }
+ 
+ // For commands that start a random snapshot view web server.
+diff --git a/internal/cli/status.go b/internal/cli/status.go
+index f3b63c5..507fb0c 100644
+--- a/internal/cli/status.go
++++ b/internal/cli/status.go
+@@ -4,7 +4,6 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+-	"net/http"
+ 
+ 	"github.com/spf13/cobra"
+ 	"k8s.io/cli-runtime/pkg/genericclioptions"
+@@ -24,27 +23,19 @@ func newStatusCmd(streams genericclioptions.IOStreams) *cobra.Command {
+ }
+ 
+ func statusRun(streams genericclioptions.IOStreams) {
+-	url := apiURL("view")
+-	res, err := http.Get(url)
+-	if err != nil {
+-		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+-	}
+-	defer func() { _ = res.Body.Close() }()
+-
+-	if res.StatusCode != http.StatusOK {
+-		failWithNonOKResponse(url, res)
+-	}
++	body := apiGet("view")
++	defer func() { _ = body.Close() }()
+ 
+-	body, err := io.ReadAll(res.Body)
++	data, err := io.ReadAll(body)
+ 	if err != nil {
+-		cmdFail(fmt.Errorf("Error reading response from %s: %v", url, err))
++		cmdFail(fmt.Errorf("Error reading response from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	var view struct {
+ 		Resources []json.RawMessage `json:"resources"`
+ 	}
+-	if err := json.Unmarshal(body, &view); err != nil {
+-		cmdFail(fmt.Errorf("Error parsing view from %s: %v", url, err))
++	if err := json.Unmarshal(data, &view); err != nil {
++		cmdFail(fmt.Errorf("Error parsing view from %s: %v", apiURL("view"), err))
+ 	}
+ 
+ 	_, _ = fmt.Fprintf(streams.Out, "%d resources\n", len(view.Resources))
+diff --git a/internal/cli/utils.go b/internal/cli/utils.go
+index 8f3adc1..dc888d0 100644
+--- a/internal/cli/utils.go
++++ b/internal/cli/utils.go
+@@ -7,6 +7,10 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"strings"
++
++	"github.com/tilt-dev/tilt/internal/hud/server"
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
+ )
+ 
+ func apiHost() string {
+@@ -18,9 +22,26 @@ func apiURL(path string) string {
+ 	return fmt.Sprintf("http://%s:%d/api/%s", provideWebHost(), provideWebPort(), path)
+ }
+ 
++func loadToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.GetOrCreateToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
+ func apiGet(path string) (body io.ReadCloser) {
+ 	url := apiURL(path)
+-	res, err := http.Get(url)
++	req, err := http.NewRequest(http.MethodGet, url, nil)
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not build request for %s: %v", url, err))
++	}
++	req.Header.Set(server.TiltTokenHeaderName, loadToken())
++	res, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+ 	}
+@@ -33,7 +54,13 @@ func apiGet(path string) (body io.ReadCloser) {
+ 
+ func apiPostJson(path string, payload []byte) (body io.ReadCloser, status int) {
+ 	url := apiURL(path)
+-	res, err := http.Post(url, "application/json", bytes.NewBuffer(payload))
++	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(payload))
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not build request for %s: %v", url, err))
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set(server.TiltTokenHeaderName, loadToken())
++	res, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
+ 	}
+diff --git a/internal/hud/client/log_streamer.go b/internal/hud/client/log_streamer.go
+index 29950b6..983c537 100644
+--- a/internal/hud/client/log_streamer.go
++++ b/internal/hud/client/log_streamer.go
+@@ -3,11 +3,18 @@ package client
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
++	"net/http"
++	neturl "net/url"
++	"strings"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/pkg/errors"
+ 
++	"github.com/tilt-dev/tilt/internal/token"
++	"github.com/tilt-dev/wmclient/pkg/dirs"
++
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/pkg/logger"
+ 	"github.com/tilt-dev/tilt/pkg/model"
+@@ -33,10 +40,58 @@ func NewLogStreamer(follow FollowFlag, url model.WebURL, filter LogFilter, print
+ 	}
+ }
+ 
++// loadSessionToken reads the running session's credential from the Tilt data
++// directory. It is the same value the engine loads at startup.
++func loadSessionToken() string {
++	dir, err := dirs.UseTiltDevDir()
++	if err != nil {
++		return ""
++	}
++	t, err := token.GetOrCreateToken(dir)
++	if err != nil {
++		return ""
++	}
++	return t.String()
++}
++
++// fetchWebsocketToken obtains the short-lived CSRF token that the server
++// requires on the view websocket. The endpoint is gated by the session token.
++func fetchWebsocketToken(ctx context.Context, u model.WebURL) (string, error) {
++	httpURL := "http://" + u.Host + "/api/websocket_token"
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpURL, nil)
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("X-Tilt-Token", loadSessionToken())
++	res, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer func() { _ = res.Body.Close() }()
++	if res.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("websocket token request failed: %s", res.Status)
++	}
++	b, err := io.ReadAll(res.Body)
++	if err != nil {
++		return "", err
++	}
++	return strings.TrimSpace(string(b)), nil
++}
++
+ func (ls *LogStreamer) Stream(ctx context.Context) error {
+ 	url := ls.url
+-	url.Scheme = "ws"
+ 	url.Path = "/ws/view"
++	csrf, err := fetchWebsocketToken(ctx, url)
++	if err != nil {
++		return errors.Wrap(err, "fetching websocket token")
++	}
++	q, err := neturl.ParseQuery(url.RawQuery)
++	if err != nil {
++		return errors.Wrap(err, "parsing websocket URL")
++	}
++	q.Set("csrf", csrf)
++	url.RawQuery = q.Encode()
++	url.Scheme = "ws"
+ 	logger.Get(ctx).Debugf("connecting to %s", url.String())
+ 
+ 	conn, _, err := websocket.DefaultDialer.Dial(url.String(), nil)
+diff --git a/internal/hud/server/compat.go b/internal/hud/server/compat.go
+index a7fb9aa..467fc61 100644
+--- a/internal/hud/server/compat.go
++++ b/internal/hud/server/compat.go
+@@ -9,8 +9,8 @@ import (
+ // registerLegacyRoutes keeps the pre-0.20 API endpoints available for scripts
+ // and extensions that still use them.
+ func (s *HeadsUpServer) registerLegacyRoutes(r *mux.Router) {
+-	r.HandleFunc("/api/v0/view", s.LegacyViewJSON)
+-	r.HandleFunc("/api/v0/trigger", s.LegacyTrigger).Methods("POST")
++	r.Handle("/api/v0/view", s.requireToken(http.HandlerFunc(s.LegacyViewJSON)))
++	r.Handle("/api/v0/trigger", s.requireToken(http.HandlerFunc(s.LegacyTrigger))).Methods("POST")
+ }
+ 
+ // LegacyViewJSON serves the current view on the old endpoint.
+diff --git a/internal/hud/server/controller.go b/internal/hud/server/controller.go
+index b8e2eb7..42f26b2 100644
+--- a/internal/hud/server/controller.go
++++ b/internal/hud/server/controller.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"net"
+ 	"net/http"
+ 	"regexp"
+ 
+@@ -144,7 +145,7 @@ func (s *HeadsUpServerController) setUpHelper(ctx context.Context, st store.RSto
+ 	apiRouter.PathPrefix("/readyz").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/swagger").Handler(apiserverHandler)
+ 	apiRouter.PathPrefix("/version").Handler(apiserverHandler)
+-	apiRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	apiRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 
+ 	var apiTLSConfig *tls.Config
+ 	if serving.Cert != nil {
+@@ -165,11 +166,11 @@ func (s *HeadsUpServerController) setUpHelper(ctx context.Context, st store.RSto
+ 	}
+ 
+ 	webRouter := mux.NewRouter()
+-	webRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
++	webRouter.PathPrefix("/debug").Handler(loopbackOnly(http.DefaultServeMux)) // for /debug/pprof
+ 	// the path prefix here must be kept in sync with the prefix configured in the proxy handler
+ 	// (it needs to know what to strip before forwarding the request)
+-	webRouter.PathPrefix(apiServerProxyPrefix).Handler(proxyHandler)
+-	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(legacyProxyHandler)
++	webRouter.PathPrefix(apiServerProxyPrefix).Handler(s.hudServer.requireToken(originCheckMiddleware(proxyHandler)))
++	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(s.hudServer.requireToken(originCheckMiddleware(legacyProxyHandler)))
+ 	webRouter.PathPrefix("/").Handler(s.hudServer.Router())
+ 
+ 	s.webServer = &http.Server{
+@@ -305,5 +306,18 @@ func newAPIServerProxyHandlerAt(prefix string, config *rest.Config) (http.Handle
+ 	return proxy.NewProxyHandler(prefix, fs, config, 0, false)
+ }
+ 
++// loopbackOnly rejects requests from non-loopback addresses, preventing remote
++// access to sensitive endpoints like /debug/pprof.
++func loopbackOnly(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		host, _, err := net.SplitHostPort(r.RemoteAddr)
++		if err != nil || !net.ParseIP(host).IsLoopback() {
++			http.Error(w, "forbidden", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ var _ store.SetUpper = &HeadsUpServerController{}
+ var _ store.TearDowner = &HeadsUpServerController{}
+diff --git a/internal/hud/server/gorilla/origin.go b/internal/hud/server/gorilla/origin.go
+deleted file mode 100644
+index 3f0d506..0000000
+--- a/internal/hud/server/gorilla/origin.go
++++ /dev/null
+@@ -1,50 +0,0 @@
+-// Copyright 2013 The Gorilla WebSocket Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-//
+-// Used from github.com/gorilla/websocket
+-
+-package gorilla
+-
+-import (
+-	"net/http"
+-	"net/url"
+-	"unicode/utf8"
+-)
+-
+-// checkSameOrigin returns true if the origin is not set or is equal to the request host.
+-func CheckSameOrigin(r *http.Request) bool {
+-	origin := r.Header["Origin"]
+-	if len(origin) == 0 {
+-		return true
+-	}
+-	u, err := url.Parse(origin[0])
+-	if err != nil {
+-		return false
+-	}
+-	return equalASCIIFold(u.Host, r.Host)
+-}
+-
+-// equalASCIIFold returns true if s is equal to t with ASCII case folding as
+-// defined in RFC 4790.
+-func equalASCIIFold(s, t string) bool {
+-	for s != "" && t != "" {
+-		sr, size := utf8.DecodeRuneInString(s)
+-		s = s[size:]
+-		tr, size := utf8.DecodeRuneInString(t)
+-		t = t[size:]
+-		if sr == tr {
+-			continue
+-		}
+-		if 'A' <= sr && sr <= 'Z' {
+-			sr = sr + 'a' - 'A'
+-		}
+-		if 'A' <= tr && tr <= 'Z' {
+-			tr = tr + 'a' - 'A'
+-		}
+-		if sr != tr {
+-			return false
+-		}
+-	}
+-	return s == t
+-}
+diff --git a/internal/hud/server/server.go b/internal/hud/server/server.go
+index 3c3ef10..a306cea 100644
+--- a/internal/hud/server/server.go
++++ b/internal/hud/server/server.go
+@@ -7,6 +7,8 @@ import (
+ 	"log"
+ 	"net/http"
+ 	_ "net/http/pprof"
++	"net/url"
++	"os"
+ 	"time"
+ 
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -29,6 +31,7 @@ import (
+ )
+ 
+ const TiltTokenCookieName = "Tilt-Token"
++const TiltTokenHeaderName = "X-Tilt-Token"
+ 
+ // CSRF token to protect the websocket. See:
+ // https://dev.solita.fi/2018/11/07/securing-websocket-endpoints.html
+@@ -72,6 +75,7 @@ func ProvideHeadsUpServer(
+ 	wsList *WebsocketList,
+ 	ctrlClient ctrlclient.Client) (*HeadsUpServer, error) {
+ 	r := mux.NewRouter().UseEncodedPath()
++	r.Use(originCheckMiddleware)
+ 	s := &HeadsUpServer{
+ 		ctx:        ctx,
+ 		store:      store,
+@@ -81,20 +85,20 @@ func ProvideHeadsUpServer(
+ 		ctrlClient: ctrlClient,
+ 	}
+ 
+-	r.HandleFunc("/api/view", s.ViewJSON)
+-	r.HandleFunc("/api/dump/engine", s.DumpEngineJSON)
+-	r.HandleFunc("/api/analytics", s.HandleAnalytics)
+-	r.HandleFunc("/api/analytics_opt", s.HandleAnalyticsOpt)
+-	r.HandleFunc("/api/trigger", s.HandleTrigger)
+-	r.HandleFunc("/api/override/trigger_mode", s.HandleOverrideTriggerMode)
++	r.Handle("/api/view", s.requireToken(http.HandlerFunc(s.ViewJSON)))
++	r.Handle("/api/dump/engine", s.requireToken(http.HandlerFunc(s.DumpEngineJSON)))
++	r.Handle("/api/analytics", s.requireToken(http.HandlerFunc(s.HandleAnalytics)))
++	r.Handle("/api/analytics_opt", s.requireToken(http.HandlerFunc(s.HandleAnalyticsOpt)))
++	r.Handle("/api/trigger", s.requireToken(http.HandlerFunc(s.HandleTrigger)))
++	r.Handle("/api/override/trigger_mode", s.requireToken(http.HandlerFunc(s.HandleOverrideTriggerMode)))
+ 	// this endpoint is only used for testing snapshots in development
+-	r.HandleFunc("/api/snapshot/{snapshot_id}", s.SnapshotJSON)
+-	r.HandleFunc("/api/websocket_token", s.WebsocketToken)
++	r.Handle("/api/snapshot/{snapshot_id}", s.requireToken(http.HandlerFunc(s.SnapshotJSON)))
++	r.Handle("/api/websocket_token", s.requireToken(http.HandlerFunc(s.WebsocketToken)))
+ 	r.HandleFunc("/ws/view", s.ViewWebsocket)
+-	r.HandleFunc("/api/set_tiltfile_args", s.HandleSetTiltfileArgs).Methods("POST")
++	r.Handle("/api/set_tiltfile_args", s.requireToken(http.HandlerFunc(s.HandleSetTiltfileArgs))).Methods("POST")
+ 	s.registerLegacyRoutes(r)
+ 
+-	r.PathPrefix("/").Handler(s.cookieWrapper(assetServer))
++	r.PathPrefix("/").Handler(s.requireToken(s.cookieWrapper(assetServer)))
+ 
+ 	return s, nil
+ }
+@@ -107,15 +111,78 @@ func (fh funcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	fh.f(w, r)
+ }
+ 
++// originCheck returns true if the Origin header is missing/empty or host
++// matches the request host.
++func originCheck(r *http.Request) bool {
++	origin := r.Header.Get("Origin")
++	if origin != "" {
++		u, err := url.Parse(origin)
++		if err != nil || u.Host != r.Host {
++			return false
++		}
++	}
++	return true
++}
++
++// originCheckMiddleware rejects requests whose Origin header is present but does
++// not match the Host the client connected to. Browsers always include Origin on
++// cross-origin requests, so this blocks CSRF from network-reachable attackers
++// without affecting same-origin browser traffic or CLI tools (which omit Origin).
++func originCheckMiddleware(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !originCheck(r) {
++			http.Error(w, "cross-origin request forbidden", http.StatusForbidden)
++			return
++		}
++
++		next.ServeHTTP(w, r)
++	})
++}
++
+ func (s *HeadsUpServer) cookieWrapper(handler http.Handler) http.Handler {
+ 	return funcHandler{f: func(w http.ResponseWriter, r *http.Request) {
+ 		state := s.store.RLockState()
+-		http.SetCookie(w, &http.Cookie{Name: TiltTokenCookieName, Value: string(state.Token), Path: "/"})
++		http.SetCookie(w, &http.Cookie{
++			Name:     TiltTokenCookieName,
++			Value:    string(state.Token),
++			Path:     "/",
++			SameSite: http.SameSiteStrictMode,
++		})
+ 		s.store.RUnlockState()
+ 		handler.ServeHTTP(w, r)
+ 	}}
+ }
+ 
++// requireToken validates the Tilt-Token header or cookie against the current
++// session token. The middleware is bypassed when TILT_DISABLE_HUD_AUTH=1 is
++// set - intended for deployments that authenticate at a reverse-proxy or
++// load-balancer layer, NOT for general use.
++func (s *HeadsUpServer) requireToken(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if os.Getenv("TILT_DISABLE_HUD_AUTH") == "1" {
++			next.ServeHTTP(w, r)
++			return
++		}
++		candidate := r.Header.Get(TiltTokenHeaderName)
++		if candidate == "" {
++			cookie, err := r.Cookie(TiltTokenCookieName)
++			if err != nil {
++				http.Error(w, "missing session token", http.StatusForbidden)
++				return
++			}
++			candidate = cookie.Value
++		}
++		state := s.store.RLockState()
++		valid := candidate == string(state.Token)
++		s.store.RUnlockState()
++		if !valid {
++			http.Error(w, "invalid session token", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ func (s *HeadsUpServer) Router() http.Handler {
+ 	return s.router
+ }
+diff --git a/internal/hud/server/websocket.go b/internal/hud/server/websocket.go
+index 2989876..d4f2dfe 100644
+--- a/internal/hud/server/websocket.go
++++ b/internal/hud/server/websocket.go
+@@ -15,7 +15,6 @@ import (
+ 	"k8s.io/client-go/util/workqueue"
+ 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+-	"github.com/tilt-dev/tilt/internal/hud/server/gorilla"
+ 	"github.com/tilt-dev/tilt/internal/hud/webview"
+ 	"github.com/tilt-dev/tilt/internal/store"
+ 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+@@ -38,21 +37,16 @@ var upgrader = websocket.Upgrader{
+ 	// a mobile network.
+ 	EnableCompression: false,
+ 
+-	// Allow the connection if either:
++	// Only allow the upgrade when the client presents the CSRF token.
+ 	//
+-	// 1) The client has a CSRF token, or
+-	// 2) The origin matches what we expect.
+-	//
+-	// Once a few releases have gone by we should remove the origin check.
+-	// (since we know some tilt users expect tabs to stay open
+-	// across releases).
++	// The token is served exclusively by /api/websocket_token, which is gated
++	// behind requireToken, so only a caller already holding the session token
++	// can obtain it. We deliberately do NOT fall back to an origin check: the
++	// previous fallback accepted any request whose Origin header was absent
++	// (originCheck returns true on missing Origin), which let a non-browser
++	// client open this socket and read the full HUD stream with no token.
+ 	CheckOrigin: func(req *http.Request) bool {
+-		if websocketCSRFToken.String() == req.URL.Query().Get("csrf") {
+-			return true
+-		}
+-
+-		// If the CSRF check fails, fallback to an origin check.
+-		return gorilla.CheckSameOrigin(req)
++		return websocketCSRFToken.String() == req.URL.Query().Get("csrf")
+ 	},
+ }
+ 

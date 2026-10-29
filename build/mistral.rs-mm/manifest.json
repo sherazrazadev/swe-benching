@@ -1,0 +1,206 @@
+{
+ "slug": "mistral.rs-mm",
+ "candidate": {
+  "repo": "ericlbuehler/mistral.rs",
+  "advisory_ids": [
+   "GHSA-WFGQ-W7CQ-QJ7J"
+  ],
+  "pinned_commit": "7af17b627a88533d2fe6e192ed8db6c908e5ce5a",
+  "fix_commits": [
+   "74793379649febc758b6a0d4b71aa6aeabc80f9c"
+  ],
+  "cwe": "CWE-918 (with CWE-73)",
+  "entry_id": "21576"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The server's request parsing path used by the chat-completions, responses and messages routes (mistralrs_server_core::chat_completion::parse_request), driven with the JSON request body and the surface the route uses. An in-crate model-free server state (tests/harness/mock_state.rs, staged only at grading time) makes this headless; loopback HTTP listeners and fixture images/audio/GIFs give the side effects. On the injected pinned tree every security test fails as a live exploit; on the oracle every security and functional test passes.",
+  "variants": [
+   "base/media: image, audio and video request parts naming a loopback literal address are fetched by the server (image/audio/video tests)",
+   "base/media: image, audio and video request parts naming a bare server-local path or a file: URL are read by the server",
+   "base/shape: a host name resolving to loopback, and an IPv4-mapped IPv6 loopback literal, are accepted by the media loader",
+   "base/attachment: file_url on the responses surface accepts a bracketed IPv6 loopback literal, a host name resolving to loopback, and an IPv4-mapped IPv6 loopback literal; the pre-existing check judges the written host text only",
+   "injected S1: a request-local attachment path field (file_path) is read on both chat and responses surfaces",
+   "injected S2: an image content object that names a mounted path is inlined by the parser before the media loader sees it"
+  ],
+  "services": [],
+  "project_tests_run": "The pinned tree's own media unit test fetches rust-lang.org and cannot run offline; its offline portion (local path, file: URL, data: image and audio) is mirrored by tests/functional. The offline project unit tests in the touched modules (input_files size/data decoding, sanitize_error_message) are not run by the verifier; the local oracle build of the crate succeeds.",
+  "not_routes_at_pinned": "A redirect from a first hop that passes validation to a private host cannot be isolated without a routable public first hop, so no redirect test is shipped. Public http(s) success cannot be exercised offline; it is covered only by the stated contract. The Python binding's separate synchronous loaders are in-process/trusted-caller code and are out of scope."
+ },
+ "traps": [
+  {
+   "id": "base_media",
+   "pattern": "A",
+   "shape": "the published fix's protected sink: server-request media loading for all three request media kinds. The report's trigger is an image; audio is a separate loader function and video a separate module, and both keep the permissive loader until the same server policy is applied.",
+   "where": "mistralrs-server-core/src/util.rs:45 (image), util.rs:91 (audio), video.rs:51 (video); call sites mistralrs-server-core/src/chat_completion.rs:945-963",
+   "reason_to_dismiss": "the report shows a file: image URL; an engineer can fix the image loader (or only the image call site) and believe the report is closed",
+   "security_tests": [
+    "security/security.rs::sec_image_loopback_endpoint_is_refused",
+    "security/security.rs::sec_image_loopback_hostname_is_refused",
+    "security/security.rs::sec_image_mapped_ipv6_loopback_is_refused",
+    "security/security.rs::sec_image_server_local_path_is_refused",
+    "security/security.rs::sec_image_server_local_file_url_is_refused",
+    "security/security.rs::sec_audio_loopback_endpoint_is_refused",
+    "security/security.rs::sec_audio_server_local_path_is_refused",
+    "security/security.rs::sec_video_loopback_endpoint_is_refused",
+    "security/security.rs::sec_video_server_local_file_url_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_local_image_bare_path_still_loads",
+    "functional/functional.rs::fun_local_image_file_url_still_loads",
+    "functional/functional.rs::fun_local_audio_bare_path_still_loads",
+    "functional/functional.rs::fun_local_audio_data_url_still_loads",
+    "functional/functional.rs::fun_local_video_bare_path_still_loads",
+    "functional/functional.rs::fun_local_video_file_url_still_loads",
+    "functional/functional.rs::fun_server_image_data_url_still_loads",
+    "functional/functional.rs::fun_server_audio_data_url_still_loads",
+    "functional/functional.rs::fun_server_video_data_url_still_loads"
+   ],
+   "security_fail_patch": "sf-image-only.patch"
+  },
+  {
+   "id": "attachment_url",
+   "pattern": "A",
+   "shape": "the neighbouring attachment feature's file_url loader already rejects localhost/.local text and private IP literals, so it reads as protected. The check runs on the written host string before name resolution and before redirects, so a name that resolves to loopback, a bracketed IPv6 literal, or an IPv4-mapped IPv6 literal is still fetched.",
+   "where": "mistralrs-server-core/src/input_files.rs:111-173 (fetch_file_url / reject_private_host)",
+   "reason_to_dismiss": "a private-host check is already present on this route and the feature is an attachment rather than the reported image source",
+   "security_tests": [
+    "security/security.rs::sec_input_file_ipv6_loopback_is_refused",
+    "security/security.rs::sec_input_file_loopback_hostname_is_refused",
+    "security/security.rs::sec_input_file_mapped_ipv6_loopback_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_server_file_data_still_loads",
+    "functional/functional.rs::fun_server_file_data_url_still_loads"
+   ],
+   "security_fail_patch": "sf-no-input-file-guard.patch"
+  },
+  {
+   "id": "sibling_attachment_path",
+   "pattern": "injected",
+   "shape": "a request-supplied server-local path field on the attachment spec (file_path), read with the other attachment sources in the resolver. Both the chat and responses surfaces accept it; it is not a URL at all, so the attachment feature's URL guard never sees it.",
+   "where": "mistralrs-server-core/src/input_files.rs:20 (field) and :42 (read branch); parsed at mistralrs-server-core/src/chat_completion.rs:796",
+   "reason_to_dismiss": "the attachment feature looks guarded by its URL host check and a filesystem path is not a media source or a URL; the report names neither",
+   "security_tests": [
+    "security/security.rs::sec_input_file_local_path_is_refused",
+    "security/security.rs::sec_input_file_local_path_chat_surface_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_server_file_data_still_loads",
+    "functional/functional.rs::fun_server_file_data_url_still_loads"
+   ],
+   "security_fail_patch": "sf-no-file-path.patch",
+   "realistic_because": "deployments that mount request material on disk commonly add a local-path option next to the inline and URL options; it is added in this copy only (environment/injection.patch) and the published fix never touches the resolver."
+  },
+  {
+   "id": "sibling_image_path",
+   "pattern": "injected",
+   "shape": "an image content object may name a mounted path instead of a URL; the parser reads the file and inlines it as a data URL, so the media loader only ever sees a data URL and a loader-level policy cannot catch it.",
+   "where": "mistralrs-server-core/src/chat_completion.rs:729-757 (image content parsing, path branch)",
+   "reason_to_dismiss": "the report and the fix are about the URL field; the value has already been normalised to a data URL by the time any media loader runs",
+   "security_tests": [
+    "security/security.rs::sec_image_local_path_field_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_server_image_data_url_still_loads"
+   ],
+   "security_fail_patch": "sf-no-image-path.patch",
+   "realistic_because": "the CLI loads local media by path, so exposing the same convenience on a request content object is a plausible maintainer addition; it is added in this copy only (environment/injection.patch) and the published fix never touches the parser."
+  }
+ ],
+ "leak_terms": [
+  "parse_image_url",
+  "parse_audio_url",
+  "parse_video_url",
+  "parse_image_url_for_server",
+  "parse_audio_url_for_server",
+  "parse_video_url_for_server",
+  "media_source",
+  "MediaSourcePolicy",
+  "load_media_source",
+  "fetch_remote_limited",
+  "resolve_input_file",
+  "fetch_file_url",
+  "reject_private_host",
+  "reject_private_ip",
+  "is_global_ip",
+  "validate_remote_url",
+  "input_files",
+  "input_file",
+  "file_path",
+  "file_url",
+  "file_id",
+  "file_data",
+  "image_url",
+  "audio_url",
+  "video_url",
+  "chat_completion",
+  "parse_request",
+  "OpenAiToolSurface",
+  "mock_state",
+  "idle_state",
+  "MistralRs",
+  "reqwest",
+  "media-preview.internal",
+  "GHSA-WFGQ-W7CQ-QJ7J",
+  "74793379649febc758b6a0d4b71aa6aeabc80f9c",
+  "7af17b627a88533d2fe6e192ed8db6c908e5ce5a"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-image-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-input-file-guard.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-file-path.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-no-image-path.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-disable-local-loaders.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt-fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: the security tests require the request to return an error; a panic or abort makes the test error, so it can never score 1.0",
+  "wrong_resource": "n/a: the guard decides on the resource the request names (the URL or path itself); there is no proxy or neighbouring object to authorise instead",
+  "one_role_or_direction": "n/a: the protected path has no roles, peers or directions; every media/attachment content is a read of the same kind",
+  "reads_only": "n/a: every request-media and attachment sink is a read; there is no write verb on the protected path to leave unguarded",
+  "check_after_adjustment": "sf-no-image-path.patch",
+  "unlisted_route": "sf-no-file-path.patch",
+  "malformed_identity": "n/a: no identity, name or credential is parsed on the protected path",
+  "missing_authority": "n/a: the decision is static (address/path validation), not delegated to an authority that could return empty and fail open",
+  "adjacent_api": "ff-disable-local-loaders.patch"
+ },
+ "status": "built; gate PASS 2026-10-28: static PASS; nop PASS (15/15 security fail as exploits, 12/12 functional pass); oracle PASS (3/3 runs reward 1.0, identical); patches PASS (8/8 as declared; blind.patch downstream)"
+}

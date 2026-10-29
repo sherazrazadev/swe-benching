@@ -1,0 +1,862 @@
+diff --git a/mistralrs-server-core/src/chat_completion.rs b/mistralrs-server-core/src/chat_completion.rs
+index 9e84cb2..0e66bfe 100644
+--- a/mistralrs-server-core/src/chat_completion.rs
++++ b/mistralrs-server-core/src/chat_completion.rs
+@@ -47,8 +47,11 @@ use crate::{
+     skills::SkillStore,
+     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
+-    util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
+-    video::parse_video_url,
++    util::{
++        parse_audio_url_for_server, parse_image_url_for_server, sanitize_error_message,
++        validate_model_name,
++    },
++    video::parse_video_url_for_server,
+ };
+ 
+ /// A callback function that processes streaming response chunks before they are sent to the client.
+@@ -736,19 +739,9 @@ pub async fn parse_request(
+                                         .context("Image sub-content `image_url` key must be an object.")?;
+                                     let source = if let Some(url) = image_object.get("url") {
+                                         url.clone()
+-                                    } else if let Some(path) = image_object.get("path") {
+-                                        // Mounted media can be named by path; inline it so the media
+-                                        // loader receives a URL.
+-                                        let bytes = tokio::fs::read(path).await.with_context(|| {
+-                                            format!("Failed to read image path `{path}`")
+-                                        })?;
+-                                        format!(
+-                                            "data:application/octet-stream;base64,{}",
+-                                            STANDARD.encode(bytes)
+-                                        )
+                                     } else {
+                                         anyhow::bail!(
+-                                            "Image sub-content `image_url` object must have a `url` or `path` key."
++                                            "Image sub-content `image_url` object must have a `url` key."
+                                         )
+                                     };
+                                     items.push(ContentPart::Image { image_url: source });
+@@ -942,7 +935,7 @@ pub async fn parse_request(
+                 // Parse images
+                 let mut images = Vec::new();
+                 for url_unparsed in image_urls {
+-                    let image = parse_image_url(&url_unparsed)
++                    let image = parse_image_url_for_server(&url_unparsed)
+                         .await
+                         .context(format!("Failed to parse image resource: {url_unparsed}"))?;
+                     images.push(image);
+@@ -951,7 +944,7 @@ pub async fn parse_request(
+                 // Parse audios
+                 let mut audios = Vec::new();
+                 for url_unparsed in audio_urls {
+-                    let audio = parse_audio_url(&url_unparsed)
++                    let audio = parse_audio_url_for_server(&url_unparsed)
+                         .await
+                         .context(format!("Failed to parse audio resource: {url_unparsed}"))?;
+                     audios.push(audio);
+@@ -960,7 +953,7 @@ pub async fn parse_request(
+                 // Parse videos
+                 let mut videos = Vec::new();
+                 for url_unparsed in video_urls {
+-                    let video = parse_video_url(&url_unparsed, None)
++                    let video = parse_video_url_for_server(&url_unparsed, None)
+                         .await
+                         .context(format!("Failed to parse video resource: {url_unparsed}"))?;
+                     videos.push(video);
+diff --git a/mistralrs-server-core/src/input_files.rs b/mistralrs-server-core/src/input_files.rs
+index b879da2..4ad5f11 100644
+--- a/mistralrs-server-core/src/input_files.rs
++++ b/mistralrs-server-core/src/input_files.rs
+@@ -1,15 +1,14 @@
+-use std::{net::IpAddr, time::Duration};
+-
+ use anyhow::Context;
+ use base64::{engine::general_purpose::STANDARD, Engine};
+ use mistralrs_core::{File, FileSource, FILE_PURPOSE_USER_DATA};
+-use url::Url;
+ 
++use crate::media_source::{
++    data_url_mime, decode_data_url_limited, fetch_remote_limited, MAX_MEDIA_BYTES,
++};
+ use crate::types::SharedMistralRsState;
+ 
+-const MAX_INPUT_FILE_BYTES: usize = 64 * 1024 * 1024;
+-const FILE_URL_TIMEOUT: Duration = Duration::from_secs(30);
+-const FILE_URL_REDIRECTS: usize = 3;
++const MAX_INPUT_FILE_BYTES: usize = MAX_MEDIA_BYTES;
++const BASE64_FILE_DATA_ALLOWANCE: usize = 4096;
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct InputFileSpec {
+@@ -91,10 +90,17 @@ fn file_from_bytes(
+ fn decode_file_data(file_data: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+     if file_data.starts_with("data:") {
+         let mime_type = data_url_mime(file_data);
+-        let data_url = data_url::DataUrl::process(file_data)?;
+-        let bytes = data_url.decode_to_vec()?.0;
++        let bytes =
++            decode_data_url_limited(file_data, MAX_INPUT_FILE_BYTES, "input_file.file_data")?;
+         ensure_size(bytes, mime_type)
+     } else {
++        let encoded_limit = MAX_INPUT_FILE_BYTES
++            .saturating_mul(4)
++            .saturating_div(3)
++            .saturating_add(BASE64_FILE_DATA_ALLOWANCE);
++        if file_data.len() > encoded_limit {
++            anyhow::bail!("input_file.file_data exceeds the {MAX_INPUT_FILE_BYTES} byte limit.");
++        }
+         let bytes = STANDARD
+             .decode(file_data)
+             .context("input_file.file_data must be base64 or a data URL")?;
+@@ -102,84 +108,22 @@ fn decode_file_data(file_data: &str) -> anyhow::Result<(Vec<u8>, Option<String>)
+     }
+ }
+ 
+-fn data_url_mime(file_data: &str) -> Option<String> {
+-    let header = file_data.strip_prefix("data:")?.split_once(',')?.0;
+-    let mime = header.split(';').next().unwrap_or_default();
+-    (!mime.is_empty()).then(|| mime.to_string())
+-}
+-
+ async fn fetch_file_url(url: &str) -> anyhow::Result<(Vec<u8>, Option<String>, Option<String>)> {
+-    let parsed = Url::parse(url).context("input_file.file_url must be a valid URL")?;
+-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+-        anyhow::bail!("input_file.file_url only supports http and https URLs.");
+-    }
+-    reject_private_host(&parsed)?;
+-
+-    let client = reqwest::Client::builder()
+-        .timeout(FILE_URL_TIMEOUT)
+-        .redirect(reqwest::redirect::Policy::limited(FILE_URL_REDIRECTS))
+-        .build()?;
+-    let response = client
+-        .get(parsed.clone())
+-        .send()
+-        .await?
+-        .error_for_status()?;
+-    if response
+-        .content_length()
+-        .is_some_and(|len| len > MAX_INPUT_FILE_BYTES as u64)
+-    {
+-        anyhow::bail!("input_file.file_url exceeds the {MAX_INPUT_FILE_BYTES} byte limit.");
+-    }
+-    let mime_type = response
+-        .headers()
+-        .get(reqwest::header::CONTENT_TYPE)
+-        .and_then(|v| v.to_str().ok())
+-        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+-        .filter(|v| !v.is_empty());
+-    let bytes = response.bytes().await?.to_vec();
+-    let (bytes, mime_type) = ensure_size(bytes, mime_type)?;
+-    let filename = parsed
+-        .path_segments()
+-        .and_then(|mut segments| segments.next_back())
++    let parsed = url::Url::parse(url).context("input_file.file_url must be a valid URL")?;
++    let media = fetch_remote_limited(parsed, MAX_INPUT_FILE_BYTES, "input_file.file_url").await?;
++    let filename = media
++        .final_url
++        .as_ref()
++        .and_then(|url| {
++            url.path_segments()
++                .and_then(|mut segments| segments.next_back())
++        })
+         .filter(|segment| !segment.is_empty())
+         .map(ToString::to_string);
++    let (bytes, mime_type) = ensure_size(media.bytes, media.mime_type)?;
+     Ok((bytes, mime_type, filename))
+ }
+ 
+-fn reject_private_host(url: &Url) -> anyhow::Result<()> {
+-    let Some(host) = url.host_str() else {
+-        anyhow::bail!("input_file.file_url must include a host.");
+-    };
+-    let host_lower = host.to_ascii_lowercase();
+-    if host_lower == "localhost"
+-        || host_lower.ends_with(".localhost")
+-        || host_lower.ends_with(".local")
+-    {
+-        anyhow::bail!("input_file.file_url must not target local hosts.");
+-    }
+-    if let Ok(ip) = host.parse::<IpAddr>() {
+-        let blocked = match ip {
+-            IpAddr::V4(ip) => {
+-                ip.is_private()
+-                    || ip.is_loopback()
+-                    || ip.is_link_local()
+-                    || ip.is_broadcast()
+-                    || ip.is_unspecified()
+-            }
+-            IpAddr::V6(ip) => {
+-                ip.is_loopback()
+-                    || ip.is_unspecified()
+-                    || ip.is_unique_local()
+-                    || ip.is_unicast_link_local()
+-            }
+-        };
+-        if blocked {
+-            anyhow::bail!("input_file.file_url must not target private or local IP addresses.");
+-        }
+-    }
+-    Ok(())
+-}
+-
+ fn ensure_size(
+     bytes: Vec<u8>,
+     mime_type: Option<String>,
+@@ -201,9 +145,14 @@ mod tests {
+         assert_eq!(mime_type.as_deref(), Some("text/plain"));
+     }
+ 
++    #[tokio::test]
++    async fn rejects_private_literal_file_urls() {
++        assert!(fetch_file_url("http://127.0.0.1/file.txt").await.is_err());
++    }
++
+     #[test]
+-    fn rejects_private_literal_file_urls() {
+-        let url = Url::parse("http://127.0.0.1/file.txt").unwrap();
+-        assert!(reject_private_host(&url).is_err());
++    fn rejects_oversized_file_data_before_decode() {
++        let source = "a".repeat(BASE64_FILE_DATA_ALLOWANCE + MAX_INPUT_FILE_BYTES * 2);
++        assert!(decode_file_data(&source).is_err());
+     }
+ }
+diff --git a/mistralrs-server-core/src/lib.rs b/mistralrs-server-core/src/lib.rs
+index 82f55d3..8d2ff21 100644
+--- a/mistralrs-server-core/src/lib.rs
++++ b/mistralrs-server-core/src/lib.rs
+@@ -247,6 +247,7 @@ mod handlers;
+ pub mod image_generation;
+ mod input_files;
+ pub mod mcp_server;
++mod media_source;
+ pub mod metrics;
+ pub mod mistralrs_for_server_builder;
+ pub mod mistralrs_server_router_builder;
+diff --git a/mistralrs-server-core/src/media_source.rs b/mistralrs-server-core/src/media_source.rs
+new file mode 100644
+index 0000000..b4d6df0
+--- /dev/null
++++ b/mistralrs-server-core/src/media_source.rs
+@@ -0,0 +1,341 @@
++use std::{
++    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
++    path::{Path, PathBuf},
++    time::Duration,
++};
++
++use anyhow::{Context, Result};
++use reqwest::{header, redirect::Policy};
++use tokio::{fs::File, io::AsyncReadExt};
++use url::Url;
++
++pub(crate) const MAX_MEDIA_BYTES: usize = 64 * 1024 * 1024;
++pub(crate) const MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
++pub(crate) const MEDIA_FETCH_REDIRECTS: usize = 3;
++pub(crate) const SERVER_VIDEO_FRAME_LIMIT: usize = 32;
++
++const DATA_URL_HEADER_ALLOWANCE: usize = 4096;
++
++#[derive(Clone, Copy)]
++pub(crate) enum MediaSourcePolicy {
++    ServerRequest,
++    Local,
++}
++
++pub(crate) struct LoadedMedia {
++    pub bytes: Vec<u8>,
++    pub mime_type: Option<String>,
++    pub final_url: Option<Url>,
++}
++
++pub(crate) async fn load_media_source(
++    source: &str,
++    policy: MediaSourcePolicy,
++    kind: &str,
++) -> Result<LoadedMedia> {
++    match Url::parse(source) {
++        Ok(url) => load_media_url(url, policy, kind).await,
++        Err(err) => {
++            if matches!(policy, MediaSourcePolicy::Local) {
++                let path = PathBuf::from(source);
++                let bytes = read_local_file_limited(&path, MAX_MEDIA_BYTES)
++                    .await
++                    .with_context(|| format!("Failed to read local {kind} path"))?;
++                Ok(LoadedMedia {
++                    bytes,
++                    mime_type: None,
++                    final_url: None,
++                })
++            } else {
++                anyhow::bail!("Invalid {kind} source: expected http, https, or data URL: {err}");
++            }
++        }
++    }
++}
++
++async fn load_media_url(url: Url, policy: MediaSourcePolicy, kind: &str) -> Result<LoadedMedia> {
++    match url.scheme() {
++        "http" | "https" => {
++            fetch_remote_limited_inner(
++                url,
++                MAX_MEDIA_BYTES,
++                kind,
++                matches!(policy, MediaSourcePolicy::ServerRequest),
++            )
++            .await
++        }
++        "data" => {
++            let bytes = decode_data_url_limited(url.as_str(), MAX_MEDIA_BYTES, kind)?;
++            Ok(LoadedMedia {
++                bytes,
++                mime_type: data_url_mime(url.as_str()),
++                final_url: Some(url),
++            })
++        }
++        "file" if matches!(policy, MediaSourcePolicy::Local) => {
++            let path = url
++                .to_file_path()
++                .map_err(|_| anyhow::anyhow!("Invalid local {kind} file URL."))?;
++            let bytes = read_local_file_limited(&path, MAX_MEDIA_BYTES).await?;
++            Ok(LoadedMedia {
++                bytes,
++                mime_type: None,
++                final_url: Some(url),
++            })
++        }
++        "file" => anyhow::bail!("Server request {kind} sources do not support file URLs."),
++        scheme => anyhow::bail!("Unsupported {kind} URL scheme: {scheme}"),
++    }
++}
++
++pub(crate) async fn fetch_remote_limited(
++    url: Url,
++    max_bytes: usize,
++    kind: &str,
++) -> Result<LoadedMedia> {
++    fetch_remote_limited_inner(url, max_bytes, kind, true).await
++}
++
++async fn fetch_remote_limited_inner(
++    mut url: Url,
++    max_bytes: usize,
++    kind: &str,
++    validate_network: bool,
++) -> Result<LoadedMedia> {
++    for redirect_idx in 0..=MEDIA_FETCH_REDIRECTS {
++        let mut client = reqwest::Client::builder()
++            .timeout(MEDIA_FETCH_TIMEOUT)
++            .redirect(Policy::none())
++            .no_proxy();
++        if validate_network {
++            let addrs = validate_remote_url(&url).await?;
++            client =
++                client.resolve_to_addrs(url.host_str().expect("validated URL has host"), &addrs);
++        } else if url.scheme() != "http" && url.scheme() != "https" {
++            anyhow::bail!("Remote media URLs must use http or https.");
++        }
++        let client = client.build()?;
++        let response = client
++            .get(url.clone())
++            .send()
++            .await
++            .with_context(|| format!("Failed to fetch {kind}: {url}"))?;
++
++        if response.status().is_redirection() {
++            if redirect_idx == MEDIA_FETCH_REDIRECTS {
++                anyhow::bail!("{kind} URL exceeded the redirect limit.");
++            }
++            url = redirect_target(&url, &response, kind)?;
++            continue;
++        }
++
++        response
++            .error_for_status_ref()
++            .map_err(|err| anyhow::anyhow!("Failed to fetch {kind}: {url}: {err}"))?;
++        if response
++            .content_length()
++            .is_some_and(|len| len > max_bytes as u64)
++        {
++            anyhow::bail!("{kind} response exceeds the {max_bytes} byte limit.");
++        }
++        let mime_type = response
++            .headers()
++            .get(header::CONTENT_TYPE)
++            .and_then(|value| value.to_str().ok())
++            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
++            .filter(|value| !value.is_empty());
++        let bytes = read_response_limited(response, max_bytes, kind).await?;
++        return Ok(LoadedMedia {
++            bytes,
++            mime_type,
++            final_url: Some(url),
++        });
++    }
++
++    unreachable!("redirect loop returns or bails")
++}
++
++fn redirect_target(current: &Url, response: &reqwest::Response, kind: &str) -> Result<Url> {
++    let Some(location) = response.headers().get(header::LOCATION) else {
++        anyhow::bail!("{kind} redirect response is missing Location.");
++    };
++    let location = location
++        .to_str()
++        .context("redirect Location header is not valid UTF-8")?;
++    let target = current
++        .join(location)
++        .with_context(|| format!("Invalid {kind} redirect target."))?;
++    if target.scheme() != "http" && target.scheme() != "https" {
++        anyhow::bail!("{kind} redirects may only target http or https URLs.");
++    }
++    Ok(target)
++}
++
++async fn read_response_limited(
++    mut response: reqwest::Response,
++    max_bytes: usize,
++    kind: &str,
++) -> Result<Vec<u8>> {
++    let mut bytes = Vec::new();
++    while let Some(chunk) = response.chunk().await? {
++        if bytes.len().saturating_add(chunk.len()) > max_bytes {
++            anyhow::bail!("{kind} response exceeds the {max_bytes} byte limit.");
++        }
++        bytes.extend_from_slice(&chunk);
++    }
++    Ok(bytes)
++}
++
++pub(crate) async fn read_local_file_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
++    let metadata = tokio::fs::metadata(path)
++        .await
++        .with_context(|| format!("Could not read local file metadata: {}", path.display()))?;
++    if !metadata.is_file() {
++        anyhow::bail!("Local media source is not a file.");
++    }
++    if metadata.len() > max_bytes as u64 {
++        anyhow::bail!("Local file exceeds the {max_bytes} byte limit.");
++    }
++    let file = File::open(path)
++        .await
++        .with_context(|| format!("Could not open local file: {}", path.display()))?;
++    let mut reader = file.take(max_bytes as u64 + 1);
++    let mut bytes = Vec::new();
++    reader.read_to_end(&mut bytes).await?;
++    if bytes.len() > max_bytes {
++        anyhow::bail!("Local file exceeds the {max_bytes} byte limit.");
++    }
++    Ok(bytes)
++}
++
++pub(crate) fn decode_data_url_limited(
++    source: &str,
++    max_bytes: usize,
++    kind: &str,
++) -> Result<Vec<u8>> {
++    let encoded_limit = max_bytes
++        .saturating_mul(4)
++        .saturating_div(3)
++        .saturating_add(DATA_URL_HEADER_ALLOWANCE);
++    if source.len() > encoded_limit {
++        anyhow::bail!("{kind} data URL exceeds the {max_bytes} byte limit.");
++    }
++    let data_url = data_url::DataUrl::process(source)?;
++    let bytes = data_url.decode_to_vec()?.0;
++    if bytes.len() > max_bytes {
++        anyhow::bail!("{kind} data URL exceeds the {max_bytes} byte limit.");
++    }
++    Ok(bytes)
++}
++
++pub(crate) fn data_url_mime(source: &str) -> Option<String> {
++    let header = source.strip_prefix("data:")?.split_once(',')?.0;
++    let mime = header.split(';').next().unwrap_or_default();
++    (!mime.is_empty()).then(|| mime.to_string())
++}
++
++async fn validate_remote_url(url: &Url) -> Result<Vec<SocketAddr>> {
++    if url.scheme() != "http" && url.scheme() != "https" {
++        anyhow::bail!("Remote media URLs must use http or https.");
++    }
++    let Some(host) = url.host_str() else {
++        anyhow::bail!("Remote media URL must include a host.");
++    };
++    reject_private_hostname(host)?;
++    let port = url
++        .port_or_known_default()
++        .ok_or_else(|| anyhow::anyhow!("Remote media URL must include a valid port."))?;
++    let addrs = tokio::net::lookup_host((host, port))
++        .await
++        .with_context(|| format!("Failed to resolve remote media host `{host}`"))?
++        .collect::<Vec<_>>();
++    if addrs.is_empty() {
++        anyhow::bail!("Remote media host `{host}` did not resolve to any addresses.");
++    }
++    for addr in &addrs {
++        reject_private_ip(addr.ip())?;
++    }
++    Ok(addrs)
++}
++
++fn reject_private_hostname(host: &str) -> Result<()> {
++    let host = host.trim_end_matches('.').to_ascii_lowercase();
++    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
++        anyhow::bail!("Remote media URLs must not target local hosts.");
++    }
++    if let Ok(ip) = host.parse::<IpAddr>() {
++        reject_private_ip(ip)?;
++    }
++    Ok(())
++}
++
++fn reject_private_ip(ip: IpAddr) -> Result<()> {
++    if !is_global_ip(ip) {
++        anyhow::bail!("Remote media URLs must not target private or local IP addresses.");
++    }
++    Ok(())
++}
++
++fn is_global_ip(ip: IpAddr) -> bool {
++    match ip {
++        IpAddr::V4(ip) => is_global_ipv4(ip),
++        IpAddr::V6(ip) => {
++            if let Some(ip) = ip.to_ipv4_mapped() {
++                return is_global_ipv4(ip);
++            }
++            is_global_ipv6(ip)
++        }
++    }
++}
++
++fn is_global_ipv4(ip: Ipv4Addr) -> bool {
++    let octets = ip.octets();
++    !(ip.is_private()
++        || ip.is_loopback()
++        || ip.is_link_local()
++        || ip.is_broadcast()
++        || ip.is_unspecified()
++        || ip.is_multicast()
++        || matches!(octets, [100, 64..=127, _, _])
++        || matches!(octets, [192, 0, 0, _])
++        || matches!(octets, [192, 0, 2, _])
++        || matches!(octets, [198, 18 | 19, _, _])
++        || matches!(octets, [198, 51, 100, _])
++        || matches!(octets, [203, 0, 113, _])
++        || octets[0] >= 240)
++}
++
++fn is_global_ipv6(ip: Ipv6Addr) -> bool {
++    let segments = ip.segments();
++    !(ip.is_loopback()
++        || ip.is_unspecified()
++        || ip.is_unique_local()
++        || ip.is_unicast_link_local()
++        || ip.is_multicast()
++        || segments[0] == 0x2001 && segments[1] == 0x0db8)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn rejects_private_remote_hosts() {
++        for source in [
++            "http://127.0.0.1/image.png",
++            "http://169.254.169.254/latest/meta-data",
++            "http://[::1]/image.png",
++            "http://localhost/image.png",
++            "http://service.local/image.png",
++        ] {
++            let url = Url::parse(source).unwrap();
++            assert!(validate_remote_url(&url).await.is_err(), "{source}");
++        }
++    }
++
++    #[test]
++    fn rejects_oversized_data_urls_before_decode() {
++        let source = format!("data:text/plain;base64,{}", "a".repeat(128));
++        assert!(decode_data_url_limited(&source, 4, "test").is_err());
++    }
++}
+diff --git a/mistralrs-server-core/src/util.rs b/mistralrs-server-core/src/util.rs
+index 79f2bf3..a157ce0 100644
+--- a/mistralrs-server-core/src/util.rs
++++ b/mistralrs-server-core/src/util.rs
+@@ -5,10 +5,8 @@ use mistralrs_core::AudioInput;
+ use mistralrs_core::MistralRs;
+ use std::error::Error;
+ use std::sync::Arc;
+-use tokio::{
+-    fs::{self, File},
+-    io::AsyncReadExt,
+-};
++
++use crate::media_source::{load_media_source, MediaSourcePolicy};
+ 
+ /// Parses and loads an image from a URL, file path, or data URL.
+ ///
+@@ -43,91 +41,40 @@ use tokio::{
+ /// let image = parse_image_url("file:///home/user/picture.jpg").await?;
+ /// ```
+ pub async fn parse_image_url(url_unparsed: &str) -> Result<DynamicImage, anyhow::Error> {
+-    let url = if let Ok(url) = url::Url::parse(url_unparsed) {
+-        url
+-    } else if File::open(url_unparsed).await.is_ok() {
+-        url::Url::from_file_path(std::path::absolute(url_unparsed)?)
+-            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url_unparsed))?
+-    } else {
+-        anyhow::bail!(
+-            "Invalid source '{}': not a valid URL (http/https/data) and file not found on server. \
+-             Use a full URL, a data URL, or an absolute file path that exists on the server.",
+-            url_unparsed
+-        )
+-    };
+-
+-    let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+-        // Read from http
+-        match reqwest::get(url.clone()).await {
+-            Ok(http_resp) => http_resp.bytes().await?.to_vec(),
+-            Err(e) => anyhow::bail!(e),
+-        }
+-    } else if url.scheme() == "file" {
+-        let path = url
+-            .to_file_path()
+-            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url))?;
+-
+-        if let Ok(mut f) = File::open(&path).await {
+-            // Read from local file
+-            let metadata = fs::metadata(&path).await?;
+-            let mut buffer = vec![0; metadata.len() as usize];
+-            f.read_exact(&mut buffer).await?;
+-            buffer
+-        } else {
+-            anyhow::bail!("Could not open file at path: {}", url);
+-        }
+-    } else if url.scheme() == "data" {
+-        // Decode with base64
+-        let data_url = data_url::DataUrl::process(url.as_str())?;
+-        data_url.decode_to_vec()?.0
+-    } else {
+-        anyhow::bail!("Unsupported URL scheme: {}", url.scheme());
+-    };
+-
+-    Ok(image::load_from_memory(&bytes)?)
++    parse_image_url_with_policy(url_unparsed, MediaSourcePolicy::Local).await
++}
++
++pub(crate) async fn parse_image_url_for_server(
++    url_unparsed: &str,
++) -> Result<DynamicImage, anyhow::Error> {
++    parse_image_url_with_policy(url_unparsed, MediaSourcePolicy::ServerRequest).await
++}
++
++async fn parse_image_url_with_policy(
++    url_unparsed: &str,
++    policy: MediaSourcePolicy,
++) -> Result<DynamicImage, anyhow::Error> {
++    let media = load_media_source(url_unparsed, policy, "image").await?;
++    Ok(image::load_from_memory(&media.bytes)?)
+ }
+ 
+ /// Parses and loads an audio file from a URL, file path, or data URL.
+ pub async fn parse_audio_url(url_unparsed: &str) -> Result<AudioInput, anyhow::Error> {
+-    let url = if let Ok(url) = url::Url::parse(url_unparsed) {
+-        url
+-    } else if File::open(url_unparsed).await.is_ok() {
+-        url::Url::from_file_path(std::path::absolute(url_unparsed)?)
+-            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url_unparsed))?
+-    } else {
+-        anyhow::bail!(
+-            "Invalid source '{}': not a valid URL (http/https/data) and file not found on server. \
+-             Use a full URL, a data URL, or an absolute file path that exists on the server.",
+-            url_unparsed
+-        )
+-    };
+-
+-    let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+-        match reqwest::get(url.clone()).await {
+-            Ok(http_resp) => http_resp.bytes().await?.to_vec(),
+-            Err(e) => anyhow::bail!(e),
+-        }
+-    } else if url.scheme() == "file" {
+-        let path = url
+-            .to_file_path()
+-            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url))?;
+-
+-        if let Ok(mut f) = File::open(&path).await {
+-            let metadata = fs::metadata(&path).await?;
+-            let mut buffer = vec![0; metadata.len() as usize];
+-            f.read_exact(&mut buffer).await?;
+-            buffer
+-        } else {
+-            anyhow::bail!("Could not open file at path: {}", url);
+-        }
+-    } else if url.scheme() == "data" {
+-        let data_url = data_url::DataUrl::process(url.as_str())?;
+-        data_url.decode_to_vec()?.0
+-    } else {
+-        anyhow::bail!("Unsupported URL scheme: {}", url.scheme());
+-    };
+-
+-    AudioInput::from_bytes(&bytes)
++    parse_audio_url_with_policy(url_unparsed, MediaSourcePolicy::Local).await
++}
++
++pub(crate) async fn parse_audio_url_for_server(
++    url_unparsed: &str,
++) -> Result<AudioInput, anyhow::Error> {
++    parse_audio_url_with_policy(url_unparsed, MediaSourcePolicy::ServerRequest).await
++}
++
++async fn parse_audio_url_with_policy(
++    url_unparsed: &str,
++    policy: MediaSourcePolicy,
++) -> Result<AudioInput, anyhow::Error> {
++    let media = load_media_source(url_unparsed, policy, "audio").await?;
++    AudioInput::from_bytes(&media.bytes)
+ }
+ 
+ /// Validates that the requested model matches one of the loaded models.
+@@ -299,6 +246,17 @@ mod tests {
+         assert_eq!(audio.samples.len(), 1);
+     }
+ 
++    #[tokio::test]
++    async fn server_media_rejects_local_sources() {
++        assert!(parse_image_url_for_server("resources/rust-logo-32x32.png")
++            .await
++            .is_err());
++
++        let absolute_path = std::path::absolute("resources/rust-logo-32x32.png").unwrap();
++        let url = format!("file://{}", absolute_path.as_os_str().to_str().unwrap());
++        assert!(parse_image_url_for_server(&url).await.is_err());
++    }
++
+     #[test]
+     fn test_sanitize_error_message_with_backtrace() {
+         // Test error with backtrace
+diff --git a/mistralrs-server-core/src/video.rs b/mistralrs-server-core/src/video.rs
+index 7e89d58..1a4c8a2 100644
+--- a/mistralrs-server-core/src/video.rs
++++ b/mistralrs-server-core/src/video.rs
+@@ -22,9 +22,10 @@ use image::{AnimationDecoder, DynamicImage};
+ use mistralrs_core::{sample_frame_indices, VideoInput};
+ use std::io::Cursor;
+ use std::path::Path;
+-use tokio::{
+-    fs::{self, File},
+-    io::AsyncReadExt,
++use tokio::fs;
++
++use crate::media_source::{
++    load_media_source, LoadedMedia, MediaSourcePolicy, SERVER_VIDEO_FRAME_LIMIT,
+ };
+ 
+ /// Default frames-per-second assumed when metadata is unavailable (e.g. GIF).
+@@ -49,56 +50,46 @@ See https://ericlbuehler.github.io/mistral.rs/guides/models/video-setup/ for det
+ /// GIF files are decoded with the `image` crate. All other formats require
+ /// FFmpeg.
+ pub async fn parse_video_url(url_unparsed: &str, num_frames: Option<usize>) -> Result<VideoInput> {
+-    let url = if let Ok(url) = url::Url::parse(url_unparsed) {
+-        url
+-    } else if File::open(url_unparsed).await.is_ok() {
+-        url::Url::from_file_path(std::path::absolute(url_unparsed)?)
+-            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url_unparsed))?
+-    } else {
+-        bail!(
+-            "Invalid video source '{}': not a valid URL (http/https/data) and file not found. \
+-             Use a full URL, a data URL, or an absolute file path.",
+-            url_unparsed
+-        )
+-    };
++    parse_video_url_with_policy(url_unparsed, num_frames, MediaSourcePolicy::Local).await
++}
+ 
+-    let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+-        let resp = reqwest::get(url.clone())
+-            .await
+-            .context(format!("Failed to fetch video: {url}"))?;
+-        resp.bytes().await?.to_vec()
+-    } else if url.scheme() == "file" {
+-        let path = url
+-            .to_file_path()
+-            .map_err(|_| anyhow::anyhow!("Invalid file path: {}", url))?;
+-        let mut f = File::open(&path)
+-            .await
+-            .context(format!("Could not open video file: {}", path.display()))?;
+-        let metadata = fs::metadata(&path).await?;
+-        let mut buffer = vec![0; metadata.len() as usize];
+-        f.read_exact(&mut buffer).await?;
+-        buffer
+-    } else if url.scheme() == "data" {
+-        let data_url = data_url::DataUrl::process(url.as_str())?;
+-        data_url.decode_to_vec()?.0
+-    } else {
+-        bail!("Unsupported URL scheme for video: {}", url.scheme());
+-    };
++pub(crate) async fn parse_video_url_for_server(
++    url_unparsed: &str,
++    num_frames: Option<usize>,
++) -> Result<VideoInput> {
++    parse_video_url_with_policy(
++        url_unparsed,
++        num_frames.or(Some(SERVER_VIDEO_FRAME_LIMIT)),
++        MediaSourcePolicy::ServerRequest,
++    )
++    .await
++}
+ 
+-    // Detect format
+-    let lower = url_unparsed.to_lowercase();
+-    let is_gif = lower.ends_with(".gif")
+-        || lower.contains("image/gif")
+-        || (bytes.len() >= 6 && &bytes[..6] == b"GIF89a")
+-        || (bytes.len() >= 6 && &bytes[..6] == b"GIF87a");
++async fn parse_video_url_with_policy(
++    url_unparsed: &str,
++    num_frames: Option<usize>,
++    policy: MediaSourcePolicy,
++) -> Result<VideoInput> {
++    let media = load_media_source(url_unparsed, policy, "video").await?;
+ 
+-    if is_gif {
+-        decode_gif_frames(&bytes, num_frames)
++    if is_gif_source(url_unparsed, &media) {
++        decode_gif_frames(&media.bytes, num_frames)
+     } else {
+-        decode_video_ffmpeg(&bytes, num_frames, url_unparsed).await
++        decode_video_ffmpeg(&media.bytes, num_frames, url_unparsed).await
+     }
+ }
+ 
++fn is_gif_source(source: &str, media: &LoadedMedia) -> bool {
++    let lower = source.to_lowercase();
++    lower.ends_with(".gif")
++        || media
++            .mime_type
++            .as_deref()
++            .is_some_and(|mime| mime.eq_ignore_ascii_case("image/gif"))
++        || media.bytes.starts_with(b"GIF89a")
++        || media.bytes.starts_with(b"GIF87a")
++}
++
+ /// Decode a GIF into frames using the `image` crate.
+ fn decode_gif_frames(bytes: &[u8], num_frames: Option<usize>) -> Result<VideoInput> {
+     let decoder = GifDecoder::new(Cursor::new(bytes)).context("Failed to decode GIF")?;
+@@ -377,4 +368,13 @@ mod tests {
+         assert!(parse_fps_fraction("").is_none());
+         assert!(parse_fps_fraction("abc").is_none());
+     }
++
++    #[tokio::test]
++    async fn server_video_rejects_local_sources() {
++        assert!(
++            parse_video_url_for_server("resources/rust-logo-32x32.png", None)
++                .await
++                .is_err()
++        );
++    }
+ }

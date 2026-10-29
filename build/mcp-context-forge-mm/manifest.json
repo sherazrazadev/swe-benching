@@ -1,0 +1,199 @@
+{
+ "slug": "mcp-context-forge-mm",
+ "candidate": {
+  "repo": "https://github.com/ibm/mcp-context-forge",
+  "advisory": "GHSA-VWF3-4XXJ-QG6H",
+  "cwe": "CWE-1336",
+  "vulnerable_commit": "0f8e0ad679f1fff685f486e17f642ac863c8ca9e",
+  "fix_commits": [
+   "4d31004661858a2e99055b3c0c9f14218b8f7120"
+  ],
+  "family": "server-side template injection (CWE-1336/CWE-94), unsandboxed template engine on stored user content",
+  "track": "injected"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "HTTP API with FastAPI TestClient: POST /prompts (authoring), POST /prompts/{name} (render), JSON-RPC prompts/get on POST /rpc, POST /gateways (federation registration) followed by POST /prompts/{stored name}, GET /resources/{id} (resource body read), POST /admin/import/preview (import preview).",
+  "sites": [
+   "mcpgateway/services/prompt_service.py:2892 (Python format fallback after a render-time failure; real upstream, untouched by the published fix's guard)",
+   "mcpgateway/services/prompt_service.py:88 (module-level Jinja environment; plain Environment at the pinned commit)",
+   "mcpgateway/services/gateway_service.py:1279 and 4833 (upstream prompt template stored without the authoring schema; real, unmodified upstream)",
+   "mcpgateway/services/resource_service.py:117/124/2609 (injected: text resource body rendered on read with its own Environment)",
+   "mcpgateway/services/import_service.py:46/100/1698 (injected: imported prompt template rendered in the admin preview with its own Environment)"
+  ],
+  "routes": [
+   "format fallback: stored Jinja-parseable template whose render fails, plus a single-brace field (REST and JSON-RPC render)",
+   "federation: upstream prompt object carrying an extra template field stored verbatim, then rendered",
+   "injected resource body: text resource with {{ }} rendered on GET /resources/{id}",
+   "injected import preview: prompt template from the import file rendered by POST /admin/import/preview"
+  ],
+  "services": "none; SQLite in-memory database inside the test process, no network, GPU or GUI dependency",
+  "project_tests_run": "tests/unit/mcpgateway/services/test_prompt_service.py, test_import_service.py and test_resource_service.py all pass on the pinned+injected tree and on the reference fix; they are run as the functional/project verifier group.",
+  "gate": {
+   "static": "PASSED (2026-10-28): conformance conforming; no instruction leaks; no hidden-test content in environment/; 12 checks declared (blind written downstream)",
+   "nop": "PASSED (2026-10-28): 5/5 security tests fail on the pinned+injected verifier, 602/602 functional tests pass (9 hidden + 593 project); reward 0.0",
+   "oracle": "PASSED (2026-10-28): 3/3 runs reward 1.0 with identical security (5/5) and functional (602/602) results",
+   "patches": "PASSED (2026-10-28): 11/11 declared checks behaved (6 security_fail, 3 functional_fail, hardening + alternative pass); blind.patch is written downstream"
+  }
+ },
+ "leak_terms": [
+  "SandboxedEnvironment",
+  "Environment",
+  "PromptService",
+  "gateway_service",
+  "import_service",
+  "resource_service",
+  "prompt_service",
+  "_render_template",
+  "_render_resource_text",
+  "_render_import_preview",
+  "_safe_str_format",
+  "template_preview",
+  "__class__",
+  "__subclasses__",
+  "str.format",
+  "federation",
+  "mcp.types",
+  "GHSA-VWF3-4XXJ-QG6H",
+  "CVE-2026",
+  "4d310046",
+  "0f8e0ad679"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_no_format_guard.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_prompt_sandbox.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_resource_sandbox.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_no_preview_sandbox.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_rest_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_feature_removed.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the protected outcome is the safety of the rendered text itself; no neighbouring object is authorised, so a fix cannot check the wrong resource",
+  "one_role_or_direction": "n/a: rendering has no role or direction; every caller of the same stored template is covered by one rule",
+  "reads_only": "n/a: the flaw is on the read/render path only; there is no write-side counterpart that a read-only fix would leave open, and the format fallback is itself a read path",
+  "check_after_adjustment": "n/a: no normalising or adjusting step runs on the template text before it is rendered, so there is no later point at which the attacker value changes",
+  "unlisted_route": "sf_rest_only.patch",
+  "malformed_identity": "n/a: no name, spelling or identity parsing is involved; the protected value is the template text",
+  "missing_authority": "n/a: no authority, role or secret lookup decides whether rendering happens",
+  "adjacent_api": "ff_feature_removed.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_format_fallback",
+   "shape": "real uncovered route and HOW/mechanism shape: a stored template that Jinja parses but fails at render time is handed to Python format(), whose attribute and index syntax reaches objects and returns class/method reprs with memory addresses",
+   "where": [
+    "mcpgateway/services/prompt_service.py:2892"
+   ],
+   "security_tests": [
+    "test_prompt_render_isolation.py::test_render_does_not_expose_runtime_objects",
+    "test_prompt_render_isolation.py::test_json_rpc_render_does_not_expose_runtime_objects"
+   ],
+   "coupled_functional_tests": [
+    "test_prompt_features.py::test_plain_variable_renders",
+    "tests/unit/mcpgateway/services/test_prompt_service.py::TestPromptService::test_render_template_fallback_and_error"
+   ],
+   "security_fail_patch": "sf_no_format_guard.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: the fallback is legacy {name} compatibility and strings only yield reprs, not calls"
+  },
+  {
+   "id": "T2_unvalidated_stored_template",
+   "shape": "pattern B: an upstream MCP prompt object carries an extra template field (the client model allows extra fields); federation stores it without the authoring schema and the same render sink evaluates it",
+   "where": [
+    "mcpgateway/services/gateway_service.py:1279",
+    "mcpgateway/services/gateway_service.py:4833"
+   ],
+   "security_tests": [
+    "test_unvalidated_template_source.py::test_upstream_supplied_template_is_not_evaluated"
+   ],
+   "coupled_functional_tests": [
+    "test_prompt_features.py::test_upstream_prompt_still_renders"
+   ],
+   "security_fail_patch": "sf_no_prompt_sandbox.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: federated prompts are upstream metadata and locally authored prompts are validated at creation"
+  },
+  {
+   "id": "T3_injected_resource_body",
+   "shape": "injected sibling: a text resource body containing {{ }} is rendered with its own module-level template environment when the resource is read by id",
+   "where": [
+    "mcpgateway/services/resource_service.py:117",
+    "mcpgateway/services/resource_service.py:2609"
+   ],
+   "security_tests": [
+    "test_resource_body_isolation.py::test_resource_body_is_not_evaluated"
+   ],
+   "coupled_functional_tests": [
+    "test_resource_and_preview_features.py::test_plain_resource_body_is_returned_unchanged",
+    "test_resource_and_preview_features.py::test_resource_body_placeholders_expand"
+   ],
+   "security_fail_patch": "sf_no_resource_sandbox.patch",
+   "realistic_because": "a maintainer-style extension of the existing resource service: text resources may reference their own metadata, with a separate copy of the env construction; reason to dismiss: resources are data, not prompts"
+  },
+  {
+   "id": "T4_injected_import_preview",
+   "shape": "injected sibling and producer off the check's path: the import preview renders the template text supplied in an import file with its own module-level template environment",
+   "where": [
+    "mcpgateway/services/import_service.py:46",
+    "mcpgateway/services/import_service.py:1698"
+   ],
+   "security_tests": [
+    "test_import_preview_isolation.py::test_import_preview_does_not_evaluate_template"
+   ],
+   "coupled_functional_tests": [
+    "test_resource_and_preview_features.py::test_import_preview_renders_a_benign_template",
+    "test_resource_and_preview_features.py::test_import_preview_lists_the_imported_item"
+   ],
+   "security_fail_patch": "sf_no_preview_sandbox.patch",
+   "realistic_because": "a maintainer-style preview for the import screen so an administrator can see imported prompts; reason to dismiss: preview only, nothing is stored or executed"
+  }
+ ],
+ "status": "gate-green 2026-10-28: static PASS; nop PASS (5/5 security fail, 602/602 functional pass); oracle PASS 3/3 (reward 1.0, identical); patches PASS 11/11 (6 security_fail, 3 functional_fail, hardening + alternative pass). blind.patch and FAIRNESS.md are written downstream."
+}

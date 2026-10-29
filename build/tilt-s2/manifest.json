@@ -1,0 +1,277 @@
+{
+ "slug": "tilt-s2",
+ "candidate": {
+  "repo": "tilt-dev/tilt",
+  "advisory_ids": [
+   "GHSA-6M68-R693-78QX",
+   "CVE-2026-55883",
+   "GO-2026-5181"
+  ],
+  "cwe": "CWE-306 / CWE-345",
+  "pinned_commit": "65ddaecbdbe3bc733ddaed6ea471afb1ebd4307d",
+  "fix_commits": [
+   "47393fba7f6ef5e305d5e814551feef8e4acbc0a"
+  ],
+  "entry_id": "16199"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "On the pinned+injected tree: HTTP GET /api/view with no credential returns the full view; POST /api/trigger dispatches a trigger with no credential; GET /api/dump/engine and GET /api/snapshot/{id} return session data; GET /api/websocket_token hands out the stream value; a websocket dial to /ws/view with no origin or credential receives the live view; the fully wired controller forwards GET /proxy/apis/tilt.dev/v1alpha1/uibuttons and the injected /k8s alias with no credential; the injected /api/v0/view and /api/v0/trigger serve with no valid credential. Security tests drive real TCP listeners (httptest for the HUD router, the controller's real web listener for the proxies), a real websocket handshake, and the tilt binary built from the workspace for the command-line tests.",
+  "sites": [
+   "internal/hud/server/server.go:88-101 (nine API route registrations, the asset catch-all cookie bootstrap)",
+   "internal/hud/server/websocket.go:49-56 (upgrader CheckOrigin: csrf OR origin fallback that accepts an absent Origin)",
+   "internal/hud/server/controller.go:172 (/proxy mount on the web listener)",
+   "internal/hud/server/controller.go:173 (injected /k8s alternate proxy mount)",
+   "internal/hud/server/compat.go:11-13 (injected /api/v0/view and /api/v0/trigger aliases; the view alias checks only that a token header is present)",
+   "internal/cli/utils.go:21-42 (apiGet/apiPostJson, the command-line request path)",
+   "internal/cli/status.go:20-47 (injected standalone command that builds its own request with http.Get)",
+   "internal/hud/client/log_streamer.go:36-50 (the product's live-log websocket client)"
+  ],
+  "routes": [
+   "GET /api/view",
+   "GET /api/dump/engine",
+   "POST /api/analytics",
+   "POST /api/analytics_opt",
+   "POST /api/trigger",
+   "POST /api/override/trigger_mode",
+   "GET /api/snapshot/{snapshot_id}",
+   "GET /api/websocket_token",
+   "POST /api/set_tiltfile_args",
+   "GET /ws/view",
+   "ANY /proxy/*",
+   "ANY /k8s/* (injected)",
+   "GET /api/v0/view (injected)",
+   "POST /api/v0/trigger (injected)"
+  ],
+  "services": [],
+  "project_tests_run": "At the pinned commit, `go test -mod=vendor ./internal/hud/server ./internal/hud/client` passes in the built image (the verifier image warms the same compile graph). At the oracle, the same two packages pass with TestAPIServerProxy excluded: its fixture builds an empty HeadsUpServer with no session store and drives an unauthenticated proxy request, which the required behaviour now refuses; the task's own fully wired proxy tests cover that surface. The hidden suites add 17 security tests and 15 functional tests; the functional group also runs the project's own tests (server, websocket, apiserver dynamic-client, client unit tests)."
+ },
+ "traps": [
+  {
+   "id": "hud_api_routes",
+   "pattern": "A",
+   "shape": "every HTTP route that returns or changes the session's state, not just the one the report shows; a plausible fix retunes only the websocket handshake",
+   "where": "internal/hud/server/server.go:88-101",
+   "reason_to_dismiss": "the report's observed trigger is a single read, and the tempting fix is on the stream handshake; the nine API routes look like they were never protected by design",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_ViewRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_DumpEngineRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_SnapshotRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_WebsocketTokenRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_ForgedHeaderCredentialRefused",
+    "security/sec_hud_test.go::TestSec_ForgedCookieCredentialRefused",
+    "security/sec_hud_test.go::TestSec_TriggerRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_OverrideTriggerModeRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_AnalyticsOptRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_SetTiltfileArgsRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_CrossOriginRequestRefusedEvenWithCredential"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_ViewWithHeaderCredential",
+    "functional/func_hud_test.go::TestFunc_ViewWithCookieCredential",
+    "functional/func_hud_test.go::TestFunc_FirstPageLoadHandsCredential",
+    "functional/func_hud_test.go::TestFunc_SameOriginWithCredentialAllowed"
+   ],
+   "security_fail_patch": "sec_miss_http.patch",
+   "realistic_because": "real unmodified upstream code at the pinned commit"
+  },
+  {
+   "id": "websocket_credential",
+   "pattern": "A",
+   "shape": "the live stream's handshake accepts a request that presents no credential when its Origin header is absent or equals the host: origin is a hint, not a credential",
+   "where": "internal/hud/server/websocket.go:49-56",
+   "reason_to_dismiss": "CheckOrigin already looks like an access check, and a same-origin or origin-less request reads as a safe local client",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_WebsocketRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_WebsocketSameOriginWithoutCredentialRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_WebsocketStreamWithCredential"
+   ],
+   "security_fail_patch": "sec_miss_ws.patch",
+   "realistic_because": "real unmodified upstream code at the pinned commit"
+  },
+  {
+   "id": "proxy_plane",
+   "pattern": "A",
+   "shape": "a separate data plane on the same listener: requests forwarded to the session's Kubernetes API state",
+   "where": "internal/hud/server/controller.go:172",
+   "reason_to_dismiss": "it forwards to the Kubernetes API server, so it reads as protected by that server's own authentication; it lives in a different file from the report's surface",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_ProxyRequiresSessionCredential"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_ProxyWithCredential"
+   ],
+   "security_fail_patch": "sec_miss_proxy.patch",
+   "realistic_because": "real unmodified upstream code at the pinned commit; the published fix adds a token check to this mount"
+  },
+  {
+   "id": "legacy_api_aliases",
+   "pattern": "injected",
+   "shape": "older API aliases that serve the same view and the same trigger action, where the protection never existed; the view alias checks only that a token header is present, not that it is the session's",
+   "where": "internal/hud/server/compat.go:11-13 (called from internal/hud/server/server.go:100)",
+   "reason_to_dismiss": "they are compatibility shims for older scripts, not the current API the report shows; and the view alias already appears to check a token",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_LegacyViewRejectsForgedCredential",
+    "security/sec_hud_test.go::TestSec_LegacyTriggerRequiresSessionCredential"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_LegacyViewWithCredential"
+   ],
+   "security_fail_patch": "sec_miss_siblings.patch",
+   "realistic_because": "injected into our copy only, in the same route-registration style as the surrounding handlers; a maintainer keeping old endpoints would plausibly add exactly this"
+  },
+  {
+   "id": "secondary_proxy_mount",
+   "pattern": "injected",
+   "shape": "a second mount of the same proxy handler under an alternate prefix; gating the reported mount leaves this one open",
+   "where": "internal/hud/server/controller.go:173",
+   "reason_to_dismiss": "it is the same handler value as the mount above, so a fix that wraps the handler once covers both; a fix that wraps the reported route only does not, and the second mount looks like internal plumbing",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_SecondaryProxyRequiresSessionCredential"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_SecondaryProxyWithCredential"
+   ],
+   "security_fail_patch": "sec_miss_siblings.patch",
+   "realistic_because": "injected into our copy only; the web router is a flat list of mounts, and an alternate prefix for older clients is the same shape as the existing /proxy mount"
+  },
+  {
+   "id": "cli_request_helper",
+   "pattern": "coupling",
+   "shape": "the credential is produced by the session at startup and consumed by a separate command-line client; a server-only fix leaves the product's own tools unable to authenticate",
+   "where": "internal/cli/utils.go:21-42",
+   "reason_to_dismiss": "the command-line client is the product's own trusted local tool, so it reads as outside the request-authorization change",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_ViewRequiresSessionCredential"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_CLITriggerAgainstSession",
+    "functional/func_hud_test.go::TestFunc_CLIDumpWebviewAgainstSession",
+    "functional/func_hud_test.go::TestFunc_CLIStatusAgainstSession"
+   ],
+   "security_fail_patch": "n/a: this is a coupled functional lever; func_break_clients.patch proves the functional tests catch its omission",
+   "realistic_because": "real unmodified upstream code at the pinned commit; the published fix updates both helpers and the task adds a second, independent command that builds its own request"
+  },
+  {
+   "id": "log_stream_client",
+   "pattern": "coupling",
+   "shape": "tightening the stream handshake without teaching the product's own live-log client to present the value it now needs; the published fix itself misses this client",
+   "where": "internal/hud/client/log_streamer.go:36-50",
+   "reason_to_dismiss": "the stream is described as the UI's, and the log client is a different package that no API test exercises",
+   "security_tests": [
+    "security/sec_hud_test.go::TestSec_WebsocketRequiresSessionCredential",
+    "security/sec_hud_test.go::TestSec_WebsocketSameOriginWithoutCredentialRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_hud_test.go::TestFunc_WebsocketStreamWithCredential"
+   ],
+   "security_fail_patch": "n/a: this is a coupled functional lever; func_break_clients.patch proves the functional tests catch its omission",
+   "realistic_because": "real unmodified upstream code at the pinned commit; the published fix leaves this client unchanged"
+  }
+ ],
+ "leak_terms": [
+  "CheckOrigin",
+  "requireToken",
+  "originCheck",
+  "originCheckMiddleware",
+  "websocketCSRFToken",
+  "TiltTokenCookieName",
+  "TiltTokenHeaderName",
+  "loadToken",
+  "apiGet",
+  "apiPostJson",
+  "TILT_DISABLE_HUD_AUTH",
+  "HeadsUpServer",
+  "ProvideHeadsUpServer",
+  "WebsocketToken",
+  "ViewJSON",
+  "DumpEngineJSON",
+  "SnapshotJSON",
+  "set_tiltfile_args",
+  "websocket_token",
+  "trigger_mode",
+  "analytics_opt",
+  "csrf",
+  "proxy",
+  "pprof",
+  "gorilla",
+  "compat",
+  "legacy",
+  "status",
+  "trigger",
+  "k8s",
+  "/api/v0",
+  "inject",
+  "compat.go",
+  "status.go",
+  "GHSA-6M68-R693-78QX",
+  "CVE-2026-55883",
+  "GO-2026-5181",
+  "65ddaecb",
+  "47393fba"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_http.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_ws.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_proxy.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_siblings.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_writes.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_break_clients.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "n/a: every security test requires a 4xx client error and no side effect; a panic or a 500 is not a client error, so a crashing refusal fails the test rather than scoring a pass",
+  "wrong_resource": "n/a: the protected object is the running session's own state; there is no neighbouring or proxy object that a check could authorize instead",
+  "one_role_or_direction": "n/a: access is decided by one session credential; there are no peers, roles or directions of which a fix could cover only one",
+  "reads_only": "sec_miss_writes.patch",
+  "check_after_adjustment": "n/a: the credential is compared as an opaque value and no normalising, merging or unit-conversion step is applied to it before or after the check",
+  "unlisted_route": "sec_miss_siblings.patch",
+  "malformed_identity": "n/a: the credential is a single opaque string compared for equality; it is never parsed into fields, so a malformed spelling cannot make the guard see nothing",
+  "missing_authority": "n/a: the expected value is the session token held in memory; the checked routes exist only on a session that holds one, and a request that presents no value is refused by the no-credential tests",
+  "adjacent_api": "n/a: no shared helper's stated behaviour is retuned; the reference fix adds authorization to handlers and adds credential presentation to the client helpers without changing their contract, and the functional tests exercise both helpers and their callers"
+ },
+ "status": "built",
+ "notes": "Injected track. environment/inject.patch adds, to our copy only: legacy /api/v0 aliases (the view alias checks only that a token header is present), a second apiserver-proxy mount under /k8s, and a standalone `tilt status` command that builds its own HTTP request instead of using the shared helpers. Oracle = the published source fix (origin middleware, per-route token checks, csrf-only stream handshake, loopback-only debug mounts, CLI header credential) plus: gate the legacy aliases, gate both proxy mounts with the token and origin check, teach the live-log client to fetch the csrf value with the session credential, and make the injected status command present the credential. The published fix's vendor/modules.txt drift and its test edits are excluded. Its loopbackOnly change to /debug is kept in the oracle but is not part of the tested property (a loopback source cannot be produced through a real local listener); the snapshot viewer is outside the advisory's property. The pristine TestAPIServerProxy is excluded from the project group because its fixture has no session store; a skip is documented in tests/test.sh."
+}

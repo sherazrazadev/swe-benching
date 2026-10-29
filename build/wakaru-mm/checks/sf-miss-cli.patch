@@ -1,0 +1,154 @@
+diff --git a/crates/core/src/sourcemap_rename.rs b/crates/core/src/sourcemap_rename.rs
+index e24f8ff..c37fc49 100644
+--- a/crates/core/src/sourcemap_rename.rs
++++ b/crates/core/src/sourcemap_rename.rs
+@@ -101,16 +101,7 @@ fn sanitize_module_source_name(raw: &str) -> String {
+         .trim_start_matches("webpack://")
+         .trim_start_matches("webpack:///")
+         .trim_start_matches('/');
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    if sanitized.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    crate::unpacker::sanitize_relative_path(stripped, "module.js")
+ }
+ 
+ /// Apply source-map-driven identifier renaming to `module`.
+diff --git a/crates/core/src/unpacker/browserify.rs b/crates/core/src/unpacker/browserify.rs
+index 1639f6a..0770c44 100644
+--- a/crates/core/src/unpacker/browserify.rs
++++ b/crates/core/src/unpacker/browserify.rs
+@@ -117,17 +117,7 @@ fn extract_browserify_modules(
+ 
+ /// Convert a module id that names a file into a relative output path.
+ fn sanitize_module_name(raw: &str) -> String {
+-    let stripped = raw.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    if sanitized.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    crate::unpacker::sanitize_relative_path(raw, "module.js")
+ }
+ 
+ fn extract_entry_ids(entry_array: &ArrayLit) -> Option<Vec<String>> {
+diff --git a/crates/core/src/unpacker/esbuild.rs b/crates/core/src/unpacker/esbuild.rs
+index 45f2f79..69e7c58 100644
+--- a/crates/core/src/unpacker/esbuild.rs
++++ b/crates/core/src/unpacker/esbuild.rs
+@@ -581,13 +581,7 @@ fn sanitize_path(raw: String) -> String {
+         .trim_start_matches("webpack://")
+         .trim_start_matches("webpack:///")
+         .trim_start_matches('/');
+-    // Strip leading `../` segments so the path doesn't escape the output directory.
+-    let s = s.trim_start_matches("../");
+-    if s.is_empty() {
+-        "module.js".to_string()
+-    } else {
+-        s.to_string()
+-    }
++    crate::unpacker::sanitize_relative_path(s, "module.js")
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/crates/core/src/unpacker/mod.rs b/crates/core/src/unpacker/mod.rs
+index c878138..58e7824 100644
+--- a/crates/core/src/unpacker/mod.rs
++++ b/crates/core/src/unpacker/mod.rs
+@@ -23,6 +23,24 @@ pub struct UnpackResult {
+ 
+ pub(crate) type BindingId = (Atom, SyntaxContext);
+ 
++/// Convert a bundler-provided module path into a relative output path.
++///
++/// This is component-based instead of replacement-based so overlapping strings
++/// like `....//foo` cannot turn into `../foo` after a single sanitation pass.
++pub(crate) fn sanitize_relative_path(raw: &str, fallback: &str) -> String {
++    let normalized = raw.replace('\\', "/");
++    let parts: Vec<&str> = normalized
++        .split('/')
++        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
++        .collect();
++
++    if parts.is_empty() {
++        fallback.to_string()
++    } else {
++        parts.join("/")
++    }
++}
++
+ pub fn unpack_bundle(source: &str) -> Option<UnpackResult> {
+     try_unpack_bundle(source).ok().flatten()
+ }
+diff --git a/crates/core/src/unpacker/systemjs.rs b/crates/core/src/unpacker/systemjs.rs
+index 8e11d9c..42fb5a8 100644
+--- a/crates/core/src/unpacker/systemjs.rs
++++ b/crates/core/src/unpacker/systemjs.rs
+@@ -808,17 +808,7 @@ fn filename_for_register(
+ }
+ 
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    let sanitized = sanitized
+-        .trim_matches('/')
+-        .trim_matches('\\')
+-        .replace('\\', "/");
+-    let mut filename = if sanitized.is_empty() {
+-        "unknown".to_string()
+-    } else {
+-        sanitized
+-    };
++    let mut filename = crate::unpacker::sanitize_relative_path(module_id, "unknown");
+     if !filename
+         .rsplit('/')
+         .next()
+diff --git a/crates/core/src/unpacker/webpack4.rs b/crates/core/src/unpacker/webpack4.rs
+index 50e8506..4119b7a 100644
+--- a/crates/core/src/unpacker/webpack4.rs
++++ b/crates/core/src/unpacker/webpack4.rs
+@@ -838,13 +838,7 @@ fn normalize_extracted_webpack_module(
+ /// Strips leading `./`, removes path traversal (`../`, `..\`), and falls back
+ /// to `"unknown.js"` when the result would be empty.
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    if sanitized.is_empty() {
+-        "unknown.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    crate::unpacker::sanitize_relative_path(module_id, "unknown.js")
+ }
+ 
+ /// Scan the bootstrap function body for `n.s = <number>` or `n(n.s = <number>)` patterns
+diff --git a/crates/core/src/unpacker/webpack5.rs b/crates/core/src/unpacker/webpack5.rs
+index 0357e33..efb786f 100644
+--- a/crates/core/src/unpacker/webpack5.rs
++++ b/crates/core/src/unpacker/webpack5.rs
+@@ -1154,13 +1154,7 @@ fn extract_callee_body(callee: &Callee) -> Option<&swc_core::ecma::ast::BlockStm
+ }
+ 
+ fn sanitize_filename(module_id: &str) -> String {
+-    let stripped = module_id.trim_start_matches("./");
+-    let sanitized = stripped.replace("../", "").replace("..\\", "");
+-    if sanitized.is_empty() {
+-        "unknown.js".to_string()
+-    } else {
+-        sanitized
+-    }
++    crate::unpacker::sanitize_relative_path(module_id, "unknown.js")
+ }
+ 
+ /// Scan the bootstrap body for `__webpack_require__(__webpack_require__.s = <id>)` and return

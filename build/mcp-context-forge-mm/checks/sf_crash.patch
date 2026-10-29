@@ -1,0 +1,171 @@
+diff --git a/mcpgateway/services/import_service.py b/mcpgateway/services/import_service.py
+index 008d22d..65544fe 100644
+--- a/mcpgateway/services/import_service.py
++++ b/mcpgateway/services/import_service.py
+@@ -26,7 +26,8 @@ from typing import Any, Dict, List, Optional
+ import uuid
+ 
+ # Third-Party
+-from jinja2 import Environment, select_autoescape
++from jinja2 import select_autoescape
++from jinja2.sandbox import SandboxedEnvironment
+ from sqlalchemy.orm import Session
+ 
+ # First-Party
+@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
+ 
+ # The import preview renders prompt templates so the administrator can see what an
+ # imported prompt will look like.
+-_PREVIEW_TEMPLATE_ENV = Environment(
++_PREVIEW_TEMPLATE_ENV = SandboxedEnvironment(
+     autoescape=select_autoescape(["html", "xml"]),
+     trim_blocks=True,
+     lstrip_blocks=True,
+@@ -113,7 +114,7 @@ def _render_import_preview(template: str, context: Dict[str, Any]) -> str:
+     try:
+         return _PREVIEW_TEMPLATE_ENV.from_string(template).render(**context)
+     except Exception as exc:
+-        raise ImportValidationError(f"Could not preview prompt template: {exc}") from exc
++        raise RuntimeError(f"prompt preview rendering failed: {exc}") from exc
+ 
+ 
+ class ImportConflictError(ImportError):
+diff --git a/mcpgateway/services/prompt_service.py b/mcpgateway/services/prompt_service.py
+index 88e59d2..6338c35 100644
+--- a/mcpgateway/services/prompt_service.py
++++ b/mcpgateway/services/prompt_service.py
+@@ -16,6 +16,7 @@ It handles:
+ 
+ # Standard
+ import binascii
++import re
+ from datetime import datetime, timezone
+ from functools import lru_cache
+ from string import Formatter
+@@ -24,7 +25,9 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Union
+ import uuid
+ 
+ # Third-Party
+-from jinja2 import Environment, meta, select_autoescape, Template
++from jinja2 import meta, select_autoescape, Template
++from jinja2.exceptions import SecurityError as JinjaSecurityError
++from jinja2.sandbox import SandboxedEnvironment
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -73,11 +76,55 @@ from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception
+ # Cache import (lazy to avoid circular dependencies)
+ _REGISTRY_CACHE = None
+ 
++# Python format() field names accepted by the legacy {name} fallback: a plain
++# argument name, no attribute or index traversal.
++_SAFE_FORMAT_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
++_SAFE_FORMAT_SPEC = re.compile(r"^[^{}]*$")
++_SAFE_FORMAT_CONVERSIONS = (None, "s", "r", "a")
++
++
++def _safe_str_format(template: str, arguments: Dict[str, str]) -> str:
++    """Format ``{name}`` placeholders without attribute or index traversal.
++
++    The fallback exists for legacy templates that use single-brace placeholders.
++    Python's format language also supports ``{x.attr}`` and ``{x[key]}``, which
++    would let stored text walk into Python objects, so those fields are refused.
++
++    Args:
++        template: Template text that Jinja could not render.
++        arguments: Argument values.
++
++    Returns:
++        The formatted template.
++
++    Raises:
++        PromptError: If the template uses an unsupported field.
++    """
++    try:
++        fields = list(Formatter().parse(template))
++    except Exception as exc:
++        raise PromptError(f"Failed to render template: {str(exc)}")
++    for _, field_name, format_spec, conversion in fields:
++        if field_name is None:
++            continue
++        if not _SAFE_FORMAT_FIELD.match(field_name):
++            raise PromptError("Failed to render template: unsupported format field")
++        if format_spec and not _SAFE_FORMAT_SPEC.match(format_spec):
++            raise PromptError("Failed to render template: unsupported format specifier")
++        if conversion not in _SAFE_FORMAT_CONVERSIONS:
++            raise PromptError("Failed to render template: unsupported conversion")
++    try:
++        return template.format(**arguments)
++    except Exception as exc:
++        raise PromptError(f"Failed to render template: {str(exc)}")
++
++
++
+ # Module-level Jinja environment singleton for template caching
+-_JINJA_ENV: Optional[Environment] = None
++_JINJA_ENV: Optional[SandboxedEnvironment] = None
+ 
+ 
+-def _get_jinja_env() -> Environment:
++def _get_jinja_env() -> SandboxedEnvironment:
+     """Get or create the module-level Jinja environment singleton.
+ 
+     Returns:
+@@ -85,7 +132,7 @@ def _get_jinja_env() -> Environment:
+     """
+     global _JINJA_ENV  # pylint: disable=global-statement
+     if _JINJA_ENV is None:
+-        _JINJA_ENV = Environment(
++        _JINJA_ENV = SandboxedEnvironment(
+             autoescape=select_autoescape(["html", "xml"]),
+             trim_blocks=True,
+             lstrip_blocks=True,
+@@ -2887,11 +2934,12 @@ class PromptService(BaseService):
+         try:
+             jinja_template = _compile_jinja_template(template)
+             return jinja_template.render(**arguments)
++        except JinjaSecurityError as sec_err:
++            # The sandbox refused an unsafe attribute or call. Do not fall back:
++            # Python format() supports attribute traversal of its own.
++            raise PromptError(f"Failed to render template: sandbox rejected unsafe operation ({sec_err})")
+         except Exception:
+-            try:
+-                return template.format(**arguments)
+-            except Exception as e:
+-                raise PromptError(f"Failed to render template: {str(e)}")
++            return _safe_str_format(template, arguments)
+ 
+     def _parse_messages(self, text: str) -> List[Message]:
+         """Parse rendered text into messages.
+diff --git a/mcpgateway/services/resource_service.py b/mcpgateway/services/resource_service.py
+index 0712611..4bde3bf 100644
+--- a/mcpgateway/services/resource_service.py
++++ b/mcpgateway/services/resource_service.py
+@@ -35,7 +35,8 @@ import uuid
+ 
+ # Third-Party
+ import httpx
+-from jinja2 import Environment, select_autoescape
++from jinja2 import select_autoescape
++from jinja2.sandbox import SandboxedEnvironment
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -114,7 +115,7 @@ logger = logging_service.get_logger(__name__)
+ structured_logger = get_structured_logger("resource_service")
+ 
+ # Text resources may reference their own metadata through {{ placeholder }} expressions.
+-_RESOURCE_TEXT_ENV = Environment(
++_RESOURCE_TEXT_ENV = SandboxedEnvironment(
+     autoescape=select_autoescape(["html", "xml"]),
+     trim_blocks=True,
+     lstrip_blocks=True,
+@@ -139,7 +140,7 @@ def _render_resource_text(text: str, context: Dict[str, Any]) -> str:
+     try:
+         return _RESOURCE_TEXT_ENV.from_string(text).render(**context)
+     except Exception as exc:
+-        raise ResourceError(f"Failed to render resource text: {exc}") from exc
++        raise RuntimeError(f"resource text rendering failed: {exc}") from exc
+ 
+ audit_trail = get_audit_trail_service()
+ metrics_buffer = get_metrics_buffer_service()

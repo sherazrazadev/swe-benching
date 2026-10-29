@@ -1,0 +1,239 @@
+diff -ruN a/api/user/passkey.go b/api/user/passkey.go
+--- a/api/user/passkey.go	2026-10-28 15:27:54.000000000 +0000
++++ b/api/user/passkey.go	2026-10-28 16:26:22.940987110 +0000
+@@ -3,7 +3,6 @@
+ import (
+ 	"encoding/base64"
+ 	"fmt"
+-	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -120,17 +119,11 @@
+ 	})
+ }
+ 
+-// passkeyAttemptAddress returns the address a passkey attempt is attributed to.
+-func passkeyAttemptAddress(c *gin.Context) string {
+-	host, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr))
+-	if err != nil {
+-		return strings.TrimSpace(c.Request.RemoteAddr)
+-	}
+-	return host
+-}
+-
++// passkeyAttemptBlocked reports whether the derived client address has already
++// used up its sign-in attempts. Failures are recorded against that address so
++// clients that share a proxy never share a lockout bucket.
+ func passkeyAttemptBlocked(c *gin.Context) bool {
+-	clientIP := passkeyAttemptAddress(c)
++	clientIP := c.ClientIP()
+ 	b := query.BanIP
+ 	banIP, _ := b.Where(b.IP.Eq(clientIP),
+ 		b.ExpiredAt.Gte(time.Now().Unix()),
+@@ -140,7 +133,7 @@
+ }
+ 
+ func recordFailedPasskeyAttempt(c *gin.Context) {
+-	user.BanIP(passkeyAttemptAddress(c))
++	user.BanIP(c.ClientIP())
+ }
+ 
+ func takePasskeyPreAuthSession(preAuthID string) (*passkeyPreAuthSession, bool) {
+diff -ruN a/internal/clientaddr/clientaddr.go b/internal/clientaddr/clientaddr.go
+--- a/internal/clientaddr/clientaddr.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/clientaddr/clientaddr.go	2026-10-28 16:26:03.335986078 +0000
+@@ -0,0 +1,62 @@
++// Package clientaddr holds the trust boundary for the client address.
++//
++// Security decisions (the address allowlist and the sign-in lockout) are made
++// from the address a request is attributed to, so that address may only be
++// taken from a forwarding header when the direct peer is a proxy this
++// deployment controls. A header presented by any other peer is ignored and the
++// request keeps its direct peer address.
++package clientaddr
++
++import (
++	"net"
++	"strings"
++
++	"github.com/0xJacky/Nginx-UI/internal/helper"
++	"github.com/gin-gonic/gin"
++)
++
++// bundledProxyPeers lists the addresses the bundled Nginx proxy connects from
++// when it forwards an inbound request to the backend over the loopback
++// interface.
++var bundledProxyPeers = []string{"127.0.0.1", "::1"}
++
++// TrustedPeers returns the peers whose client-address headers are honoured.
++//
++// The bundled proxy is trusted implicitly, because the deployment runs it in
++// front of the backend, but only for as long as this process owns that proxy.
++// When the bundled proxy is disabled or absent no peer is trusted implicitly,
++// so forwarded headers are ignored entirely.
++func TrustedPeers() []string {
++	if !helper.ShouldManageBundledNginx() {
++		return nil
++	}
++
++	peers := make([]string, len(bundledProxyPeers))
++	copy(peers, bundledProxyPeers)
++	return peers
++}
++
++// Configure installs the trust boundary on engine. Afterwards a request is
++// attributed to the nearest address in the forwarding chain that is not a
++// trusted peer, which is the direct peer when no trusted proxy forwarded it.
++func Configure(engine *gin.Engine) error {
++	if engine == nil {
++		return nil
++	}
++
++	if err := engine.SetTrustedProxies(TrustedPeers()); err != nil {
++		// SetTrustedProxies applies the list before parsing it, so a bad entry
++		// would leave a partial trust set behind. Trust nobody instead.
++		_ = engine.SetTrustedProxies(nil)
++		return err
++	}
++
++	return nil
++}
++
++// IsLoopback reports whether ip is a loopback address (127.0.0.0/8 or ::1).
++// A request from the local machine is always allowed to reach the application.
++func IsLoopback(ip string) bool {
++	parsed := net.ParseIP(strings.TrimSpace(ip))
++	return parsed != nil && parsed.IsLoopback()
++}
+diff -ruN a/internal/middleware/ip_whitelist.go b/internal/middleware/ip_whitelist.go
+--- a/internal/middleware/ip_whitelist.go	2026-10-28 15:27:50.000000000 +0000
++++ b/internal/middleware/ip_whitelist.go	2026-10-28 16:26:10.366982457 +0000
+@@ -2,25 +2,31 @@
+ 
+ import (
+ 	"net/http"
++	"slices"
+ 
++	"github.com/0xJacky/Nginx-UI/internal/clientaddr"
+ 	"github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
+-	"github.com/samber/lo"
+ )
+ 
++// IPWhiteList refuses requests whose derived client address is not covered by
++// the configured address allowlist. An unset allowlist leaves the feature off.
+ func IPWhiteList() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+-		clientIP := c.ClientIP()
+-		if len(settings.AuthSettings.IPWhiteList) == 0 || clientIP == "" || clientIP == "127.0.0.1" || clientIP == "::1" {
++		allowlist := settings.AuthSettings.IPWhiteList
++		if len(allowlist) == 0 {
+ 			c.Next()
+ 			return
+ 		}
+ 
+-		if !lo.Contains(settings.AuthSettings.IPWhiteList, clientIP) {
+-			c.AbortWithStatus(http.StatusForbidden)
++		// The derived address is the only thing a decision may rest on. If it
++		// cannot be derived the request is not treated as trusted.
++		clientIP := c.ClientIP()
++		if clientaddr.IsLoopback(clientIP) || slices.Contains(allowlist, clientIP) {
++			c.Next()
+ 			return
+ 		}
+ 
+-		c.Next()
++		c.AbortWithStatus(http.StatusForbidden)
+ 	}
+ }
+diff -ruN a/mcp/router.go b/mcp/router.go
+--- a/mcp/router.go	2026-10-28 15:27:54.000000000 +0000
++++ b/mcp/router.go	2026-10-28 16:26:16.732979193 +0000
+@@ -16,7 +16,6 @@
+ 	"github.com/0xJacky/Nginx-UI/model"
+ 	"github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
+-	"github.com/samber/lo"
+ )
+ 
+ var sensitiveMCPTools = map[string]struct{}{
+@@ -37,51 +36,16 @@
+ }
+ 
+ func InitRouter(r *gin.Engine) {
+-	r.Any("/mcp", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+-	r.Any("/mcp_message", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp_message", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+ }
+ 
+-// mcpIPWhiteList keeps the MCP endpoints on the same address allowlist as the
+-// rest of the API.
+-func mcpIPWhiteList() gin.HandlerFunc {
+-	return func(c *gin.Context) {
+-		if len(settings.AuthSettings.IPWhiteList) == 0 {
+-			c.Next()
+-			return
+-		}
+-
+-		clientIP := c.ClientIP()
+-		if forwarded := forwardedClientIP(c.GetHeader("X-Forwarded-For")); forwarded != "" {
+-			clientIP = forwarded
+-		} else if realIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); realIP != "" {
+-			clientIP = realIP
+-		}
+-
+-		if clientIP == "127.0.0.1" || clientIP == "::1" ||
+-			lo.Contains(settings.AuthSettings.IPWhiteList, clientIP) {
+-			c.Next()
+-			return
+-		}
+-
+-		c.AbortWithStatus(http.StatusForbidden)
+-	}
+-}
+-
+-func forwardedClientIP(header string) string {
+-	for _, part := range strings.Split(header, ",") {
+-		if ip := strings.TrimSpace(part); ip != "" {
+-			return ip
+-		}
+-	}
+-	return ""
+-}
+-
+ func mcpAuthRequired() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		if c.Request.URL.Query().Has("node_secret") {
+diff -ruN a/router/routers.go b/router/routers.go
+--- a/router/routers.go	2026-10-28 15:27:50.000000000 +0000
++++ b/router/routers.go	2026-10-28 16:26:07.506983930 +0000
+@@ -30,6 +30,7 @@
+ 	"github.com/0xJacky/Nginx-UI/api/terminal"
+ 	"github.com/0xJacky/Nginx-UI/api/upstream"
+ 	"github.com/0xJacky/Nginx-UI/api/user"
++	"github.com/0xJacky/Nginx-UI/internal/clientaddr"
+ 	"github.com/0xJacky/Nginx-UI/internal/middleware"
+ 	"github.com/0xJacky/Nginx-UI/mcp"
+ 	"github.com/gin-gonic/gin"
+@@ -44,7 +45,12 @@
+ 
+ 	r.Use(audit.LoggingMiddleware())
+ 
+-	r.SetTrustedProxies(nil)
++	// Attribute every request to an address derived only from a peer this
++	// deployment trusts. The bundled proxy's loopback peer is trusted while the
++	// bundled proxy is in use; no other peer's forwarding header is honoured.
++	if err := clientaddr.Configure(r); err != nil {
++		panic("router: configure client address trust boundary: " + err.Error())
++	}
+ 
+ 	// Add CORS middleware to allow all origins
+ 	r.Use(middleware.CORS())

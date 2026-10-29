@@ -1,0 +1,158 @@
+diff --git a/api/user/passkey.go b/api/user/passkey.go
+index 12582f7..879cabe 100644
+--- a/api/user/passkey.go
++++ b/api/user/passkey.go
+@@ -3,7 +3,6 @@ package user
+ import (
+ 	"encoding/base64"
+ 	"fmt"
+-	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -122,11 +121,7 @@ func FinishPasskeyPreAuthentication(c *gin.Context) {
+ 
+ // passkeyAttemptAddress returns the address a passkey attempt is attributed to.
+ func passkeyAttemptAddress(c *gin.Context) string {
+-	host, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr))
+-	if err != nil {
+-		return strings.TrimSpace(c.Request.RemoteAddr)
+-	}
+-	return host
++	return c.ClientIP()
+ }
+ 
+ func passkeyAttemptBlocked(c *gin.Context) bool {
+diff --git a/internal/middleware/ip_whitelist.go b/internal/middleware/ip_whitelist.go
+index 6de0d0d..891b600 100644
+--- a/internal/middleware/ip_whitelist.go
++++ b/internal/middleware/ip_whitelist.go
+@@ -11,7 +11,7 @@ import (
+ func IPWhiteList() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		clientIP := c.ClientIP()
+-		if len(settings.AuthSettings.IPWhiteList) == 0 || clientIP == "" || clientIP == "127.0.0.1" || clientIP == "::1" {
++		if len(settings.AuthSettings.IPWhiteList) == 0 || clientIP == "127.0.0.1" || clientIP == "::1" {
+ 			c.Next()
+ 			return
+ 		}
+diff --git a/mcp/router.go b/mcp/router.go
+index d51f68c..fc8c087 100644
+--- a/mcp/router.go
++++ b/mcp/router.go
+@@ -16,7 +16,6 @@ import (
+ 	"github.com/0xJacky/Nginx-UI/model"
+ 	"github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
+-	"github.com/samber/lo"
+ )
+ 
+ var sensitiveMCPTools = map[string]struct{}{
+@@ -37,51 +36,16 @@ type mcpToolCallProbe struct {
+ }
+ 
+ func InitRouter(r *gin.Engine) {
+-	r.Any("/mcp", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+-	r.Any("/mcp_message", mcpIPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
++	r.Any("/mcp_message", middleware.IPWhiteList(), mcpAuthRequired(), authorizeMCPToolRequest(),
+ 		func(c *gin.Context) {
+ 			internalmcp.ServeHTTP(c)
+ 		})
+ }
+ 
+-// mcpIPWhiteList keeps the MCP endpoints on the same address allowlist as the
+-// rest of the API.
+-func mcpIPWhiteList() gin.HandlerFunc {
+-	return func(c *gin.Context) {
+-		if len(settings.AuthSettings.IPWhiteList) == 0 {
+-			c.Next()
+-			return
+-		}
+-
+-		clientIP := c.ClientIP()
+-		if forwarded := forwardedClientIP(c.GetHeader("X-Forwarded-For")); forwarded != "" {
+-			clientIP = forwarded
+-		} else if realIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); realIP != "" {
+-			clientIP = realIP
+-		}
+-
+-		if clientIP == "127.0.0.1" || clientIP == "::1" ||
+-			lo.Contains(settings.AuthSettings.IPWhiteList, clientIP) {
+-			c.Next()
+-			return
+-		}
+-
+-		c.AbortWithStatus(http.StatusForbidden)
+-	}
+-}
+-
+-func forwardedClientIP(header string) string {
+-	for _, part := range strings.Split(header, ",") {
+-		if ip := strings.TrimSpace(part); ip != "" {
+-			return ip
+-		}
+-	}
+-	return ""
+-}
+-
+ func mcpAuthRequired() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		if c.Request.URL.Query().Has("node_secret") {
+diff --git a/router/routers.go b/router/routers.go
+index 7d548b8..f7c0c0d 100644
+--- a/router/routers.go
++++ b/router/routers.go
+@@ -2,6 +2,7 @@ package router
+ 
+ import (
+ 	"net/http"
++	"slices"
+ 
+ 	"github.com/0xJacky/Nginx-UI/api/analytic"
+ 	"github.com/0xJacky/Nginx-UI/api/audit"
+@@ -30,11 +31,14 @@ import (
+ 	"github.com/0xJacky/Nginx-UI/api/terminal"
+ 	"github.com/0xJacky/Nginx-UI/api/upstream"
+ 	"github.com/0xJacky/Nginx-UI/api/user"
++	"github.com/0xJacky/Nginx-UI/internal/helper"
+ 	"github.com/0xJacky/Nginx-UI/internal/middleware"
+ 	"github.com/0xJacky/Nginx-UI/mcp"
++	cfgsettings "github.com/0xJacky/Nginx-UI/settings"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/uozi-tech/cosy"
+ 	"github.com/uozi-tech/cosy/debug"
++	"github.com/uozi-tech/cosy/logger"
+ )
+ 
+ func InitRouter() {
+@@ -44,7 +48,13 @@ func InitRouter() {
+ 
+ 	r.Use(audit.LoggingMiddleware())
+ 
+-	r.SetTrustedProxies(nil)
++	trustedProxies := slices.Clone(cfgsettings.AuthSettings.TrustedProxies)
++	if helper.ShouldManageBundledNginx() {
++		trustedProxies = append(trustedProxies, "127.0.0.1", "::1")
++	}
++	if err := r.SetTrustedProxies(trustedProxies); err != nil {
++		logger.Fatalf("Configure trusted proxies: %v", err)
++	}
+ 
+ 	// Add CORS middleware to allow all origins
+ 	r.Use(middleware.CORS())
+diff --git a/settings/auth.go b/settings/auth.go
+index ab49fb5..318b448 100644
+--- a/settings/auth.go
++++ b/settings/auth.go
+@@ -2,6 +2,7 @@ package settings
+ 
+ type Auth struct {
+ 	IPWhiteList         []string `json:"ip_white_list" binding:"omitempty,dive,ip|redacted" ini:",,allowshadow" protected:"true"`
++	TrustedProxies      []string `json:"trusted_proxies" binding:"omitempty,dive,ip|cidr|redacted" ini:",,allowshadow" protected:"true"`
+ 	BanThresholdMinutes int      `json:"ban_threshold_minutes" binding:"min=1"`
+ 	MaxAttempts         int      `json:"max_attempts" binding:"min=1"`
+ }

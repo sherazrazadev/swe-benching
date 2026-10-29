@@ -1,0 +1,192 @@
+{
+ "slug": "nginxui-origin-inj",
+ "candidate": {
+  "repo": "0xjacky/nginx-ui",
+  "advisory_ids": [
+   "GHSA-9H23-53F4-Q947",
+   "CVE-2026-107804"
+  ],
+  "pinned_commit": "ece8c62c512378eb8360bf8d6d31bec7468f15bb",
+  "fix_commits": [
+   "e30e331303fc21cf077a2bea724bd79e66892eaf"
+  ],
+  "cwe": "CWE-346",
+  "entry_id": "16906"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "HTTP requests on the gin engine the server builds in router.InitRouter(): the address allowlist runs on the /api group, /mcp and /mcp_message; sign-in runs on POST /api/login and POST /api/finish_passkey_pre_auth. Hidden tests start the real engine with cosyRouter.Init() + router.InitRouter() (build tag unembed) and send httptest requests, exactly as the project's own router test does; the MCP and middleware routes are exercised through the same engine and through the shared middleware. No network, no external services, sqlite in memory for the ban records.",
+  "variants": [
+   "base (published fix, pattern A, the lead): the engine-wide trusted-proxy setting is cleared in the router bootstrap, so behind the bundled loopback proxy every request is attributed to the proxy address; the address allowlist exempts that address and the sign-in lockout keys on it, giving allowlist bypass and one shared lockout bucket.",
+   "base (published fix, pattern A, far site): the allowlist treats an undeterminable client address as trusted, so a request whose peer address cannot be parsed bypasses a configured allowlist.",
+   "injected sibling (separate route family): the MCP endpoints keep their own allowlist copy that reads forwarded client-address headers directly from the request instead of using the engine-derived address; a spoofed header from an untrusted peer satisfies the allowlist. INJECTED into our copy only.",
+   "injected sibling (second sign-in entry point): passkey pre-authentication attributes failed attempts to the direct connection peer, so every client behind the bundled proxy shares one lockout bucket. INJECTED into our copy only."
+  ],
+  "services": [],
+  "project_tests_run": "The project's own tests for the affected packages build and pass at the pinned+injected commit and on the oracle: go test -tags unembed ./internal/middleware/ ./settings/ ./mcp/ ./api/user/ ./router/ ./api/public/ (Go 1.27, CGO_ENABLED=1 for the sqlite-backed tests). The pinned commit does not contain the advisory's regression tests (the fix commit adds internal/middleware/ip_whitelist_test.go, router/client_ip_test.go and internal/user/login_ban_test.go). Hidden suites: 4 security tests fail on pinned+injected and pass on the oracle; 7 functional tests pass on both; the injected siblings break no project test.",
+  "notes": "Each check patch was applied with patch -p1 -E to a fresh copy of the pinned+injected tree and run locally before the gate.",
+  "gate": {
+   "static": "pass",
+   "nop": "pass (10 security tests fail on the vulnerable code, 185 functional pass)",
+   "oracle": "pass (3/3 trials reward 1.0, identical results)",
+   "patches": "pass (sec_miss_engine 0.4, sec_miss_failclosed 0.9, sec_miss_mcp 0.7, sec_miss_passkey 0.9; func_refuseall 0.0, func_overbroad 0.0; hardening 1.0, alt_fix 1.0)"
+  }
+ },
+ "traps": [
+  {
+   "id": "engine_trust_default",
+   "pattern": "A",
+   "shape": "the published fix's protected sink: the engine-wide trusted-proxy setting trusts no peer, so behind the bundled loopback proxy every request is attributed to the proxy address",
+   "where": "router/routers.go:47 (SetTrustedProxies(nil)); the fix adds router/client_ip.go and calls it from the same line",
+   "reason_to_dismiss": "the router bootstrap reads as generic framework setup, and clearing the trusted-proxy list looks like it is already the hardened choice; the report's lead points at the allowlist middleware instead",
+   "security_tests": [
+    "security/sec_test.go::TestSec_BundledProxyUsesDerivedClientForAllowlist"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_test.go::TestFunc_AllowlistedClientsAreServed",
+    "functional/func_test.go::TestFunc_DirectLoopbackClientIsServed",
+    "functional/func_test.go::TestFunc_BundledProxyDisabledDoesNotTrustLoopback",
+    "functional/func_test.go::TestFunc_UntrustedPeerForwardedHeaderIsIgnored"
+   ],
+   "security_fail_patch": "sec_miss_engine.patch"
+  },
+  {
+   "id": "undeterminable_address_fail_open",
+   "pattern": "A",
+   "shape": "the allowlist treats a client address that the framework could not derive (empty) as exempt",
+   "where": "internal/middleware/ip_whitelist.go:14",
+   "reason_to_dismiss": "once the engine derives a real address the empty case looks like defensive dead code, so a fix that rewrites the loopback exemption can leave it in place",
+   "security_tests": [
+    "security/sec_test.go::TestSec_UndeterminableClientAddressIsNotTrusted"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_test.go::TestFunc_EmptyAllowlistAllowsRequests"
+   ],
+   "security_fail_patch": "sec_miss_failclosed.patch"
+  },
+  {
+   "id": "mcp_allowlist_copy",
+   "pattern": "injected",
+   "shape": "a second allowlist implementation on the MCP endpoints reads forwarded client-address headers from the request directly, so an untrusted peer's header satisfies the allowlist",
+   "where": "mcp/router.go:39-46 and the mcpIPWhiteList helper directly below (injected into our copy)",
+   "reason_to_dismiss": "the MCP endpoints are registered outside the main API group with their own middleware chain, so a separate allowlist there looks deliberate and is easy to miss when the shared allowlist is fixed; the published fix never touches this file",
+   "security_tests": [
+    "security/sec_test.go::TestSec_MCPRouteIgnoresForwardedAddressFromUntrustedPeer"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_test.go::TestFunc_MCPAllowlistedClientIsServed"
+   ],
+   "security_fail_patch": "sec_miss_mcp.patch",
+   "realistic_because": "a maintainer adding an allowlist to the separately-registered MCP endpoints (where clients normally arrive through a proxy) would plausibly read the forwarded address on that route; INJECTED into our copy only, registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "passkey_lockout_peer",
+   "pattern": "injected",
+   "shape": "the passkey pre-authentication entry point attributes failed attempts to the direct connection peer instead of the derived client address, so all clients behind the bundled proxy share one lockout bucket",
+   "where": "api/user/passkey.go:65 and the passkeyAttemptAddress helper below it (injected into our copy)",
+   "reason_to_dismiss": "the report's impact is the password sign-in lockout; passkey is a separate sign-in entry point with its own attempt handling, and the published fix never touches this file",
+   "security_tests": [
+    "security/sec_test.go::TestSec_PasskeyLockoutIsPerClient"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_test.go::TestFunc_PasskeyBelowThresholdIsNotLockedOut"
+   ],
+   "security_fail_patch": "sec_miss_passkey.patch",
+   "realistic_because": "a maintainer adding per-connection throttling to the passkey sign-in path (a second, separately written entry point) would plausibly key it on the connection address; INJECTED into our copy only, registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "SetTrustedProxies",
+  "ClientIP",
+  "IPWhiteList",
+  "configureTrustedProxies",
+  "trustedProxiesForCurrentTopology",
+  "ShouldManageBundledNginx",
+  "InitRouter",
+  "FinishPasskeyPreAuthentication",
+  "mcpIPWhiteList",
+  "mcpAuthRequired",
+  "BanIP",
+  "AuthSettings",
+  "TrustedProxies",
+  "RemoteAddr",
+  "passkey",
+  "mcp",
+  "X-Forwarded-For",
+  "X-Real-IP",
+  "127.0.0.1",
+  "::1",
+  "NGINX_UI_OFFICIAL_DOCKER",
+  "NGINX_UI_DISABLE_BUNDLED_NGINX",
+  "NGINX_UI_AUTH_TRUSTED_PROXIES",
+  "routers.go",
+  "client_ip.go",
+  "ip_whitelist.go",
+  "auth.go",
+  "passkey.go",
+  "router.go",
+  "middleware.go",
+  "docker.go",
+  "GHSA-9H23-53F4-Q947",
+  "CVE-2026-107804",
+  "ece8c62c",
+  "e30e3313"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_engine.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_failclosed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_mcp.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_passkey.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_refuseall.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuseall.patch",
+  "crash_as_refusal": "n/a: the security tests require a client error and the functional suite has positive controls, so a panic or 5xx fails rather than passing as a refusal",
+  "wrong_resource": "n/a: there is one protected resource - the attribution of a request to a client address - and no neighbouring or proxy resource a fix could authorise instead",
+  "one_role_or_direction": "sec_miss_passkey.patch",
+  "reads_only": "n/a: the sink is address attribution; there is no read-vs-write split in the protected operations",
+  "check_after_adjustment": "n/a: the guard decides on the raw peer address before the framework parses any forwarded header; there is no normalising step on the attacker value ahead of it",
+  "unlisted_route": "sec_miss_mcp.patch",
+  "malformed_identity": "sec_miss_failclosed.patch",
+  "missing_authority": "n/a: trust is decided structurally from the peer address, not from an external authority that could return empty and fail open",
+  "adjacent_api": "n/a: the fix changes only the address-attribution path; hardening.patch adds validation of the trusted-proxy list without changing any stated behaviour"
+ },
+ "status": "built"
+}

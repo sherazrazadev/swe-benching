@@ -1,0 +1,167 @@
+diff --git a/internal/cli/cli.go b/internal/cli/cli.go
+index 078fa52..5c6db99 100644
+--- a/internal/cli/cli.go
++++ b/internal/cli/cli.go
+@@ -90,6 +90,7 @@ up-to-date in real-time. Think 'docker build && kubectl apply' or 'docker-compos
+ 	rootCmd.AddCommand(newAlphaCmd(streams))
+ 	rootCmd.AddCommand(newLspCmd())
+ 	rootCmd.AddCommand(newSnapshotCmd())
++	rootCmd.AddCommand(newStatusCmd(streams))
+ 
+ 	globalFlags := rootCmd.PersistentFlags()
+ 	globalFlags.BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+diff --git a/internal/cli/status.go b/internal/cli/status.go
+new file mode 100644
+index 0000000..f3b63c5
+--- /dev/null
++++ b/internal/cli/status.go
+@@ -0,0 +1,51 @@
++package cli
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++
++	"github.com/spf13/cobra"
++	"k8s.io/cli-runtime/pkg/genericclioptions"
++)
++
++func newStatusCmd(streams genericclioptions.IOStreams) *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "status",
++		Short: "Print a summary of the resources in a running Tilt session",
++		Args:  cobra.NoArgs,
++		Run: func(cmd *cobra.Command, args []string) {
++			statusRun(streams)
++		},
++	}
++	addConnectServerFlags(cmd)
++	return cmd
++}
++
++func statusRun(streams genericclioptions.IOStreams) {
++	url := apiURL("view")
++	res, err := http.Get(url)
++	if err != nil {
++		cmdFail(fmt.Errorf("Could not connect to Tilt at %s: %v", url, err))
++	}
++	defer func() { _ = res.Body.Close() }()
++
++	if res.StatusCode != http.StatusOK {
++		failWithNonOKResponse(url, res)
++	}
++
++	body, err := io.ReadAll(res.Body)
++	if err != nil {
++		cmdFail(fmt.Errorf("Error reading response from %s: %v", url, err))
++	}
++
++	var view struct {
++		Resources []json.RawMessage `json:"resources"`
++	}
++	if err := json.Unmarshal(body, &view); err != nil {
++		cmdFail(fmt.Errorf("Error parsing view from %s: %v", url, err))
++	}
++
++	_, _ = fmt.Fprintf(streams.Out, "%d resources\n", len(view.Resources))
++}
+diff --git a/internal/hud/server/compat.go b/internal/hud/server/compat.go
+new file mode 100644
+index 0000000..a7fb9aa
+--- /dev/null
++++ b/internal/hud/server/compat.go
+@@ -0,0 +1,28 @@
++package server
++
++import (
++	"net/http"
++
++	"github.com/gorilla/mux"
++)
++
++// registerLegacyRoutes keeps the pre-0.20 API endpoints available for scripts
++// and extensions that still use them.
++func (s *HeadsUpServer) registerLegacyRoutes(r *mux.Router) {
++	r.HandleFunc("/api/v0/view", s.LegacyViewJSON)
++	r.HandleFunc("/api/v0/trigger", s.LegacyTrigger).Methods("POST")
++}
++
++// LegacyViewJSON serves the current view on the old endpoint.
++func (s *HeadsUpServer) LegacyViewJSON(w http.ResponseWriter, req *http.Request) {
++	if req.Header.Get("X-Tilt-Token") == "" {
++		http.Error(w, "session token required", http.StatusForbidden)
++		return
++	}
++	s.ViewJSON(w, req)
++}
++
++// LegacyTrigger triggers a resource update on the old endpoint.
++func (s *HeadsUpServer) LegacyTrigger(w http.ResponseWriter, req *http.Request) {
++	s.HandleTrigger(w, req)
++}
+diff --git a/internal/hud/server/controller.go b/internal/hud/server/controller.go
+index 99e5a7a..b8e2eb7 100644
+--- a/internal/hud/server/controller.go
++++ b/internal/hud/server/controller.go
+@@ -35,6 +35,9 @@ import (
+ //	chosen here.
+ const apiServerProxyPrefix = "/proxy"
+ 
++// legacyAPIServerProxyPrefix is kept for clients that used the older /k8s prefix.
++const legacyAPIServerProxyPrefix = "/k8s"
++
+ type HeadsUpServerController struct {
+ 	// configAccess may be nil in cases where we don't
+ 	// want to persist the config to disk.
+@@ -156,11 +159,17 @@ func (s *HeadsUpServerController) setUpHelper(ctx context.Context, st store.RSto
+ 		return fmt.Errorf("failed to create apiserver proxy: %v", err)
+ 	}
+ 
++	legacyProxyHandler, err := newAPIServerProxyHandlerAt(legacyAPIServerProxyPrefix, config.GenericConfig.LoopbackClientConfig)
++	if err != nil {
++		return fmt.Errorf("failed to create legacy apiserver proxy: %v", err)
++	}
++
+ 	webRouter := mux.NewRouter()
+ 	webRouter.PathPrefix("/debug").Handler(http.DefaultServeMux) // for /debug/pprof
+ 	// the path prefix here must be kept in sync with the prefix configured in the proxy handler
+ 	// (it needs to know what to strip before forwarding the request)
+ 	webRouter.PathPrefix(apiServerProxyPrefix).Handler(proxyHandler)
++	webRouter.PathPrefix(legacyAPIServerProxyPrefix).Handler(legacyProxyHandler)
+ 	webRouter.PathPrefix("/").Handler(s.hudServer.Router())
+ 
+ 	s.webServer = &http.Server{
+@@ -272,6 +281,10 @@ func (s *HeadsUpServerController) modifyConfig(config clientcmdapi.Config) error
+ }
+ 
+ func newAPIServerProxyHandler(config *rest.Config) (http.Handler, error) {
++	return newAPIServerProxyHandlerAt(apiServerProxyPrefix, config)
++}
++
++func newAPIServerProxyHandlerAt(prefix string, config *rest.Config) (http.Handler, error) {
+ 	// all requests to the proxy handler are same origin from the HUD server, so there is
+ 	// no CORS policy in place because we explicitly want to reject all other origin requests
+ 	// in the future, it's worth considering adding a CSRF token for a bit of extra robustness;
+@@ -289,7 +302,7 @@ func newAPIServerProxyHandler(config *rest.Config) (http.Handler, error) {
+ 	}
+ 
+ 	// the prefix here must be kept in sync with the route definition on the mux
+-	return proxy.NewProxyHandler(apiServerProxyPrefix, fs, config, 0, false)
++	return proxy.NewProxyHandler(prefix, fs, config, 0, false)
+ }
+ 
+ var _ store.SetUpper = &HeadsUpServerController{}
+diff --git a/internal/hud/server/server.go b/internal/hud/server/server.go
+index b2d83f8..3c3ef10 100644
+--- a/internal/hud/server/server.go
++++ b/internal/hud/server/server.go
+@@ -92,6 +92,7 @@ func ProvideHeadsUpServer(
+ 	r.HandleFunc("/api/websocket_token", s.WebsocketToken)
+ 	r.HandleFunc("/ws/view", s.ViewWebsocket)
+ 	r.HandleFunc("/api/set_tiltfile_args", s.HandleSetTiltfileArgs).Methods("POST")
++	s.registerLegacyRoutes(r)
+ 
+ 	r.PathPrefix("/").Handler(s.cookieWrapper(assetServer))
+ 
