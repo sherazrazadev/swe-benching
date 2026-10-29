@@ -1,0 +1,239 @@
+{
+ "slug": "plugins-s4",
+ "candidate": "GHSA-JHJP-4C2Q-XMX4 / GO-2026-6538 (falcosecurity/plugins) \u2014 the shipped k8s-audit detection sees per-container security settings only on a pod's regular container list",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "14de2cb5e1c8ec0b2718f89e3dd821fd33c2f4e2 (parent of published fix 0adb9b3c7e2c8bad53f30d01c057e038b2afa5e1; verified with git rev-parse 0adb9b3c^)",
+  "entry_points": [
+   "k8saudit plugin public field catalogue: Plugin.Fields() (plugins/k8saudit/pkg/k8saudit/fields.go:25), the interface the rule engine resolves every ka.* field through",
+   "k8saudit plugin public extraction path: Plugin.ExtractFromJSON (extract.go:118), reached by Extract/ExtractFromEvent (extract.go:56, :108) and inherited by the aks/eks/gke/ovh wrappers",
+   "shipped k8s_audit rule set (plugins/k8saudit/rules/k8s_audit_rules.yaml), evaluated by Falco over the fields above; the hidden tests load the solver's rule file and evaluate its conditions with a test-side Falco-condition evaluator"
+  ],
+  "sites": [
+   "plugins/k8saudit/rules/k8s_audit_rules.yaml:240-246 \u2014 Create Privileged Pod consults only ka.req.pod.containers.privileged (landing point)",
+   "plugins/k8saudit/pkg/k8saudit/extract.go:290-301 \u2014 ka.req.pod.containers.privileged and the deprecated ka.req.container.privileged read requestObject.spec.containers only",
+   "plugins/k8saudit/pkg/k8saudit/fields.go:25-523 \u2014 Fields() publishes per-container values only for ka.req.pod.containers.*",
+   "plugins/k8saudit/rules/k8s_audit_rules.yaml:310-324 (injected) \u2014 Create Pod Running As Root reports only the regular container list",
+   "plugins/k8saudit/rules/k8s_audit_rules.yaml:473-487 (injected) \u2014 Create Pod With Privilege Escalation reports only the regular container list",
+   "plugins/k8saudit/rules/k8s_audit_rules.yaml:400-407 \u2014 EphemeralContainers Created matches the container-attachment request but has no security-setting check"
+  ],
+  "routes": [
+   "pod create with a privileged init container \u2014 reported by the fixed detection; unreported on the pinned tree (security test confirmed)",
+   "pods/ephemeralcontainers update/patch adding a privileged ephemeral container \u2014 the request object is a Pod carrying the list at spec.ephemeralContainers; confirmed unreported on the pinned tree: only EphemeralContainers Created (NOTICE) fires, for the benign and malicious requests alike, because no shipped rule checks the ephemeral list's security settings and the ephemeral per-container fields are not registered (Pattern B route built)",
+   "screener route 'deprecated scalar ka.req.container.privileged still reads only spec.containers' \u2014 confirmed but not built as a security route: no shipped rule consumes that field; kept as a coupled functional contract instead",
+   "screener route 'trusted-image exception reads only regular-container images' \u2014 confirmed; treated as deliberate product policy and kept as a coupled functional contract (the exception must keep suppressing and must stay scoped to regular-container images)",
+   "screener note about the legacy top-level ephemeral payload \u2014 superseded: current requests carry the list at spec.ephemeralContainers, which the existing extractor reads; the gap is the missing per-container fields and attachment detection, folded into the route above",
+   "image-allowlist rules (Create Disallowed Pod, Pod Created in Kube Namespace) reading only spec.containers \u2014 image policy, outside the per-container security-setting property; not built"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./pkg/k8saudit -run '^TestOpen' -count=1 (5 watch tests) passes at the pinned tree, on the injected tree, and on the reference fix; run by the verifier from a pristine copy of watch_test.go",
+  "local_runs": "Local matrix on the injected tree (Go 1.24, GOPROXY=off, GOSUMDB=off): nop security 0/7 pass (all 7 fail), functional 10/10 hidden + 5/5 project; oracle 7/7 + 10/10; miss_subresource security 6/7 + 10/10; miss_root_rule 6/7 + 10/10; miss_esc_rule 6/7 + 10/10; miss_init 3/7 + 10/10; wrong_union 7/7 + functional 7/10; wrong_refuse_all security 6/7 + functional 7/10; pass_alt 7/7 + 10/10; pass_pod_only 7/7 + 10/10; hardening 7/7 + 10/10; blind 7/7 + 10/10",
+  "pattern_b_register": "one built uncovered route (ephemeral container attachment); register row appended with disclosure_status 'pending client decision'"
+ },
+ "leak_terms": [
+  "GHSA-JHJP-4C2Q-XMX4",
+  "GO-2026-6538",
+  "14de2cb5",
+  "0adb9b3c",
+  "falcosecurity/plugins",
+  "extract.go",
+  "fields.go",
+  "k8s_audit_rules.yaml",
+  "k8s_audit_rules",
+  "k8s_audit",
+  "ExtractFromJSON",
+  "ExtractFromEvent",
+  "containerListFields",
+  "extractContainerField",
+  "getContainerValues",
+  "readFromContainerEffectively",
+  "readContainerImages",
+  "arrayAsStringsSkipNil",
+  "any_container_privileged",
+  "Create Privileged Pod",
+  "Add Privileged Ephemeral Container",
+  "EphemeralContainers Created",
+  "Create Pod With Privilege Escalation",
+  "initContainers",
+  "ephemeralContainers",
+  "ephemeralcontainers",
+  "subresource",
+  "ka.req.pod",
+  "ka.req.container",
+  "requestObject",
+  "Create Pod Running As Root"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_subresource.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L1"
+   ],
+   "note": "reference fix without the attachment-request detection; the ephemeral attachment route stays unreported"
+  },
+  {
+   "patch": "miss_root_rule.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L3"
+   ],
+   "note": "the root-user rule still consults only the regular container list"
+  },
+  {
+   "patch": "miss_esc_rule.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L4"
+   ],
+   "note": "the privilege-escalation rule still consults only the regular container list"
+  },
+  {
+   "patch": "miss_init.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L0"
+   ],
+   "note": "the init-container fields are registered but wired to the regular container list, so the init container's own values are never seen"
+  },
+  {
+   "patch": "wrong_union.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "unions all container lists into the regular-container values; breaks their scope, alignment, deprecated summaries and the trusted-image allowance"
+  },
+  {
+   "patch": "wrong_refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "makes the privileged rule fire on every pod create; reports non-privileged and trusted-image pods"
+  },
+  {
+   "patch": "hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "note": "reference fix plus defensive nil/index guards in the extraction helpers the tests import"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "kind": "alternative",
+   "expect": "pass",
+   "note": "independent design: inline rule terms instead of a macro, top-level-first ephemeral lookup, renamed attachment rule"
+  },
+  {
+   "patch": "pass_pod_only.patch",
+   "kind": "alternative",
+   "expect": "pass",
+   "note": "reference fix without the legacy top-level ephemeral lookup: a Pod-only fix for the current pods/ephemeralcontainers payload must score 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "wrong_refuse_all.patch",
+  "crash_as_refusal": "n/a: the product reports detections and has no refusal path; a crash in extraction would be an ordinary API break and is not the failure mode here",
+  "wrong_resource": "miss_init.patch",
+  "one_role_or_direction": "n/a: there are no roles, peers or directions; every request is evaluated by the same rule set",
+  "reads_only": "n/a: the product only reads and reports audit records; there is no write path to guard",
+  "check_after_adjustment": "wrong_union.patch",
+  "unlisted_route": "miss_subresource.patch",
+  "malformed_identity": "n/a: no caller-supplied identity or name is parsed to make the detection",
+  "missing_authority": "n/a: the rule set is evaluated in-process; there is no external authority lookup that can be absent",
+  "adjacent_api": "wrong_union.patch"
+ },
+ "traps": [
+  {
+   "id": "L1",
+   "pattern": "B",
+   "shape": "route where the protection never existed: a container-attachment request is a pods/ephemeralcontainers update or patch whose Pod payload carries the list at spec.ephemeralContainers; no shipped rule checks a security setting there, and the ephemeral per-container fields are not registered at the pinned commit",
+   "where": "plugins/k8saudit/rules/k8s_audit_rules.yaml:400-407 (existing attachment rule, no security check) and fields.go (no ephemeral per-container fields)",
+   "security_tests": [
+    "TestSecPrivilegedEphemeralContainerReported",
+    "TestSecEphemeralContainerValuesExtracted"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncRegularContainerValuesStayScoped",
+    "TestFuncTrustedImageExceptionStillSuppresses",
+    "TestFuncBenignEphemeralAttachmentStillNoticed"
+   ],
+   "security_fail_patch": "miss_subresource.patch",
+   "realistic_because": "real, unmodified upstream code; ephemeral containers are only ever added through this request, and the existing EphemeralContainers Created rule is the natural reason to dismiss it as already covered",
+   "reason_to_dismiss": "ephemeral containers are a separate feature with their own rule, and the reported rule is about pod create"
+  },
+  {
+   "id": "L2",
+   "pattern": "coupled",
+   "shape": "coupled must-keep-working: regular-container values, their index alignment with the image repository, the deprecated per-pod summaries, and the trusted-image allowance",
+   "where": "plugins/k8saudit/rules/k8s_audit_rules.yaml:243 and extract.go:290-301",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "TestFuncRegularContainerValuesStayScoped",
+    "TestFuncTrustedImageExceptionStillSuppresses",
+    "TestFuncDeprecatedSummariesUnchanged",
+    "TestFuncAllowedPodsRaiseNoPrivilegedAlert"
+   ],
+   "security_fail_patch": "n/a: this is a functional lever, proven by wrong_union.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix deliberately keeps the regular-container values scoped and adds separate per-list values",
+   "reason_to_dismiss": "unioning the lists into the existing value is the smallest change and appears to fix the reported case"
+  },
+  {
+   "id": "L3",
+   "pattern": "injected",
+   "shape": "second shipped detection with the same one-list gap, added where the published fix never touches (a CIS root-user rule)",
+   "where": "plugins/k8saudit/rules/k8s_audit_rules.yaml:310-324 (injected)",
+   "security_tests": [
+    "TestSecRootUserInInitContainerReported"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncRegularPrivilegedPodStillReported"
+   ],
+   "security_fail_patch": "miss_root_rule.patch",
+   "realistic_because": "a maintainer adding the next CIS-benchmark rule copies the existing rule's condition and consults only the regular list, as the shipped privileged rule did",
+   "reason_to_dismiss": "the report is about privileged containers; running as root is a different per-container setting"
+  },
+  {
+   "id": "L4",
+   "pattern": "injected",
+   "shape": "third shipped detection with the same one-list gap, far from the landing point",
+   "where": "plugins/k8saudit/rules/k8s_audit_rules.yaml:473-487 (injected)",
+   "security_tests": [
+    "TestSecPrivilegeEscalationInInitContainerReported"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncRegularPrivilegedPodStillReported"
+   ],
+   "security_fail_patch": "miss_esc_rule.patch",
+   "realistic_because": "same maintainer pattern as L3, for a different CIS benchmark item, appended further down the rule file",
+   "reason_to_dismiss": "a different per-container setting, and a rule the report does not name"
+  },
+  {
+   "id": "L5",
+   "pattern": "A",
+   "shape": "far site: the engine resolves a rule's fields through the exported field catalogue and the extractor, neither of which the rule calls; the catalogue and extraction must both cover the new lists",
+   "where": "plugins/k8saudit/pkg/k8saudit/fields.go:25-523 and extract.go:118",
+   "security_tests": [
+    "TestSecFieldCatalogueCoversEveryContainerList",
+    "TestSecInitContainerValuesExtracted"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncRegularContainerValuesStayScoped",
+    "TestFuncIndexOrderingAndJoinsPreserved"
+   ],
+   "security_fail_patch": "miss_init.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix protects both entry points, and a partial fix that wires only one of them is the natural shortcut",
+   "reason_to_dismiss": "the report names a rule, and the rule looks like the fix site; the field catalogue looks like documentation"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle, patches)"
+}
