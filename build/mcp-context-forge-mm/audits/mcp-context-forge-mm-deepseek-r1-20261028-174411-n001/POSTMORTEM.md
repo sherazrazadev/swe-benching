@@ -1,0 +1,28 @@
+# Post-run audit: mcp-context-forge-mm__V9q7Ugc
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.8.
+
+**Trustworthy:** False  **Attribution:** test-fault  **Confidence:** high
+
+Reward 0.8 comes from a single security failure, test_resource_body_is_not_evaluated. It is a test fault, not a gap in the model's fix. The model added write-time validation to the resource schema (ResourceCreate/ResourceUpdate content containing '{{' goes through validate_template_safety), so POST /resources/ with the SSTI body is refused with 422. The test hard-asserts `created.status_code == 200` before it even reads the resource, so it fails on that first line. The instruction never requires the create step to accept the malicious body. Its wording ('refused with a client error and leaves no prompt, resource or other state created') actually supports refusing at create time. The suite is also inconsistent with itself: both prompt-render tests explicitly allow a create-time refusal (`name = ... if created.status_code == 200 else "missing-prompt"`), but the resource test does not. The model also hardened the read path (_render_resource_text runs validate_template_safety and renders in a deny-all-attribute SandboxedEnvironment with an output finalizer), so even if the body had been stored, the read would be refused. The other 4 security tests and all 9 hidden functional tests pass, along with the ~590 project unit tests. There was no timeout or infra problem, and there was no contamination. A fair grader would very likely have given 1.0.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| security.test_resource_body_isolation::test_resource_body_is_not_evaluated | fail | test-fault | False | False |
+
+**Lookup or leak:** None found. The agent read and edited only the repository's own tests (/workspace/tests/security/test_input_validation.py, tests/unit/...) and temporary probe files it wrote and then deleted (transcript.md:320-346, 418-422). There are no reads of the hidden verifier tests and no web fetches. No netguard.log is present. run.json shows 0 tool calls during the grading window.
+
+**Evidence:**
+- evidence/tests/security/test_resource_body_isolation.py:8 `assert created.status_code == 200, created.text` (hard requirement that the malicious resource is accepted at create time)
+- evidence/tests/security/test_prompt_render_isolation.py:23,31 `name = created.json().get("name") if created.status_code == 200 else "missing-prompt"` (the prompt tests tolerate create-time refusal; the resource test does not)
+- evidence/instruction.md:20-21 'A request that would do so is refused with a client error and leaves no prompt, resource or other state created or changed.'
+- evidence/instruction.md:22-23 'This holds for every template the gateway holds ... however the text reached the gateway.' (nothing requires accepting the malicious body)
+- evidence/final-code/changes.patch:77-93 schemas.py: `if isinstance(v, str) and "{{" in v: validate_template_safety(v)` for resource content (create and update)
+- evidence/final-code/changes.patch:879-899 resource_service._render_resource_text: sandboxed env plus validate_template_safety before render (read path also protected)
+- evidence/transcript.md:331 probe output 'CREATE 422 ... Template contains potentially dangerous expressions' / 'RENDER 422'
+- evidence/grading/results.json:6 the only failing test; every other security and functional entry is 'pass' (passed_total 0.998)
+- evidence/run.json timing: agent_end 18:08:37 before grading window 18:08:56; tool_calls_during_grading []
+- evidence/solution/fix.patch: the reference uses only a read-time SandboxedEnvironment, so it stores the body and refuses on read; the test encodes that one layer choice
+- evidence/build-notes.md:43-47 T3 design expects rendering to be refused on GET; write-time rejection was not anticipated in the patch checks
+
+**Recommended action:** Treat this trial as a likely full solve (effective reward 1.0) and do not count it as a model shortfall. Fix the task: in test_resource_body_isolation, accept a 4xx refusal at create time as satisfying the property (mirror the prompt tests: if creation is refused with a 4xx and the response has no runtime marker, pass; otherwise read and assert_refused). Then regrade this and the sibling trials on the same task, since any fix that validates resource content at write time will fail the same way.

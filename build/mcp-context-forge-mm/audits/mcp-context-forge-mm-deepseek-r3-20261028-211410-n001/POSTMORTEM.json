@@ -1,0 +1,46 @@
+{
+ "trial": "mcp-context-forge-mm__Wr3vJM7",
+ "task": "mcp-context-forge-mm",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-28T21:46:03+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T01:51:43+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "test-fault",
+  "confidence": "high",
+  "summary": "Reward 0.8 comes from a single failing security test, test_resource_body_is_not_evaluated. That test asserts the malicious resource CREATE returns HTTP 200 before checking that the READ is refused (tests/security/test_resource_body_isolation.py:8 `assert created.status_code == 200`). The model's fix refuses the unsafe resource body at creation time: the ResourceCreate content validator calls validate_jinja_template, so the request gets a 422. That is exactly what the instruction asks for: \"A request that would do so is refused with a client error and leaves no prompt, resource or other state created\" (instruction.md:20-21). The model also hardened the read path (_render_resource_text -> render_jinja_template with a sandbox, an AST allow-list and finalize), which covers resource rows that reached the DB another way. So the test failed on its precondition, not on any exposure. The tests also disagree with each other: the prompt security tests explicitly allow a creation-time refusal (test_prompt_render_isolation.py:23 `if created.status_code == 200 else \"missing-prompt\"`), but the resource test does not. Every other test passed (all 4 other security tests, 9 hidden functional tests, and the project unit suites). No contamination was found and no tool calls happened during grading. A fair grader would very likely have given 1.0.",
+  "items": [
+   {
+    "test": "security.test_resource_body_isolation::test_resource_body_is_not_evaluated",
+    "outcome": "fail",
+    "model_behaviour": "Added a ResourceCreate/ResourceUpdate content validator in schemas.py that runs validate_jinja_template on any body containing '{{' (changes.patch ~L1046-1051, ~L1086-1091). It also validates in register_resource, the bulk path and update_resource (resource_service.py hunks), and renders reads through the sandboxed render_jinja_template, which turns TemplateSecurityError into ResourceError. The admin route maps that to 422. For '{{ ''.__class__.__mro__[1].__subclasses__ }}' the Getattr on a Const is refused by _validate_loop_attribute, so POST /resources/ returns a 4xx (transcript.md:594 shows the same body rejected by ResourceCreate with 'Template contains potentially dangerous expressions'). The test's `assert created.status_code == 200` therefore fails before the read is ever attempted.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   },
+   {
+    "test": "security.test_prompt_render_isolation::test_render_does_not_expose_runtime_objects / test_json_rpc_render_does_not_expose_runtime_objects",
+    "outcome": "pass",
+    "model_behaviour": "The model refuses the template at creation (_validate_template -> validate_template_text rejects the format traversal '{x.__class__...}'), and also at render time (validate_template_text in _render_template, plus substitute_single_braces in place of str.format). The test then renders 'missing-prompt', which comes back as a 4xx/JSON-RPC error. These tests are somewhat lenient, since a create-time refusal makes the render step trivially pass. Here the pass is still genuine: the render path is independently hardened, and test_upstream_supplied_template_is_not_evaluated exercises it on a stored template that bypassed the schema and passed.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-pass"
+   }
+  ],
+  "lookup_or_leak": "None found. The agent only read and ran the repository's own project tests under /workspace/tests (e.g. tests/unit/..., tests/security/test_input_validation.py). It wrote temporary self-check tests and deleted them (transcript.md:474-516). There is no sign of access to the hidden verifier tests or of fetching an upstream fix. run.json shows tool_calls_during_grading is empty and agent_events_after_end is 0.",
+  "evidence": [
+   "evidence/tests/security/test_resource_body_isolation.py:7-10: create must return 200, then the read must be refused",
+   "evidence/instruction.md:19-21: 'A request that would do so is refused with a client error and leaves no prompt, resource or other state created or changed.'",
+   "evidence/instruction.md:22: 'This holds for every template the gateway holds ... however the text reached the gateway.' The model covers the read path too (resource_service.py _render_resource_text -> render_jinja_template).",
+   "evidence/tests/security/test_prompt_render_isolation.py:23,31: prompt tests explicitly tolerate a creation-time refusal; the resource test does not (inconsistent)",
+   "evidence/final-code/changes.patch schemas.py hunks: 'if isinstance(v, str) and \"{{\" in v: validate_jinja_template(v)' in ResourceCreate/ResourceUpdate content validators",
+   "evidence/transcript.md:594: 'resource rejected: ValidationError 1 validation error for ResourceCreate | content | Value error, Template contains potentially dangerous expressions'",
+   "evidence/solution/fix.patch: the reference only swaps in SandboxedEnvironment and does no creation-time validation for resources, so the test encodes the reference's choice of layer",
+   "evidence/build-notes.md:43-47: T3 is described as rendering on GET /resources/{id}; nothing says creation must succeed",
+   "evidence/grading/results.json: the only failure is the resource test; all other security, hidden functional and 593 project tests pass",
+   "evidence/run.json: tool_calls_during_grading [], exception_info null"
+  ],
+  "recommended_action": "Fix the test. Accept a refusal at either point in test_resource_body_isolation: if the create returns 4xx, assert no resource was stored and treat that as refused (as the prompt tests already do). Or seed the malicious resource directly into the DB so that only the read path is tested. Then regrade this trial; it would very likely score 1.0. Until then, do not report the 0.8 as a model shortfall."
+ }
+}
