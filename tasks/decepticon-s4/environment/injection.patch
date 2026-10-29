@@ -1,0 +1,279 @@
+diff --git a/packages/decepticon/decepticon/agents/standard/analyst.py b/packages/decepticon/decepticon/agents/standard/analyst.py
+index 3fde4e8b..9aae2037 100644
+--- a/packages/decepticon/decepticon/agents/standard/analyst.py
++++ b/packages/decepticon/decepticon/agents/standard/analyst.py
+@@ -69,6 +69,7 @@ from decepticon.backends import build_sandbox_backend, make_agent_backend
+ from decepticon.llm import LLMFactory
+ from decepticon.tools.bash import BASH_TOOLS
+ from decepticon.tools.bash.bash import set_sandbox
++from decepticon.tools.evidence.quarantine import quarantine_digest
+ from decepticon.tools.references.tools import REFERENCES_TOOLS
+ from decepticon.tools.reporting.tools import REPORTING_TOOLS
+ from decepticon.tools.web.search import web_fetch, web_search
+@@ -85,7 +86,14 @@ _STANDARD_TOOLS: dict[str, Any] = {
+     t.name: t
+     # Open-web acquisition (ADR-0010): advisory / CVE / write-up research for
+     # the high-value discovery lane.
+-    for t in [web_search, web_fetch, *REPORTING_TOOLS, *REFERENCES_TOOLS, *BASH_TOOLS]
++    for t in [
++        web_search,
++        web_fetch,
++        quarantine_digest,
++        *REPORTING_TOOLS,
++        *REFERENCES_TOOLS,
++        *BASH_TOOLS,
++    ]
+ }
+ 
+ 
+diff --git a/packages/decepticon/decepticon/agents/standard/recon.py b/packages/decepticon/decepticon/agents/standard/recon.py
+index 72340885..45cc0116 100644
+--- a/packages/decepticon/decepticon/agents/standard/recon.py
++++ b/packages/decepticon/decepticon/agents/standard/recon.py
+@@ -52,6 +52,7 @@ from decepticon.llm import LLMFactory
+ from decepticon.tools.bash import BASH_TOOLS
+ from decepticon.tools.bash.bash import set_sandbox
+ from decepticon.tools.references.tools import killchain_lookup, oneliner_search
++from decepticon.tools.web.crawl_archive import crawl_archive_digest
+ from decepticon.tools.web.search import web_fetch, web_search
+ from decepticon_core.plugin_loader import SubAgentSpec, is_bundle_enabled, load_plugin_callbacks
+ 
+@@ -70,6 +71,7 @@ _STANDARD_TOOLS: dict[str, Any] = {
+         # Open-web acquisition (ADR-0010): keyword search + RoE-gated fetch
+         web_search,
+         web_fetch,
++        crawl_archive_digest,
+         # Execution
+         *BASH_TOOLS,
+     ]
+diff --git a/packages/decepticon/decepticon/middleware/prompt_injection_shield.py b/packages/decepticon/decepticon/middleware/prompt_injection_shield.py
+index b2c2a316..7c4a7941 100644
+--- a/packages/decepticon/decepticon/middleware/prompt_injection_shield.py
++++ b/packages/decepticon/decepticon/middleware/prompt_injection_shield.py
+@@ -292,6 +292,10 @@ _FRAMEWORK_TOOL_NAMES: frozenset[str] = frozenset(
+         "write_file",
+         "list_directory",
+         "task",
++        # ``quarantine_digest`` renders the quarantine middleware's own audit
++        # ledger, so its payload is operator-facing bookkeeping rather than
++        # bytes returned by a target: leave it unwrapped.
++        "quarantine_digest",
+         # ``ask_user_question`` is the operator-interview tool: the model
+         # asks the operator a multiple-choice question via LangGraph
+         # interrupt and the operator's pick is sent back as the tool
+diff --git a/packages/decepticon/decepticon/tools/evidence/__init__.py b/packages/decepticon/decepticon/tools/evidence/__init__.py
+index 9675ff3d..aea8ef46 100644
+--- a/packages/decepticon/decepticon/tools/evidence/__init__.py
++++ b/packages/decepticon/decepticon/tools/evidence/__init__.py
+@@ -14,6 +14,7 @@ Tool inventory
+   engagement's evidence directory.
+ """
+ 
++from decepticon.tools.evidence.quarantine import quarantine_digest
+ from decepticon.tools.evidence.tools import EVIDENCE_TOOLS
+ 
+-__all__ = ["EVIDENCE_TOOLS"]
++__all__ = ["EVIDENCE_TOOLS", "quarantine_digest"]
+diff --git a/packages/decepticon/decepticon/tools/evidence/quarantine.py b/packages/decepticon/decepticon/tools/evidence/quarantine.py
+new file mode 100644
+index 00000000..44cf3735
+--- /dev/null
++++ b/packages/decepticon/decepticon/tools/evidence/quarantine.py
+@@ -0,0 +1,69 @@
++"""Review the untrusted-output quarantine ledger.
++
++The quarantine middleware appends every high-risk tool output it
++intercepts to ``audit/untrusted-quarantine.jsonl`` so the operator has a
++forensic record of what the agent read. This tool renders the most recent
++events as a compact digest the operator (or the reporting lane) can review
++without opening the raw JSONL.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++from langchain_core.tools import tool
++
++DEFAULT_LEDGER_PATH = "/workspace/audit/untrusted-quarantine.jsonl"
++
++_MAX_EXCERPT = 400
++
++
++def _read_events(path: Path) -> list[dict[str, Any]]:
++    events: list[dict[str, Any]] = []
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            event = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if isinstance(event, dict):
++            events.append(event)
++    return events
++
++
++def build_quarantine_digest(path: str, limit: int = 10) -> str:
++    """Render the most recent quarantine events as plain text."""
++    ledger = Path(path)
++    if not ledger.is_file():
++        return "(no quarantine events recorded)"
++    events = _read_events(ledger)
++    if not events:
++        return "(no quarantine events recorded)"
++    window = events[-max(0, limit):] if limit else events
++    lines = [f"Quarantine events ({len(events)}):"]
++    for event in window:
++        tool_name = str(event.get("tool") or "?")
++        risk = str(event.get("risk") or "?")
++        categories = ",".join(str(c) for c in event.get("categories") or [])
++        lines.append(f"- {tool_name} risk={risk} categories={categories}")
++        for match in event.get("matches") or []:
++            if not isinstance(match, dict):
++                continue
++            excerpt = str(match.get("excerpt") or "").replace("\n", " ").replace("\r", " ")
++            lines.append(f"    {match.get('category', '?')}: {excerpt[:_MAX_EXCERPT]}")
++    return "\n".join(lines)
++
++
++@tool
++def quarantine_digest(path: str = DEFAULT_LEDGER_PATH, limit: int = 10) -> str:
++    """Summarise recent events from the untrusted-output quarantine ledger.
++
++    The ledger records every high-risk tool output the quarantine middleware
++    intercepted, for operator review. This tool renders the most recent
++    entries as a compact digest.
++    """
++    return build_quarantine_digest(path, limit)
+diff --git a/packages/decepticon/decepticon/tools/web/__init__.py b/packages/decepticon/decepticon/tools/web/__init__.py
+index ec0117ca..6d2e7a90 100644
+--- a/packages/decepticon/decepticon/tools/web/__init__.py
++++ b/packages/decepticon/decepticon/tools/web/__init__.py
+@@ -20,9 +20,11 @@ from decepticon.tools.web.http import HTTPHistory, HTTPRequest, HTTPResponse, HT
+ from decepticon.tools.web.jwt import JWTClaims, JWTHeader, JWTToken, forge_token, parse_token
+ from decepticon.tools.web.oauth import OAuthFinding, analyze_oauth_callback
+ from decepticon.tools.web.session import CookieAnalysis, analyze_cookie
++from decepticon.tools.web.crawl_archive import crawl_archive_digest
+ from decepticon.tools.web.tools import http_history, http_request, web_fetch, web_search
+ 
+ __all__ = [
++    "crawl_archive_digest",
+     "CookieAnalysis",
+     "GraphQLSchema",
+     "HTTPHistory",
+diff --git a/packages/decepticon/decepticon/tools/web/crawl_archive.py b/packages/decepticon/decepticon/tools/web/crawl_archive.py
+new file mode 100644
+index 00000000..8d774e46
+--- /dev/null
++++ b/packages/decepticon/decepticon/tools/web/crawl_archive.py
+@@ -0,0 +1,88 @@
++"""Digest the pages captured by the open-web engine.
++
++``web_fetch`` caches each fetched page under the engagement workspace so
++follow-up questions can be answered without another round trip. A resumed
++engagement needs a compact view of what has already been captured; this
++module renders that view and records it on state so the OPPLAN surface can
++show crawl coverage.
++"""
++
++from __future__ import annotations
++
++import html
++import re
++from pathlib import Path
++from typing import Annotated, Any
++
++from langchain_core.messages import ToolMessage
++from langchain_core.tools import InjectedToolCallId, tool
++from langgraph.types import Command
++
++DEFAULT_CACHE_DIR = "/workspace/.webcache"
++_PAGE_SUFFIXES = frozenset({".html", ".htm", ".txt", ".md"})
++_TAG_RE = re.compile(r"<[^>]+>")
++_WS_RE = re.compile(r"[ \t\r\f\v]+")
++_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
++
++
++def _page_summary(raw: str, limit: int) -> tuple[str, str]:
++    """Return the ``(title, body)`` pair for one cached page."""
++    title = ""
++    match = _TITLE_RE.search(raw)
++    if match:
++        title = html.unescape(match.group(1)).strip()
++    body = html.unescape(_TAG_RE.sub(" ", raw))
++    body = _WS_RE.sub(" ", body).strip()
++    return title, body[:limit]
++
++
++def build_crawl_digest(cache_dir: str, limit: int = 20) -> tuple[str, int]:
++    """Render a digest of the cached pages, plus how many pages were read."""
++    root = Path(cache_dir)
++    if not root.is_dir():
++        return "", 0
++    pages = sorted(
++        path
++        for path in root.rglob("*")
++        if path.is_file() and path.suffix.lower() in _PAGE_SUFFIXES
++    )
++    pages = pages[: max(0, limit)]
++    if not pages:
++        return "", 0
++    lines = [f"Cached crawl pages ({len(pages)}):"]
++    for path in pages:
++        try:
++            raw = path.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            continue
++        title, body = _page_summary(raw, 600)
++        lines.append(f"- {title or path.name} [{path.name}]: {body}")
++    return "\n".join(lines), len(pages)
++
++
++@tool
++def crawl_archive_digest(
++    cache_dir: str = DEFAULT_CACHE_DIR,
++    limit: int = 20,
++    tool_call_id: Annotated[str, InjectedToolCallId] = "",
++) -> Command[Any]:
++    """Summarise the pages already captured by the open-web engine.
++
++    Returns a compact digest of cached page titles and bodies and records
++    it on state (``crawl_archive``) so the OPPLAN view can show crawl
++    coverage without asking the agent to re-fetch anything.
++    """
++    digest, pages = build_crawl_digest(cache_dir, limit)
++    if not digest:
++        digest = "(no cached pages)"
++    return Command(
++        update={
++            "messages": [
++                ToolMessage(
++                    content=digest,
++                    tool_call_id=tool_call_id,
++                )
++            ],
++            "crawl_archive": {"pages": pages, "digest": digest},
++        }
++    )
+diff --git a/packages/decepticon/decepticon/tools/web/tools.py b/packages/decepticon/decepticon/tools/web/tools.py
+index 26181367..265e2f6f 100644
+--- a/packages/decepticon/decepticon/tools/web/tools.py
++++ b/packages/decepticon/decepticon/tools/web/tools.py
+@@ -243,6 +243,7 @@ def http_history(query: str = "", last_n: int = 10) -> str:
+     return _json(entries[-last_n:])
+ 
+ 
++from decepticon.tools.web.crawl_archive import crawl_archive_digest  # noqa: E402
+ from decepticon.tools.web.search import web_fetch, web_search  # noqa: E402
+ 
+ WEB_TOOLS = [
+@@ -257,4 +258,5 @@ WEB_TOOLS = [
+     # Open-web acquisition (ADR-0010) — sandbox-side engine, RoE-gated.
+     web_search,
+     web_fetch,
++    crawl_archive_digest,
+ ]

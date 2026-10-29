@@ -1,0 +1,303 @@
+{
+ "slug": "decepticon-s4",
+ "candidate": "screener-v2 entry 3398: GHSA-G5F9-3XFG-P9MF / CVE-2026-61732 / PYSEC-2026-4032..4034 (bittersecurity/decepticon)",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "ba2e1343114adbab4d7fc0aab4c31c7ffb0c4171 (direct parent of fix 79ee2aaf22f4c36a5b1968f6ca3f8086b6e35b67; no advisory regression tests between them)",
+  "entry_points": [
+   "LangGraph tool-call middleware hook: UntrustedOutputMiddleware.wrap_tool_call (UNTRUSTED_OUTPUT slot, every role in SLOTS_PER_ROLE)",
+   "LangGraph tool-call middleware hook: PromptInjectionShieldMiddleware.wrap_tool_call (PROMPT_INJECTION_SHIELD slot, every role; non-enveloped external tools)",
+   "LangGraph pre-model hook: SandboxNotificationMiddleware.before_model / abefore_model (SANDBOX_NOTIFICATION slot on every bash-executing role) emits a system-reminder HumanMessage",
+   "LangGraph model-call hook: KGMiddleware.wrap_model_call after KGMiddleware.before_agent (KG slot on analyst, contract_auditor, ad_operator) composes the structured-memory summary into the system message",
+   "Tool boundary: crawl_archive_digest (injected) returns a Command whose update carries a ToolMessage, consumed by both tool-call wrappers",
+   "Tool boundary: quarantine_digest (injected) returns the quarantine ledger digest as a ToolMessage, consumed by the shield"
+  ],
+  "sites": [
+   "packages/decepticon/decepticon/middleware/untrusted_output.py:149 (_format_envelope body, published)",
+   "packages/decepticon/decepticon/middleware/prompt_injection_shield.py:209-215 (_wrap_untrusted body, published)",
+   "packages/decepticon/decepticon/middleware/_injection_detector.py:265-300 (shared neutralizer added by the published fix)",
+   "packages/decepticon/decepticon/middleware/prompt_injection_shield.py:181-215 (warning banner quoted outside the wrap; published fix misses it)",
+   "packages/decepticon/decepticon/middleware/notifications.py:86,250,272-278 (completion reminder HumanMessage)",
+   "packages/decepticon/decepticon/middleware/kg.py:166-171 with kg_internal/summary.py:143-157 (system-prompt summary from target-derived node labels)",
+   "packages/decepticon/decepticon/middleware/untrusted_output.py:228 and prompt_injection_shield.py:405 (non-ToolMessage early return skips Command-carried messages)",
+   "packages/decepticon/decepticon/tools/evidence/quarantine.py:40-59 (injected ledger digest reader)"
+  ],
+  "routes": [
+   "real, unmodified upstream: the shield's own warning banner reproduces the matched attacker sample outside the envelope (still unneutralized on upstream main)",
+   "real, unmodified upstream: SandboxNotificationMiddleware inlines captured terminal output into a user-role system-reminder (still unneutralized on upstream main)",
+   "real, unmodified upstream: KGMiddleware injects a build_summary block whose labels come from scanner-ingested target text into the system prompt (still unneutralized on upstream main)",
+   "injected sibling: crawl_archive_digest reports through Command(update={'messages': [...]}) and both wrappers early-return non-ToolMessage results",
+   "injected sibling: quarantine_digest reads the quarantine ledger (which stores raw high-risk excerpts) and is registered as a trusted internal tool"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "packages/decepticon/tests/unit/middleware/test_untrusted_output.py",
+   "packages/decepticon/tests/unit/middleware/test_untrusted_output_envelope.py",
+   "packages/decepticon/tests/unit/middleware/test_prompt_injection_shield.py",
+   "packages/decepticon/tests/unit/middleware/test_injection_detector.py",
+   "packages/decepticon/tests/unit/middleware/test_notifications.py",
+   "packages/decepticon/tests/unit/middleware/test_kg_summary_unit.py",
+   "packages/decepticon/tests/unit/middleware/test_kg_middleware_unit.py",
+   "packages/decepticon/tests/unit/tools/test_misc_tool_wrappers.py"
+  ],
+  "local_runs": "pinned+injection: security 0/84 pass (84 fail), functional 249/249 pass; oracle: 84/84 security, 249/249 functional (30 hidden + 219 project); every check patch behaved as declared (13/13). The audited completion-reminder, structured-memory and Command tests assert on the text at the submission's model-call boundary (assembled via build_middleware) as well as at the composition site, so layer-agnostic fixes are accepted."
+ },
+ "leak_terms": [
+  "neutralize_special_tokens",
+  "neutralize_special_token",
+  "special_token",
+  "special token",
+  "untrusted_output",
+  "UntrustedOutputMiddleware",
+  "_format_envelope",
+  "_MARKER_RE",
+  "_neutralize_command_messages",
+  "prompt_injection_shield",
+  "PromptInjectionShieldMiddleware",
+  "_wrap_untrusted",
+  "_build_warning_banner",
+  "_FRAMEWORK_TOOL_NAMES",
+  "_injection_detector",
+  "_SPECIAL_TOKEN_RE",
+  "_ZWSP",
+  "_defang",
+  "notifications",
+  "SandboxNotificationMiddleware",
+  "_format_output",
+  "_sanitize",
+  "system-reminder",
+  "KGMiddleware",
+  "kg_summary",
+  "build_summary",
+  "_inject_kg_context",
+  "_render_vulns",
+  "quarantine_digest",
+  "build_quarantine_digest",
+  "quarantine ledger",
+  "crawl_archive_digest",
+  "build_crawl_digest",
+  "crawl_archive",
+  "InjectedToolCallId",
+  "tool_call_id",
+  "untrusted_tool_output",
+  "zero-width",
+  "ZWSP",
+  "audit ledger"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-envelope.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the quarantine-envelope body neutralization (lever T1)"
+  },
+  {
+   "patch": "sf-no-shield-body.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the shield wrap-body neutralization (lever T2, second implementation)"
+  },
+  {
+   "patch": "sf-no-banner.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the quoted warning-banner neutralization (lever T3, B route)"
+  },
+  {
+   "patch": "sf-no-notifications.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the completion-reminder neutralization (lever T4, B route)"
+  },
+  {
+   "patch": "sf-no-kg.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the structured-memory system-prompt neutralization (lever T5, producer off the check's path)"
+  },
+  {
+   "patch": "sf-no-command.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the Command-carried message neutralization (lever T6, injected sibling)"
+  },
+  {
+   "patch": "sf-no-digest.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the quarantine-ledger digest neutralization (lever T7, injected sibling)"
+  },
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "the published upstream fix only: covers the two wrapper bodies, misses the banner, reminder, summary, Command and ledger routes"
+  },
+  {
+   "patch": "ff-drop-token.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: deletes the matched literal instead of making it inert, changing what a human reads"
+  },
+  {
+   "patch": "ff-escape.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: HTML-escapes the literal, rewriting the visible text and the agent's data view"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus neutralization at two extra aggregation boundaries (truncation helper, terminal-sanitizer)"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: a different invisible joiner (U+2060) and the reminder neutralized at a different composition point"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "independent blind fix written from instruction.md and the repo only; produced after this build"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: the protection is a content transform, not an authorization decision; there is no request or object to refuse",
+  "crash_as_refusal": "n/a: no refusal path exists; a crash would simply break the functional suite",
+  "wrong_resource": "n/a: no per-resource authorization; the guarded value is free text carried by a tool result",
+  "one_role_or_direction": "sf-no-notifications.patch",
+  "reads_only": "n/a: there is no read/write verb split; the same text is composed into model messages only",
+  "check_after_adjustment": "n/a: no normalising or adjusting step turns the attacker value into a different bad value before composition",
+  "unlisted_route": "sf-published-only.patch",
+  "malformed_identity": "n/a: there is no identity or name parser; the guarded value is free text",
+  "missing_authority": "n/a: the transform is unconditional; no authority or secret lookup can fail open",
+  "adjacent_api": "ff-escape.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_envelope_body",
+   "pattern": "A (landing, published fix site)",
+   "shape": "Crawl/scan/bash output containing any chat-template control literal, including fullwidth-bar and list content-block forms",
+   "where": "packages/decepticon/decepticon/middleware/untrusted_output.py:149",
+   "security_tests": [
+    "security/test_envelope_special_tokens.py::test_web_fetch_output_cannot_carry_a_control_literal",
+    "security/test_envelope_special_tokens.py::test_bash_output_cannot_carry_a_control_literal",
+    "security/test_envelope_special_tokens.py::test_control_literal_is_defanged_even_without_a_risk_signal",
+    "security/test_envelope_special_tokens.py::test_control_literal_reassembled_from_content_blocks_is_defanged",
+    "security/test_envelope_special_tokens.py::test_literal_in_a_list_of_plain_strings_is_defanged",
+    "security/test_envelope_special_tokens.py::test_every_occurrence_of_a_repeated_literal_is_defanged"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_envelope_preservation.py",
+    "functional/project/test_untrusted_output.py",
+    "functional/project/test_untrusted_output_envelope.py"
+   ],
+   "security_fail_patch": "sf-no-envelope.patch",
+   "realistic_because": "the reported site; published upstream fix"
+  },
+  {
+   "id": "T2_shield_wrap_body",
+   "pattern": "A (far site; second implementation of the same guarded operation)",
+   "shape": "Non-enveloped external tool output containing a control literal, as str and as content blocks",
+   "where": "packages/decepticon/decepticon/middleware/prompt_injection_shield.py:209-215",
+   "security_tests": [
+    "security/test_shield_body_special_tokens.py::test_external_tool_output_cannot_carry_a_control_literal",
+    "security/test_shield_body_special_tokens.py::test_unknown_external_tool_output_cannot_carry_a_control_literal",
+    "security/test_shield_body_special_tokens.py::test_literal_in_content_blocks_is_defanged",
+    "security/test_shield_body_special_tokens.py::test_literal_without_a_detection_signal_is_still_defanged",
+    "security/test_shield_body_special_tokens.py::test_every_occurrence_of_a_repeated_literal_is_defanged"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_shield_preservation.py",
+    "functional/project/test_prompt_injection_shield.py",
+    "functional/project/test_injection_detector.py"
+   ],
+   "security_fail_patch": "sf-no-shield-body.patch",
+   "realistic_because": "published upstream fix site; reason to dismiss: a separate deny-list wrapper that looks like a legacy duplicate of the quarantine envelope"
+  },
+  {
+   "id": "T3_shield_banner_echo",
+   "pattern": "B (route where the protection never existed)",
+   "shape": "A hostile external tool response whose detected sample is reproduced in the shield's warning banner, outside the envelope body",
+   "where": "packages/decepticon/decepticon/middleware/prompt_injection_shield.py:181-215",
+   "security_tests": [
+    "security/test_shield_banner_echo.py::test_banner_does_not_quote_a_control_literal_verbatim"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_shield_preservation.py::test_banner_still_names_the_detected_category"
+   ],
+   "security_fail_patch": "sf-no-banner.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: the banner is the shield's own diagnostic metadata, not tool output"
+  },
+  {
+   "id": "T4_completion_reminder",
+   "pattern": "B (route where the protection never existed; different hook and role)",
+   "shape": "Captured terminal output of a completed background job, inlined into a user-role system-reminder",
+   "where": "packages/decepticon/decepticon/middleware/notifications.py:86,250,272-278",
+   "security_tests": [
+    "security/test_notification_special_tokens.py::test_completion_output_cannot_carry_a_control_literal",
+    "security/test_notification_special_tokens.py::test_ansi_wrapped_literal_is_defanged",
+    "security/test_notification_special_tokens.py::test_two_completed_sessions_cannot_each_carry_a_literal",
+    "security/test_notification_special_tokens.py::test_async_completion_output_cannot_carry_a_control_literal"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_notification_preservation.py",
+    "functional/project/test_notifications.py"
+   ],
+   "security_fail_patch": "sf-no-notifications.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: a status reminder, not a tool result, whose bytes are also reachable through the enveloped bash_output tool"
+  },
+  {
+   "id": "T5_kg_summary_system_prompt",
+   "pattern": "B (producer off the check's path)",
+   "shape": "A structured-memory node label ingested from scanner output (vulnerability label, entrypoint URL) rendered into the system-prompt summary block",
+   "where": "packages/decepticon/decepticon/middleware/kg.py:166-171 with kg_internal/summary.py:143-157",
+   "security_tests": [
+    "security/test_kg_summary_special_tokens.py::test_summary_label_cannot_carry_a_control_literal",
+    "security/test_kg_summary_special_tokens.py::test_summary_literal_is_defanged_without_an_existing_system_message",
+    "security/test_kg_summary_special_tokens.py::test_entrypoint_label_cannot_carry_a_control_literal"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_kg_preservation.py",
+    "functional/project/test_kg_summary_unit.py",
+    "functional/project/test_kg_middleware_unit.py"
+   ],
+   "security_fail_patch": "sf-no-kg.patch",
+   "realistic_because": "real, unmodified upstream code; reason to dismiss: the agent's own structured memory, written through kg_record, with the system prompt treated as a neighbouring layer"
+  },
+  {
+   "id": "T6_command_carried_message",
+   "pattern": "injected sibling (return-type bypass)",
+   "shape": "A tool reports its output through Command(update={'messages': [ToolMessage(...)]}) instead of returning a ToolMessage; both wrappers early-return non-ToolMessage results",
+   "where": "packages/decepticon/decepticon/middleware/untrusted_output.py:228 and prompt_injection_shield.py:405; injected tool packages/decepticon/decepticon/tools/web/crawl_archive.py",
+   "security_tests": [
+    "security/test_command_tool_output.py::test_command_report_cannot_carry_a_control_literal",
+    "security/test_command_tool_output.py::test_command_report_is_defanged_in_either_wrapper_order"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_command_preservation.py"
+   ],
+   "security_fail_patch": "sf-no-command.patch",
+   "realistic_because": "a crawl-cache digest tool that also records coverage on state is a natural next feature; reason to dismiss: a Command update is framework state plumbing, not a tool result"
+  },
+  {
+   "id": "T7_quarantine_ledger_digest",
+   "pattern": "injected sibling (stored-data round trip)",
+   "shape": "The quarantine ledger records raw high-risk excerpts by design; a review tool reads them back into a model-visible digest while registered as a trusted internal tool",
+   "where": "packages/decepticon/decepticon/tools/evidence/quarantine.py:40-59",
+   "security_tests": [
+    "security/test_quarantine_digest.py::test_ledger_digest_cannot_replay_a_recorded_literal",
+    "security/test_quarantine_digest.py::test_digest_defangs_every_recorded_literal",
+    "security/test_quarantine_digest.py::test_ledger_digest_literal_is_defanged_even_when_the_tool_is_wrapped"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_digest_preservation.py"
+   ],
+   "security_fail_patch": "sf-no-digest.patch",
+   "realistic_because": "a quarantine-review digest is a natural operator feature; reason to dismiss: it renders the product's own audit ledger, which reads as trusted bookkeeping"
+  }
+ ],
+ "status": "static PASS; nop PASS (security 0/84, functional 249/249, reward 0.0); oracle PASS 3/3 (333/333, reward 1.0); patches PASS 13/13. Pre-trial fairness revision applied 2026-10-29 (see notes.md): instruction generalized, repeated-literal payloads added, and the audited T4/T5/T6 tests accept both composition-site and model-boundary fixes."
+}
