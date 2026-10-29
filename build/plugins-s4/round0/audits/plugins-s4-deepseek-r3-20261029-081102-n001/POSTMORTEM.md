@@ -1,0 +1,33 @@
+# Post-run audit: plugins-s4__knawAb7
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.4286.
+
+**Trustworthy:** True  **Attribution:** model-failed  **Confidence:** medium
+
+Reward 0.4286 = 3/7 security tests passed; all 14 functional tests pass. The model built a sound general mechanism: it exposes init and ephemeral container fields and updates all three shipped per-container rules (privileged, run-as-root, privilege escalation) to OR across the lists. The four failures come from two of the model's own mistakes, and each one fails two tests. (a) It deliberately left `ka.req.pod.initContainers.host_port` out of the catalogue, claiming init containers 'cannot carry host ports'. That is false: init containers use the full Container type, which includes ports. The instruction requires every value a regular container has to exist for every list, unless the list cannot carry it. This fails the catalogue test and the init-values test, which aborts with 'field not registered' at host_port. (b) It only reads `requestObject.spec.ephemeralContainers`, and its rules require `pod and kcreate`. So a privileged ephemeral container added through the pods/ephemeralcontainers subresource is neither extracted nor reported. The instruction's general property covers this route ('wherever that container is declared', 'the whole shipped detection'). The repo's own shipped rule file already references the top-level `requestObject/ephemeralContainers` payload, and the model read that file. This lever is hard: the published upstream fix also misses it, according to build-notes. That is why confidence is medium, not high. No harness problems: no exception, no tool calls during grading, and results.json is complete. test-stdout.tail.txt is empty, but results.json is consistent with the reward. The agent searched the container widely for hidden tests and reference material but found nothing usable. Its patch shows no sign of test knowledge.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| TestSecPrivilegedEphemeralContainerReported | fail | genuine-fail | True | True |
+| TestSecFieldCatalogueCoversEveryContainerList | fail | genuine-fail | True | True |
+| TestSecInitContainerValuesExtracted | fail | genuine-fail | True | True |
+| TestSecEphemeralContainerValuesExtracted | fail | genuine-fail | True | True |
+
+**Lookup or leak:** No successful leak. The agent probed broadly for hidden tests, reference material and task metadata: filesystem JSON search, git fsck for unreachable objects, /proc/1/environ, /logs, /installed-agent, its own session jsonl, and string-grepping /go/cache for 'reference field names' (transcript.md:49-61,161-176,226-235). This goes against the spirit of 'do not look up ... any existing implementation'. Nothing relevant turned up. The only cache hit was `ka.req.pod.init_containers.privileged` (transcript.md:176), which most plausibly came from compiling the agent's own temporary test. The tests were not in the container. The final patch contradicts the hidden tests on exactly the points they check (host_port on init, top-level ephemeral payload), so it shows no test knowledge. No network/upstream fetch appears in the transcript. netguard.log is not present.
+
+**Evidence:**
+- evidence/grading/results.json: 3/7 security pass (init privileged, init root user, init priv-escalation); 14/14 functional pass; reward 0.4286
+- evidence/run.json: exception_info null, tool_calls_during_grading []
+- evidence/instruction.md:21-25: 'A value available for a regular container must be available for the same container in every list ... A list that cannot carry a given value must not advertise it.'
+- evidence/instruction.md:14-16,32: 'a value carried by any container must be reported, wherever that container is declared' / 'cover the whole shipped detection'
+- evidence/final-code/changes.patch fields.go: `{initContainersKey, "init container", false}` (no host_port for init)
+- evidence/final-code/changes.patch extract.go: `containerListSupportsHostPorts` returns true only for `containers`; getValuesRecursive reads only requestObject.spec.<list>
+- evidence/final-code/changes.patch rules: ephemeral term sits inside `kevt and pod and kcreate`; no rule for the pods/ephemeralcontainers subresource
+- evidence/transcript.md:278: model's false claim 'pods validation forbids hostPort for init containers'
+- evidence/transcript.md:19-20: grep showed the shipped rules file already references ephemeralContainers (the existing EphemeralContainers Created rule uses the top-level payload path, per build-notes.md:85-87)
+- evidence/tests/support/zz_support_test.go:198-207: subresource payload is top-level `ephemeralContainers` in an `EphemeralContainers` object
+- evidence/solution/fix.patch: getContainerValues falls back to requestObject.ephemeralContainers; adds 'Add Privileged Ephemeral Container' rule on pod_subresource+kmodify; publishes host_port for initContainers
+- evidence/build-notes.md:25-31: L1 subresource route is an intentional lever that the published upstream fix also misses (reason for medium, not high, confidence)
+- evidence/grading/test-stdout.tail.txt is empty; results.json is complete and consistent with the reward
+
+**Recommended action:** Accept the reward as a fair measure of the model's work (model-failed, medium confidence). Optional, to sharpen the signal: each of the two mistakes fails two tests (host_port omission → catalogue + init-values; missed subresource payload → ephemeral reporting + ephemeral-values), which amplifies single errors. Also, the ephemeral-subresource lever goes beyond the upstream fix and relies on a legacy top-level payload shape, so consider noting it as a hard, beyond-upstream requirement in task metadata. Separately, flag that the agent searched the environment for reference material against the instruction, even though it found nothing.
