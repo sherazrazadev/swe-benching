@@ -183,6 +183,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           I: ${{ toJSON(inputs) }}
         run: |
+          # at most MAX_CHAINS batches at once (repo variable, default 2): more parallel MiMo sessions hit its rate limit
+          others=$(gh run list -R "$GITHUB_REPOSITORY" -w build.yml -L 30 --json databaseId,status \
+            -q "[.[] | select(.status != \"completed\" and .databaseId != $GITHUB_RUN_ID)] | length")
+          if [ "$others" -ge "${{ vars.MAX_CHAINS || 2 }}" ]; then
+            echo "$others other batches running (cap ${{ vars.MAX_CHAINS || 2 }}): this chain stops here" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
           gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref main -f chain=true \
             $(echo "$I" | jq -r 'to_entries[] | select(.key | IN("slugs","chain") | not) | "-f \(.key)=\(.value)"')
           echo "next batch dispatched" | tee -a "$GITHUB_STEP_SUMMARY"
