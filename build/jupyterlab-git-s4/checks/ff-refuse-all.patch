@@ -1,0 +1,167 @@
+diff --git a/src/components/diff/ImageDiff.tsx b/src/components/diff/ImageDiff.tsx
+index e012369..2e3cd51 100644
+--- a/src/components/diff/ImageDiff.tsx
++++ b/src/components/diff/ImageDiff.tsx
+@@ -2,7 +2,7 @@ import { ReactWidget } from '@jupyterlab/apputils';
+ import { Contents } from '@jupyterlab/services';
+ import { nullTranslator, TranslationBundle } from '@jupyterlab/translation';
+ import { PromiseDelegate } from '@lumino/coreutils';
+-import { Panel, Widget } from '@lumino/widgets';
++import { Panel } from '@lumino/widgets';
+ import Slider, { SliderProps } from '@mui/material/Slider';
+ import { styled } from '@mui/material/styles';
+ import Tab from '@mui/material/Tab';
+@@ -45,6 +45,7 @@ import {
+   twoUpView
+ } from '../../style/ImageDiffStyle';
+ import { Git } from '../../tokens';
++import { displayable } from './dom';
+ 
+ export const createImageDiff: Git.Diff.Factory = async ({
+   model,
+@@ -417,11 +418,7 @@ export class ImageDiffWidget extends Panel implements Git.Diff.IDiffWidget {
+     this._model = model;
+     this._trans = translator ?? nullTranslator.load('jupyterlab_git');
+ 
+-    // Show the path of the file that is being compared.
+-    const caption = document.createElement('div');
+-    caption.className = 'jp-git-image-diff-caption';
+-    caption.innerHTML = `<span>${model.filename}</span>`;
+-    this.addWidget(new Widget({ node: caption }));
++
+ 
+     this.refresh()
+       .then(() => {
+@@ -513,7 +510,8 @@ export class ImageDiffWidget extends Panel implements Git.Diff.IDiffWidget {
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const raw = String(error.message || error);
++    const msg = displayable(raw) ? raw : 'Failed to load image diff.';
+     this.node.innerHTML = `<p style="color: unset" class="jp-git-diff-error">
+       <span>${this._trans.__('Error Loading Image Diff:')}</span>
+       <span class="jp-git-diff-error-message">${msg}</span>
+diff --git a/src/components/diff/NotebookDiff.ts b/src/components/diff/NotebookDiff.ts
+index a5330c5..3c2bb6b 100644
+--- a/src/components/diff/NotebookDiff.ts
++++ b/src/components/diff/NotebookDiff.ts
+@@ -26,6 +26,7 @@ import { CELLMERGE_CLASS, NotebookMergeWidget } from 'nbdime/lib/merge/widget';
+ import { UNCHANGED_MERGE_CLASS } from 'nbdime/lib/merge/widget/common';
+ import { requestAPI } from '../../git';
+ import { Git } from '../../tokens';
++import { displayable } from './dom';
+ 
+ /**
+  * Class of the outermost widget, the draggable tab
+@@ -104,15 +105,7 @@ export const createNotebookDiff = async ({
+     );
+     toolbar.addItem('hideUnchanged', new Widget({ node: label }));
+ 
+-    // Show the revisions that are being compared.
+-    const context = document.createElement('span');
+-    context.className = 'jp-git-diff-context';
+-    context.innerHTML = `<span title="${escapeHtml(
+-      model.reference.label
+-    )}">${escapeHtml(model.reference.label)} &rarr; ${escapeHtml(
+-      model.challenger.label
+-    )}</span>`;
+-    toolbar.addItem('diff-context', new Widget({ node: context }));
++
+ 
+     if (model.hasConflict) {
+       // Move merge notebook controls in the toolbar
+@@ -369,7 +362,8 @@ export class NotebookDiff extends Panel implements Git.Diff.IDiffWidget {
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const raw = String(error.message || error);
++    const msg = displayable(raw) ? raw : 'Failed to load notebook diff.';
+     this.node.innerHTML = `<p class="jp-git-diff-error">
+       <span>${this._trans.__('Error Loading Notebook Diff:')}</span>
+       <span class="jp-git-diff-error-message">${msg}</span>
+@@ -404,16 +398,13 @@ namespace Private {
+       : 'jp-git-diff-banner';
+     const node = document.createElement('div');
+     node.className = 'jp-git-diff-header';
+-    node.innerHTML = `<div class="${bannerClass}">
+-        <span>${localLabel}</span>
+-        ${
+-          hasConflict
+-            ? // Add extra space during notebook merge view
+-              `<span>${baseLabel}</span>`
+-            : ''
+-        }
+-        <span>${remoteLabel}</span>
+-      </div>`;
++    const labels = hasConflict
++      ? [localLabel, baseLabel, remoteLabel]
++      : [localLabel, remoteLabel];
++    node.innerHTML = `<div class="${bannerClass}">${labels
++      .filter((label): label is string => !!label && displayable(label))
++      .map(label => `<span>${label}</span>`)
++      .join('')}</div>`;
+ 
+     return new Widget({ node });
+   }
+@@ -515,13 +506,3 @@ namespace Private {
+     }
+   }
+ }
+-
+-/**
+- * Escape the characters that are special in HTML text.
+- */
+-function escapeHtml(value: string): string {
+-  return value
+-    .replace(/&/g, '&amp;')
+-    .replace(/</g, '&lt;')
+-    .replace(/>/g, '&gt;');
+-}
+diff --git a/src/components/diff/PlainTextDiff.ts b/src/components/diff/PlainTextDiff.ts
+index cd068eb..60c8df2 100644
+--- a/src/components/diff/PlainTextDiff.ts
++++ b/src/components/diff/PlainTextDiff.ts
+@@ -23,6 +23,7 @@ import {
+ } from 'nbdime/lib/diff/model';
+ import { DiffRangeRaw } from 'nbdime/lib/diff/range';
+ import { Git } from '../../tokens';
++import { displayable } from './dom';
+ 
+ /**
+  * Diff callback to be registered for plain-text files.
+@@ -219,7 +220,7 @@ export class PlainTextDiff extends Panel implements Git.Diff.IDiffWidget {
+     const head = document.createElement('div');
+     head.classList.add(bannerClass);
+     head.innerHTML = labels
+-      .filter(label => !!label)
++      .filter(label => !!label && displayable(label))
+       .map(label => `<span>${label}</span>`)
+       .join('');
+     return head;
+@@ -283,7 +284,8 @@ export class PlainTextDiff extends Panel implements Git.Diff.IDiffWidget {
+       error,
+       (error as any)?.traceback
+     );
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const raw = String(error.message || error);
++    const msg = displayable(raw) ? raw : 'Failed to load file diff.';
+     while (this.widgets.length > 0) {
+       const w = this.widgets[0];
+       this.layout?.removeWidget(w);
+diff --git a/src/components/diff/dom.ts b/src/components/diff/dom.ts
+new file mode 100644
+index 0000000..f186456
+--- /dev/null
++++ b/src/components/diff/dom.ts
+@@ -0,0 +1,9 @@
++/**
++ * Whether a value is simple enough to display.
++ *
++ * @param value Value to check
++ * @returns Whether the value may be displayed
++ */
++export function displayable(value: string): boolean {
++  return /^[A-Za-z0-9 ._/@-]*$/.test(value);
++}

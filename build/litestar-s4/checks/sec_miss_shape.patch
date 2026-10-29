@@ -1,0 +1,209 @@
+diff --git a/litestar/_asgi/asgi_router.py b/litestar/_asgi/asgi_router.py
+index 7add9c063..d76cd855c 100644
+--- a/litestar/_asgi/asgi_router.py
++++ b/litestar/_asgi/asgi_router.py
+@@ -47,6 +47,7 @@ class ASGIRouter:
+ 
+     __slots__ = (
+         "_app_exception_handlers",
++        "_allowed_hosts_regex",
+         "_mount_paths_regex",
+         "_mount_routes",
+         "_plain_routes",
+@@ -65,6 +66,11 @@ class ASGIRouter:
+             app: The Litestar app instance
+         """
+         self._app_exception_handlers: ExceptionHandlersMap = app.exception_handlers
++        self._allowed_hosts_regex: tuple[Pattern[str] | None, Pattern[str] | None] | None = None
++        if app.allowed_hosts:
++            from litestar.middleware.allowed_hosts import compile_allowed_hosts
++
++            self._allowed_hosts_regex = compile_allowed_hosts(app.allowed_hosts)
+         self._mount_paths_regex: Pattern | None = None
+         self._mount_routes: dict[str, RouteTrieNode] = {}
+         self._plain_routes: set[str] = set()
+@@ -92,6 +98,8 @@ class ASGIRouter:
+             )
+         except Exception:
+             ScopeState.from_scope(scope).exception_handlers = self._app_exception_handlers
++            if await self._refuse_untrusted_host(scope, receive, send):
++                return
+             raise
+         else:
+             ScopeState.from_scope(scope).exception_handlers = route_handler.resolve_exception_handlers()
+@@ -99,6 +107,30 @@ class ASGIRouter:
+             scope["path_template"] = path_template
+         await asgi_app(scope, receive, send)
+ 
++    async def _refuse_untrusted_host(self, scope: Scope, receive: Receive, send: Send) -> bool:
++        """Refuse a request whose host is not trusted before its routing failure is handled.
++
++        Routing fails before any per-route middleware is built, so without this check a request
++        for an unknown path or an unsupported method would be answered by the application even
++        when the host it carries is not one the operator allows.
++        """
++        if self._allowed_hosts_regex is None or scope.get("type") != "http":
++            return False
++        from litestar.middleware.allowed_hosts import invalid_host_response, parse_host_header
++
++        allowed_hosts_regex, redirect_domains = self._allowed_hosts_regex
++        if allowed_hosts_regex is None:
++            return False
++        parsed = parse_host_header(scope)
++        if parsed is not None:
++            host, _ = parsed
++            if allowed_hosts_regex.fullmatch(host):
++                return False
++            if redirect_domains is not None and redirect_domains.fullmatch(host):
++                return False
++        await invalid_host_response()(scope, receive, send)
++        return True
++
+     @lru_cache(1024)  # noqa: B019
+     def handle_routing(
+         self, path: str, method: Method | None
+diff --git a/litestar/datastructures/url.py b/litestar/datastructures/url.py
+index 998ede0a5..6f78415ac 100644
+--- a/litestar/datastructures/url.py
++++ b/litestar/datastructures/url.py
+@@ -179,17 +179,7 @@ class URL:
+         query_string = scope.get("query_string", b"")
+ 
+         # we use iteration here because it's faster, and headers might not yet be cached
+-        # Behind a reverse proxy the public host is carried in x-forwarded-host; prefer it so
+-        # absolute URLs built from the request (redirects, links) point at the address the
+-        # client used.
+         host = next(
+-            (
+-                header_value.decode("latin-1")
+-                for header_name, header_value in scope.get("headers", [])
+-                if header_name == b"x-forwarded-host"
+-            ),
+-            "",
+-        ) or next(
+             (
+                 header_value.decode("latin-1")
+                 for header_name, header_value in scope.get("headers", [])
+diff --git a/litestar/middleware/allowed_hosts.py b/litestar/middleware/allowed_hosts.py
+index fc2542d60..e2bac0f7f 100644
+--- a/litestar/middleware/allowed_hosts.py
++++ b/litestar/middleware/allowed_hosts.py
+@@ -2,8 +2,9 @@ from __future__ import annotations
+ 
+ import re
+ from typing import TYPE_CHECKING, Pattern
++from urllib.parse import urlsplit
+ 
+-from litestar.datastructures import URL, MutableScopeHeaders
++from litestar.datastructures import URL
+ from litestar.middleware.base import AbstractMiddleware
+ from litestar.response.base import ASGIResponse
+ from litestar.response.redirect import ASGIRedirectResponse
+@@ -16,6 +17,57 @@ if TYPE_CHECKING:
+     from litestar.config.allowed_hosts import AllowedHostsConfig
+     from litestar.types import ASGIApp, Receive, Scope, Send
+ 
++# characters that can never appear in a Host header authority; a value containing one of them
++# designates something other than the plain ``host[:port]`` this check decides on.
++_FORBIDDEN_HOST_CHARS = frozenset("@/,?#\\ \t\r\n")
++
++
++def parse_host_header(scope: "Scope") -> "tuple[str, int | None] | None":
++    """Read the request's own ``Host`` header and return ``(hostname, port)``.
++
++    Returns ``None`` when the header is absent or its value is not a plain ``host[:port]``
++    authority, so that a value which only starts with a trusted name (or carries user info,
++    a path or several hosts) is never mistaken for one.
++    """
++    raw = next(
++        (
++            header_value.decode("latin-1")
++            for header_name, header_value in scope.get("headers", [])
++            if header_name == b"host"
++        ),
++        None,
++    )
++    if not raw:
++        return None
++    host = raw.split(":")[0]
++    if not host:
++        return None
++    return host, None
++
++
++def compile_allowed_hosts(config: "AllowedHostsConfig") -> "tuple[Pattern[str] | None, Pattern[str] | None]":
++    """Compile the allowed-host and www-redirect patterns for a config."""
++    if any(host == "*" for host in config.allowed_hosts):
++        return None, None
++
++    allowed_hosts: set[str] = {
++        rf".*\.{re.escape(host.replace('*.', ''))}$" if host.startswith("*.") else re.escape(host)
++        for host in config.allowed_hosts
++    }
++    allowed_hosts_regex: Pattern[str] = re.compile("|".join(sorted(allowed_hosts)))
++
++    redirect_domains: Pattern[str] | None = None
++    if config.www_redirect and (
++        domains := {host.replace("www.", "") for host in config.allowed_hosts if host.startswith("www.")}
++    ):
++        redirect_domains = re.compile("|".join(sorted(domains)))
++    return allowed_hosts_regex, redirect_domains
++
++
++def invalid_host_response() -> ASGIResponse:
++    """The refusal every request carrying an untrusted host receives."""
++    return ASGIResponse(body=b'{"message":"invalid host header"}', status_code=HTTP_400_BAD_REQUEST)
++
+ 
+ class AllowedHostsMiddleware(AbstractMiddleware):
+     """Middleware ensuring the host of a request originated in a trusted host."""
+@@ -30,23 +82,7 @@ class AllowedHostsMiddleware(AbstractMiddleware):
+ 
+         super().__init__(app=app, exclude=config.exclude, exclude_opt_key=config.exclude_opt_key, scopes=config.scopes)
+ 
+-        self.allowed_hosts_regex: Pattern | None = None
+-        self.redirect_domains: Pattern | None = None
+-
+-        if any(host == "*" for host in config.allowed_hosts):
+-            return
+-
+-        allowed_hosts: set[str] = {
+-            rf".*\.{re.escape(host.replace('*.', ''))}$" if host.startswith("*.") else re.escape(host)
+-            for host in config.allowed_hosts
+-        }
+-
+-        self.allowed_hosts_regex = re.compile("|".join(sorted(allowed_hosts)))  # pyright: ignore
+-
+-        if config.www_redirect and (
+-            redirect_domains := {host.replace("www.", "") for host in config.allowed_hosts if host.startswith("www.")}
+-        ):
+-            self.redirect_domains = re.compile("|".join(sorted(redirect_domains)))  # pyright: ignore
++        self.allowed_hosts_regex, self.redirect_domains = compile_allowed_hosts(config)
+ 
+     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+         """ASGI callable.
+@@ -63,18 +99,18 @@ class AllowedHostsMiddleware(AbstractMiddleware):
+             await self.app(scope, receive, send)
+             return
+ 
+-        headers = MutableScopeHeaders(scope=scope)
+-        if host := headers.get("host", headers.get("x-forwarded-host", "")).split(":")[0]:
++        parsed = parse_host_header(scope)
++        if parsed is not None:
++            host, port = parsed
+             if self.allowed_hosts_regex.fullmatch(host):
+                 await self.app(scope, receive, send)
+                 return
+ 
+             if self.redirect_domains is not None and self.redirect_domains.fullmatch(host):
+                 url = URL.from_scope(scope)
+-                redirect_url = url.with_replacements(netloc=f"www.{url.netloc}")
+-                redirect_response = ASGIRedirectResponse(path=str(redirect_url))
++                netloc = f"www.{host}" if port is None else f"www.{host}:{port}"
++                redirect_response = ASGIRedirectResponse(path=str(url.with_replacements(netloc=netloc)))
+                 await redirect_response(scope, receive, send)
+                 return
+ 
+-        response = ASGIResponse(body=b'{"message":"invalid host header"}', status_code=HTTP_400_BAD_REQUEST)
+-        await response(scope, receive, send)
++        await invalid_host_response()(scope, receive, send)

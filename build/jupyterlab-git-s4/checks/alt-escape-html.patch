@@ -1,0 +1,181 @@
+diff --git a/src/components/diff/ImageDiff.tsx b/src/components/diff/ImageDiff.tsx
+index e012369..d872770 100644
+--- a/src/components/diff/ImageDiff.tsx
++++ b/src/components/diff/ImageDiff.tsx
+@@ -45,6 +45,7 @@ import {
+   twoUpView
+ } from '../../style/ImageDiffStyle';
+ import { Git } from '../../tokens';
++import { escapeHtml } from './dom';
+ 
+ export const createImageDiff: Git.Diff.Factory = async ({
+   model,
+@@ -417,10 +418,9 @@ export class ImageDiffWidget extends Panel implements Git.Diff.IDiffWidget {
+     this._model = model;
+     this._trans = translator ?? nullTranslator.load('jupyterlab_git');
+ 
+-    // Show the path of the file that is being compared.
+     const caption = document.createElement('div');
+     caption.className = 'jp-git-image-diff-caption';
+-    caption.innerHTML = `<span>${model.filename}</span>`;
++    caption.innerHTML = `<span>${escapeHtml(model.filename)}</span>`;
+     this.addWidget(new Widget({ node: caption }));
+ 
+     this.refresh()
+@@ -513,9 +513,12 @@ export class ImageDiffWidget extends Panel implements Git.Diff.IDiffWidget {
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const msg = escapeHtml(String(error.message || error)).replace(
++      /\n/g,
++      '<br />'
++    );
+     this.node.innerHTML = `<p style="color: unset" class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading Image Diff:')}</span>
++      <span>${escapeHtml(this._trans.__('Error Loading Image Diff:'))}</span>
+       <span class="jp-git-diff-error-message">${msg}</span>
+     </p>`;
+   }
+diff --git a/src/components/diff/NotebookDiff.ts b/src/components/diff/NotebookDiff.ts
+index a5330c5..49ab221 100644
+--- a/src/components/diff/NotebookDiff.ts
++++ b/src/components/diff/NotebookDiff.ts
+@@ -26,6 +26,7 @@ import { CELLMERGE_CLASS, NotebookMergeWidget } from 'nbdime/lib/merge/widget';
+ import { UNCHANGED_MERGE_CLASS } from 'nbdime/lib/merge/widget/common';
+ import { requestAPI } from '../../git';
+ import { Git } from '../../tokens';
++import { escapeHtml } from './dom';
+ 
+ /**
+  * Class of the outermost widget, the draggable tab
+@@ -104,12 +105,11 @@ export const createNotebookDiff = async ({
+     );
+     toolbar.addItem('hideUnchanged', new Widget({ node: label }));
+ 
+-    // Show the revisions that are being compared.
+     const context = document.createElement('span');
+     context.className = 'jp-git-diff-context';
+     context.innerHTML = `<span title="${escapeHtml(
+       model.reference.label
+-    )}">${escapeHtml(model.reference.label)} &rarr; ${escapeHtml(
++    )}">${escapeHtml(model.reference.label)} \u2192 ${escapeHtml(
+       model.challenger.label
+     )}</span>`;
+     toolbar.addItem('diff-context', new Widget({ node: context }));
+@@ -369,9 +369,12 @@ export class NotebookDiff extends Panel implements Git.Diff.IDiffWidget {
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const msg = escapeHtml(String(error.message || error)).replace(
++      /\n/g,
++      '<br />'
++    );
+     this.node.innerHTML = `<p class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading Notebook Diff:')}</span>
++      <span>${escapeHtml(this._trans.__('Error Loading Notebook Diff:'))}</span>
+       <span class="jp-git-diff-error-message">${msg}</span>
+     </p>`;
+   }
+@@ -404,16 +407,13 @@ namespace Private {
+       : 'jp-git-diff-banner';
+     const node = document.createElement('div');
+     node.className = 'jp-git-diff-header';
+-    node.innerHTML = `<div class="${bannerClass}">
+-        <span>${localLabel}</span>
+-        ${
+-          hasConflict
+-            ? // Add extra space during notebook merge view
+-              `<span>${baseLabel}</span>`
+-            : ''
+-        }
+-        <span>${remoteLabel}</span>
+-      </div>`;
++    const labels = hasConflict
++      ? [localLabel, baseLabel, remoteLabel]
++      : [localLabel, remoteLabel];
++    node.innerHTML = `<div class="${bannerClass}">${labels
++      .filter((label): label is string => !!label)
++      .map(label => `<span>${escapeHtml(label)}</span>`)
++      .join('')}</div>`;
+ 
+     return new Widget({ node });
+   }
+@@ -515,13 +515,3 @@ namespace Private {
+     }
+   }
+ }
+-
+-/**
+- * Escape the characters that are special in HTML text.
+- */
+-function escapeHtml(value: string): string {
+-  return value
+-    .replace(/&/g, '&amp;')
+-    .replace(/</g, '&lt;')
+-    .replace(/>/g, '&gt;');
+-}
+diff --git a/src/components/diff/PlainTextDiff.ts b/src/components/diff/PlainTextDiff.ts
+index cd068eb..31fd844 100644
+--- a/src/components/diff/PlainTextDiff.ts
++++ b/src/components/diff/PlainTextDiff.ts
+@@ -23,6 +23,7 @@ import {
+ } from 'nbdime/lib/diff/model';
+ import { DiffRangeRaw } from 'nbdime/lib/diff/range';
+ import { Git } from '../../tokens';
++import { escapeHtml } from './dom';
+ 
+ /**
+  * Diff callback to be registered for plain-text files.
+@@ -219,8 +220,8 @@ export class PlainTextDiff extends Panel implements Git.Diff.IDiffWidget {
+     const head = document.createElement('div');
+     head.classList.add(bannerClass);
+     head.innerHTML = labels
+-      .filter(label => !!label)
+-      .map(label => `<span>${label}</span>`)
++      .filter((label): label is string => !!label)
++      .map(label => `<span>${escapeHtml(label)}</span>`)
+       .join('');
+     return head;
+   }
+@@ -283,14 +284,17 @@ export class PlainTextDiff extends Panel implements Git.Diff.IDiffWidget {
+       error,
+       (error as any)?.traceback
+     );
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const msg = escapeHtml(String(error.message || error)).replace(
++      /\n/g,
++      '<br />'
++    );
+     while (this.widgets.length > 0) {
+       const w = this.widgets[0];
+       this.layout?.removeWidget(w);
+       w.dispose();
+     }
+     this.node.innerHTML = `<p class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading File Diff:')}</span>
++      <span>${escapeHtml(this._trans.__('Error Loading File Diff:'))}</span>
+       <span class="jp-git-diff-error-message">${msg}</span>
+     </p>`;
+   }
+diff --git a/src/components/diff/dom.ts b/src/components/diff/dom.ts
+new file mode 100644
+index 0000000..b95c660
+--- /dev/null
++++ b/src/components/diff/dom.ts
+@@ -0,0 +1,14 @@
++/**
++ * Escape a value so that it can be placed in HTML text or in a quoted attribute.
++ *
++ * @param value Value to escape
++ * @returns The escaped value
++ */
++export function escapeHtml(value: string): string {
++  return value
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++    .replace(/'/g, '&#39;');
++}

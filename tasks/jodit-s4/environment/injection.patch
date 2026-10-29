@@ -1,0 +1,86 @@
+diff --git a/src/core/storage/engines/local-storage-provider.ts b/src/core/storage/engines/local-storage-provider.ts
+index 4f53c2c..e6a18ea 100644
+--- a/src/core/storage/engines/local-storage-provider.ts
++++ b/src/core/storage/engines/local-storage-provider.ts
+@@ -8,7 +8,8 @@
+  * @module storage
+  */
+ 
+-import type { IStorage, StorageValueType } from 'jodit/types';
++import type { IDictionary, IStorage, StorageValueType } from 'jodit/types';
++import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
+ 
+ export type WebStorageStrategy = 'localStorage' | 'sessionStorage';
+ 
+@@ -60,7 +61,13 @@ export class LocalStorageProvider<T = StorageValueType> implements IStorage<T> {
+ 
+ 			const json = buffer ? JSON.parse(buffer) : {};
+ 
+-			json[key] = value;
++			const prev = json[key];
++
++			// A partial object keeps the fields that were stored before it
++			json[key] =
++				isPlainObject(prev) && isPlainObject(value)
++					? this.mergeObject(prev, value as IDictionary)
++					: value;
+ 
+ 			this.storage.setItem(this.rootKey, JSON.stringify(json));
+ 		} catch {}
+@@ -68,6 +75,23 @@ export class LocalStorageProvider<T = StorageValueType> implements IStorage<T> {
+ 		return this;
+ 	}
+ 
++	private mergeObject(
++		target: IDictionary,
++		source: IDictionary
++	): IDictionary {
++		Object.keys(source).forEach(key => {
++			const value = source[key],
++				prev = target[key];
++
++			target[key] =
++				isPlainObject(prev) && isPlainObject(value)
++					? this.mergeObject(prev as IDictionary, value)
++					: value;
++		});
++
++		return target;
++	}
++
+ 	delete(key: string): this {
+ 		try {
+ 			this.storage.removeItem(this.rootKey);
+diff --git a/src/jodit.ts b/src/jodit.ts
+index 0f9e0b9..055fef2 100644
+--- a/src/jodit.ts
++++ b/src/jodit.ts
+@@ -46,6 +46,7 @@ import {
+ } from 'jodit/core/decorators';
+ import {
+ 	eventEmitter,
++	extendLang,
+ 	instances,
+ 	modules,
+ 	pluginSystem
+@@ -270,6 +271,20 @@ export class Jodit extends ViewWithToolbar implements IJodit, Dlgs {
+ 
+ 	static readonly lang: any = lang;
+ 
++	/**
++	 * Register one or more language packs at runtime. Packs that already exist
++	 * are extended, new codes are added:
++	 *
++	 * ```js
++	 * Jodit.extendLanguages({
++	 *   de: { Bold: 'Fett' }
++	 * });
++	 * ```
++	 */
++	static extendLanguages(packs: IDictionary): void {
++		extendLang(packs);
++	}
++
+ 	static readonly core = {
+ 		Plugin
+ 	};

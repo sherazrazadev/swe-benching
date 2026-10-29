@@ -1,0 +1,92 @@
+diff --git a/ui/src/components/layout/Markdown.vue b/ui/src/components/layout/Markdown.vue
+index 050b2c6..51e9176 100644
+--- a/ui/src/components/layout/Markdown.vue
++++ b/ui/src/components/layout/Markdown.vue
+@@ -26,8 +26,12 @@
+ 
+ <script setup lang="ts">
+     import {ref, watch, nextTick, onBeforeUnmount, onMounted, computed} from "vue";
++    import {useRouter} from "vue-router";
+     import Magnify from "vue-material-design-icons/Magnify.vue";
+     import * as Markdown from "../../utils/markdown";
++    import linkifyRouterMd from "../logs/linkify";
++
++    const router = useRouter();
+ 
+     /**
+      * Unified component props
+@@ -144,6 +148,7 @@
+         const root = markdownContainer.value;
+         if (!root) return;
+ 
++        linkifyRouterMd(root, router);
+         transformTables(root);
+         setupCardToggles(root);
+         setupCollapsibles(root);
+@@ -535,7 +540,7 @@
+             const tip = document.createElement("span");
+             tip.classList.add("doc-link-tip");
+             tip.setAttribute("role", "tooltip");
+-            tip.innerHTML = link.getAttribute("title") ?? "";
++            tip.textContent = link.getAttribute("title") ?? "";
+             link.appendChild(tip);
+ 
+             cleanups.push(() => tip.remove());
+diff --git a/ui/src/components/logs/linkify.ts b/ui/src/components/logs/linkify.ts
+index cf299b2..4341b7d 100644
+--- a/ui/src/components/logs/linkify.ts
++++ b/ui/src/components/logs/linkify.ts
+@@ -45,11 +45,7 @@ export default function linkify(element?: HTMLElement, router?: Router) {
+     // we create the anchor nodes
+     const anchorNodeExection = document.createElement("a");
+     anchorNodeExection.href = executionUrl.href;
+-    if (label) {
+-        anchorNodeExection.innerHTML = label;
+-    } else {
+-        anchorNodeExection.textContent = execution;
+-    }
++    anchorNodeExection.textContent = label || execution;
+     anchorNodeExection.onclick = (event: MouseEvent) => {
+         gotoRoute(event, executionRoute, router);
+     }
+diff --git a/ui/src/utils/markdown.ts b/ui/src/utils/markdown.ts
+index 1133519..c73d65c 100644
+--- a/ui/src/utils/markdown.ts
++++ b/ui/src/utils/markdown.ts
+@@ -29,6 +29,14 @@ interface RenderOptions {
+     linkify?: boolean;
+ }
+ 
++function escapeMarkup(value: string): string {
++    return value
++        .replace(/&/g, "&amp;")
++        .replace(/</g, "&lt;")
++        .replace(/>/g, "&gt;")
++        .replace(/"/g, "&quot;");
++}
++
+ export async function render(markdown: string, options: RenderOptions = {}) {
+     const markdownWithAlerts = typeof markdown === "string"
+         ? markdown
+@@ -44,7 +52,7 @@ export async function render(markdown: string, options: RenderOptions = {}) {
+             )
+             .replace(
+                 /::\s*key\{key="(.*?)"\}\s*/g,
+-                (_: string, key: string) => `<kbd class="doc-key">${key}</kbd>`
++                (_: string, key: string) => `<kbd class="doc-key">${escapeMarkup(key)}</kbd>`
+             )
+         : markdown;
+ 
+diff --git a/ui/src/utils/markdown_plugins/link.ts b/ui/src/utils/markdown_plugins/link.ts
+index ab93fd9..199591d 100644
+--- a/ui/src/utils/markdown_plugins/link.ts
++++ b/ui/src/utils/markdown_plugins/link.ts
+@@ -18,7 +18,7 @@ export function linkTag(md: MarkdownIt) {
+ 
+         const token = state.push("link_custom_open", "link", 1);
+         token.markup = "[[link]]";
+-        token.attrs = attrs;
++        token.attrs = [];
+         state.push("link_custom_close", "link_custom", -1);
+ 
+         state.pos = state.pos + match[0].length;

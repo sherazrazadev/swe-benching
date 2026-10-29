@@ -1,0 +1,70 @@
+diff --git a/ui/src/components/layout/Markdown.vue b/ui/src/components/layout/Markdown.vue
+index 050b2c6..31029f8 100644
+--- a/ui/src/components/layout/Markdown.vue
++++ b/ui/src/components/layout/Markdown.vue
+@@ -535,7 +535,7 @@
+             const tip = document.createElement("span");
+             tip.classList.add("doc-link-tip");
+             tip.setAttribute("role", "tooltip");
+-            tip.innerHTML = link.getAttribute("title") ?? "";
++            tip.textContent = link.getAttribute("title") ?? "";
+             link.appendChild(tip);
+ 
+             cleanups.push(() => tip.remove());
+diff --git a/ui/src/components/logs/linkify.ts b/ui/src/components/logs/linkify.ts
+index cf299b2..4341b7d 100644
+--- a/ui/src/components/logs/linkify.ts
++++ b/ui/src/components/logs/linkify.ts
+@@ -45,11 +45,7 @@ export default function linkify(element?: HTMLElement, router?: Router) {
+     // we create the anchor nodes
+     const anchorNodeExection = document.createElement("a");
+     anchorNodeExection.href = executionUrl.href;
+-    if (label) {
+-        anchorNodeExection.innerHTML = label;
+-    } else {
+-        anchorNodeExection.textContent = execution;
+-    }
++    anchorNodeExection.textContent = label || execution;
+     anchorNodeExection.onclick = (event: MouseEvent) => {
+         gotoRoute(event, executionRoute, router);
+     }
+diff --git a/ui/src/utils/markdown.ts b/ui/src/utils/markdown.ts
+index 1133519..ba1bc6a 100644
+--- a/ui/src/utils/markdown.ts
++++ b/ui/src/utils/markdown.ts
+@@ -29,6 +29,26 @@ interface RenderOptions {
+     linkify?: boolean;
+ }
+ 
++
++const SANITIZE_URL_ATTRS = ["href", "src", "action", "formaction", "xlink:href"];
++
++function sanitizeRendered(html: string): string {
++    const root = document.createElement("div");
++    root.innerHTML = html;
++    root.querySelectorAll("script, iframe, object, embed").forEach((node) => node.remove());
++    root.querySelectorAll("*").forEach((element) => {
++        for (const attr of Array.from(element.attributes)) {
++            const name = attr.name.toLowerCase();
++            const value = attr.value.trim();
++            const scriptUrl = SANITIZE_URL_ATTRS.includes(name) && /^(javascript|vbscript|data:text\/html)/i.test(value);
++            if (name.startsWith("on") || scriptUrl || (name === "style" && /position\s*:\s*fixed/i.test(value))) {
++                element.removeAttribute(attr.name);
++            }
++        }
++    });
++    return root.innerHTML;
++}
++
+ export async function render(markdown: string, options: RenderOptions = {}) {
+     const markdownWithAlerts = typeof markdown === "string"
+         ? markdown
+@@ -95,7 +115,7 @@ export async function render(markdown: string, options: RenderOptions = {}) {
+     } else {
+         md.renderer.rules.table_open = () => "<table class=\"table\">\n";
+     }
+-    return md.render(markdownWithAlerts);
++    return sanitizeRendered(md.render(markdownWithAlerts));
+ }
+ 
+ function applyEnhancedRenderers(md: any, showCopyButtons: boolean) {

@@ -1,0 +1,91 @@
+diff --git a/lib/policy/celchecker.go b/lib/policy/celchecker.go
+index adfcd285..dd373635 100644
+--- a/lib/policy/celchecker.go
++++ b/lib/policy/celchecker.go
+@@ -13,11 +13,12 @@ import (
+ )
+ 
+ type CELChecker struct {
+-	program cel.Program
+-	src     string
++	program        cel.Program
++	src            string
++	subRequestMode bool
+ }
+ 
+-func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns) (*CELChecker, error) {
++func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns, subrequestMode bool) (*CELChecker, error) {
+ 	env, err := expressions.BotEnvironment(dnsObj)
+ 	if err != nil {
+ 		return nil, err
+@@ -29,8 +30,9 @@ func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns) (*CELChecker,
+ 	}
+ 
+ 	return &CELChecker{
+-		src:     cfg.String(),
+-		program: program,
++		src:            cfg.String(),
++		program:        program,
++		subRequestMode: subrequestMode,
+ 	}, nil
+ }
+ 
+@@ -39,7 +41,7 @@ func (cc *CELChecker) Hash() string {
+ }
+ 
+ func (cc *CELChecker) Check(r *http.Request) (bool, error) {
+-	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{r})
++	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{r, cc.subRequestMode})
+ 
+ 	if err != nil {
+ 		return false, err
+@@ -54,6 +56,7 @@ func (cc *CELChecker) Check(r *http.Request) (bool, error) {
+ 
+ type CELRequest struct {
+ 	*http.Request
++	subRequestMode bool
+ }
+ 
+ func (cr *CELRequest) Parent() cel.Activation { return nil }
+@@ -71,6 +74,14 @@ func (cr *CELRequest) ResolveName(name string) (any, bool) {
+ 	case "userAgent":
+ 		return cr.UserAgent(), true
+ 	case "path":
++		if cr.subRequestMode {
++			if xou := cr.Header.Get("X-Original-URI"); xou != "" {
++				return xou, true
++			}
++			if xfu := cr.Header.Get("X-Forwarded-Uri"); xfu != "" {
++				return xfu, true
++			}
++		}
+ 		return cr.URL.Path, true
+ 	case "requestUri":
+ 		return cr.URL.RequestURI(), true
+diff --git a/lib/policy/checker.go b/lib/policy/checker.go
+index 38003164..a8032c83 100644
+--- a/lib/policy/checker.go
++++ b/lib/policy/checker.go
+@@ -110,6 +110,9 @@ func NewPathChecker(rexStr string, subrequestMode bool) (checker.Impl, error) {
+ func (pc *PathChecker) Check(r *http.Request) (bool, error) {
+ 	if pc.subRequestMode {
+ 		originalUrl := r.Header.Get("X-Original-URI")
++		if originalUrl == "" {
++			originalUrl = r.Header.Get("X-Forwarded-Uri")
++		}
+ 		if originalUrl != "" {
+ 			if pc.regexp.MatchString(originalUrl) {
+ 				return true, nil
+diff --git a/lib/policy/policy.go b/lib/policy/policy.go
+index e1747472..6163ff3f 100644
+--- a/lib/policy/policy.go
++++ b/lib/policy/policy.go
+@@ -179,7 +179,7 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 		}
+ 
+ 		if b.Expression != nil {
+-			c, err := NewCELChecker(b.Expression, result.Dns)
++			c, err := NewCELChecker(b.Expression, result.Dns, subrequestMode)
+ 			if err != nil {
+ 				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s expressions: %w", b.Name, err))
+ 			} else {

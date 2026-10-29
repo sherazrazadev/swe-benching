@@ -1,0 +1,177 @@
+diff -ruN a/lib/policy/celchecker.go b/lib/policy/celchecker.go
+--- a/lib/policy/celchecker.go	2026-10-29 12:04:08.000000000 +0000
++++ b/lib/policy/celchecker.go	2026-10-29 12:36:15.193051344 +0000
+@@ -13,11 +13,22 @@
+ )
+ 
+ type CELChecker struct {
+-	program cel.Program
+-	src     string
++	program        cel.Program
++	src            string
++	subrequestMode bool
+ }
+ 
++// NewCELChecker compiles a policy expression for a deployment that evaluates the
++// request Anubis receives itself.
+ func NewCELChecker(cfg *config.ExpressionOrList, dnsObj *dns.Dns) (*CELChecker, error) {
++	return NewCELCheckerInMode(cfg, dnsObj, false)
++}
++
++// NewCELCheckerInMode compiles a policy expression for a deployment. In an
++// authorization-service deployment (subrequestMode) the URL values the expression
++// sees describe the client's request, which the fronting proxy reports in a
++// forwarding field, rather than the internal call Anubis receives.
++func NewCELCheckerInMode(cfg *config.ExpressionOrList, dnsObj *dns.Dns, subrequestMode bool) (*CELChecker, error) {
+ 	env, err := expressions.BotEnvironment(dnsObj)
+ 	if err != nil {
+ 		return nil, err
+@@ -29,8 +40,9 @@
+ 	}
+ 
+ 	return &CELChecker{
+-		src:     cfg.String(),
+-		program: program,
++		src:            cfg.String(),
++		program:        program,
++		subrequestMode: subrequestMode,
+ 	}, nil
+ }
+ 
+@@ -39,7 +51,7 @@
+ }
+ 
+ func (cc *CELChecker) Check(r *http.Request) (bool, error) {
+-	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{r})
++	result, _, err := cc.program.ContextEval(r.Context(), &CELRequest{cc.evaluatedRequest(r)})
+ 
+ 	if err != nil {
+ 		return false, err
+@@ -52,6 +64,26 @@
+ 	return false, nil
+ }
+ 
++// evaluatedRequest is the request the expression is evaluated against. In an
++// authorization-service deployment the client's request URL stands in for the
++// URL of the internal call, so every URL-derived value (path, request URI and
++// query alike) resolves what the client actually requested.
++func (cc *CELChecker) evaluatedRequest(r *http.Request) *http.Request {
++	if !cc.subrequestMode {
++		return r
++	}
++
++	u := clientRequestURL(r)
++	if u == nil {
++		return r
++	}
++
++	client := new(http.Request)
++	*client = *r
++	client.URL = u
++	return client
++}
++
+ type CELRequest struct {
+ 	*http.Request
+ }
+diff -ruN a/lib/policy/checker.go b/lib/policy/checker.go
+--- a/lib/policy/checker.go	2026-10-29 12:04:04.000000000 +0000
++++ b/lib/policy/checker.go	2026-10-29 12:36:10.230926284 +0000
+@@ -109,11 +109,12 @@
+ 
+ func (pc *PathChecker) Check(r *http.Request) (bool, error) {
+ 	if pc.subRequestMode {
+-		originalUrl := r.Header.Get("X-Original-URI")
+-		if originalUrl != "" {
+-			if pc.regexp.MatchString(originalUrl) {
+-				return true, nil
+-			}
++		// The path the client asked for is the only path this rule may match in
++		// authorization-service mode. It may arrive in either forwarding field,
++		// and it is a path, not a whole request target: the query string the
++		// client sent must not stop an anchored rule from matching.
++		if u := clientRequestURL(r); u != nil && pc.regexp.MatchString(u.Path) {
++			return true, nil
+ 		}
+ 	}
+ 
+diff -ruN a/lib/policy/clienturl.go b/lib/policy/clienturl.go
+--- a/lib/policy/clienturl.go	1970-01-01 00:00:00.000000000 +0000
++++ b/lib/policy/clienturl.go	2026-10-29 12:36:07.263849173 +0000
+@@ -0,0 +1,49 @@
++package policy
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// clientURLHeaders are the forwarding fields a fronting proxy can use to report
++// the request target the client actually asked for. Anubis has always honored
++// X-Original-URI in authorization-service mode; X-Forwarded-Uri is the other
++// field standard reverse proxies populate for the same purpose. When a request
++// carries both, X-Original-URI is the authoritative one.
++var clientURLHeaders = []string{"X-Original-URI", "X-Forwarded-Uri"}
++
++// clientRequestURL returns the URL of the client's request as reported by the
++// fronting proxy, or nil when the request carries no such report. A policy rule
++// that decides on the request URL must decide on this value whenever it is
++// present, never on the URL of the internal authorization call Anubis received.
++func clientRequestURL(r *http.Request) *url.URL {
++	for _, header := range clientURLHeaders {
++		target := strings.TrimSpace(r.Header.Get(header))
++		if target == "" {
++			continue
++		}
++		return parseRequestTarget(target)
++	}
++	return nil
++}
++
++// parseRequestTarget interprets a forwarded request target: a path optionally
++// followed by a query string. The query is part of the URL's query, not of its
++// path, so a request target of /admin?x=1 still names the path /admin.
++func parseRequestTarget(target string) *url.URL {
++	if u, err := url.ParseRequestURI(target); err == nil {
++		return &url.URL{
++			Path:       u.Path,
++			RawPath:    u.RawPath,
++			RawQuery:   u.RawQuery,
++			ForceQuery: u.ForceQuery,
++		}
++	}
++
++	// The value is not a well-formed request target. Keep it as a path so the
++	// rule can still decide on the client's request instead of silently falling
++	// back to the internal call.
++	path, query, _ := strings.Cut(target, "?")
++	return &url.URL{Path: path, RawQuery: query}
++}
+diff -ruN a/lib/policy/policy.go b/lib/policy/policy.go
+--- a/lib/policy/policy.go	2026-10-29 12:04:08.000000000 +0000
++++ b/lib/policy/policy.go	2026-10-29 12:36:15.538060049 +0000
+@@ -179,7 +179,7 @@
+ 		}
+ 
+ 		if b.Expression != nil {
+-			c, err := NewCELChecker(b.Expression, result.Dns)
++			c, err := NewCELCheckerInMode(b.Expression, result.Dns, subrequestMode)
+ 			if err != nil {
+ 				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s expressions: %w", b.Name, err))
+ 			} else {
+diff -ruN a/lib/policy/prefixchecker.go b/lib/policy/prefixchecker.go
+--- a/lib/policy/prefixchecker.go	2026-10-29 12:04:08.000000000 +0000
++++ b/lib/policy/prefixchecker.go	2026-10-29 12:36:11.061947169 +0000
+@@ -21,8 +21,9 @@
+ 
+ func (pc *PrefixChecker) Check(r *http.Request) (bool, error) {
+ 	if pc.subRequestMode {
+-		original := r.Header.Get("X-Original-URI")
+-		if original != "" && strings.HasPrefix(original, pc.prefix) {
++		// The client's request target arrives in a forwarding field and may carry
++		// a query string; only its path can start with the configured prefix.
++		if u := clientRequestURL(r); u != nil && strings.HasPrefix(u.Path, pc.prefix) {
+ 			return true, nil
+ 		}
+ 	}

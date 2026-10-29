@@ -1,0 +1,251 @@
+diff -ruN a/src/components/diff/ImageDiff.tsx b/src/components/diff/ImageDiff.tsx
+--- a/src/components/diff/ImageDiff.tsx	2026-10-29 12:20:19.000000000 +0000
++++ b/src/components/diff/ImageDiff.tsx	2026-10-29 12:41:37.328371069 +0000
+@@ -45,6 +45,7 @@
+   twoUpView
+ } from '../../style/ImageDiffStyle';
+ import { Git } from '../../tokens';
++import { appendTextWithLines, rejectionText, textSpan } from './safeDom';
+ 
+ export const createImageDiff: Git.Diff.Factory = async ({
+   model,
+@@ -420,7 +421,7 @@
+     // Show the path of the file that is being compared.
+     const caption = document.createElement('div');
+     caption.className = 'jp-git-image-diff-caption';
+-    caption.innerHTML = `<span>${model.filename}</span>`;
++    caption.appendChild(textSpan(model.filename));
+     this.addWidget(new Widget({ node: caption }));
+ 
+     this.refresh()
+@@ -513,11 +514,15 @@
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
+-    this.node.innerHTML = `<p style="color: unset" class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading Image Diff:')}</span>
+-      <span class="jp-git-diff-error-message">${msg}</span>
+-    </p>`;
++    const msg = rejectionText(error);
++    const banner = document.createElement('p');
++    banner.style.color = 'unset';
++    banner.className = 'jp-git-diff-error';
++    banner.appendChild(textSpan(this._trans.__('Error Loading Image Diff:')));
++    const message = textSpan('', 'jp-git-diff-error-message');
++    appendTextWithLines(message, msg);
++    banner.appendChild(message);
++    this.node.replaceChildren(banner);
+   }
+ 
+   protected _container: HTMLElement;
+diff -ruN a/src/components/diff/NotebookDiff.ts b/src/components/diff/NotebookDiff.ts
+--- a/src/components/diff/NotebookDiff.ts	2026-10-29 12:20:19.000000000 +0000
++++ b/src/components/diff/NotebookDiff.ts	2026-10-29 12:41:33.700376313 +0000
+@@ -26,6 +26,7 @@
+ import { UNCHANGED_MERGE_CLASS } from 'nbdime/lib/merge/widget/common';
+ import { requestAPI } from '../../git';
+ import { Git } from '../../tokens';
++import { appendTextWithLines, rejectionText, textSpan } from './safeDom';
+ 
+ /**
+  * Class of the outermost widget, the draggable tab
+@@ -107,11 +108,10 @@
+     // Show the revisions that are being compared.
+     const context = document.createElement('span');
+     context.className = 'jp-git-diff-context';
+-    context.innerHTML = `<span title="${escapeHtml(
+-      model.reference.label
+-    )}">${escapeHtml(model.reference.label)} &rarr; ${escapeHtml(
+-      model.challenger.label
+-    )}</span>`;
++    const contextText = document.createElement('span');
++    contextText.title = model.reference.label;
++    contextText.textContent = `${model.reference.label} → ${model.challenger.label}`;
++    context.appendChild(contextText);
+     toolbar.addItem('diff-context', new Widget({ node: context }));
+ 
+     if (model.hasConflict) {
+@@ -369,11 +369,14 @@
+       this.widgets[0].dispose();
+     }
+ 
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
+-    this.node.innerHTML = `<p class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading Notebook Diff:')}</span>
+-      <span class="jp-git-diff-error-message">${msg}</span>
+-    </p>`;
++    const msg = rejectionText(error);
++    const banner = document.createElement('p');
++    banner.className = 'jp-git-diff-error';
++    banner.appendChild(textSpan(this._trans.__('Error Loading Notebook Diff:')));
++    const message = textSpan('', 'jp-git-diff-error-message');
++    appendTextWithLines(message, msg);
++    banner.appendChild(message);
++    this.node.replaceChildren(banner);
+   }
+ 
+   protected _areUnchangedCellsHidden = false;
+@@ -404,16 +407,18 @@
+       : 'jp-git-diff-banner';
+     const node = document.createElement('div');
+     node.className = 'jp-git-diff-header';
+-    node.innerHTML = `<div class="${bannerClass}">
+-        <span>${localLabel}</span>
+-        ${
+-          hasConflict
+-            ? // Add extra space during notebook merge view
+-              `<span>${baseLabel}</span>`
+-            : ''
+-        }
+-        <span>${remoteLabel}</span>
+-      </div>`;
++    const banner = document.createElement('div');
++    banner.className = bannerClass;
++    const labels = hasConflict
++      ? // Add the common ancestor label during notebook merge view
++        [localLabel, baseLabel, remoteLabel]
++      : [localLabel, remoteLabel];
++    labels
++      .filter((label): label is string => label !== undefined && label !== '')
++      .forEach(label => {
++        banner.appendChild(textSpan(label));
++      });
++    node.appendChild(banner);
+ 
+     return new Widget({ node });
+   }
+@@ -515,13 +520,3 @@
+     }
+   }
+ }
+-
+-/**
+- * Escape the characters that are special in HTML text.
+- */
+-function escapeHtml(value: string): string {
+-  return value
+-    .replace(/&/g, '&amp;')
+-    .replace(/</g, '&lt;')
+-    .replace(/>/g, '&gt;');
+-}
+diff -ruN a/src/components/diff/PlainTextDiff.ts b/src/components/diff/PlainTextDiff.ts
+--- a/src/components/diff/PlainTextDiff.ts	2026-10-29 12:20:17.000000000 +0000
++++ b/src/components/diff/PlainTextDiff.ts	2026-10-29 12:41:28.690383591 +0000
+@@ -23,6 +23,7 @@
+ } from 'nbdime/lib/diff/model';
+ import { DiffRangeRaw } from 'nbdime/lib/diff/range';
+ import { Git } from '../../tokens';
++import { appendTextWithLines, rejectionText, textSpan } from './safeDom';
+ 
+ /**
+  * Diff callback to be registered for plain-text files.
+@@ -218,10 +219,11 @@
+       labels[1] !== undefined ? 'jp-git-merge-banner' : 'jp-git-diff-banner';
+     const head = document.createElement('div');
+     head.classList.add(bannerClass);
+-    head.innerHTML = labels
+-      .filter(label => !!label)
+-      .map(label => `<span>${label}</span>`)
+-      .join('');
++    labels
++      .filter((label): label is string => label !== undefined && label !== '')
++      .forEach(label => {
++        head.appendChild(textSpan(label));
++      });
+     return head;
+   }
+ 
+@@ -283,16 +285,19 @@
+       error,
+       (error as any)?.traceback
+     );
+-    const msg = ((error.message || error) as string).replace('\n', '<br />');
++    const msg = rejectionText(error);
+     while (this.widgets.length > 0) {
+       const w = this.widgets[0];
+       this.layout?.removeWidget(w);
+       w.dispose();
+     }
+-    this.node.innerHTML = `<p class="jp-git-diff-error">
+-      <span>${this._trans.__('Error Loading File Diff:')}</span>
+-      <span class="jp-git-diff-error-message">${msg}</span>
+-    </p>`;
++    const banner = document.createElement('p');
++    banner.className = 'jp-git-diff-error';
++    banner.appendChild(textSpan(this._trans.__('Error Loading File Diff:')));
++    const message = textSpan('', 'jp-git-diff-error-message');
++    appendTextWithLines(message, msg);
++    banner.appendChild(message);
++    this.node.replaceChildren(banner);
+   }
+ 
+   protected _editorFactory: CodeEditor.Factory;
+diff -ruN a/src/components/diff/safeDom.ts b/src/components/diff/safeDom.ts
+--- a/src/components/diff/safeDom.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/src/components/diff/safeDom.ts	2026-10-29 12:41:25.167389120 +0000
+@@ -0,0 +1,64 @@
++/**
++ * Helpers for putting values that come from the repository or the git server
++ * (revision labels, commit identifiers, file paths, and messages returned with
++ * a failed request) on the page.
++ *
++ * These values are data, never markup: each helper below only creates text
++ * nodes and attribute values, so the characters in the value are shown as
++ * written and cannot introduce elements, attributes, or script.
++ */
++
++/**
++ * Build a span that shows `value` as literal text.
++ *
++ * @param value Value to show
++ * @param className Optional class for the span
++ * @returns The new span
++ */
++export function textSpan(value: string, className?: string): HTMLSpanElement {
++  const span = document.createElement('span');
++  if (className !== undefined) {
++    span.className = className;
++  }
++  span.textContent = value;
++  return span;
++}
++
++/**
++ * Append `value` to `parent` as literal text, keeping each line of a
++ * multi-line value on its own line.
++ *
++ * @param parent Element to append to
++ * @param value Value to show
++ */
++export function appendTextWithLines(
++  parent: HTMLElement,
++  value: string
++): void {
++  const lines = value.split('\n');
++  lines.forEach((line, index) => {
++    if (index > 0) {
++      parent.appendChild(document.createElement('br'));
++    }
++    parent.appendChild(document.createTextNode(line));
++  });
++}
++
++/**
++ * The text to show for a rejected request.
++ *
++ * An Error contributes its message; a rejection that is not an Error object
++ * contributes the value itself.
++ *
++ * @param reason The rejection reason
++ * @returns The text to show
++ */
++export function rejectionText(reason: unknown): string {
++  if (reason !== null && typeof reason === 'object') {
++    const message = (reason as { message?: unknown }).message;
++    if (message !== undefined && message !== null && message !== '') {
++      return String(message);
++    }
++  }
++  return String(reason);
++}

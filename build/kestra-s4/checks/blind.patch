@@ -1,0 +1,107 @@
+diff -ruN a/ui/src/components/layout/Markdown.vue b/ui/src/components/layout/Markdown.vue
+--- a/ui/src/components/layout/Markdown.vue	2026-10-29 12:03:01.000000000 +0000
++++ b/ui/src/components/layout/Markdown.vue	2026-10-29 12:25:35.905188296 +0000
+@@ -535,7 +535,9 @@
+             const tip = document.createElement("span");
+             tip.classList.add("doc-link-tip");
+             tip.setAttribute("role", "tooltip");
+-            tip.innerHTML = link.getAttribute("title") ?? "";
++            // The title is authored text that the Markdown layer escaped; the DOM decodes
++            // it, so it must be placed as text and not parsed again.
++            tip.textContent = link.getAttribute("title") ?? "";
+             link.appendChild(tip);
+ 
+             cleanups.push(() => tip.remove());
+diff -ruN a/ui/src/components/logs/linkify.ts b/ui/src/components/logs/linkify.ts
+--- a/ui/src/components/logs/linkify.ts	2026-10-29 12:03:01.000000000 +0000
++++ b/ui/src/components/logs/linkify.ts	2026-10-29 12:25:29.351162004 +0000
+@@ -45,11 +45,8 @@
+     // we create the anchor nodes
+     const anchorNodeExection = document.createElement("a");
+     anchorNodeExection.href = executionUrl.href;
+-    if (label) {
+-        anchorNodeExection.innerHTML = label;
+-    } else {
+-        anchorNodeExection.textContent = execution;
+-    }
++    // The display text comes from authored Markdown, so it is content, never markup.
++    anchorNodeExection.textContent = label ? label : execution;
+     anchorNodeExection.onclick = (event: MouseEvent) => {
+         gotoRoute(event, executionRoute, router);
+     }
+diff -ruN a/ui/src/utils/markdown.ts b/ui/src/utils/markdown.ts
+--- a/ui/src/utils/markdown.ts	2026-10-29 12:03:01.000000000 +0000
++++ b/ui/src/utils/markdown.ts	2026-10-29 12:25:33.702179607 +0000
+@@ -29,6 +29,23 @@
+     linkify?: boolean;
+ }
+ 
++const HTML_ENTITIES: Record<string, string> = {
++    "&": "&amp;",
++    "<": "&lt;",
++    ">": "&gt;",
++    "\"": "&quot;",
++    "'": "&#39;",
++};
++
++/**
++ * Encode authored text so that it is inserted into the pre-parsed Markdown source as
++ * literal characters rather than as HTML. The substitutions in this function run before
++ * markdown-it, so whatever they build is parsed as markup.
++ */
++function escapeForMarkup(value: string): string {
++    return value.replace(/[&<>"']/g, (character) => HTML_ENTITIES[character]);
++}
++
+ export async function render(markdown: string, options: RenderOptions = {}) {
+     const markdownWithAlerts = typeof markdown === "string"
+         ? markdown
+@@ -44,7 +61,7 @@
+             )
+             .replace(
+                 /::\s*key\{key="(.*?)"\}\s*/g,
+-                (_: string, key: string) => `<kbd class="doc-key">${key}</kbd>`
++                (_: string, key: string) => `<kbd class="doc-key">${escapeForMarkup(key)}</kbd>`
+             )
+         : markdown;
+ 
+diff -ruN a/ui/src/utils/markdown_plugins/link.ts b/ui/src/utils/markdown_plugins/link.ts
+--- a/ui/src/utils/markdown_plugins/link.ts	2026-10-29 12:03:01.000000000 +0000
++++ b/ui/src/utils/markdown_plugins/link.ts	2026-10-29 12:25:26.966152355 +0000
+@@ -1,5 +1,10 @@
+ import MarkdownIt from "markdown-it";
+ 
++// The only attribute names the link tag is allowed to carry. Every name here is one the
++// product reads back (see the linkifier); the tag is rendered as raw HTML, so any other
++// name an author writes would be emitted verbatim and become live markup.
++const LINK_TAG_ATTRIBUTES = new Set(["execution", "flowid", "namespace", "label"]);
++
+ export function linkTag(md: MarkdownIt) {
+     const linkTagRegex = /\[\[link(\s+(.*?))?\]\]/g;
+ 
+@@ -10,9 +15,12 @@
+         const match = state.src.match(linkTagRegex);
+         if (!match) return false;
+ 
+-        // Get the attributes, they must have the following format: key="value"
++        // Get the attributes, they must have the following format: key="value".
++        // Attribute names are author text; keep only the names the product understands so
++        // nothing else can be spliced into the generated element.
+         const attrs = Array.from(match[0].matchAll(/(\S+)="([^"]*)"/g))
+-            .map((attr): [string, string] => [attr[1], attr[2]]);
++            .map((attr): [string, string] => [attr[1], attr[2]])
++            .filter(([name]) => LINK_TAG_ATTRIBUTES.has(name.toLowerCase()));
+ 
+         if (!attrs.length) return false;
+ 
+@@ -28,7 +36,9 @@
+ 
+     md.renderer.rules.link_custom_open = (tokens, idx) => {
+         const token = tokens[idx];
+-        const attrs = token.attrs ? token.attrs.map(([name, value]) => `${name}="${value}"`).join("") : "";
++        const attrs = token.attrs
++            ? token.attrs.map(([name, value]) => `${name}="${md.utils.escapeHtml(value)}"`).join(" ")
++            : "";
+ 
+         return `<router-md ${attrs}>`;
+     };

@@ -1,0 +1,101 @@
+diff --git a/ui/src/components/layout/Markdown.vue b/ui/src/components/layout/Markdown.vue
+index 584d433..050b2c6 100644
+--- a/ui/src/components/layout/Markdown.vue
++++ b/ui/src/components/layout/Markdown.vue
+@@ -149,6 +149,7 @@
+         setupCollapsibles(root);
+         setupFlowExampleToggle(root);
+         setupCopyButtons(root);
++        setupLinkTooltips(root);
+         setupSmoothScrolling(root);
+     }
+ 
+@@ -522,6 +523,25 @@
+         }
+     }
+ 
++    /* -------------------------
++   Link tooltips
++   ------------------------- */
++    function setupLinkTooltips(root: HTMLElement) {
++        const links = Array.from(root.querySelectorAll<HTMLAnchorElement>("a[title]"));
++
++        links.forEach((link) => {
++            if (link.querySelector(".doc-link-tip")) return;
++
++            const tip = document.createElement("span");
++            tip.classList.add("doc-link-tip");
++            tip.setAttribute("role", "tooltip");
++            tip.innerHTML = link.getAttribute("title") ?? "";
++            link.appendChild(tip);
++
++            cleanups.push(() => tip.remove());
++        });
++    }
++
+     /* -------------------------
+    Smooth scrolling for anchors
+    ------------------------- */
+diff --git a/ui/src/components/logs/linkify.ts b/ui/src/components/logs/linkify.ts
+index 75357ec..cf299b2 100644
+--- a/ui/src/components/logs/linkify.ts
++++ b/ui/src/components/logs/linkify.ts
+@@ -35,6 +35,7 @@ export default function linkify(element?: HTMLElement, router?: Router) {
+     const execution = link.getAttribute("execution");
+     const namespace = link.getAttribute("namespace");
+     const flowId = link.getAttribute("flowId");
++    const label = link.getAttribute("label");
+ 
+     const executionRoute = {name: "executions/update", params: {id: execution, namespace: namespace, flowId: flowId}}
+     const executionUrl = router.resolve(executionRoute)
+@@ -44,7 +45,11 @@ export default function linkify(element?: HTMLElement, router?: Router) {
+     // we create the anchor nodes
+     const anchorNodeExection = document.createElement("a");
+     anchorNodeExection.href = executionUrl.href;
+-    anchorNodeExection.textContent = execution;
++    if (label) {
++        anchorNodeExection.innerHTML = label;
++    } else {
++        anchorNodeExection.textContent = execution;
++    }
+     anchorNodeExection.onclick = (event: MouseEvent) => {
+         gotoRoute(event, executionRoute, router);
+     }
+diff --git a/ui/src/utils/markdown.ts b/ui/src/utils/markdown.ts
+index 8cefbc4..1133519 100644
+--- a/ui/src/utils/markdown.ts
++++ b/ui/src/utils/markdown.ts
+@@ -39,9 +39,13 @@ export async function render(markdown: string, options: RenderOptions = {}) {
+             )
+             .replace(
+                 /::\s*alert\{type="(.*?)"\}\s*([^\n]*)\s*::/g,
+-                (_: string, type: string, content: string) => 
++                (_: string, type: string, content: string) =>
+                     `::: ${type}\n${content}\n:::`
+             )
++            .replace(
++                /::\s*key\{key="(.*?)"\}\s*/g,
++                (_: string, key: string) => `<kbd class="doc-key">${key}</kbd>`
++            )
+         : markdown;
+ 
+     const {createHighlighterCore, githubDark, githubLight, markdownIt, mark, meta, mila, anchor, container, fromHighlighter, linkTag, langs, onigurumaEngine} = await import("./markdownDeps")
+diff --git a/ui/src/utils/markdown_plugins/link.ts b/ui/src/utils/markdown_plugins/link.ts
+index 472b7b6..ab93fd9 100644
+--- a/ui/src/utils/markdown_plugins/link.ts
++++ b/ui/src/utils/markdown_plugins/link.ts
+@@ -11,11 +11,10 @@ export function linkTag(md: MarkdownIt) {
+         if (!match) return false;
+ 
+         // Get the attributes, they must have the following format: key="value"
+-        const attrs = match[0].match(/\S+="(\S)+"/g)
+-            ?.map(attr => attr.split("="))
+-            .map(([name, value]): [string, string] => [name, value.replace(/"/g, "")]);
++        const attrs = Array.from(match[0].matchAll(/(\S+)="([^"]*)"/g))
++            .map((attr): [string, string] => [attr[1], attr[2]]);
+ 
+-        if (!attrs) return false;
++        if (!attrs.length) return false;
+ 
+         const token = state.push("link_custom_open", "link", 1);
+         token.markup = "[[link]]";

@@ -1,0 +1,250 @@
+--- a/spring-graphql/src/main/java/org/springframework/graphql/data/pagination/CursorJsonTypes.java
++++ b/spring-graphql/src/main/java/org/springframework/graphql/data/pagination/CursorJsonTypes.java
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2026-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.graphql.data.pagination;
++
++import java.util.Calendar;
++import java.util.Collections;
++import java.util.Date;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.UUID;
++
++/**
++ * The types that a JSON cursor may deserialize into.
++ *
++ * <p>A cursor is produced by the application but sent back by the client, so its
++ * content is untrusted. When a cursor is decoded with polymorphic typing enabled,
++ * the type name it carries decides which class is instantiated; a cursor that names
++ * an arbitrary class would therefore let the client run that class' constructor.
++ * The entries here are the only types the pagination feature has any use for:
++ * the map implementations it creates to carry a position, and the ordinary value
++ * types such a position can hold.
++ *
++ * <p>A validator built from these entries must refuse every other type name before
++ * the class is instantiated. Note that none of the entries may be relaxed into a
++ * base type such as {@code Map} or {@code Object}: a base-type rule short-circuits
++ * subtype validation and would accept every implementation visible to the
++ * application's class loader.
++ *
++ * @since 2.0.4
++ * @see JsonCursorEncoder
++ */
++public final class CursorJsonTypes {
++
++	/**
++	 * Map implementations the pagination feature itself creates for the keys
++	 * of a {@code KeysetScrollPosition}.
++	 */
++	private static final List<Class<?>> CONTAINER_TYPES =
++			List.of(LinkedHashMap.class, HashMap.class);
++
++	/**
++	 * Class name prefixes of JDK types the feature produces or consumes: the
++	 * read-only collection wrappers used for an unmodifiable position, and the
++	 * {@code java.time} values a position may carry.
++	 */
++	private static final List<String> TYPE_NAME_PREFIXES =
++			List.of(Collections.class.getName(), "java.time.");
++
++	/**
++	 * Value types a position may carry.
++	 */
++	private static final List<Class<?>> VALUE_TYPES =
++			List.of(Calendar.class, Date.class, UUID.class, Number.class, Enum.class);
++
++
++	private CursorJsonTypes() {
++	}
++
++
++	/**
++	 * Container types that may carry a position.
++	 */
++	public static List<Class<?>> containerTypes() {
++		return CONTAINER_TYPES;
++	}
++
++	/**
++	 * Prefixes of type names that may carry a position value.
++	 */
++	public static List<String> typeNamePrefixes() {
++		return TYPE_NAME_PREFIXES;
++	}
++
++	/**
++	 * Value types that may be held by a position.
++	 */
++	public static List<Class<?>> valueTypes() {
++		return VALUE_TYPES;
++	}
++
++}
+--- a/spring-graphql/src/main/java/org/springframework/graphql/data/pagination/JsonCursorEncoder.java
++++ b/spring-graphql/src/main/java/org/springframework/graphql/data/pagination/JsonCursorEncoder.java
+@@ -17,12 +17,8 @@
+ package org.springframework.graphql.data.pagination;
+ 
+ import java.time.Instant;
+-import java.util.Calendar;
+-import java.util.Date;
+-import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+-import java.util.UUID;
+ 
+ import tools.jackson.databind.DefaultTyping;
+ import tools.jackson.databind.ObjectMapper;
+@@ -53,11 +49,12 @@
+ 
+ 
+ 	public JsonCursorEncoder() {
+-		BasicPolymorphicTypeValidator validator = BasicPolymorphicTypeValidator.builder()
+-				.allowIfBaseType(Object.class)
+-				.build();
++		BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
++		CursorJsonTypes.containerTypes().forEach(builder::allowIfSubType);
++		CursorJsonTypes.typeNamePrefixes().forEach(builder::allowIfSubType);
++		CursorJsonTypes.valueTypes().forEach(builder::allowIfSubType);
+ 		this.objectMapper = JsonMapper.builder()
+-				.activateDefaultTyping(validator, DefaultTyping.NON_FINAL)
++				.activateDefaultTyping(builder.build(), DefaultTyping.NON_FINAL)
+ 				.build();
+ 	}
+ 
+--- a/spring-graphql/src/main/java/org/springframework/graphql/data/query/JsonKeysetCursorStrategy.java
++++ b/spring-graphql/src/main/java/org/springframework/graphql/data/query/JsonKeysetCursorStrategy.java
+@@ -20,8 +20,6 @@
+ import java.util.Calendar;
+ import java.util.Collections;
+ import java.util.Date;
+-import java.util.HashMap;
+-import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.UUID;
+ 
+@@ -38,6 +36,7 @@
+ import org.springframework.core.io.buffer.DataBuffer;
+ import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+ import org.springframework.data.domain.KeysetScrollPosition;
++import org.springframework.graphql.data.pagination.CursorJsonTypes;
+ import org.springframework.graphql.data.pagination.CursorStrategy;
+ import org.springframework.http.MediaType;
+ import org.springframework.http.codec.CodecConfigurer;
+@@ -156,17 +155,11 @@
+ 
+ 		static void customize(CodecConfigurer configurer) {
+ 
+-			PolymorphicTypeValidator validator = BasicPolymorphicTypeValidator.builder()
+-					.allowIfSubType(LinkedHashMap.class)
+-					.allowIfSubType(HashMap.class)
+-					.allowIfSubType("java.util.Collections")
+-					.allowIfSubType("java.time.")
+-					.allowIfSubType(Calendar.class)
+-					.allowIfSubType(Date.class)
+-					.allowIfSubType(UUID.class)
+-					.allowIfSubType(Number.class)
+-					.allowIfSubType(Enum.class)
+-					.build();
++			BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
++			CursorJsonTypes.containerTypes().forEach(builder::allowIfSubType);
++			CursorJsonTypes.typeNamePrefixes().forEach(builder::allowIfSubType);
++			CursorJsonTypes.valueTypes().forEach(builder::allowIfSubType);
++			PolymorphicTypeValidator validator = builder.build();
+ 
+ 			JsonMapper mapper = JsonMapper.builder()
+ 					.activateDefaultTyping(validator, DefaultTyping.NON_FINAL)
+@@ -189,16 +182,12 @@
+ 
+ 		static void customize(CodecConfigurer configurer) {
+ 
+-			com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator validator =
+-					com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator.builder()
+-					.allowIfBaseType(Map.class)
+-					.allowIfSubType("java.time.")
+-					.allowIfSubType(Calendar.class)
+-					.allowIfSubType(Date.class)
+-					.allowIfSubType(UUID.class)
+-					.allowIfSubType(Number.class)
+-					.allowIfSubType(Enum.class)
+-					.build();
++			com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator.Builder builder =
++					com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator.builder();
++			CursorJsonTypes.containerTypes().forEach(builder::allowIfSubType);
++			CursorJsonTypes.typeNamePrefixes().forEach(builder::allowIfSubType);
++			CursorJsonTypes.valueTypes().forEach(builder::allowIfSubType);
++			com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator validator = builder.build();
+ 
+ 			com.fasterxml.jackson.databind.ObjectMapper mapper = Jackson2ObjectMapperBuilder.json().build();
+ 			mapper.activateDefaultTyping(validator, com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping.NON_FINAL);
+--- a/spring-graphql-docs/src/main/java/org/springframework/graphql/docs/data/pagination/scroll/keyset/KeysetCursorConfiguration.java
++++ b/spring-graphql-docs/src/main/java/org/springframework/graphql/docs/data/pagination/scroll/keyset/KeysetCursorConfiguration.java
+@@ -16,21 +16,16 @@
+ 
+ package org.springframework.graphql.docs.data.pagination.scroll.keyset;
+ 
+-import java.util.Calendar;
+-import java.util.Date;
+-import java.util.Map;
+-import java.util.UUID;
+-
+ import tools.jackson.databind.DefaultTyping;
+ import tools.jackson.databind.cfg.DateTimeFeature;
+ import tools.jackson.databind.json.JsonMapper;
+ import tools.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+-import tools.jackson.databind.jsontype.PolymorphicTypeValidator;
+ 
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.data.domain.ScrollPosition;
+ import org.springframework.graphql.data.pagination.CursorEncoder;
++import org.springframework.graphql.data.pagination.CursorJsonTypes;
+ import org.springframework.graphql.data.pagination.CursorStrategy;
+ import org.springframework.graphql.data.pagination.EncodingCursorStrategy;
+ import org.springframework.graphql.data.query.JsonKeysetCursorStrategy;
+@@ -68,20 +63,16 @@
+ 
+ 	// create a custom JsonMapper
+ 	private JsonMapper keysetJsonMapper() {
+-		// Configure which types should be allowed for serialization
+-		// those should include all fields included in the keyset
+-		PolymorphicTypeValidator validator = BasicPolymorphicTypeValidator.builder()
+-				.allowIfBaseType(Map.class)
+-				.allowIfSubType(Calendar.class)
+-				.allowIfSubType(Date.class)
+-				.allowIfSubType(UUID.class)
+-				.allowIfSubType(Number.class)
+-				.allowIfSubType(Enum.class)
+-				.allowIfSubType("java.time.")
+-				.build();
++		// Configure which types should be allowed for deserialization: the map
++		// implementations the feature itself creates, and the value types a
++		// keyset position can hold. Anything else named by a cursor is refused.
++		BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
++		CursorJsonTypes.containerTypes().forEach(builder::allowIfSubType);
++		CursorJsonTypes.typeNamePrefixes().forEach(builder::allowIfSubType);
++		CursorJsonTypes.valueTypes().forEach(builder::allowIfSubType);
+ 
+ 		return JsonMapper.builder()
+-				.activateDefaultTyping(validator, DefaultTyping.NON_FINAL)
++				.activateDefaultTyping(builder.build(), DefaultTyping.NON_FINAL)
+ 				// as of Jackson 3.0, dates are not written as timestamps by default
+ 				.enable(DateTimeFeature.WRITE_DATES_AS_TIMESTAMPS)
+ 				.build();

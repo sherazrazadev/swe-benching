@@ -1,0 +1,199 @@
+{
+ "slug": "litestar-s4",
+ "candidate": {
+  "repo": "litestar-org/litestar",
+  "advisory_ids": [
+   "GHSA-3QMC-CJ7Q-62HV",
+   "CVE-2026-48061",
+   "PYSEC-2026-2603"
+  ],
+  "pinned_commit": "299a5845d2e9a067ed7fb716fecf518cfed8b67b",
+  "fix_commits": [
+   "6930a20ceb543912cd651b42deae5b9f3637a262"
+  ],
+  "cwe": "CWE-348",
+  "entry_id": "525"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "An HTTP request to a Litestar application constructed with `allowed_hosts` set, driven over a real loopback socket to uvicorn exactly as a downstream user would run it. The security suite builds apps through the public `Litestar(...)` constructor and sends raw HTTP/1.0 and HTTP/1.1 requests (missing Host, user-info authority, forwarded-host headers), so the wire-level request form is what reaches the framework.",
+  "variants": [
+   "reported (site litestar/middleware/allowed_hosts.py:67): no Host header + X-Forwarded-Host naming an allowed host is served; the forwarded value stands in for the connection's host.",
+   "uncovered route (pattern B, real upstream): the host check takes the part of the Host value before the first ':' and the redirect target is built from the raw netloc, so `ok.example.com:80@evil.example.net` is served and a redirect variant points the client at the attacker's host.",
+   "uncovered route (pattern B, real upstream): the host check is installed per route node, so a request for an unknown path or an unsupported method is answered by the router's error response (404/405) instead of the host refusal, even for a disallowed host.",
+   "injected sibling (environment/inject.patch): the request URL builder prefers a client-supplied X-Forwarded-Host when composing absolute URLs, so the addresses the application returns for an allowed host name the client's host; the redirect target built from the request URL inherits the same value at the vulnerable commit."
+  ],
+  "services": [],
+  "project_tests_run": "The project's own allowed-hosts behavioural tests (test_middleware_allowed_hosts, test_middleware_allow_all, test_middleware_redirect_on_www_by_default, test_middleware_does_not_redirect_when_off, test_validation_raises_for_wrong_wildcard_domain) are shipped from a pristine pinned copy and pass at pinned+injected and on the oracle. The file's three layer-structural tests are deliberately not run so a correct fix may place the gate at a different layer. The pinned commit does not contain the advisory's regression test: the fix commit changes test_middleware_allowed_hosts to add the forwarded-header case; the pinned copy does not have it. All 16 hidden tests fail (security, 7) or pass (functional, 9) on pinned+injected as the gate requires.",
+  "sites": [
+   "litestar/middleware/allowed_hosts.py:67 (reported forwarded-host fallback; the published fix's site)",
+   "litestar/middleware/allowed_hosts.py:67 and litestar/datastructures/url.py:182-201 (authority-prefix identity + redirect netloc; real upstream)",
+   "litestar/_asgi/routing_trie/mapping.py:216-217, litestar/_asgi/routing_trie/traversal.py:54,85, litestar/_asgi/asgi_router.py:89-100 (routing-failure route; real upstream)",
+   "litestar/datastructures/url.py:181-199 (injected forwarded-host preference in the URL builder)"
+  ],
+  "routes": [
+   "HTTP/1.0 request with no Host header + X-Forwarded-Host naming an allowed host (reported)",
+   "HTTP/1.1 request with Host value allowed:port@evil (authority-prefix identity) and its redirect variant",
+   "HTTP/1.1 request with a disallowed Host to an unknown path or an unsupported method (routing failure)",
+   "HTTP/1.1 request with an allowed Host + X-Forwarded-Host to a URL-building handler and the redirect variant (injected producer)"
+  ],
+  "gate_evidence": "build/litestar-s4/gate_report.static.json, gate_report.patches.json, gate-nop.log, gate-oracle.log, gate-patches.log"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "reported",
+   "shape": "a request that carries no Host header at all but sets X-Forwarded-Host to an allowed name is served; the client-supplied forwarded value becomes the host identity",
+   "where": "litestar/middleware/allowed_hosts.py:67 (pinned; the published fix removes the fallback)",
+   "reason_to_dismiss": "none needed - this is the request form named in the report; the published one-line fix closes it",
+   "security_tests": [
+    "security/test_host_validation.py::test_forwarded_host_cannot_stand_in_for_the_host"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_allowed_hosts_behaviour.py::test_stray_forwarding_header_does_not_change_or_block_an_allowed_request"
+   ],
+   "security_fail_patch": "sec_miss_reported.patch",
+   "realistic_because": "real, unmodified upstream code; this is the published fix's own site"
+  },
+  {
+   "id": "T2",
+   "pattern": "B",
+   "shape": "the host check decides on the text before the first ':' and the redirect target is built from the raw authority, so a Host value that only starts with an allowed name and carries user-info (`allowed:80@evil`) is served, and the redirect variant points the client at the other host",
+   "where": "litestar/middleware/allowed_hosts.py:67 and litestar/middleware/allowed_hosts.py:72-77; consumer litestar/datastructures/url.py:182-201 (pinned)",
+   "reason_to_dismiss": "the first-colon split is there to strip the port; '@' is not legal in a Host header and the report named a different header",
+   "security_tests": [
+    "security/test_host_validation.py::test_authority_prefix_cannot_extend_the_host",
+    "security/test_host_validation.py::test_redirect_target_cannot_be_the_attacker_host"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_allowed_hosts_behaviour.py::test_allowed_host_with_port_is_served",
+    "functional/test_allowed_hosts_behaviour.py::test_redirect_from_variant_form_is_preserved"
+   ],
+   "security_fail_patch": "sec_miss_shape.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T3",
+   "pattern": "B",
+   "shape": "the host check is installed per route node, so a request whose routing fails (unknown path, unsupported method) is answered by the application's error response for a host the operator never allowed",
+   "where": "litestar/_asgi/routing_trie/mapping.py:216-217 (per-route install); litestar/_asgi/routing_trie/traversal.py:54 and :85 (failures raised before the stack); litestar/_asgi/asgi_router.py:89-100 (caller)",
+   "reason_to_dismiss": "an unknown path or unsupported method never reaches a handler, and host validation is per-route by design",
+   "security_tests": [
+    "security/test_host_validation.py::test_routing_errors_get_the_same_refusal"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_allowed_hosts_behaviour.py::test_allowed_host_still_gets_a_not_found_for_an_unknown_path",
+    "functional/test_allowed_hosts_behaviour.py::test_allowed_host_still_gets_method_not_allowed"
+   ],
+   "security_fail_patch": "sec_miss_route.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4",
+   "pattern": "injected",
+   "shape": "the request URL builder prefers a client-supplied X-Forwarded-Host when composing absolute URLs, so the addresses the application returns for an allowed host name the client's host; the redirect target built from the request URL inherits it at the vulnerable commit",
+   "where": "litestar/datastructures/url.py:181-199 (added to our copy by environment/inject.patch)",
+   "reason_to_dismiss": "the request already passed host validation, so the URL builder reads as presentation code; honouring a proxy's forwarded host is a normal reverse-proxy convenience",
+   "security_tests": [
+    "security/test_host_validation.py::test_forwarded_host_cannot_change_the_url_the_app_builds",
+    "security/test_host_validation.py::test_forwarded_host_cannot_choose_the_redirect_target"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_allowed_hosts_behaviour.py::test_stray_forwarding_header_does_not_change_or_block_an_allowed_request",
+    "functional/test_allowed_hosts_behaviour.py::test_redirect_from_variant_form_is_preserved"
+   ],
+   "security_fail_patch": "sec_miss_producer.patch",
+   "realistic_because": "a maintainer adding reverse-proxy support would prefer the forwarded host when building absolute URLs; injected into our copy only, in the same scope-header lookup style as the surrounding code; registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "leak_terms": [
+  "AllowedHostsMiddleware",
+  "AllowedHostsConfig",
+  "allowed_hosts",
+  "allowed_hosts.py",
+  "asgi_router.py",
+  "mapping.py",
+  "traversal.py",
+  "url.py",
+  "parse_host_header",
+  "compile_allowed_hosts",
+  "invalid_host_response",
+  "_refuse_untrusted_host",
+  "from_scope",
+  "MutableScopeHeaders",
+  "ASGIResponse",
+  "ASGIRedirectResponse",
+  "www_redirect",
+  "redirect_domains",
+  "exclude_opt_key",
+  "GHSA-3QMC-CJ7Q-62HV",
+  "CVE-2026-48061",
+  "PYSEC-2026-2603",
+  "299a5845",
+  "6930a20c"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_reported.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_shape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_route.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_producer.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_reject_forwarded.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "n/a: every security test requires a 4xx client error, so a crash or 500 fails the test rather than being scored as a refusal",
+  "wrong_resource": "n/a: there is one protected object, the request's host identity; no neighbouring or proxy resource is authorised in its place",
+  "one_role_or_direction": "n/a: there are no roles or directions; the host decision is the same for every method, and the tests drive both a GET and a POST",
+  "reads_only": "n/a: host validation is not a read/write permission; it applies to every request independently of the verb",
+  "check_after_adjustment": "sec_miss_shape.patch",
+  "unlisted_route": "sec_miss_route.patch",
+  "malformed_identity": "sec_miss_shape.patch",
+  "missing_authority": "n/a: the decision is made only from the request's own header; no external authority can return empty and make it fail open",
+  "adjacent_api": "n/a: the reference fix adds shared helpers used by the middleware and the router without retuning a helper whose stated behaviour a sibling API depends on; the alternative fix changes the placement layer and leaves every public API unchanged"
+ },
+ "status": "built",
+ "notes": "Injected track, pattern B. environment/inject.patch adds reverse-proxy host support to litestar/datastructures/url.py (source only) and is applied at image build after the pinned checkout. The oracle closes the reported forwarded-host fallback, parses the Host value as a whole authority (rejecting user-info/paths and matching the parsed host), builds the redirect target from the validated host and its port, stops the URL builder from preferring a forwarded host, and applies the same host refusal on the router's failure path so unknown paths and unsupported methods cannot be answered by the application for a disallowed host. The register rows for T2/T3/T4 are in build/audit/uncovered-routes.tsv.",
+ "gate": {
+  "static": "pass",
+  "nop": "pass (7 security fail, 19 functional pass)",
+  "oracle": "pass (3 runs, reward 1.0, identical results)",
+  "patches": "pass (8/8 as declared; blind.patch declared, file produced later by the blind-fix stage)"
+ }
+}

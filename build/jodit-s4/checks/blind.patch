@@ -1,0 +1,156 @@
+diff -ruN pristine/src/core/global.ts app/src/core/global.ts
+--- a/src/core/global.ts	2026-10-29 12:02:39.000000000 +0000
++++ b/src/core/global.ts	2026-10-29 12:35:14.558425456 +0000
+@@ -17,6 +17,7 @@
+ 	IViewComponent,
+ 	IViewOptions
+ } from 'jodit/types';
++import { isForbiddenKey } from 'jodit/core/helpers/checker/is-forbidden-key';
+ import { isJoditObject } from 'jodit/core/helpers/checker/is-jodit-object';
+ import { isString } from 'jodit/core/helpers/checker/is-string';
+ import { isViewObject } from 'jodit/core/helpers/checker/is-view-object';
+@@ -60,6 +61,12 @@
+ 
+ export const extendLang = (langs: IDictionary): void => {
+ 	Object.keys(langs).forEach(key => {
++		// `lang[key]` for a shared-prototype key is `Object.prototype` itself;
++		// assigning into it would let a pack name pollute every object.
++		if (isForbiddenKey(key)) {
++			return;
++		}
++
+ 		if (lang[key]) {
+ 			Object.assign(lang[key], langs[key]);
+ 		} else {
+diff -ruN pristine/src/core/helpers/checker/index.ts app/src/core/helpers/checker/index.ts
+--- a/src/core/helpers/checker/index.ts	2026-10-29 12:02:39.000000000 +0000
++++ b/src/core/helpers/checker/index.ts	2026-10-29 12:34:55.082410502 +0000
+@@ -13,6 +13,7 @@
+ export * from './is-array';
+ export * from './is-boolean';
+ export * from './is-equal';
++export * from './is-forbidden-key';
+ export * from './is-function';
+ export * from './is-html';
+ export * from './is-html-from-word';
+diff -ruN pristine/src/core/helpers/checker/is-forbidden-key.ts app/src/core/helpers/checker/is-forbidden-key.ts
+--- a/src/core/helpers/checker/is-forbidden-key.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/helpers/checker/is-forbidden-key.ts	2026-10-29 12:34:54.716410327 +0000
+@@ -0,0 +1,24 @@
++/*!
++ * Jodit Editor (https://xdsoft.net/jodit/)
++ * Released under MIT see LICENSE.txt in the project root for license information.
++ * Copyright (c) 2013-2026 Valerii Chupurnov. All rights reserved. https://xdsoft.net
++ */
++
++/**
++ * @module helpers/checker
++ */
++
++/**
++ * Object keys that are never taken from an external source. Writing one of them
++ * (or walking into it while merging) can land on a prototype shared with objects
++ * the library does not own - for example `Object.prototype` - which is prototype
++ * pollution (CWE-1321). Values carrying these keys are dropped instead.
++ */
++const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
++
++/**
++ * Check whether a key could be used to reach a shared prototype.
++ */
++export function isForbiddenKey(key: string): boolean {
++	return FORBIDDEN_KEYS.has(key);
++}
+diff -ruN pristine/src/core/helpers/utils/config-proto.ts app/src/core/helpers/utils/config-proto.ts
+--- a/src/core/helpers/utils/config-proto.ts	2026-10-29 12:02:39.000000000 +0000
++++ b/src/core/helpers/utils/config-proto.ts	2026-10-29 12:35:02.424413981 +0000
+@@ -10,6 +10,7 @@
+ 
+ import type { IDictionary } from 'jodit/types';
+ import { isArray } from 'jodit/core/helpers/checker/is-array';
++import { isForbiddenKey } from 'jodit/core/helpers/checker/is-forbidden-key';
+ import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
+ import { isString } from 'jodit/core/helpers/checker/is-string';
+ import { isVoid } from 'jodit/core/helpers/checker/is-void';
+@@ -77,6 +78,10 @@
+ 	const newOpt: IDictionary = {};
+ 
+ 	Object.keys(options).forEach(key => {
++		if (isForbiddenKey(key)) {
++			return;
++		}
++
+ 		const opt = options[key],
+ 			protoKey = proto ? proto[key] : null;
+ 
+@@ -145,6 +150,12 @@
+  */
+ export function ConfigMerge(target: IDictionary, source: IDictionary): void {
+ 	Object.keys(source).forEach(key => {
++		// Never merge through a key that can reach a shared prototype: for such
++		// a key `target[key]` is the prototype itself, not an owned container.
++		if (isForbiddenKey(key)) {
++			return;
++		}
++
+ 		const srcVal = source[key];
+ 		const tgtVal = target[key];
+ 
+diff -ruN pristine/src/core/helpers/utils/set.ts app/src/core/helpers/utils/set.ts
+--- a/src/core/helpers/utils/set.ts	2026-10-29 12:02:39.000000000 +0000
++++ b/src/core/helpers/utils/set.ts	2026-10-29 12:35:06.018415648 +0000
+@@ -10,6 +10,7 @@
+ 
+ import type { IDictionary } from 'jodit/types';
+ import { isArray } from 'jodit/core/helpers/checker/is-array';
++import { isForbiddenKey } from 'jodit/core/helpers/checker/is-forbidden-key';
+ import { isNumeric } from 'jodit/core/helpers/checker/is-numeric';
+ import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
+ import { isString } from 'jodit/core/helpers/checker/is-string';
+@@ -34,6 +35,12 @@
+ 
+ 	const parts = chain.split('.');
+ 
++	// A path that names a shared-prototype key would write onto that prototype
++	// (for example `__proto__.x` resolves to `Object.prototype`), so refuse it.
++	if (parts.some(isForbiddenKey)) {
++		return;
++	}
++
+ 	let result = obj,
+ 		key = parts[0];
+ 
+diff -ruN pristine/src/core/storage/engines/local-storage-provider.ts app/src/core/storage/engines/local-storage-provider.ts
+--- a/src/core/storage/engines/local-storage-provider.ts	2026-10-29 12:02:42.000000000 +0000
++++ b/src/core/storage/engines/local-storage-provider.ts	2026-10-29 12:35:11.805421771 +0000
+@@ -9,6 +9,7 @@
+  */
+ 
+ import type { IDictionary, IStorage, StorageValueType } from 'jodit/types';
++import { isForbiddenKey } from 'jodit/core/helpers/checker/is-forbidden-key';
+ import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
+ 
+ export type WebStorageStrategy = 'localStorage' | 'sessionStorage';
+@@ -56,6 +57,11 @@
+ 	}
+ 
+ 	set(key: string, value: T): this {
++		// A key that names a shared-prototype member is not a storable setting.
++		if (isForbiddenKey(key)) {
++			return this;
++		}
++
+ 		try {
+ 			const buffer = this.storage.getItem(this.rootKey);
+ 
+@@ -80,6 +86,10 @@
+ 		source: IDictionary
+ 	): IDictionary {
+ 		Object.keys(source).forEach(key => {
++			if (isForbiddenKey(key)) {
++				return;
++			}
++
+ 			const value = source[key],
+ 				prev = target[key];
+ 

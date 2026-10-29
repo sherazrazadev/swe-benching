@@ -1,0 +1,179 @@
+diff --git a/src/core/global.ts b/src/core/global.ts
+index 60fdc94..b8f8bc6 100644
+--- a/src/core/global.ts
++++ b/src/core/global.ts
+@@ -23,6 +23,7 @@ import { isViewObject } from 'jodit/core/helpers/checker/is-view-object';
+ import { kebabCase } from 'jodit/core/helpers/string/kebab-case';
+ import { css } from 'jodit/core/helpers/utils/css';
+ import { getClassName } from 'jodit/core/helpers/utils/get-class-name';
++import { sanitizeConfigValue } from 'jodit/core/helpers/utils/is-unsafe-proto-key';
+ import { PluginSystem } from 'jodit/core/plugin/plugin-system';
+ 
+ import { eventEmitter as globalEventEmitter } from './event-emitter/global';
+@@ -59,6 +60,8 @@ export const pluginSystem = new PluginSystem({
+ export const modules: IDictionary<Function> = {};
+ 
+ export const extendLang = (langs: IDictionary): void => {
++	langs = sanitizeConfigValue(langs) as IDictionary;
++
+ 	Object.keys(langs).forEach(key => {
+ 		if (lang[key]) {
+ 			Object.assign(lang[key], langs[key]);
+diff --git a/src/core/helpers/utils/config-proto.ts b/src/core/helpers/utils/config-proto.ts
+index 6cc18dd..32c79e7 100644
+--- a/src/core/helpers/utils/config-proto.ts
++++ b/src/core/helpers/utils/config-proto.ts
+@@ -16,6 +16,7 @@ import { isVoid } from 'jodit/core/helpers/checker/is-void';
+ import { Config } from 'jodit/config';
+ 
+ import { isAtom } from './extend';
++import { sanitizeConfigValue } from './is-unsafe-proto-key';
+ import { keys } from './utils';
+ 
+ /**
+@@ -53,6 +54,10 @@ export function ConfigProto(
+ 	proto: IDictionary,
+ 	deep: number = 0
+ ): IDictionary {
++	if (deep === 0) {
++		options = sanitizeConfigValue(options) as IDictionary;
++	}
++
+ 	// Already prototyped object should not be prototyped again
+ 	if (Object.getPrototypeOf(options) !== Object.prototype) {
+ 		return options;
+@@ -144,6 +149,8 @@ export function ConfigFlatten(obj: IDictionary): IDictionary {
+  * @see {@link ConfigProto} for the prototype-chain variant used at editor creation time
+  */
+ export function ConfigMerge(target: IDictionary, source: IDictionary): void {
++	source = sanitizeConfigValue(source) as IDictionary;
++
+ 	Object.keys(source).forEach(key => {
+ 		const srcVal = source[key];
+ 		const tgtVal = target[key];
+diff --git a/src/core/helpers/utils/index.ts b/src/core/helpers/utils/index.ts
+index c82b40f..cbd7db6 100644
+--- a/src/core/helpers/utils/index.ts
++++ b/src/core/helpers/utils/index.ts
+@@ -26,6 +26,7 @@ export * from './extend';
+ export * from './get';
+ export * from './get-class-name';
+ export * from './human-size-to-bytes';
++export * from './is-unsafe-proto-key';
+ export * from './mark-deprecated';
+ export * from './parse-query';
+ export * from './print';
+diff --git a/src/core/helpers/utils/is-unsafe-proto-key.ts b/src/core/helpers/utils/is-unsafe-proto-key.ts
+new file mode 100644
+index 0000000..acbd9e9
+--- /dev/null
++++ b/src/core/helpers/utils/is-unsafe-proto-key.ts
+@@ -0,0 +1,51 @@
++/*!
++ * Jodit Editor (https://xdsoft.net/jodit/)
++ * Released under MIT see LICENSE.txt in the project root for license information.
++ * Copyright (c) 2013-2026 Valerii Chupurnov. All rights reserved. https://xdsoft.net
++ */
++
++/**
++ * @module helpers/utils
++ */
++
++import type { IDictionary } from 'jodit/types';
++import { isArray } from 'jodit/core/helpers/checker/is-array';
++import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
++
++import { isAtom } from './extend';
++
++export const UNSAFE_PROTO_KEYS = ['__proto__', 'constructor', 'prototype'];
++
++export function isUnsafeProtoKey(key: string): boolean {
++	return UNSAFE_PROTO_KEYS.indexOf(key) !== -1;
++}
++
++/**
++ * Return a copy of a configuration value with every unsafe key removed at
++ * every level. Atomic values are kept as they are.
++ */
++export function sanitizeConfigValue(value: unknown): unknown {
++	if (isAtom(value)) {
++		return value;
++	}
++
++	if (isArray(value)) {
++		return value.map(item => sanitizeConfigValue(item));
++	}
++
++	if (!isPlainObject(value)) {
++		return value;
++	}
++
++	const result: IDictionary = {};
++
++	Object.keys(value as IDictionary).forEach(key => {
++		if (isUnsafeProtoKey(key)) {
++			return;
++		}
++
++		result[key] = sanitizeConfigValue((value as IDictionary)[key]);
++	});
++
++	return result;
++}
+diff --git a/src/core/helpers/utils/set.ts b/src/core/helpers/utils/set.ts
+index af598cf..50a6c92 100644
+--- a/src/core/helpers/utils/set.ts
++++ b/src/core/helpers/utils/set.ts
+@@ -32,6 +32,10 @@ export function set<T>(chain: string, value: unknown, obj: IDictionary): void {
+ 		return;
+ 	}
+ 
++	if (/(^|\.)(__proto__|constructor|prototype)(\.|$)/.test(chain)) {
++		return;
++	}
++
+ 	const parts = chain.split('.');
+ 
+ 	let result = obj,
+diff --git a/src/core/storage/engines/local-storage-provider.ts b/src/core/storage/engines/local-storage-provider.ts
+index e6a18ea..829f583 100644
+--- a/src/core/storage/engines/local-storage-provider.ts
++++ b/src/core/storage/engines/local-storage-provider.ts
+@@ -10,6 +10,10 @@
+ 
+ import type { IDictionary, IStorage, StorageValueType } from 'jodit/types';
+ import { isPlainObject } from 'jodit/core/helpers/checker/is-plain-object';
++import {
++	isUnsafeProtoKey,
++	sanitizeConfigValue
++} from 'jodit/core/helpers/utils/is-unsafe-proto-key';
+ 
+ export type WebStorageStrategy = 'localStorage' | 'sessionStorage';
+ 
+@@ -56,18 +60,23 @@ export class LocalStorageProvider<T = StorageValueType> implements IStorage<T> {
+ 	}
+ 
+ 	set(key: string, value: T): this {
++		if (isUnsafeProtoKey(key)) {
++			return this;
++		}
++
+ 		try {
+ 			const buffer = this.storage.getItem(this.rootKey);
+ 
+ 			const json = buffer ? JSON.parse(buffer) : {};
+ 
++			const safeValue = sanitizeConfigValue(value) as T;
+ 			const prev = json[key];
+ 
+ 			// A partial object keeps the fields that were stored before it
+ 			json[key] =
+-				isPlainObject(prev) && isPlainObject(value)
+-					? this.mergeObject(prev, value as IDictionary)
+-					: value;
++				isPlainObject(prev) && isPlainObject(safeValue)
++					? this.mergeObject(prev, safeValue as IDictionary)
++					: safeValue;
+ 
+ 			this.storage.setItem(this.rootKey, JSON.stringify(json));
+ 		} catch {}

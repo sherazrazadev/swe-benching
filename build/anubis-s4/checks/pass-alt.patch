@@ -1,0 +1,86 @@
+diff --git a/lib/anubis.go b/lib/anubis.go
+index ac3481ab..44c463d2 100644
+--- a/lib/anubis.go
++++ b/lib/anubis.go
+@@ -252,7 +252,7 @@ func (s *Server) maybeReverseProxy(w http.ResponseWriter, r *http.Request, httpS
+ 		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+ 	}
+ 
+-	cr, rule, err := s.check(r, lg)
++	cr, rule, err := s.check(s.policy.RequestWithClientURL(r), lg)
+ 	if err != nil {
+ 		lg.Error("check failed", "err", err)
+ 		localizer := localization.GetLocalizer(r)
+diff --git a/lib/policy/checker.go b/lib/policy/checker.go
+index 38003164..c2f03855 100644
+--- a/lib/policy/checker.go
++++ b/lib/policy/checker.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/netip"
++	"net/url"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -128,6 +129,40 @@ func (pc *PathChecker) Hash() string {
+ 	return pc.hash
+ }
+ 
++// RequestWithClientURL returns a request whose URL is the URL the client asked for when
++// Anubis is authorizing a request for a fronting proxy. Every policy rule then evaluates
++// the client's request target; the forwarding fields are removed from the copy so that a
++// rule cannot see them twice.
++func (pc *ParsedConfig) RequestWithClientURL(r *http.Request) *http.Request {
++	if !pc.SubrequestMode {
++		return r
++	}
++
++	original := r.Header.Get("X-Original-URI")
++	if original == "" {
++		original = r.Header.Get("X-Forwarded-Uri")
++	}
++	if original == "" {
++		return r
++	}
++
++	path := original
++	query := ""
++	if u, err := url.ParseRequestURI(original); err == nil {
++		path, query = u.Path, u.RawQuery
++	} else if i := strings.IndexByte(original, '?'); i >= 0 {
++		path, query = original[:i], original[i+1:]
++	}
++
++	clone := r.Clone(r.Context())
++	u := *r.URL
++	u.Path, u.RawPath, u.RawQuery = path, "", query
++	clone.URL = &u
++	clone.Header.Del("X-Original-URI")
++	clone.Header.Del("X-Forwarded-Uri")
++	return clone
++}
++
+ func NewHeaderExistsChecker(key string) checker.Impl {
+ 	return headerExistsChecker{strings.TrimSpace(key)}
+ }
+diff --git a/lib/policy/policy.go b/lib/policy/policy.go
+index e1747472..11bc3abe 100644
+--- a/lib/policy/policy.go
++++ b/lib/policy/policy.go
+@@ -42,6 +42,7 @@ type ParsedConfig struct {
+ 	Thresholds        []*Threshold
+ 	StatusCodes       config.StatusCodes
+ 	DefaultDifficulty int
++	SubrequestMode    bool
+ 	DNSBL             bool
+ 	DnsCache          *dns.DnsCache
+ 	Dns               *dns.Dns
+@@ -72,6 +73,7 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
+ 
+ 	result := newParsedConfig(c)
+ 	result.DefaultDifficulty = defaultDifficulty
++	result.SubrequestMode = subrequestMode
+ 	result.LogASN = c.Logging.LogASN
+ 	if hasThothClient {
+ 		result.ThothClient = tc
