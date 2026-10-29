@@ -9,4 +9,4 @@ Started 2026-10-28T07:00Z. [run 40647352109](https://github.com/sherazrazadev/sw
 | `file-viewer-xss-inj` | sound | 1 | 0 | **REJECTED** |
 | `graylog2-server-mm` | sound | 0 0 0 | 0 0 1 | **REJECTED** |
 | `http4k-mm` | sound | 0.9 0.9 1 | 0 0.9 0.9 | **REJECTED** |
-| `izpack-zip-path-inj` | sound | 0.7778 0.5556 0.6667 | 0.7778 0.7778 1 | **REJECTED** |
+| `izpack-zip-path-inj` | sound | 0 0.5882 0.7059 | 0.4118 0.4706 0.4706 | **REJECTED** |
