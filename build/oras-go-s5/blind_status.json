@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/oras-go-s5/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/oras-go-s5/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 54,
+ "duration_ms": 261696,
+ "total_cost_usd": 1.2714488,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "6aab4024-dd23-4bbc-b729-1c78ac78e7bd",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 56602,
+   "outputTokens": 27141,
+   "cacheReadInputTokens": 2511104,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 1.2714488,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "Done.\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/oras-go-s5/blind.patch` (applies cleanly with `patch -p1 --dry-run` to a fresh `pristine`; the patched tree is byte-identical to `app/` and builds).\n\n**Summary of the fix (5 lines):**\n1. Added a shared `internal/origin` package: `origin.Same(a, b)` compares scheme, case-insensitive host name and effective port (80/443 default), i.e. a real HTTP origin rather than just a host name.\n2. `retry.keepAuthorizationOnRedirect` now deletes `Authorization` whenever the redirect target leaves the addressed origin's origin, and only re-adds it on a hop that stays there \u2014 fixing the same-host/different-port copy that `net/http` makes.\n3. `auth.Client.send` sends through a copied `*http.Client` whose `CheckRedirect` strips `Authorization` on any redirect off the addressed origin, then calls the caller's existing `CheckRedirect` (retry's or a custom one) unchanged.\n4. `auth.Client.Do` refuses a 401 that did not come from the addressed origin (no challenge parsing, no credential resolution, no realm fetch), and keys credentials by `URL.Host` when `Request.Host` is empty.\n5. `blobStore.completeChunkedUpload` rejects a continuation `Location` on a different origin before copying the chunk request's credential to it.\n\n**Mechanisms list** (also in `WORK/mechanisms.md`):\n- `registry/remote/internal/origin/origin.go` \u2014 new shared origin comparator (`origin.Same`), used by all sites.\n- `registry/remote/retry/client.go` \u2014 `keepAuthorizationOnRedirect`: drop, don't re-add, `Authorization` when the redirect target is not the addressed origin.\n- `registry/remote/auth/client.go` \u2014 `Client.send`: wrapped `CheckRedirect` on a client copy deletes `Authorization` on cross-origin redirects, then delegates to the caller's callback.\n- `registry/remote/auth/client.go` \u2014 `Client.Do`: ignores a 401 that came from a non-addressed origin, preventing credential resolution/transmission and realm fetches.\n- `registry/remote/auth/client.go` \u2014 `credentialHost`: falls back to `URL.Host` when the request has no explicit `Host`.\n- `registry/remote/repository.go` \u2014 `completeChunkedUpload`: refuses a continuation `Location` outside the chunk request's origin before copying the credential.\n\nVerification: hidden suites 4/4 security + 6/6 functional pass on the fixed tree and the 4 security tests fail on `pristine`; all project tests in `auth`, `retry`, `remote` pass; 5 extra probes in `WORK/probe/` (multi-hop chain, no credential resolution on foreign 401, retry client standalone, caller `CheckRedirect` + same-origin, challenge after same-origin redirect) pass on the fix and the three security-shaped ones fail on the baseline.",
+ "status": "ok"
+}

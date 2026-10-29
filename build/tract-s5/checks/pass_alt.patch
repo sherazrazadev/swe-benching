@@ -1,0 +1,71 @@
+diff --git a/data/src/tensor.rs b/data/src/tensor.rs
+index 16c3b153b..3bab382b0 100644
+--- a/data/src/tensor.rs
++++ b/data/src/tensor.rs
+@@ -279,7 +279,11 @@ impl Tensor {
+         shape: &[usize],
+         alignment: usize,
+     ) -> TractResult<Tensor> {
+-        let bytes = shape.iter().cloned().product::<usize>() * dt.size_of();
++        let bytes = shape
++            .iter()
++            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
++            .and_then(|n| n.checked_mul(dt.size_of()))
++            .ok_or_else(|| format_err!("Tensor shape {:?} overflows its byte size", shape))?;
+         let storage = StorageKind::Plain(PlainStorage::from(unsafe {
+             Blob::new_for_size_and_align(bytes, alignment)
+         }));
+diff --git a/linalg/src/frame/block_quant/storage.rs b/linalg/src/frame/block_quant/storage.rs
+index a36941d21..0b8016d8e 100644
+--- a/linalg/src/frame/block_quant/storage.rs
++++ b/linalg/src/frame/block_quant/storage.rs
+@@ -17,8 +17,10 @@ pub struct BlockQuantStorage {
+ }
+ 
+ impl BlockQuantStorage {
+-    fn expected_bytes(format: &dyn BlockQuant, m: usize, k: usize) -> usize {
+-        m * k / format.block_len() * format.block_bytes()
++    fn expected_bytes(format: &dyn BlockQuant, m: usize, k: usize) -> Option<usize> {
++        m.checked_mul(k)
++            .map(|n| n / format.block_len())
++            .and_then(|n| n.checked_mul(format.block_bytes()))
+     }
+ 
+     pub fn new(
+@@ -27,7 +29,8 @@ impl BlockQuantStorage {
+         k: usize,
+         data: Arc<Blob>,
+     ) -> TractResult<Self> {
+-        let expected = Self::expected_bytes(&*format, m, k);
++        let expected = Self::expected_bytes(&*format, m, k)
++            .ok_or_else(|| format_err!("Block quant byte size overflows for {m}x{k}"))?;
+         ensure!(
+             data.len() == expected,
+             "BlockQuantStorage::new: blob length {} does not match expected {} (m={}, k={}, format={})",
+diff --git a/nnef/src/ops/nnef/deser.rs b/nnef/src/ops/nnef/deser.rs
+index 2d6c6e301..3e932f236 100644
+--- a/nnef/src/ops/nnef/deser.rs
++++ b/nnef/src/ops/nnef/deser.rs
+@@ -105,6 +105,22 @@ pub fn variable(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) ->
+     if let Some(bqs) = tensor.storage_as::<BlockQuantStorage>() {
+         // Use the NNEF variable shape directly — the graph's own unsqueeze
+         // ops will add any group dims as needed.
++        let header_len = tensor
++            .shape()
++            .iter()
++            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
++            .with_context(|| format!("Tensor shape product overflows usize for {:?}", label))?;
++        let graph_len = shape
++            .iter()
++            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
++            .with_context(|| format!("Tensor shape product overflows usize for {:?}", label))?;
++        ensure!(
++            header_len == graph_len,
++            "Wrong shape for tensor {:?}: graph shape {:?} does not hold the same number of values as the tensor file shape {:?}",
++            label,
++            shape,
++            tensor.shape()
++        );
+         let tensor =
+             bqs.clone().into_tensor_with_shape(tensor.datum_type(), &shape).into_arc_tensor();
+         let fact: Box<dyn ExoticFact> = Box::new(BlockQuantFact::new(

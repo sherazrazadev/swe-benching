@@ -1,0 +1,335 @@
+{
+ "slug": "spark-s5",
+ "candidate": {
+  "repo": "apache/spark",
+  "advisory_ids": [
+   "GHSA-9437-39HJ-3C93",
+   "BIT-SPARK-2026-32773",
+   "CVE-2026-32773",
+   "PYSEC-2026-3966"
+  ],
+  "pinned_commit": "dc5bb9641b6e6fb8f55b1c524b3a21d4b5063283",
+  "fix_commits": [
+   "3c83c2c6a22fe384280b99bb753b14800b7e27e1",
+   "e739b7d349dbd41b78d49bc8086cab63db057e14"
+  ],
+  "cwe": "CWE-79",
+  "screener_entry_id": "2338"
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The history server's application listing page module (core/src/main/resources/org/apache/spark/ui/static/historypage.js) is imported as an ES module into a jsdom document whose jQuery, DataTables 1.13.11, rowsGroup plug-in and Mustache are the project's own vendored files from the same pinned tree (copies kept in tests/support/vendor). Only $.getJSON (the applications listing) and $.get (the page template, read from the submitted tree) are answered locally; the product's DataTables column configuration, render functions, sort plug-ins, template rendering and produced DOM are what the cases inspect.",
+  "sites": [
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:138 (application name kept raw in the row data)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:196 (appName column composes the raw name)",
+   "core/src/main/resources/org/apache/spark/ui/static/utils.js:276-287,238-247 (stringAbbreviate composes the raw full value into a <pre> via detailsUINode)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:186 (version is a bare data column)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:191 (app id in the title attribute, anchor text and attempt URL)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:201 (attempt id in the anchor text and attempt URL)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:211 (spark user is a bare data column)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:216-217 (injected: event-log download control names the application in a title attribute)",
+   "core/src/main/resources/org/apache/spark/ui/static/historypage.js:255-260 and historypage-template.html:82-85 (injected: multiple-attempt notice rendered through Mustache's unescaped value path)"
+  ],
+  "routes": [
+   "T1: application name (short, and long enough to expand into the details <pre>) rendered by the appName column",
+   "T2: Spark user rendered by the bare 'sparkUser' data column",
+   "T3: application id rendered in the appId cell's title/text and used in the attempt and event-log destinations and the appid-numeric sort key",
+   "T4: attempt id rendered in the attemptId cell's text and used in the attempt and event-log destinations",
+   "T5: Spark version rendered by the bare 'version' data column",
+   "I1: application name placed in the event-log download control's tooltip (injected attribute sink)",
+   "I2: application names placed in the multiple-attempt notice through a second Mustache template using the unescaped value form (injected template sink)"
+  ],
+  "services": [],
+  "project_tests_run": "ui-test/tests/utils.test.js at the pinned commit (npm ci; NODE_OPTIONS=--experimental-vm-modules npx jest --ci tests/utils.test.js) run as a Docker build step in environment/Dockerfile; the same pinned file is re-run in the functional group through a Jest-compatible shim against the submitted utils.js.",
+  "local_runs": "Pinned+injection: security 0/10, functional 10/10. Oracle: security 10/10, functional 10/10. Alternative fix: 10/10 + 10/10. Hardening: 10/10 + 10/10. Every checks/ patch reproduced its declared result locally (16 variants; see notes.md).",
+  "not_routes_at_pinned": "The server-side scala.xml pages (Master/Worker UI) that also show an application name are a separate renderer and entry point and are not part of this task. utils.js:detailsUINode is also used by errorMessageCell (stage/task error summaries), a separate sink; only its use through stringAbbreviate is in scope. Current master builds attemptUrl with encodeURIComponent and still interpolates it unescaped into href at historypage.js:189; that is a later-tree concern outside this advisory and was not built on."
+ },
+ "leak_terms": [
+  "historypage",
+  "historypage.js",
+  "historypage-template.html",
+  "utils.js",
+  "DataTables",
+  "dataTable",
+  "dataTableExt",
+  "appId",
+  "appName",
+  "attemptId",
+  "attemptUrl",
+  "sparkUser",
+  "appSparkVersion",
+  "eventLog",
+  "escapeHtml",
+  "stringAbbreviate",
+  "detailsUINode",
+  "makeIdNumeric",
+  "appNameIndex",
+  "appNames",
+  "history-notice",
+  "history-notice-template",
+  "notice",
+  "tooltip",
+  "innerHTML",
+  "href",
+  "XSS",
+  "SPARK-53337",
+  "GHSA",
+  "CVE"
+ ],
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "B (advisory route; shape trap)",
+   "origin": "advisory_route",
+   "shape": "the application name is kept raw and composed into the cell; a name longer than the abbreviation limit is inserted a second time as the expanded details' <pre> content, so escaping only the abbreviated summary leaves that path live",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:138,196; core/src/main/resources/org/apache/spark/ui/static/utils.js:276-287,238-247",
+   "reason_to_dismiss": "the report names application names, so every solver attempts this route and the obvious point to escape is the summary the render returns",
+   "security_tests": [
+    "security/app-name-short",
+    "security/app-name-long-details"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row",
+    "functional/long-name-expands"
+   ],
+   "security_fail_patch": "miss_t1_name.patch",
+   "realistic_because": "published fix site (SPARK-53337, e739b7d3 and cherry-pick 3c83c2c6): the upstream change escapes the name at the data layer, before abbreviation"
+  },
+  {
+   "id": "T2",
+   "pattern": "B (uncovered route)",
+   "origin": "uncovered_upstream",
+   "shape": "the Spark user is a bare data column, so DataTables writes the event-log value as HTML; the advisory fix never touches this column",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:211",
+   "reason_to_dismiss": "the report is about application names, and the user field is supplied by the framework's own event-log record, so the column looks out of scope",
+   "security_tests": [
+    "security/spark-user"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row"
+   ],
+   "security_fail_patch": "miss_t2_user.patch",
+   "realistic_because": "real, unmodified upstream code: the column is a bare data: entry in the pinned tree and is unchanged by every published fix commit"
+  },
+  {
+   "id": "T3",
+   "pattern": "B (uncovered route; coupled value)",
+   "origin": "uncovered_upstream",
+   "shape": "the application id is interpolated into a title attribute, the anchor text, the attempt and event-log destinations and the appid-numeric sort key; escaping the visible text alone leaves the attribute and destination breakouts, and escaping the composed cell changes the rendered link and the sort key",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:191,151-169,81-94",
+   "reason_to_dismiss": "application ids look cluster-manager generated and are the identifier the page must keep raw to build destinations and sort, so an engineer can call the column trusted and must-keep-raw",
+   "security_tests": [
+    "security/app-id-attribute",
+    "security/app-id-element"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row",
+    "functional/multiple-attempts",
+    "functional/sort-by-app-id"
+   ],
+   "security_fail_patch": "miss_t3_appid.patch",
+   "realistic_because": "real, unmodified upstream code: the title/text/destination/sort coupling is present in the pinned tree and is untouched by the published fix"
+  },
+  {
+   "id": "T4",
+   "pattern": "B (uncovered route; coupled value)",
+   "origin": "uncovered_upstream",
+   "shape": "the attempt id is interpolated into the anchor text and into the attempt and event-log destinations; it repeats the absent-protection judgement one column over from the application id",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:201,151-169",
+   "reason_to_dismiss": "attempt ids are assigned by the resource manager, not chosen by the submitting user, so the column looks framework-owned",
+   "security_tests": [
+    "security/attempt-id-attribute",
+    "security/attempt-id-element"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row",
+    "functional/multiple-attempts"
+   ],
+   "security_fail_patch": "miss_t4_attemptid.patch",
+   "realistic_because": "real, unmodified upstream code: the attempt-id cell and its destination composition are unchanged by every published fix commit"
+  },
+  {
+   "id": "T5",
+   "pattern": "B (uncovered route)",
+   "origin": "uncovered_upstream",
+   "shape": "the Spark version is a bare data column; the value is read back out of the event log's log-start header, so a crafted log chooses it",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:186; core/src/main/scala/org/apache/spark/deploy/history/FsHistoryProvider.scala:1630",
+   "reason_to_dismiss": "the version looks like a build constant emitted by the framework, so the column looks like it can never carry attacker input",
+   "security_tests": [
+    "security/version"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row"
+   ],
+   "security_fail_patch": "miss_t5_version.patch",
+   "realistic_because": "real, unmodified upstream code: a bare data: column in the pinned tree, untouched by every published fix commit"
+  },
+  {
+   "id": "I1",
+   "pattern": "injected sibling (attribute sink)",
+   "origin": "injected",
+   "shape": "the event-log download control names the application in a tooltip attribute built from the same raw row value; a fix applied only where the name is displayed leaves this attribute breakable",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:216-217",
+   "reason_to_dismiss": "the tooltip belongs to a different column (the download control), and escaping the value where it is displayed looks sufficient",
+   "security_tests": [
+    "security/app-name-download-title"
+   ],
+   "coupled_functional_tests": [
+    "functional/ordinary-row"
+   ],
+   "security_fail_patch": "miss_i1_download.patch",
+   "realistic_because": "a tooltip naming the application on the download control is a natural small enhancement, and the value it needs is already on the row; the published fix never touches this render"
+  },
+  {
+   "id": "I2",
+   "pattern": "injected sibling (template sink)",
+   "origin": "injected",
+   "shape": "the multiple-attempt notice is rendered from a second Mustache template that interpolates the joined application names through the unescaped value form; escaping the table's columns leaves the notice live",
+   "where": "core/src/main/resources/org/apache/spark/ui/static/historypage.js:255-260; core/src/main/resources/org/apache/spark/ui/static/historypage-template.html:82-85",
+   "reason_to_dismiss": "the template engine escapes ordinary interpolations by default and the notice is rendered from the page's own template layer, so the value looks safe there",
+   "security_tests": [
+    "security/app-name-notice"
+   ],
+   "coupled_functional_tests": [
+    "functional/multiple-attempts"
+   ],
+   "security_fail_patch": "miss_i2_notice.patch",
+   "realistic_because": "a notice listing the applications that have several attempts is a natural enhancement and reuses the page's existing Mustache template style; only the triple-brace form of one interpolation makes it unsafe, and the published fix never touches the template"
+  }
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_t1_name.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ]
+  },
+  {
+   "patch": "miss_t2_user.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2"
+   ]
+  },
+  {
+   "patch": "miss_t3_appid.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T3"
+   ]
+  },
+  {
+   "patch": "miss_t4_attemptid.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T4"
+   ]
+  },
+  {
+   "patch": "miss_t5_version.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T5"
+   ]
+  },
+  {
+   "patch": "miss_i1_download.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "I1"
+   ]
+  },
+  {
+   "patch": "miss_i2_notice.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "I2"
+   ]
+  },
+  {
+   "patch": "upstream_fix.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2",
+    "T3",
+    "T4",
+    "T5",
+    "I2"
+   ]
+  },
+  {
+   "patch": "check_after_adjustment.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ]
+  },
+  {
+   "patch": "malformed_identity.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T3",
+    "T4",
+    "I1"
+   ]
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "kind": "security_fail",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "functional_overbroad.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "alt_correct_fix.patch",
+   "kind": "alternative",
+   "expect": "pass"
+  },
+  {
+   "patch": "hardening.patch",
+   "kind": "hardening",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "n/a: the surface has no per-resource authorization; every rendered value is guarded where it becomes markup",
+  "one_role_or_direction": "n/a: no roles, peers or directions exist on this display surface",
+  "reads_only": "n/a: the surface is a single read-only listing; there is no write path to leave unguarded",
+  "check_after_adjustment": "check_after_adjustment.patch",
+  "unlisted_route": "upstream_fix.patch",
+  "malformed_identity": "malformed_identity.patch",
+  "missing_authority": "n/a: no authority, secret or role is consulted while rendering the listing",
+  "adjacent_api": "n/a: the reference fix is confined to the listing module and the page template; the only shared helper it reuses is exercised by the project's own unit test in the functional group"
+ },
+ "status": "built 2026-10-29; static PASS, nop PASS (security 0/10, functional 10/10), oracle PASS (3x reward 1.0), patches PASS (15/15)"
+}

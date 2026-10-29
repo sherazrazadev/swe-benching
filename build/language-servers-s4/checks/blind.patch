@@ -1,0 +1,404 @@
+diff -ruN a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsent.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsent.ts
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsent.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsent.ts	2026-10-29 01:00:30.522241952 +0000
+@@ -0,0 +1,237 @@
++/*!
++ * Copyright Amazon.com, Inc. or its affiliates.
++ * All Rights Reserved. SPDX-License-Identifier: Apache-2.0
++ */
++
++import { createHash } from 'crypto'
++import * as path from 'path'
++import { URI } from 'vscode-uri'
++import type { Logger, Workspace } from '@aws/language-server-runtimes/server-interface'
++import type { MCPServerConfig } from './mcpTypes'
++import { getGlobalAgentConfigPath, getGlobalMcpConfigPath } from './mcpUtils'
++
++/**
++ * Consent for workspace-supplied MCP configuration.
++ *
++ * A workspace is not trusted to make the assistant run programs or open
++ * connections. Every server whose execution settings come from a file inside a
++ * workspace must be approved for the exact execution configuration, in the
++ * workspace that supplied it. Approvals live in the user's home directory so
++ * they outlive the workspace and the language-server process.
++ *
++ * This module only computes identities and persists approvals; the dialog and
++ * the start/no-start decision live in McpManager.
++ */
++
++const CONSENT_FILE = 'mcp-consent.json'
++const CONSENT_VERSION = 1
++
++interface StoredApproval {
++    /** Fingerprint of the full execution configuration that was approved. */
++    fingerprint: string
++    approvedAt: string
++}
++
++interface ConsentStore {
++    version: number
++    /** workspace scope -> server name -> approval */
++    workspaces: Record<string, Record<string, StoredApproval>>
++}
++
++/** Recursively sort object keys so equivalent configurations hash identically. */
++function canonicalize(value: any): any {
++    if (Array.isArray(value)) {
++        return value.map(canonicalize)
++    }
++    if (value !== null && typeof value === 'object') {
++        const out: Record<string, any> = {}
++        for (const key of Object.keys(value).sort()) {
++            out[key] = canonicalize(value[key])
++        }
++        return out
++    }
++    return value
++}
++
++function sha256(material: string): string {
++    return createHash('sha256').update(material).digest('hex')
++}
++
++/**
++ * Normalize a config path or file: URI to a plain filesystem path.
++ */
++export function configFilePath(raw: string): string {
++    let p = raw
++    if (p && p.startsWith('file:')) {
++        try {
++            p = URI.parse(p).fsPath
++        } catch {
++            // Fall through with the raw value; it will simply not match a
++            // trusted global path and therefore require consent.
++        }
++    }
++    return path.normalize(p)
++}
++
++/**
++ * True only for configuration the user authored in their own global settings.
++ * Anything else (including a config file inside a workspace, or a record with
++ * no source at all) is workspace-scoped from the assistant's point of view.
++ */
++export function isUserGlobalConfig(configPath: string, homeDir: string): boolean {
++    const normalized = configFilePath(configPath)
++    return (
++        normalized === configFilePath(getGlobalMcpConfigPath(homeDir)) ||
++        normalized === configFilePath(getGlobalAgentConfigPath(homeDir))
++    )
++}
++
++/**
++ * The environment the stdio transport will actually spawn with, as far as the
++ * configuration controls it. Registry entries carry their workspace-supplied
++ * variables in `__additionalEnv__`, which is merged only at spawn time.
++ */
++export function configuredEnv(cfg: MCPServerConfig): Record<string, string> {
++    return { ...(cfg.env ?? {}), ...(cfg.__additionalEnv__ ?? {}) }
++}
++
++/** The headers the HTTP/SSE transport will actually send. */
++export function configuredHeaders(cfg: MCPServerConfig): Record<string, string> {
++    return { ...(cfg.headers ?? {}), ...(cfg.__additionalHeaders__ ?? {}) }
++}
++
++/**
++ * A fingerprint of everything in the configuration that determines what gets
++ * executed or contacted: the command, its arguments, the merged environment,
++ * the address and the merged headers.
++ */
++export function configFingerprint(cfg: MCPServerConfig): string {
++    const material = canonicalize({
++        command: cfg.command ?? null,
++        args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
++        env: configuredEnv(cfg),
++        url: cfg.url ?? null,
++        headers: configuredHeaders(cfg),
++    })
++    return 'sha256:' + sha256(JSON.stringify(material))
++}
++
++/**
++ * The workspace a config file belongs to: the directory above its `.amazonq`
++ * folder, so every file the workspace contributes shares one scope. A path
++ * outside any workspace falls back to its own directory.
++ */
++export function workspaceScope(configPath: string): string {
++    const normalized = configFilePath(configPath).replace(/\\/g, '/')
++    const marker = '/.amazonq/'
++    const at = normalized.lastIndexOf(marker)
++    const root = at > 0 ? normalized.slice(0, at) : path.posix.dirname(normalized)
++    return 'sha256:' + sha256('workspace:' + root)
++}
++
++function storePath(workspace: Workspace): string {
++    return path.join(workspace.fs.getUserHomeDir(), '.aws', 'amazonq', CONSENT_FILE)
++}
++
++function emptyStore(): ConsentStore {
++    return { version: CONSENT_VERSION, workspaces: {} }
++}
++
++async function readStore(workspace: Workspace, logging: Logger): Promise<ConsentStore> {
++    const file = storePath(workspace)
++    try {
++        if (!(await workspace.fs.exists(file))) {
++            return emptyStore()
++        }
++        const parsed = JSON.parse((await workspace.fs.readFile(file)).toString())
++        const usable =
++            parsed &&
++            parsed.version === CONSENT_VERSION &&
++            parsed.workspaces &&
++            typeof parsed.workspaces === 'object' &&
++            !Array.isArray(parsed.workspaces)
++        if (!usable) {
++            logging.warn(`MCP consent: unrecognized approval store at ${file}; treating it as empty`)
++            return emptyStore()
++        }
++        return { version: CONSENT_VERSION, workspaces: parsed.workspaces }
++    } catch (e: any) {
++        logging.warn(`MCP consent: could not read approval store ${file}: ${e?.message ?? e}`)
++        return emptyStore()
++    }
++}
++
++/**
++ * Serialize read/modify/write of the approval store. Servers are initialized in
++ * concurrent batches, and a lost update would silently drop an approval.
++ */
++let storeTurn: Promise<void> = Promise.resolve()
++
++async function exclusive<T>(task: () => Promise<T>): Promise<T> {
++    const previous = storeTurn
++    let release!: () => void
++    storeTurn = new Promise<void>(resolve => (release = resolve))
++    await previous
++    try {
++        return await task()
++    } finally {
++        release()
++    }
++}
++
++/** True when this exact configuration was already approved in this workspace. */
++export async function isApproved(
++    workspace: Workspace,
++    logging: Logger,
++    serverName: string,
++    cfg: MCPServerConfig,
++    configPath: string
++): Promise<boolean> {
++    const store = await readStore(workspace, logging)
++    const bucket = store.workspaces[workspaceScope(configPath)]
++    if (!bucket || !Object.prototype.hasOwnProperty.call(bucket, serverName)) {
++        return false
++    }
++    const approval = bucket[serverName]
++    return !!approval && approval.fingerprint === configFingerprint(cfg)
++}
++
++/**
++ * Remember an approval. It is keyed by workspace and server name, and it only
++ * ever matches the exact execution configuration stored alongside it.
++ */
++export async function rememberApproval(
++    workspace: Workspace,
++    logging: Logger,
++    serverName: string,
++    cfg: MCPServerConfig,
++    configPath: string
++): Promise<void> {
++    await exclusive(async () => {
++        const store = await readStore(workspace, logging)
++        const scope = workspaceScope(configPath)
++        const bucket = store.workspaces[scope] ?? (store.workspaces[scope] = {})
++        // defineProperty rather than assignment so an unusual server name such as
++        // "__proto__" becomes an ordinary own entry instead of mutating the
++        // bucket's prototype.
++        Object.defineProperty(bucket, serverName, {
++            value: {
++                fingerprint: configFingerprint(cfg),
++                approvedAt: new Date().toISOString(),
++            },
++            enumerable: true,
++            configurable: true,
++            writable: true,
++        })
++        const file = storePath(workspace)
++        try {
++            await workspace.fs.mkdir(path.dirname(file), { recursive: true })
++            await workspace.fs.writeFile(file, JSON.stringify(store, null, 2))
++        } catch (e: any) {
++            // A failed write means the approval is not remembered (the user is
++            // asked again next time); it must not prevent this start, which the
++            // user did approve.
++            logging.warn(`MCP consent: could not persist approval store ${file}: ${e?.message ?? e}`)
++        }
++    })
++}
+diff -ruN a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts	2026-10-29 00:26:52.000000000 +0000
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts	2026-10-29 00:57:59.673297287 +0000
+@@ -39,6 +39,14 @@
+ import { Mutex } from 'async-mutex'
+ import path = require('path')
+ import { URI } from 'vscode-uri'
++import { MessageType } from '@aws/language-server-runtimes/protocol'
++import {
++    configFilePath,
++    configFingerprint,
++    isApproved,
++    isUserGlobalConfig,
++    rememberApproval,
++} from './mcpConsent'
+ import { sanitizeInput } from '../../../../shared/utils'
+ import { ProfileStatusMonitor } from './profileStatusMonitor'
+ import { OAuthClient } from './mcpOauthClient'
+@@ -78,6 +86,8 @@
+     private currentRegistry: McpRegistryData | null = null
+     private registryUrlProvided: boolean = false
+     private isPeriodicSync: boolean = false
++    /** Denials answered in this process; never persisted (a refusal has no side effect). */
++    private sessionDeniedConsent = new Set<string>()
+ 
+     private constructor(
+         private agentPaths: string[],
+@@ -409,6 +419,74 @@
+     }
+ 
+     /**
++     * Decide whether this exact execution configuration may start.
++     *
++     * Configuration the user authored in their own global settings keeps
++     * starting as before. Anything else must be covered by an approval for
++     * this precise command, arguments, environment, address and headers, given
++     * in the very workspace that supplied the configuration. A dismissal, an
++     * unexpected answer or an unavailable dialog all count as a refusal.
++     */
++    private async requestConsent(serverName: string, cfg: MCPServerConfig): Promise<boolean> {
++        if (!cfg.__configPath__) {
++            this.features.logging.warn(
++                `MCP: refusing to start '${serverName}': its configuration source cannot be established`
++            )
++            return false
++        }
++
++        const configPath = configFilePath(cfg.__configPath__)
++        if (isUserGlobalConfig(configPath, this.features.workspace.fs.getUserHomeDir())) {
++            return true
++        }
++
++        const denialKey = `${serverName}|${configPath}|${configFingerprint(cfg)}`
++        if (this.sessionDeniedConsent.has(denialKey)) {
++            return false
++        }
++
++        if (await isApproved(this.features.workspace, this.features.logging, serverName, cfg, configPath)) {
++            return true
++        }
++
++        const allowAction = { title: 'Allow for this server' }
++        const denyAction = { title: 'Deny' }
++        const commandLine = [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').slice(0, 200)
++        let answer: { title?: string } | null | undefined = undefined
++        try {
++            answer = await this.features.lsp.window.showMessageRequest({
++                type: MessageType.Warning,
++                message:
++                    `Amazon Q: a workspace file configures an MCP server.\n\n` +
++                    `Server: ${serverName}\n` +
++                    `Command: ${commandLine}\n` +
++                    `Source: ${configPath}\n\n` +
++                    `Starting it runs the above command with your permissions. ` +
++                    `Allow only if you trust this workspace.\n\n` +
++                    `Your choice is remembered for this workspace and this exact configuration.`,
++                actions: [allowAction, denyAction],
++            })
++        } catch (e: any) {
++            this.features.logging.warn(
++                `MCP: could not ask for consent for '${serverName}': ${e?.message ?? e}`
++            )
++            return false
++        }
++
++        if (answer?.title !== allowAction.title) {
++            this.features.logging.info(
++                `MCP: user did not allow workspace-scoped server '${serverName}' (answer: ${answer?.title ?? 'dismissed'})`
++            )
++            this.sessionDeniedConsent.add(denialKey)
++            return false
++        }
++
++        await rememberApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
++        this.features.logging.info(`MCP: user allowed workspace-scoped server '${serverName}'`)
++        return true
++    }
++
++    /**
+      * Start a server process, connect client, and register its tools.
+      * Errors are logged but do not stop discovery of other servers.
+      */
+@@ -440,6 +518,14 @@
+     ): Promise<void> {
+         const DEFAULT_SERVER_INIT_TIMEOUT_MS = 120_000
+ 
++        // Consent gate: nothing workspace-supplied may run or connect until the
++        // user has approved this exact execution in this workspace.
++        if (!(await this.requestConsent(serverName, cfg))) {
++            this.features.logging.info(`MCP: server '${serverName}' was not started: consent not granted`)
++            this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
++            return
++        }
++
+         // Lightweight cleanup - only kill our tracked processes
+         await this.cleanupExistingServer(serverName)
+ 
+@@ -1317,6 +1403,7 @@
+         this.mcpTools = []
+         this.mcpServers.clear()
+         this.mcpServerStates.clear()
++        this.sessionDeniedConsent.clear()
+         this.agentConfig = {
+             name: 'q_ide_default',
+             description: 'Agent configuration',
+diff -ruN a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts	2026-10-29 00:26:52.000000000 +0000
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts	2026-10-29 00:57:08.683543876 +0000
+@@ -402,8 +402,10 @@
+             }
+         }
+ 
+-        // 5c) Collect the lifecycle hooks declared by this agent configuration
+-        if (json.hooks && typeof json.hooks === 'object') {
++        // 5c) Collect the lifecycle hooks declared by the user's own global agent
++        // configuration. Hooks run shell commands at spawn, so a workspace file
++        // must never be able to contribute them.
++        if (fsPath === globalConfigPath && json.hooks && typeof json.hooks === 'object') {
+             if (!agentConfig.hooks) {
+                 agentConfig.hooks = { agentSpawn: [], userPromptSubmit: [] }
+             }
+@@ -625,15 +627,12 @@
+         for (const [sanitizedName, mcpConfig] of mcpResult.servers) {
+             const originalName = mcpResult.serverNameMapping.get(sanitizedName)
+             if (originalName) {
+-                // If the agent configuration already had this server, keep the
+-                // bookkeeping recorded for it (permissions and management actions
+-                // are keyed on the agent file) while the legacy entry supplies the
+-                // execution settings.
+-                const prior = servers.get(sanitizedName)
+-                const mergedConfig = prior
+-                    ? { ...mcpConfig, __configPath__: prior.__configPath__ }
+-                    : mcpConfig
+-                servers.set(sanitizedName, mergedConfig)
++                // The legacy MCP entry supplies the execution settings, so it must
++                // also supply the provenance: never carry over the source path of an
++                // agent-config entry that merely happens to share the name. Doing so
++                // would let a workspace command inherit a globally-defined server's
++                // trusted origin.
++                servers.set(sanitizedName, mcpConfig)
+                 serverNameMapping.set(sanitizedName, originalName)
+ 
+                 // Add MCP server tools to agent config for permission management

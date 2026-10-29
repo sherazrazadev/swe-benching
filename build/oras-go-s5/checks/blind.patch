@@ -1,0 +1,203 @@
+diff -ruN a/registry/remote/auth/client.go b/registry/remote/auth/client.go
+--- a/registry/remote/auth/client.go	2026-10-29 00:06:36.000000000 +0000
++++ b/registry/remote/auth/client.go	2026-10-29 00:24:56.067629618 +0000
+@@ -29,6 +29,7 @@
+ 	"strings"
+ 
+ 	"oras.land/oras-go/v2/registry/remote/internal/errutil"
++	"oras.land/oras-go/v2/registry/remote/internal/origin"
+ 	"oras.land/oras-go/v2/registry/remote/retry"
+ )
+ 
+@@ -137,7 +138,38 @@
+ 	for key, values := range c.Header {
+ 		req.Header[key] = append(req.Header[key], values...)
+ 	}
+-	return c.client().Do(req)
++	// Requests sent by this client may carry a credential. net/http only
++	// withholds sensitive headers when a redirect changes the host name, so a
++	// redirect to another port or scheme on the same host would carry the
++	// Authorization header along. Strip it whenever the redirect target is not
++	// the origin the request was addressed to, before any caller-configured
++	// redirect policy gets to see the request.
++	client := c.client()
++	guarded := *client
++	inner := client.CheckRedirect
++	guarded.CheckRedirect = func(next *http.Request, via []*http.Request) error {
++		if len(via) > 0 && !origin.Same(via[0].URL, next.URL) {
++			next.Header.Del("Authorization")
++		}
++		if inner != nil {
++			return inner(next, via)
++		}
++		return nil
++	}
++	return guarded.Do(req)
++}
++
++// credentialHost returns the registry (host[:port]) that a credential for req
++// belongs to: the Host field when the caller set one, otherwise the host of
++// the request URL, which is what net/http actually connects to.
++func credentialHost(req *http.Request) string {
++	if req.Host != "" {
++		return req.Host
++	}
++	if req.URL != nil {
++		return req.URL.Host
++	}
++	return ""
+ }
+ 
+ // credential resolves the credential for the given registry.
+@@ -225,7 +257,7 @@
+ 	// attempt cached auth token
+ 	var attemptedKey string
+ 	cache := c.cache()
+-	host := originalReq.Host
++	host := credentialHost(originalReq)
+ 	scheme, err := cache.GetScheme(ctx, host)
+ 	if err == nil {
+ 		switch scheme {
+@@ -251,6 +283,13 @@
+ 	if resp.StatusCode != http.StatusUnauthorized {
+ 		return resp, nil
+ 	}
++	// A challenge is only answered when it came from the origin the caller
++	// addressed. A 401 produced by a redirect target elsewhere (or by a
++	// redirected request that came back from some other origin) must neither
++	// resolve the credential nor make it travel to a realm that response names.
++	if resp.Request != nil && !origin.Same(originalReq.URL, resp.Request.URL) {
++		return resp, nil
++	}
+ 
+ 	// attempt again with credentials for recognized schemes
+ 	challenge := resp.Header.Get("Www-Authenticate")
+diff -ruN a/registry/remote/internal/origin/origin.go b/registry/remote/internal/origin/origin.go
+--- a/registry/remote/internal/origin/origin.go	1970-01-01 00:00:00.000000000 +0000
++++ b/registry/remote/internal/origin/origin.go	2026-10-29 00:22:34.120812764 +0000
+@@ -0,0 +1,60 @@
++/*
++Copyright The ORAS Authors.
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package origin identifies the HTTP origin of a URL.
++//
++// A credential handed to the client belongs to one origin: the scheme, host
++// name and port that the caller addressed. Two URLs denote the same origin
++// only when all three agree, with the scheme's default port implied when the
++// URL does not spell it out.
++package origin
++
++import (
++	"net/url"
++	"strings"
++)
++
++// Same reports whether a and b denote the same HTTP origin, i.e. the same
++// scheme, host name and port. Host names are compared case-insensitively and
++// an absent port is the scheme's default port (80 for http, 443 for https).
++//
++// A nil URL denotes no origin and never matches, not even another nil.
++func Same(a, b *url.URL) bool {
++	if a == nil || b == nil {
++		return false
++	}
++	if !strings.EqualFold(a.Scheme, b.Scheme) {
++		return false
++	}
++	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
++		return false
++	}
++	return port(a) == port(b)
++}
++
++// port returns the effective port of u: the explicit port when there is one,
++// otherwise the default port of the scheme.
++func port(u *url.URL) string {
++	if p := u.Port(); p != "" {
++		return p
++	}
++	switch strings.ToLower(u.Scheme) {
++	case "http":
++		return "80"
++	case "https":
++		return "443"
++	}
++	return ""
++}
+diff -ruN a/registry/remote/repository.go b/registry/remote/repository.go
+--- a/registry/remote/repository.go	2026-10-29 00:06:40.000000000 +0000
++++ b/registry/remote/repository.go	2026-10-29 00:23:00.415150635 +0000
+@@ -45,6 +45,7 @@
+ 	"oras.land/oras-go/v2/registry/remote/auth"
+ 	"oras.land/oras-go/v2/registry/remote/errcode"
+ 	"oras.land/oras-go/v2/registry/remote/internal/errutil"
++	"oras.land/oras-go/v2/registry/remote/internal/origin"
+ )
+ 
+ const (
+@@ -999,6 +1000,13 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	// The continuation endpoint is chosen by the registry, and the credential
++	// from the chunk request is attached to it below. It must stay on the same
++	// origin as the upload request: a Location that points elsewhere would
++	// hand the registry credential to that endpoint.
++	if !origin.Same(next, req.URL) {
++		return fmt.Errorf("chunked upload continuation Location %q is on a different origin than the upload %q", next, req.URL)
++	}
+ 	url := next.String()
+ 	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, nil)
+ 	if err != nil {
+diff -ruN a/registry/remote/retry/client.go b/registry/remote/retry/client.go
+--- a/registry/remote/retry/client.go	2026-10-29 00:06:40.000000000 +0000
++++ b/registry/remote/retry/client.go	2026-10-29 00:22:38.811873656 +0000
+@@ -17,8 +17,9 @@
+ 
+ import (
+ 	"net/http"
+-	"strings"
+ 	"time"
++
++	"oras.land/oras-go/v2/registry/remote/internal/origin"
+ )
+ 
+ // DefaultClient is a client with the default retry policy.
+@@ -33,17 +34,20 @@
+ }
+ 
+ // keepAuthorizationOnRedirect keeps the Authorization header when a redirect
+-// stays on the same host. The standard library drops sensitive headers when the
+-// host name changes; some registries redirect blob traffic to another port on
+-// the same host, and those requests have to stay authenticated.
++// stays on the origin (scheme, host and port) the caller addressed. net/http
++// only withholds sensitive headers when the host name changes, so a redirect
++// that swaps the port or the scheme on an otherwise identical host would keep
++// carrying the header; such a redirect is to a different origin and the
++// header is dropped instead.
+ func keepAuthorizationOnRedirect(req *http.Request, via []*http.Request) error {
+ 	if len(via) == 0 {
+ 		return nil
+ 	}
+-	prev := via[len(via)-1]
+-	if !strings.EqualFold(req.URL.Hostname(), prev.URL.Hostname()) {
++	if !origin.Same(via[0].URL, req.URL) {
++		req.Header.Del("Authorization")
+ 		return nil
+ 	}
++	prev := via[len(via)-1]
+ 	if auth := prev.Header.Get("Authorization"); auth != "" {
+ 		req.Header.Set("Authorization", auth)
+ 	}

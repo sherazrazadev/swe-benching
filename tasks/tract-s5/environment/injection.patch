@@ -1,0 +1,243 @@
+diff --git a/nnef/src/bundle.rs b/nnef/src/bundle.rs
+new file mode 100644
+index 000000000..a436b168f
+--- /dev/null
++++ b/nnef/src/bundle.rs
+@@ -0,0 +1,116 @@
++//! Weight bundles: several named tensors packed into one file.
++//!
++//! A bundle keeps the tensors of a model together in a single resource. The file starts with a
++//! short header, followed by one index record per tensor and then the payload region the records
++//! point into.
++use std::io::Read;
++use std::path::Path;
++
++use crate::internal::*;
++use crate::resource::resource_path_to_id;
++
++const MAGIC: [u8; 4] = *b"TBND";
++const BUNDLE_HEADER_LEN: usize = 12;
++
++fn read_at(file: &[u8], pos: usize, len: usize) -> TractResult<&[u8]> {
++    let end = pos.checked_add(len).ok_or_else(|| format_err!("Bundle index offset overflow"))?;
++    file.get(pos..end).ok_or_else(|| format_err!("Truncated tensor bundle"))
++}
++
++fn read_u8(file: &[u8], pos: usize) -> TractResult<u8> {
++    Ok(read_at(file, pos, 1)?[0])
++}
++
++fn read_u32(file: &[u8], pos: usize) -> TractResult<u32> {
++    let b = read_at(file, pos, 4)?;
++    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn read_u64(file: &[u8], pos: usize) -> TractResult<u64> {
++    let b = read_at(file, pos, 8)?;
++    Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
++}
++
++fn datum_type_for_elem_size(elem_size: u8) -> TractResult<DatumType> {
++    Ok(match elem_size {
++        1 => DatumType::U8,
++        2 => DatumType::U16,
++        4 => DatumType::F32,
++        8 => DatumType::F64,
++        _ => bail!("Unsupported tensor bundle element size {elem_size}"),
++    })
++}
++
++/// Reads the index and payload of a bundle, returning its named tensors.
++fn read_bundle(file: &[u8], count: u32) -> TractResult<Vec<(String, Arc<Tensor>)>> {
++    let mut pos = BUNDLE_HEADER_LEN;
++    let mut tensors = Vec::with_capacity(count as usize);
++    for _ in 0..count {
++        let name_len = read_u32(file, pos)? as usize;
++        pos += 4;
++        let name = String::from_utf8(read_at(file, pos, name_len)?.to_vec())?;
++        pos += name_len;
++        let rank = read_u32(file, pos)? as usize;
++        pos += 4;
++        ensure!(rank <= 8, "Tensor {name}: rank {rank} is not supported");
++        let mut dims = TVec::with_capacity(rank);
++        for _ in 0..rank {
++            dims.push(read_u32(file, pos)? as usize);
++            pos += 4;
++        }
++        let elem_size = read_u8(file, pos)?;
++        pos += 4; // element size and three reserved bytes
++        let elem_count = read_u64(file, pos)?;
++        pos += 8;
++        let offset = read_u64(file, pos)? as usize;
++        pos += 8;
++        let byte_len = read_u64(file, pos)? as usize;
++        pos += 8;
++
++        let expected_elems = dims.iter().product::<usize>();
++        ensure!(
++            elem_count as usize == expected_elems,
++            "Tensor {name}: element count {elem_count} does not match shape {dims:?}"
++        );
++        let bytes = elem_count as usize * elem_size as usize;
++        ensure!(
++            byte_len == bytes,
++            "Tensor {name}: stored byte length {byte_len} does not match {bytes}"
++        );
++        let payload = read_at(file, offset, byte_len)?;
++        let dt = datum_type_for_elem_size(elem_size)?;
++        let tensor = unsafe { Tensor::from_raw_dt(dt, &dims, payload)? };
++        tensors.push((name, tensor.into_arc_tensor()));
++    }
++    Ok(tensors)
++}
++
++/// Loads a `.tbundle` weight bundle.
++pub struct TensorBundleLoader;
++
++impl ResourceLoader for TensorBundleLoader {
++    fn name(&self) -> StaticName {
++        "TensorBundleLoader".into()
++    }
++
++    fn try_load(
++        &self,
++        path: &Path,
++        reader: &mut dyn Read,
++        _framework: &Nnef,
++    ) -> TractResult<Option<(String, Arc<dyn Resource>)>> {
++        if path.extension().is_some_and(|e| e == "tbundle") {
++            let mut file = Vec::new();
++            reader.read_to_end(&mut file)?;
++            ensure!(file.len() >= BUNDLE_HEADER_LEN, "Truncated tensor bundle");
++            ensure!(file[0..4] == MAGIC, "Wrong tensor bundle magic");
++            let version = u16::from_le_bytes([file[4], file[5]]);
++            ensure!(version == 1, "Unsupported tensor bundle version {version}");
++            let count = read_u32(&file, 8)?;
++            let tensors = read_bundle(&file, count)?;
++            Ok(Some((resource_path_to_id(path)?, Arc::new(tensors))))
++        } else {
++            Ok(None)
++        }
++    }
++}
+diff --git a/nnef/src/framework.rs b/nnef/src/framework.rs
+index edf819073..b6f594053 100644
+--- a/nnef/src/framework.rs
++++ b/nnef/src/framework.rs
+@@ -3,6 +3,8 @@ use tract_core::tract_data::itertools::Itertools;
+ 
+ use crate::ast::quant::write_quant_format;
+ use crate::ast::{Identifier, ProtoModel, QuantFormat};
++use crate::bundle::TensorBundleLoader;
++use crate::legacy::LegacyTensorLoader;
+ use crate::resource::{GraphNnef, SafeTensorsLoader};
+ use crate::{internal::*, nnef};
+ use std::io::Read;
+@@ -30,10 +32,12 @@ impl Default for Nnef {
+             registries: vec![crate::ops::tract_nnef(), crate::ops::tract_core()],
+             resource_loaders: vec![
+                 GraphNnefLoader.into_boxed(),
++                LegacyTensorLoader.into_boxed(),
+                 DatLoader.into_boxed(),
+                 GraphQuantLoader.into_boxed(),
+                 TypedModelLoader::new(false).into_boxed(),
+                 SafeTensorsLoader.into_boxed(),
++                TensorBundleLoader.into_boxed(),
+             ],
+             allow_extended_identifier_syntax: false,
+             extern_all_constants: false,
+diff --git a/nnef/src/legacy.rs b/nnef/src/legacy.rs
+new file mode 100644
+index 000000000..9597b1d71
+--- /dev/null
++++ b/nnef/src/legacy.rs
+@@ -0,0 +1,74 @@
++//! Reader for the pre-1.0 single-tensor weight file.
++//!
++//! The legacy `TRT0` container declares its rank, dimensions, element size and element count in a
++//! fixed 48-byte header, then stores the raw values. It predates the NNEF tensor file and is kept
++//! so that older model directories keep loading.
++use std::io::Read;
++use std::path::Path;
++
++use crate::internal::*;
++use crate::resource::resource_path_to_id;
++
++const MAGIC: [u8; 4] = *b"TRT0";
++const LEGACY_HEADER_LEN: usize = 48;
++
++fn datum_type_for_elem_size(elem_size: usize) -> TractResult<DatumType> {
++    Ok(match elem_size {
++        1 => DatumType::U8,
++        2 => DatumType::U16,
++        4 => DatumType::F32,
++        8 => DatumType::F64,
++        _ => bail!("Unsupported legacy tensor element size {elem_size}"),
++    })
++}
++
++/// Loads a `.tensor` weight file written by the legacy writer.
++pub struct LegacyTensorLoader;
++
++impl ResourceLoader for LegacyTensorLoader {
++    fn name(&self) -> StaticName {
++        "LegacyTensorLoader".into()
++    }
++
++    fn try_load(
++        &self,
++        path: &Path,
++        reader: &mut dyn Read,
++        _framework: &Nnef,
++    ) -> TractResult<Option<(String, Arc<dyn Resource>)>> {
++        if path.extension().is_some_and(|e| e == "tensor") {
++            let mut file = Vec::new();
++            reader.read_to_end(&mut file)?;
++            ensure!(file.len() >= LEGACY_HEADER_LEN, "Truncated legacy tensor file");
++            ensure!(file[0..4] == MAGIC, "Wrong legacy tensor magic");
++            let elem_size = file[4] as usize;
++            let rank = file[5] as usize;
++            ensure!(rank <= 8, "Legacy tensor rank {rank} is not supported");
++            let mut dims = TVec::with_capacity(rank);
++            for i in 0..rank {
++                let at = 8 + 4 * i;
++                dims.push(u32::from_le_bytes([file[at], file[at + 1], file[at + 2], file[at + 3]])
++                    as usize);
++            }
++            let elem_count = u64::from_le_bytes([
++                file[40], file[41], file[42], file[43], file[44], file[45], file[46], file[47],
++            ]) as usize;
++
++            let expected_elems = dims.iter().product::<usize>();
++            ensure!(
++                elem_count == expected_elems,
++                "Legacy tensor: element count {elem_count} does not match shape {dims:?}"
++            );
++            let bytes = elem_count * elem_size;
++            ensure!(
++                file.len() - LEGACY_HEADER_LEN == bytes,
++                "Legacy tensor: stored payload does not match {bytes} bytes"
++            );
++            let dt = datum_type_for_elem_size(elem_size)?;
++            let tensor = unsafe { Tensor::from_raw_dt(dt, &dims, &file[LEGACY_HEADER_LEN..])? };
++            Ok(Some((resource_path_to_id(path)?, Arc::new(tensor))))
++        } else {
++            Ok(None)
++        }
++    }
++}
+diff --git a/nnef/src/lib.rs b/nnef/src/lib.rs
+index 6ad224779..04542fc27 100644
+--- a/nnef/src/lib.rs
++++ b/nnef/src/lib.rs
+@@ -3,8 +3,10 @@
+ extern crate log;
+ 
+ pub mod ast;
++pub mod bundle;
+ pub mod deser;
+ pub mod framework;
++pub mod legacy;
+ mod liquid;
+ pub mod ops;
+ pub mod registry;

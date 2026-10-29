@@ -1,0 +1,59 @@
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/backends/facebook_limited.py b/social_core/backends/facebook_limited.py
+--- a/social_core/backends/facebook_limited.py	2026-10-28 23:50:58.848539517 +0000
++++ b/social_core/backends/facebook_limited.py	2026-10-28 23:55:37.554892542 +0000
+@@ -32,6 +32,16 @@
+         kwargs["response"] = self.validate_and_return_id_token(raw_jwt, "")
+         return super().authenticate(*args, **kwargs)
+ 
++    def continue_pipeline(self, partial):
++        # The ID token was validated when the flow started; restore the claims
++        # kept on the stored flow and resume from the step it stopped at.
++        self.id_token = partial.kwargs.get("id_token")
++        return self.pipeline(
++            self.strategy.get_pipeline(self),
++            pipeline_index=partial.next_step,
++            **partial.kwargs,
++        )
++
+     def get_user_details(self, response):
+         return {
+             "fullname": response.get("name"),
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/pipeline/utils.py b/social_core/pipeline/utils.py
+--- a/social_core/pipeline/utils.py	2026-10-28 23:50:58.856098022 +0000
++++ b/social_core/pipeline/utils.py	2026-10-28 23:55:41.773883409 +0000
+@@ -9,7 +9,7 @@
+ if TYPE_CHECKING:
+     from social_core.backends.base import BaseAuth
+     from social_core.storage import PartialMixin, UserProtocol
+-    from social_core.strategy import BaseStrategy
++    from social_core.strategy import BaseStrategy, HttpResponseProtocol
+ 
+ SERIALIZABLE_TYPES = (dict, list, tuple, set, bool, type(None), int, str, bytes)
+ 
+@@ -102,3 +102,26 @@
+             key: strategy.from_session_value(val) for key, val in kwargs.items()
+         }
+     return partial
++
++
++def partial_resume(
++    strategy: BaseStrategy,
++    backend: BaseAuth,
++    token: str | None = None,
++) -> UserProtocol | HttpResponseProtocol | None:
++    """Load a stored partial pipeline and continue it from its next step.
++
++    Integrations that expose their own resume URL use this to hand a token
++    back to the pipeline without rebuilding the partial object themselves.
++    """
++    from social_core.utils import PARTIAL_TOKEN_SESSION_NAME
++
++    token = token or strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
++    if not token:
++        return None
++    partial = partial_load(strategy, token)
++    if partial is None or partial.backend != backend.name:
++        return None
++    return strategy.authenticate(
++        backend, *partial.args, pipeline_index=partial.next_step, **partial.kwargs
++    )

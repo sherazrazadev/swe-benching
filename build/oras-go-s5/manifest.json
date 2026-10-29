@@ -1,0 +1,200 @@
+{
+ "slug": "oras-go-s5",
+ "candidate": "screener-v2 entry 19374: GHSA-VH4V-2XQ2-G5CG / GO-2026-5884 (oras-project/oras-go)",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "cc323e564d90c6b5b4bdd71d3c8d2ee2713b37e5 (direct parent tree of the published fix 3c2e884e12ea52b6bff60c97f1edb7df7d0e0909; the fix changes only registry/remote/auth/client.go and its test file, so the pinned tree has no regression tests)",
+  "entry_points": [
+   "Go library API: auth.Client.Do with the retry HTTP client (retry.NewClient) and a credential callback",
+   "Go library API: auth.Client.Do with a caller-built HTTP client and no credential callback (anonymous bearer exchange)",
+   "Go library API: remote.Repository.Push (blob upload POST -> chunked PATCH -> final PUT)"
+  ],
+  "sites": [
+   "registry/remote/auth/client.go:136-141 (published send(); landing point for the reported redirect)",
+   "registry/remote/auth/client.go:251-262 (published 401 challenge origin guard; far function from the landing point)",
+   "registry/remote/auth/client.go:228-230 (published empty-Host fallback; robustness, not used as a lever)",
+   "registry/remote/retry/client.go:27-47 (injected keepAuthorizationOnRedirect callback; second implementation)",
+   "registry/remote/repository.go:1013-1040 (injected completeChunkedUpload; server-named continuation endpoint)"
+  ],
+  "routes": [
+   "S1 redirect after authentication to another port on the same host (confirmed leak at pin+injection)",
+   "S2 cached bearer token attached before a cross-origin redirect (confirmed leak at pin+injection)",
+   "S3 redirect before authentication whose 401 names a bearer realm on a third origin (confirmed credential posted to the realm at pin+injection)",
+   "S4 chunked upload continuation Location on another origin (confirmed credential sent to the continuation at pin+injection)",
+   "checked and rejected: pagination continuation via a server-supplied Link (utils.go:40-59) - credentials are resolved for the Link host and StaticCredential does not answer for a foreign host, so no leak through the real entry point",
+   "checked and rejected: auth cache as producer off the check's path - Do itself calls GetScheme/GetToken, so the producer is on the check's path"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "go test ./registry/remote/auth ./registry/remote/retry ./registry/remote -count=1 (all pass at pin+injection and after the reference fix, offline)"
+  ],
+  "local_runs": "Injected tree: security 4/4 fail, functional 6/6 pass. Reference fix: security 4/4 pass, functional 6/6 pass. Project tests for the three packages pass on both. Variant matrix: 8 security_fail patches each leave the declared lever open while all functional tests pass; 3 functional_fail patches break only functional tests; both pass patches score full.",
+  "gate": "static PASS; nop PASS; oracle PASS x3; patches PASS 13/13 (the blind pass patch is produced by run_blindfix and was not part of this build)"
+ },
+ "leak_terms": [
+  "sameHTTPOrigin",
+  "canonicalHost",
+  "keepAuthorizationOnRedirect",
+  "sameOrigin",
+  "sameUploadHost",
+  "completeChunkedUpload",
+  "completePushAfterInitialPost",
+  "headerOCIChunkMinLength",
+  "OCI-Chunk-Min-Length",
+  "Www-Authenticate",
+  "Authorization",
+  "CheckRedirect",
+  "Location",
+  "realm",
+  "chunked",
+  "resumable",
+  "retry",
+  "client.go",
+  "repository.go"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "published client.go fix only: the retry callback re-adds the credential and the upload continuation is unvalidated"
+  },
+  {
+   "patch": "sf-landing-only.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: drop the credential in the reported redirect path only; misses the challenge, the wrapper callback and the upload continuation"
+  },
+  {
+   "patch": "sf-no-retry.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the retry wrapper's origin rule (L1 left open)"
+  },
+  {
+   "patch": "sf-no-challenge-origin.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the 401 challenge origin guard (L2 left open)"
+  },
+  {
+   "patch": "sf-no-upload-check.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the chunked-upload continuation validation (L3 left open)"
+  },
+  {
+   "patch": "sf-hostname-only.patch",
+   "expect": "security_fail",
+   "note": "origin compared by host name only (port normalised away)"
+  },
+  {
+   "patch": "sf-wrong-location.patch",
+   "expect": "security_fail",
+   "note": "re-checks the upload-session URL but trusts the continuation endpoint"
+  },
+  {
+   "patch": "sf-crash.patch",
+   "expect": "security_fail",
+   "note": "panics on a cross-origin redirect carrying credentials instead of a clean drop"
+  },
+  {
+   "patch": "ff-overbroad-redirect.patch",
+   "expect": "functional_fail",
+   "note": "strips the credential on every redirect, breaking same-origin redirects"
+  },
+  {
+   "patch": "ff-block-cross-host-realm.patch",
+   "expect": "functional_fail",
+   "note": "refuses a token service the addressed origin designates on another host"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "denies every outbound request"
+  },
+  {
+   "patch": "pass-alt-remove-retry.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "drops the wrapper's header-preserving redirect callback instead of making it origin-aware, keeping the client-side origin rule"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive stripping of proxy credentials and cookies, and rejection of upload Locations carrying user information"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written by the blind-fix step from instruction.md and the repository only"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "sf-wrong-location.patch",
+  "one_role_or_direction": "sf-landing-only.patch",
+  "reads_only": "sf-no-upload-check.patch",
+  "check_after_adjustment": "sf-hostname-only.patch",
+  "unlisted_route": "sf-published-only.patch",
+  "malformed_identity": "n/a: origins are produced by net/url and the address is scheme+host+port; the instruction names no ambiguous spelling and no test relies on one, so no parser mismatch can hide a destination",
+  "missing_authority": "n/a: the credential is supplied by the caller's callback, not resolved from an authority or role lookup that could return nothing and fail open",
+  "adjacent_api": "ff-block-cross-host-realm.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_redirect_origin_shape",
+   "pattern": "A (main, how-type; injected second implementation)",
+   "shape": "redirect after authentication to another port on the same host; the HTTP wrapper's redirect callback re-adds the credential after the auth client dropped it, and its own check compares host names only",
+   "where": "registry/remote/retry/client.go:27-47 (injected) interacting with registry/remote/auth/client.go:136-165 (published)",
+   "security_tests": [
+    "auth_test::TestSec_AuthenticatedRedirectDoesNotForwardCredential",
+    "auth_test::TestSec_CachedTokenRedirectDoesNotForwardCredential"
+   ],
+   "coupled_functional_tests": [
+    "auth_test::TestFunc_SameOriginRedirectKeepsCredential",
+    "auth_test::TestFunc_CallerCheckRedirectIsPreserved"
+   ],
+   "security_fail_patch": "sf-no-retry.patch",
+   "realistic_because": "a header-preserving redirect callback in the retry wrapper is a natural helper for registries that redirect to another port; reason to dismiss: the transport wrapper is not where redirects are handled, and the host-name comparison looks like it already restricts the copy"
+  },
+  {
+   "id": "T2_preauth_challenge_origin",
+   "pattern": "A (published far site, how-type)",
+   "shape": "redirect before authentication; the target's 401 names a bearer realm on a third origin, and the credential resolved for the addressed registry is posted to that realm",
+   "where": "registry/remote/auth/client.go:251-262 (published)",
+   "security_tests": [
+    "auth_test::TestSec_PreAuthRedirectChallengeDoesNotLeakCredential"
+   ],
+   "coupled_functional_tests": [
+    "auth_test::TestFunc_TokenServiceOnOtherHostReceivesCredential",
+    "auth_test::TestFunc_AnonymousBearerExchangeStillWorks"
+   ],
+   "security_fail_patch": "sf-no-challenge-origin.patch",
+   "realistic_because": "real published fix site in a different phase of the same client; reason to dismiss: redirects are already stripped and a cross-host token service is documented as legitimate"
+  },
+  {
+   "id": "T3_upload_continuation",
+   "pattern": "A (injected sibling, where+shape)",
+   "shape": "a chunked upload whose continuation Location is on another origin; the credential is copied by hand and no HTTP redirect is involved",
+   "where": "registry/remote/repository.go:1013-1040 (injected)",
+   "security_tests": [
+    "remote_test::TestSec_UploadContinuationLocationDoesNotReceiveCredential"
+   ],
+   "coupled_functional_tests": [
+    "remote_test::TestFunc_ChunkedUploadSameOriginCompletes",
+    "remote_test::TestFunc_MonolithicUploadStillWorks"
+   ],
+   "security_fail_patch": "sf-no-upload-check.patch",
+   "realistic_because": "a resumable-upload step copying the credential exactly like the neighbouring monolithic path; reason to dismiss: uploads are not redirects and the first Location is already validated"
+  }
+ ],
+ "status": "static PASS; nop PASS (security 0/4 pass = 4/4 fail, functional 394/394 pass); oracle PASS 3/3 (reward 1.0, identical); patches PASS 13/13 (8 security_fail, 3 functional_fail, 2 pass). Blind patch and FAIRNESS.md remain for the post-build steps."
+}

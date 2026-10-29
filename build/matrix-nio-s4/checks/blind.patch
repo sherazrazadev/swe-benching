@@ -1,0 +1,1006 @@
+diff -ruN a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml	2026-10-29 00:14:14.000000000 +0000
++++ b/pyproject.toml	2026-10-29 00:38:16.663619811 +0000
+@@ -29,7 +29,7 @@
+     "atomicwrites~=1.4",
+     "cachetools~=5.3",
+     "peewee~=3.14",
+-    "python-olm~=3.2",
++    "vodozemac~=0.9",
+ ]
+ 
+ dev = [
+diff -ruN a/src/nio/crypto/__init__.py b/src/nio/crypto/__init__.py
+--- a/src/nio/crypto/__init__.py	2026-10-29 00:14:14.000000000 +0000
++++ b/src/nio/crypto/__init__.py	2026-10-29 00:38:13.184556587 +0000
+@@ -20,7 +20,7 @@
+ )
+ from .attachments import decrypt_attachment, encrypt_attachment
+ 
+-if package_installed("olm"):
++if package_installed("vodozemac"):
+     from .sessions import (  # isort:skip
+         InboundGroupSession,
+         InboundSession,
+diff -ruN a/src/nio/crypto/olm_machine.py b/src/nio/crypto/olm_machine.py
+--- a/src/nio/crypto/olm_machine.py	2026-10-29 00:14:16.000000000 +0000
++++ b/src/nio/crypto/olm_machine.py	2026-10-29 00:38:38.180883213 +0000
+@@ -20,10 +20,10 @@
+ from json.decoder import JSONDecodeError
+ from typing import Any, DefaultDict, Dict, Iterator, List, Optional, Set, Tuple, Union
+ 
+-import olm
++import vodozemac
+ from cachetools import LRUCache
+ from jsonschema import SchemaError, ValidationError
+-from olm import OlmGroupSessionError, OlmMessage, OlmPreKeyMessage, OlmSessionError
++from unpaddedbase64 import decode_base64, encode_base64
+ 
+ from ..api import Api
+ from ..crypto.sessions import Session
+@@ -395,13 +395,15 @@
+         olm_message = session.encrypt(Api.to_json(payload))
+         self.store.save_session(recipient_device.curve25519, session)
+ 
++        message_type, ciphertext = olm_message.to_parts()
++
+         return {
+             "algorithm": self._olm_algorithm,
+             "sender_key": self.account.identity_keys["curve25519"],
+             "ciphertext": {
+                 recipient_device.curve25519: {
+-                    "type": olm_message.message_type,
+-                    "body": olm_message.ciphertext,
++                    "type": message_type,
++                    "body": encode_base64(ciphertext),
+                 }
+             },
+         }
+@@ -900,7 +902,7 @@
+         self,
+         sender: str,
+         sender_key: str,
+-        message: Union[OlmPreKeyMessage, OlmMessage],
++        message: Union[vodozemac.PreKeyMessage, vodozemac.AnyOlmMessage],
+     ) -> InboundSession:
+         logger.info(f"Creating Inbound session for {sender}")
+         # Let's create a new inbound session.
+@@ -967,11 +969,11 @@
+                 session_key, sender_fp_key, sender_key, room_id
+             )
+             if session.id != session_id:
+-                raise OlmSessionError(
++                raise ValueError(
+                     "Mismatched session id while creating " "inbound group session"
+                 )
+ 
+-        except OlmSessionError as e:
++        except (ValueError, vodozemac.SessionKeyDecodeException, vodozemac.DecodeException) as e:
+             logger.warning(e)
+             return
+ 
+@@ -1067,7 +1069,7 @@
+         self,
+         sender: str,
+         sender_key: str,
+-        message: Union[OlmPreKeyMessage, OlmMessage],
++        message: Union[vodozemac.PreKeyMessage, vodozemac.AnyOlmMessage],
+     ) -> Optional[str]:
+         plaintext = None
+ 
+@@ -1076,7 +1078,7 @@
+         for session in self.session_store[sender_key]:
+             matches = False
+             try:
+-                if isinstance(message, OlmPreKeyMessage):
++                if isinstance(message, vodozemac.PreKeyMessage):
+                     # It's a prekey message, check if the session matches
+                     # if it doesn't no need to try to decrypt.
+                     matches = session.matches(message)
+@@ -1096,7 +1098,7 @@
+                 )
+                 return plaintext
+ 
+-            except OlmSessionError as e:
++            except (vodozemac.OlmDecryptionException, vodozemac.DecodeException) as e:
+                 # Decryption failed using a matching session, we don't want
+                 # to create a new session using this prekey message so
+                 # raise an exception and log the error.
+@@ -1367,7 +1369,7 @@
+ 
+     def _decrypt_megolm_no_error(
+         self, event: MegolmEvent, room_id: Optional[str] = None
+-    ) -> Optional[Union[Event, BadEvent]]:
++    ) -> Optional[Union[Event, BadEvent, UnknownBadEvent]]:
+         try:
+             return self.decrypt_megolm_event(event, room_id)
+         except EncryptionError:
+@@ -1375,7 +1377,7 @@
+ 
+     def decrypt_megolm_event(
+         self, event: MegolmEvent, room_id: Optional[str] = None
+-    ) -> Union[Event, BadEvent]:
++    ) -> Union[Event, BadEvent, UnknownBadEvent]:
+         room_id = room_id or event.room_id
+ 
+         if not room_id:
+@@ -1398,7 +1400,7 @@
+ 
+         try:
+             plaintext, message_index = session.decrypt(event.ciphertext)
+-        except OlmGroupSessionError as e:
++        except (vodozemac.MegolmDecryptionException, vodozemac.DecodeException) as e:
+             message = f"Error decrypting megolm event: {str(e)}"
+             logger.warning(message)
+             raise EncryptionError(message)
+@@ -1497,9 +1499,11 @@
+                 return None
+ 
+             if own_ciphertext["type"] == 0:
+-                message = OlmPreKeyMessage(own_ciphertext["body"])
++                message = vodozemac.PreKeyMessage.from_base64(own_ciphertext["body"])
+             elif own_ciphertext["type"] == 1:
+-                message = OlmMessage(own_ciphertext["body"])
++                message = vodozemac.AnyOlmMessage.normal(
++                    decode_base64(own_ciphertext["body"])
++                )
+             else:
+                 logger.warning(
+                     f"Unsupported olm message type: {own_ciphertext['type']}"
+@@ -1520,7 +1524,7 @@
+         self,
+         sender: str,
+         sender_key: str,
+-        message: Union[OlmPreKeyMessage, OlmMessage],
++        message: Union[vodozemac.PreKeyMessage, vodozemac.AnyOlmMessage],
+     ) -> DecryptedOlmT:
+         try:
+             # First try to decrypt using an existing session.
+@@ -1538,7 +1542,7 @@
+             # New sessions can only be created if it's a prekey message, we
+             # can't decrypt the message if it isn't one at this point in time
+             # anymore, so return early
+-            if not isinstance(message, OlmPreKeyMessage):
++            if not isinstance(message, vodozemac.PreKeyMessage):
+                 self._mark_device_for_unwedging(sender, sender_key)
+                 return None
+ 
+@@ -1550,7 +1554,11 @@
+                 # Store the new session
+                 self.session_store.add(sender_key, s)
+                 self.save_session(sender_key, s)
+-            except OlmSessionError as e:
++            except (
++                vodozemac.SessionCreationException,
++                vodozemac.OlmDecryptionException,
++                vodozemac.DecodeException,
++            ) as e:
+                 logger.error(
+                     f"Failed to create new session from prekeymessage: {str(e)}"
+                 )
+@@ -1879,9 +1887,17 @@
+         unsigned = json.pop("unsigned", None)
+ 
+         try:
+-            olm.ed25519_verify(user_key, Api.to_canonical_json(json), signature_base64)
++            key = vodozemac.Ed25519PublicKey.from_base64(user_key)
++            signature = vodozemac.Ed25519Signature.from_base64(signature_base64)
++            key.verify_signature(
++                Api.to_canonical_json(json).encode(), signature
++            )
+             success = True
+-        except olm.utility.OlmVerifyError:
++        except (
++            vodozemac.SignatureException,
++            vodozemac.KeyException,
++            vodozemac.DecodeException,
++        ):
+             success = False
+ 
+         json["signatures"] = signatures
+@@ -1945,7 +1961,7 @@
+                 room_id,
+                 forwarding_chain,
+             )
+-        except OlmSessionError as e:
++        except (vodozemac.SessionKeyDecodeException, vodozemac.DecodeException) as e:
+             logger.warning(f"Error importing inbound group session: {e}")
+             return None
+ 
+diff -ruN a/src/nio/crypto/sas.py b/src/nio/crypto/sas.py
+--- a/src/nio/crypto/sas.py	2026-10-29 00:14:14.000000000 +0000
++++ b/src/nio/crypto/sas.py	2026-10-29 00:38:55.088197342 +0000
+@@ -16,11 +16,12 @@
+ 
+ from datetime import datetime, timedelta
+ from enum import Enum
++from hashlib import sha256
+ from itertools import zip_longest
+ from typing import List, Optional, Tuple
+ from uuid import uuid4
+ 
+-import olm
++import vodozemac
+ 
+ from ..api import Api
+ from ..event_builders import ToDeviceMessage
+@@ -43,7 +44,7 @@
+     canceled = 5
+ 
+ 
+-class Sas(olm.Sas):
++class Sas:
+     """Matrix Short Authentication String class.
+ 
+     This class implements a state machine to handle device verification using
+@@ -80,8 +81,7 @@
+     _key_agreeemnt_protocols = [_key_agreement_v1, _key_agreement_v2]
+     _hash_v1 = "sha256"
+     _mac_normal = "hkdf-hmac-sha256"
+-    _mac_old = "hmac-sha256"
+-    _mac_v1 = [_mac_normal, _mac_old]
++    _mac_v1 = [_mac_normal]
+     _strings_v1 = ["emoji", "decimal"]
+ 
+     _user_cancel_error = ("m.user", "Canceled by user")
+@@ -181,6 +181,8 @@
+         short_auth_string: Optional[List[str]] = None,
+         mac_methods: Optional[List[str]] = None,
+     ):
++        self._sas = vodozemac.Sas()
++
+         self.own_user = own_user
+         self.own_device = own_device
+         self.own_fp_key = own_fp_key
+@@ -202,12 +204,12 @@
+         self.cancel_code = ""
+ 
+         self.their_sas_key: Optional[str] = None
++        self.established_sas: Optional[vodozemac.EstablishedSas] = None
+ 
+         self.verified_devices: List[str] = []
+ 
+         self.creation_time = datetime.now()
+         self._last_event_time = self.creation_time
+-        super().__init__()
+ 
+     @classmethod
+     def from_key_verification_start(
+@@ -244,7 +246,9 @@
+         obj.state = SasState.started
+ 
+         string_content = Api.to_canonical_json(event.source["content"])
+-        obj.commitment = olm.sha256(obj.pubkey + string_content)
++        obj.commitment = sha256(
++            obj.pubkey.encode() + string_content.encode()
++        ).hexdigest()
+         obj.key_agreement_protocols = event.key_agreement_protocols
+ 
+         if (
+@@ -254,10 +258,7 @@
+                 and Sas._key_agreement_v2 not in event.key_agreement_protocols
+             )
+             or Sas._hash_v1 not in event.hashes
+-            or (
+-                Sas._mac_normal not in event.message_authentication_codes
+-                and Sas._mac_old not in event.message_authentication_codes
+-            )
++            or (Sas._mac_normal not in event.message_authentication_codes)
+             or (
+                 "emoji" not in event.short_authentication_string
+                 and "decimal" not in event.short_authentication_string
+@@ -269,6 +270,11 @@
+         return obj
+ 
+     @property
++    def pubkey(self) -> str:
++        """The public key that can be used to establish a shared secret."""
++        return self._sas.public_key.to_base64()
++
++    @property
+     def canceled(self) -> bool:
+         """Is the verification request canceled."""
+         return self.state == SasState.canceled
+@@ -294,9 +300,22 @@
+         """Is the device verified and the request done."""
+         return self.state == SasState.mac_received and self.sas_accepted
+ 
+-    def set_their_pubkey(self, pubkey: str):
+-        self.their_sas_key = pubkey
+-        super().set_their_pubkey(pubkey)
++    def set_their_pubkey(self, pubkey: str) -> None:
++        """Set the other side's public key (kept for API compatibility)."""
++        self.establish_sas(pubkey)
++
++    def establish_sas(self, their_public_key: str) -> None:
++        """Perform the Diffie-Hellman handshake with the other side."""
++        self.established_sas = self._sas.diffie_hellman(
++            vodozemac.Curve25519PublicKey.from_base64(their_public_key)
++        )
++        self.their_sas_key = their_public_key
++
++    def diffie_hellman(self, their_public_key: str) -> vodozemac.EstablishedSas:
++        """Establish a SAS secret by performing a DH handshake."""
++        return self._sas.diffie_hellman(
++            vodozemac.Curve25519PublicKey.from_base64(their_public_key)
++        )
+ 
+     def accept_sas(self):
+         """Accept the short authentication string."""
+@@ -307,7 +326,7 @@
+                 "string"
+             )
+ 
+-        if not self.other_key_set:
++        if not self.established_sas:
+             raise LocalProtocolError(
+                 "Other public key isn't set yet, can't "
+                 "generate nor accept a short "
+@@ -317,7 +336,7 @@
+ 
+     def reject_sas(self):
+         """Reject the authentication string."""
+-        if not self.other_key_set:
++        if not self.established_sas:
+             raise LocalProtocolError(
+                 "Other public key isn't set yet, can't "
+                 "generate nor reject a short "
+@@ -334,9 +353,10 @@
+ 
+     def _check_commitment(self, key: str):
+         assert self.commitment
+-        calculated_commitment = olm.sha256(
+-            key + Api.to_canonical_json(self.start_verification().content)
+-        )
++        calculated_commitment = sha256(
++            key.encode()
++            + Api.to_canonical_json(self.start_verification().content).encode()
++        ).hexdigest()
+         return self.commitment == calculated_commitment
+ 
+     def _grouper(self, iterable, n, fillvalue=None):
+@@ -400,8 +420,9 @@
+ 
+     def _generate_emoji(self, extra_info: str) -> List[Tuple[str, str]]:
+         """Create a list of emojies from our shared secret."""
+-        generated_bytes = self.generate_bytes(extra_info, 6)
+-        number = "".join([format(x, "08b") for x in bytes(generated_bytes)])
++        assert self.established_sas
++        generated_bytes = self.established_sas.bytes(extra_info).emoji_indices
++        number = "".join([format(x, "08b") for x in generated_bytes])
+         return [
+             self.emoji[int(x, 2)]
+             for x in map("".join, list(self._grouper(number[:42], 6)))
+@@ -409,11 +430,8 @@
+ 
+     def _generate_decimals(self, extra_info: str) -> Tuple[int, ...]:
+         """Create a decimal number from our shared secret."""
+-        generated_bytes = self.generate_bytes(extra_info, 5)
+-        number = "".join([format(x, "08b") for x in bytes(generated_bytes)])
+-        return tuple(
+-            int(x, 2) + 1000 for x in map("".join, list(self._grouper(number[:-1], 13)))
+-        )
++        assert self.established_sas
++        return self.established_sas.bytes(extra_info).decimals
+ 
+     def start_verification(self) -> ToDeviceMessage:
+         """Create a content dictionary to start the verification."""
+@@ -468,10 +486,7 @@
+         if "decimal" in self.short_auth_string:
+             sas_methods.append("decimal")
+ 
+-        if self._mac_normal in self.mac_methods:
+-            self.chosen_mac_method = self._mac_normal
+-        else:
+-            self.chosen_mac_method = self._mac_old
++        self.chosen_mac_method = self._mac_normal
+ 
+         if Sas._key_agreement_v2 in self.key_agreement_protocols:
+             self.chosen_key_agreement = Sas._key_agreement_v2
+@@ -504,7 +519,6 @@
+             )
+ 
+         content = {"transaction_id": self.transaction_id, "key": self.pubkey}
+-
+         message = ToDeviceMessage(
+             "m.key.verification.key",
+             self.other_olm_device.user_id,
+@@ -526,11 +540,10 @@
+ 
+         key_id = f"ed25519:{self.own_device}"
+ 
++        assert self.established_sas
+         assert self.chosen_mac_method
+-        if self.chosen_mac_method == self._mac_normal:
+-            calculate_mac = self.calculate_mac
+-        elif self.chosen_mac_method == self._mac_old:
+-            calculate_mac = self.calculate_mac_long_kdf
++
++        calculate_mac = self.established_sas.calculate_mac
+ 
+         info = (
+             "MATRIX_KEY_VERIFICATION_MAC"
+@@ -628,7 +641,7 @@
+ 
+     def receive_key_event(self, event):
+         """Receive a KeyVerificationKey event."""
+-        if self.other_key_set or (
++        if self.established_sas or (
+             (self.state != SasState.started) and (self.state != SasState.accepted)
+         ):
+             self.state = SasState.canceled
+@@ -682,12 +695,10 @@
+ 
+         key_ids = ",".join(sorted(event.mac.keys()))
+ 
++        assert self.established_sas
+         assert self.chosen_mac_method
+ 
+-        if self.chosen_mac_method == self._mac_normal:
+-            calculate_mac = self.calculate_mac
+-        elif self.chosen_mac_method == self._mac_old:
+-            calculate_mac = self.calculate_mac_long_kdf
++        calculate_mac = self.established_sas.calculate_mac
+ 
+         if event.keys != calculate_mac(key_ids, info + "KEY_IDS"):
+             self.state = SasState.canceled
+diff -ruN a/src/nio/crypto/sessions.py b/src/nio/crypto/sessions.py
+--- a/src/nio/crypto/sessions.py	2026-10-29 00:14:14.000000000 +0000
++++ b/src/nio/crypto/sessions.py	2026-10-29 00:38:09.322479088 +0000
+@@ -15,108 +15,270 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ from datetime import datetime, timedelta
+-from typing import List, Optional, Set, Tuple
++from typing import Dict, List, Optional, Set, Tuple, Union
+ 
+-import olm
++import vodozemac
+ 
+ from ..exceptions import EncryptionError
+ 
++# The maintained engine stores its pickles under a symmetric key and expects
++# exactly 32 bytes.  Deriving the key from the user supplied passphrase keeps
++# the store API (a passphrase, not a raw key) unchanged.
++_PICKLE_KEY_SIZE = 32
+ 
+-class OlmAccount(olm.Account):
+-    def __init__(self) -> None:
++
++def _pickle_key(passphrase: str) -> bytes:
++    """Turn a store passphrase into the fixed size key the engine wants."""
++    digest = hashlib.sha256(passphrase.encode("utf-8")).digest()
++    assert len(digest) == _PICKLE_KEY_SIZE
++    return digest
++
++
++def _as_text(value: Union[str, bytes]) -> str:
++    """Return the string form the engine uses for its pickle payloads."""
++    return value.decode("utf-8") if isinstance(value, bytes) else value
++
++
++def _as_bytes(value: Union[str, bytes]) -> bytes:
++    return value.encode("utf-8") if isinstance(value, str) else value
++
++
++OlmMessageT = Union[vodozemac.PreKeyMessage, vodozemac.AnyOlmMessage]
++
++
++class OlmAccount:
++    """An Olm account, backed by the maintained cryptographic engine."""
++
++    def __init__(self, account: Optional[vodozemac.Account] = None) -> None:
++        self._account = account if account is not None else vodozemac.Account()
+         self.shared = False
+-        super().__init__()
+ 
+-    def __new__(cls, *args):
+-        return super().__new__(cls)
++    @property
++    def identity_keys(self) -> Dict[str, str]:
++        return {
++            "ed25519": self._account.ed25519_key.to_base64(),
++            "curve25519": self._account.curve25519_key.to_base64(),
++        }
++
++    @property
++    def one_time_keys(self) -> Dict[str, Dict[str, str]]:
++        # The engine returns ``{key_id: Curve25519PublicKey}``.  The outer
++        # ``curve25519`` level is kept so the published API does not change.
++        return {
++            "curve25519": {
++                key_id: key.to_base64()
++                for key_id, key in self._account.one_time_keys.items()
++            }
++        }
++
++    @property
++    def fallback_key(self) -> Dict[str, Dict[str, str]]:
++        return {
++            "curve25519": {
++                key_id: key.to_base64()
++                for key_id, key in self._account.fallback_key.items()
++            }
++        }
++
++    @property
++    def max_one_time_keys(self) -> int:
++        return self._account.max_number_of_one_time_keys
++
++    def generate_one_time_keys(self, count: int) -> None:
++        self._account.generate_one_time_keys(count)
++
++    def generate_fallback_key(self) -> None:
++        self._account.generate_fallback_key()
++
++    def mark_keys_as_published(self) -> None:
++        self._account.mark_keys_as_published()
++
++    def sign(self, message: str) -> str:
++        return self._account.sign(message.encode("utf-8")).to_base64()
++
++    def remove_one_time_keys(self, session: "Session") -> None:
++        # The engine consumes a one-time key while it creates the matching
++        # inbound session, so there is nothing left to remove here.  The
++        # method stays for API compatibility.
++        return None
++
++    def pickle(self, passphrase: str = "") -> bytes:
++        return self._account.pickle(_pickle_key(passphrase)).encode("utf-8")
+ 
+     @classmethod
+     def from_pickle(
+         cls,
+-        pickle: bytes,
++        pickle: Union[str, bytes],
+         passphrase: str = "",
+         shared: bool = False,
+-    ) -> OlmAccount:
+-        account = super().from_pickle(pickle, passphrase)
++    ) -> "OlmAccount":
++        account = cls(account=_load_account(_as_text(pickle), passphrase))
+         account.shared = shared
+         return account
+ 
++    def create_inbound_session(
++        self, identity_key: str, message: OlmMessageT
++    ) -> Tuple[vodozemac.Session, bytes]:
++        if not isinstance(message, vodozemac.PreKeyMessage):
++            message = message.to_pre_key()
++        return self._account.create_inbound_session(
++            vodozemac.Curve25519PublicKey.from_base64(identity_key), message
++        )
++
++    def create_outbound_session(
++        self, identity_key: str, one_time_key: str
++    ) -> vodozemac.Session:
++        return self._account.create_outbound_session(
++            vodozemac.Curve25519PublicKey.from_base64(identity_key),
++            vodozemac.Curve25519PublicKey.from_base64(one_time_key),
++        )
++
++
++def _load_account(raw: str, passphrase: str) -> vodozemac.Account:
++    """Open an account pickle from any format the library has ever written.
++
++    The current engine format is tried first.  Pickles written by the
++    deprecated backend are converted by the engine.  The oldest pickle layout
++    can only be re-encoded with the backend that wrote it; an upgrading
++    installation still carries that backend, and without it the error is
++    passed on instead of silently dropping the account.
++    """
++    try:
++        return vodozemac.Account.from_pickle(raw, _pickle_key(passphrase))
++    except vodozemac.PickleException:
++        pass
++
++    try:
++        return vodozemac.Account.from_libolm_pickle(raw, _as_bytes(passphrase))
++    except vodozemac.LibolmPickleException as error:
++        if "unsupported version" not in str(error):
++            raise
++        try:
++            import olm
++        except ImportError:
++            # Nothing can upgrade this byte stream; never pretend it loaded.
++            raise error
++        legacy = olm.Account.from_pickle(_as_bytes(raw), passphrase)
++        upgraded = legacy.pickle(passphrase)
++        return vodozemac.Account.from_libolm_pickle(
++            _as_text(upgraded), _as_bytes(passphrase)
++        )
++
+ 
+-class _SessionExpirationMixin:
++class _ExpiringSessionMixin:
+     @property
+-    def expired(self):
++    def expired(self) -> bool:
+         return False
+ 
+ 
+-class Session(olm.Session, _SessionExpirationMixin):
+-    def __init__(self):
+-        super().__init__()
++class Session(_ExpiringSessionMixin):
++    """A one-to-one Olm session, backed by the maintained engine."""
++
++    def __init__(self, session: Optional[vodozemac.Session] = None) -> None:
++        self._session = session
+         self.creation_time = datetime.now()
+         self.use_time = datetime.now()
+ 
+-    def __new__(cls, *args):
+-        return super().__new__(cls, *args)
++    @property
++    def id(self) -> str:
++        return self._session.session_id if self._session is not None else ""
+ 
+     @classmethod
+     def from_pickle(
+         cls,
+-        pickle: str,
++        pickle: Union[str, bytes],
+         creation_time: datetime,
+         passphrase: str = "",
+         use_time: Optional[datetime] = None,
+-    ) -> Session:
+-        session = super().from_pickle(pickle, passphrase)
++    ) -> "Session":
++        raw = _as_text(pickle)
++        try:
++            impl = vodozemac.Session.from_pickle(raw, _pickle_key(passphrase))
++        except vodozemac.PickleException:
++            impl = vodozemac.Session.from_libolm_pickle(
++                raw, _as_bytes(passphrase)
++            )
++        session = cls(session=impl)
+         session.creation_time = creation_time
+         session.use_time = use_time or creation_time
+         return session
+ 
+-    def decrypt(self, ciphertext, unicode_errors="replace"):
+-        self.use_time = datetime.now()
+-        return super().decrypt(ciphertext, unicode_errors)
+-
+-    def encrypt(self, plaintext):
++    def pickle(self, passphrase: str = "") -> bytes:
++        if self._session is None:
++            raise EncryptionError("The session is not established yet")
++        return self._session.pickle(_pickle_key(passphrase)).encode("utf-8")
++
++    def encrypt(self, plaintext: str) -> vodozemac.AnyOlmMessage:
++        if self._session is None:
++            raise EncryptionError("The session is not established yet")
+         self.use_time = datetime.now()
+-        return super().encrypt(plaintext)
+-
++        return self._session.encrypt(plaintext.encode("utf-8"))
+ 
+-class InboundSession(olm.InboundSession, _SessionExpirationMixin):
+-    def __new__(cls, *args):
+-        return super().__new__(cls, *args)
+-
+-    def __init__(self, account, message, identity_key=None):
+-        super().__init__(account, message, identity_key)
+-        self.creation_time = datetime.now()
++    def decrypt(
++        self, message: OlmMessageT, unicode_errors: str = "replace"
++    ) -> str:
++        if self._session is None:
++            raise EncryptionError("The session is not established yet")
+         self.use_time = datetime.now()
++        if isinstance(message, vodozemac.PreKeyMessage):
++            message = message.to_any()
++        return self._session.decrypt(message).decode(errors=unicode_errors)
++
++    def matches(self, message: vodozemac.PreKeyMessage) -> bool:
++        if self._session is None:
++            return False
++        return self._session.session_matches(message)
++
++
++class InboundSession(Session):
++    """An inbound Olm session created from a pre-key message.
++
++    The engine hands back the decrypted first message while it creates the
++    session, while the API here starts with an empty session and decrypts the
++    message on the first call.  The plaintext is therefore held until the
++    first :meth:`decrypt`.
++    """
+ 
+-    def decrypt(self, ciphertext, unicode_errors="replace"):
+-        self.use_time = datetime.now()
+-        return super().decrypt(ciphertext, unicode_errors)
++    def __init__(
++        self,
++        account: OlmAccount,
++        message: OlmMessageT,
++        identity_key: Optional[str] = None,
++    ) -> None:
++        super().__init__()
++        self._account = account
++        self._identity_key = identity_key
+ 
+-    def encrypt(self, plaintext):
+-        self.use_time = datetime.now()
+-        return super().encrypt(plaintext)
++    def decrypt(
++        self, message: OlmMessageT, unicode_errors: str = "replace"
++    ) -> str:
++        if self._session is None:
++            if self._identity_key is None:
++                raise EncryptionError("An identity key is needed to create a session")
++            self._session, plaintext = self._account.create_inbound_session(
++                self._identity_key, message
++            )
++            self.use_time = datetime.now()
++            return plaintext.decode(errors=unicode_errors)
++        return super().decrypt(message, unicode_errors)
+ 
+ 
+-class OutboundSession(olm.OutboundSession, _SessionExpirationMixin):
+-    def __new__(cls, *args):
+-        return super().__new__(cls, *args)
++class OutboundSession(Session):
++    """An outbound Olm session, backed by the maintained engine."""
+ 
+-    def __init__(self, account, identity_key, one_time_key):
+-        super().__init__(account, identity_key, one_time_key)
+-        self.creation_time = datetime.now()
+-        self.use_time = datetime.now()
+-
+-    def decrypt(self, ciphertext, unicode_errors="replace"):
+-        self.use_time = datetime.now()
+-        return super().decrypt(ciphertext, unicode_errors)
++    def __init__(
++        self, account: OlmAccount, identity_key: str, one_time_key: str
++    ) -> None:
++        super().__init__(
++            session=account.create_outbound_session(identity_key, one_time_key)
++        )
+ 
+-    def encrypt(self, plaintext):
+-        self.use_time = datetime.now()
+-        return super().encrypt(plaintext)
+ 
++class InboundGroupSession:
++    """An inbound Megolm session, backed by the maintained engine."""
+ 
+-class InboundGroupSession(olm.InboundGroupSession):
+     def __init__(
+         self,
+         session_key: str,
+@@ -124,32 +286,53 @@
+         sender_key: str,
+         room_id: str,
+         forwarding_chains: Optional[List[str]] = None,
++        session: Optional[vodozemac.InboundGroupSession] = None,
+     ) -> None:
++        if session is None:
++            session = vodozemac.InboundGroupSession(
++                vodozemac.SessionKey(session_key)
++            )
++        self._session = session
+         self.ed25519 = signing_key
+         self.sender_key = sender_key
+         self.room_id = room_id
+-        self.forwarding_chain: List[str] = forwarding_chains or []
+-        super().__init__(session_key)
++        self.forwarding_chain: List[str] = list(forwarding_chains or [])
++
++    @property
++    def id(self) -> str:
++        return self._session.session_id
+ 
+-    def __new__(cls, *args):
+-        return super().__new__(cls)
++    @property
++    def first_known_index(self) -> int:
++        return self._session.first_known_index
+ 
+     @classmethod
+     def from_pickle(
+         cls,
+-        pickle: bytes,
++        pickle: Union[str, bytes],
+         signing_key: str,
+         sender_key: str,
+         room_id: str,
+         passphrase: str = "",
+         forwarding_chain: Optional[List[str]] = None,
+-    ) -> InboundGroupSession:
+-        session = super().from_pickle(pickle, passphrase)
+-        session.ed25519 = signing_key
+-        session.sender_key = sender_key
+-        session.room_id = room_id
+-        session.forwarding_chain = forwarding_chain or []
+-        return session
++    ) -> "InboundGroupSession":
++        raw = _as_text(pickle)
++        try:
++            impl = vodozemac.InboundGroupSession.from_pickle(
++                raw, _pickle_key(passphrase)
++            )
++        except vodozemac.PickleException:
++            impl = vodozemac.InboundGroupSession.from_libolm_pickle(
++                raw, _as_bytes(passphrase)
++            )
++        return cls(
++            session_key="",
++            signing_key=signing_key,
++            sender_key=sender_key,
++            room_id=room_id,
++            forwarding_chains=forwarding_chain,
++            session=impl,
++        )
+ 
+     @classmethod
+     def import_session(
+@@ -159,16 +342,38 @@
+         sender_key: str,
+         room_id: str,
+         forwarding_chain: Optional[List[str]] = None,
+-    ):
+-        session = super().import_session(session_key)
+-        session.ed25519 = signing_key
+-        session.sender_key = sender_key
+-        session.room_id = room_id
+-        session.forwarding_chain = forwarding_chain or []
+-        return session
++    ) -> "InboundGroupSession":
++        impl = vodozemac.InboundGroupSession.import_session(
++            vodozemac.ExportedSessionKey(session_key)
++        )
++        return cls(
++            session_key="",
++            signing_key=signing_key,
++            sender_key=sender_key,
++            room_id=room_id,
++            forwarding_chains=forwarding_chain,
++            session=impl,
++        )
++
++    def export_session(self, message_index: int) -> str:
++        exported = self._session.export_at(message_index)
++        if exported is None:
++            raise EncryptionError("The session cannot be exported at this index")
++        return exported.to_base64()
++
++    def pickle(self, passphrase: str = "") -> bytes:
++        return self._session.pickle(_pickle_key(passphrase)).encode("utf-8")
++
++    def decrypt(
++        self, message: str, unicode_errors: str = "replace"
++    ) -> Tuple[str, int]:
++        decrypted = self._session.decrypt(
++            vodozemac.MegolmMessage.from_base64(message)
++        )
++        return decrypted.plaintext.decode(errors=unicode_errors), decrypted.message_index
+ 
+ 
+-class OutboundGroupSession(olm.OutboundGroupSession):
++class OutboundGroupSession:
+     """Outbound group session aware of the users it is shared with.
+ 
+     Also remembers the time it was created and the number of messages it has
+@@ -180,7 +385,10 @@
+ 
+     """
+ 
+-    def __init__(self):
++    def __init__(
++        self, session: Optional[vodozemac.GroupSession] = None
++    ) -> None:
++        self._session = session if session is not None else vodozemac.GroupSession()
+         self.max_age = timedelta(days=7)
+         self.max_messages = 100
+         self.creation_time = datetime.now()
+@@ -188,19 +396,39 @@
+         self.users_shared_with: Set[Tuple[str, str]] = set()
+         self.users_ignored: Set[Tuple[str, str]] = set()
+         self.shared = False
+-        super().__init__()
+ 
+-    def __new__(cls, **kwargs):
+-        return super().__new__(cls)
++    @property
++    def id(self) -> str:
++        return self._session.session_id
+ 
+-    def mark_as_shared(self):
+-        self.shared = True
++    @property
++    def message_index(self) -> int:
++        return self._session.message_index
+ 
+     @property
+-    def expired(self):
++    def session_key(self) -> str:
++        return self._session.session_key.to_base64()
++
++    @property
++    def expired(self) -> bool:
+         return self.should_rotate()
+ 
+-    def should_rotate(self):
++    @classmethod
++    def from_pickle(
++        cls, pickle: Union[str, bytes], passphrase: str = ""
++    ) -> "OutboundGroupSession":
++        impl = vodozemac.GroupSession.from_pickle(
++            _as_text(pickle), _pickle_key(passphrase)
++        )
++        return cls(session=impl)
++
++    def pickle(self, passphrase: str = "") -> bytes:
++        return self._session.pickle(_pickle_key(passphrase)).encode("utf-8")
++
++    def mark_as_shared(self) -> None:
++        self.shared = True
++
++    def should_rotate(self) -> bool:
+         """Should the session be rotated?
+         Returns:
+             True if it should, False if not.
+@@ -212,7 +440,7 @@
+             return True
+         return False
+ 
+-    def encrypt(self, plaintext):
++    def encrypt(self, plaintext: str) -> str:
+         if not self.shared:
+             raise EncryptionError("Error, session is not shared")
+ 
+@@ -220,4 +448,4 @@
+             raise EncryptionError("Error, session is has expired")
+ 
+         self.message_count += 1
+-        return super().encrypt(plaintext)
++        return self._session.encrypt(plaintext.encode("utf-8")).to_base64()
+diff -ruN a/src/nio/store/__init__.py b/src/nio/store/__init__.py
+--- a/src/nio/store/__init__.py	2026-10-29 00:14:14.000000000 +0000
++++ b/src/nio/store/__init__.py	2026-10-29 00:38:13.485562627 +0000
+@@ -15,7 +15,7 @@
+ 
+ from .._compat import package_installed
+ 
+-if package_installed("olm"):
++if package_installed("vodozemac"):
+     from .log import logger
+     from .file_trustdb import Ed25519Key, Key, KeyStore
+     from .models import (
+diff -ruN a/src/nio/store/file_trustdb.py b/src/nio/store/file_trustdb.py
+--- a/src/nio/store/file_trustdb.py	2026-10-29 00:14:16.000000000 +0000
++++ b/src/nio/store/file_trustdb.py	2026-10-29 00:39:00.223325869 +0000
+@@ -3,6 +3,7 @@
+ from functools import wraps
+ from typing import Any, Iterator, List, Optional
+ 
++import vodozemac
+ from atomicwrites import atomic_write
+ 
+ from ..crypto import OlmDevice
+@@ -72,11 +73,16 @@
+         Returns:
+             True if the signature is valid, False otherwise.
+         """
+-        import olm
+-
+         try:
+-            olm.ed25519_verify(self.key, message, signature)
+-        except olm.utility.OlmVerifyError:
++            key = vodozemac.Ed25519PublicKey.from_base64(self.key)
++            signature_object = vodozemac.Ed25519Signature.from_base64(signature)
++            key.verify_signature(message.encode(), signature_object)
++        except (
++            vodozemac.KeyException,
++            vodozemac.SignatureException,
++            vodozemac.DecodeException,
++        ):
++            # A missing, malformed or wrong key/signature never verifies.
+             return False
+ 
+         return True

@@ -1,0 +1,91 @@
+diff --git a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
+index f5ab29d94..6532745cd 100644
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
+@@ -233,6 +233,8 @@ export class McpManager {
+ 
+         // Extract agent config and other data
+         this.agentConfig = result.agentConfig
++        // Run the agent's spawn hooks, if the active configuration declares any.
++        void this.runAgentSpawnHooks(this.agentConfig)
+         this.permissionManager = new AgentPermissionManager(
+             this.agentConfig,
+             (serverName: string) => this.getAvailableToolsForServer(serverName),
+@@ -376,6 +378,36 @@ export class McpManager {
+         }
+     }
+ 
++    /**
++     * Run the shell commands the active agent configuration lists as spawn hooks.
++     * Hook failures are logged and never block server discovery.
++     */
++    private async runAgentSpawnHooks(agentConfig: AgentConfig): Promise<void> {
++        const hooks = agentConfig?.hooks?.agentSpawn
++        if (!Array.isArray(hooks) || hooks.length === 0) {
++            return
++        }
++        let cwd: string | undefined
++        try {
++            const folders = this.features.workspace.getAllWorkspaceFolders()
++            if (folders.length > 0) cwd = URI.parse(folders[0].uri).fsPath
++        } catch {}
++        for (const hook of hooks) {
++            if (!hook || typeof hook.command !== 'string' || hook.command.trim() === '') {
++                continue
++            }
++            try {
++                const { spawn } = require('child_process')
++                const child = spawn(hook.command, { shell: true, cwd, stdio: 'ignore' })
++                child.on('error', (e: any) =>
++                    this.features.logging.warn(`MCP: agent spawn hook failed: ${e?.message ?? e}`)
++                )
++            } catch (e: any) {
++                this.features.logging.warn(`MCP: agent spawn hook failed: ${e?.message ?? e}`)
++            }
++        }
++    }
++
+     /**
+      * Start a server process, connect client, and register its tools.
+      * Errors are logged but do not stop discovery of other servers.
+diff --git a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
+index 694554207..3b30a1f30 100644
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
+@@ -402,6 +402,19 @@ export async function loadAgentConfig(
+             }
+         }
+ 
++        // 5c) Collect the lifecycle hooks declared by this agent configuration
++        if (json.hooks && typeof json.hooks === 'object') {
++            if (!agentConfig.hooks) {
++                agentConfig.hooks = { agentSpawn: [], userPromptSubmit: [] }
++            }
++            if (Array.isArray(json.hooks.agentSpawn)) {
++                agentConfig.hooks.agentSpawn!.push(...json.hooks.agentSpawn)
++            }
++            if (Array.isArray(json.hooks.userPromptSubmit)) {
++                agentConfig.hooks.userPromptSubmit!.push(...json.hooks.userPromptSubmit)
++            }
++        }
++
+         // 6) Process MCP servers (similar to loadMcpServerConfigs)
+         if (json.mcpServers && typeof json.mcpServers === 'object') {
+             for (const [name, entryRaw] of Object.entries(json.mcpServers)) {
+@@ -612,7 +625,15 @@ export async function loadAgentConfig(
+         for (const [sanitizedName, mcpConfig] of mcpResult.servers) {
+             const originalName = mcpResult.serverNameMapping.get(sanitizedName)
+             if (originalName) {
+-                servers.set(sanitizedName, mcpConfig)
++                // If the agent configuration already had this server, keep the
++                // bookkeeping recorded for it (permissions and management actions
++                // are keyed on the agent file) while the legacy entry supplies the
++                // execution settings.
++                const prior = servers.get(sanitizedName)
++                const mergedConfig = prior
++                    ? { ...mcpConfig, __configPath__: prior.__configPath__ }
++                    : mcpConfig
++                servers.set(sanitizedName, mergedConfig)
+                 serverNameMapping.set(sanitizedName, originalName)
+ 
+                 // Add MCP server tools to agent config for permission management

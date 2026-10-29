@@ -1,0 +1,242 @@
+{
+ "slug": "social-core-s5",
+ "candidate": "5847: GHSA-VQG6-3FW6-J9JG / CVE-2026-57179 / PYSEC-2026-4168 (python-social-auth/social-core) \u2014 session fixation / login CSRF by cross-session resume of a stored partial pipeline",
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "6fcde2c2bf16b6fefb15316e4c9f7a9d9ddfd95b (parent of published fix 0418782454ac7bbc6a9230ea21f7f5066fe89686; the fix's regression tests are absent from the pinned tree, confirmed with git log 6fcde2c..0418782)",
+  "entry_points": [
+   "social_core.actions.do_complete (framework completion action)",
+   "social_core.actions.do_disconnect (framework disconnect action)",
+   "social_core.utils.partial_pipeline_data (public partial-resume utility)",
+   "social_core.pipeline.utils.partial_resume (injected public pipeline resume helper)",
+   "social_core.backends.base.BaseAuth.continue_pipeline (public backend resume hook)",
+   "social_core.backends.facebook_limited.FacebookLimitedLogin.continue_pipeline (injected provider override)"
+  ],
+  "sites": [
+   "social_core/utils.py:289-397 \u2014 shared resume decision (T1)",
+   "social_core/pipeline/partial.py:45-58 and social_core/pipeline/mail.py:13-37 \u2014 stored out-of-band allowance producer (T1)",
+   "social_core/backends/base.py:269-275 \u2014 lower-level resume hook, no ownership decision at the pinned commit (T2)",
+   "social_core/pipeline/utils.py:107-135 \u2014 injected pipeline resume helper (T3)",
+   "social_core/backends/facebook_limited.py:35-50 \u2014 injected provider resume override (T4)"
+  ],
+  "routes": [
+   "do_complete and do_disconnect with a stored flow identifier that belongs to another session (T1); confirmed reachable through the public actions",
+   "BaseAuth.continue_pipeline with a partial loaded through BaseStrategy.partial_load (T2); confirmed reachable through the public backend API",
+   "pipeline.utils.partial_resume with another session's identifier (T3); confirmed reachable through the public pipeline helper",
+   "FacebookLimitedLogin.continue_pipeline with a partial loaded through the strategy loader (T4); confirmed reachable through the provider resume hook",
+   "BaseOpenID.continue_pipeline (screener O8 route 2) is not built on: at the pinned commit its override passes response= together with partial.kwargs, which always already contains response, so a product-produced partial raises TypeError before any flow resumes"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "social_core/tests/test_utils.py \u2014 51 tests, passes at the pinned commit, on every security_fail check and on the reference fix",
+   "social_core/tests/actions/test_login.py \u2014 included in the same 51, passes at the pinned commit and on the reference fix"
+  ],
+  "local_runs": "Local matrix (pinned+injection and each checks/ variant, Python 3.12): nop security 0/8, functional 9/9 (plus project 51/51); oracle security 8/8, functional 9/9 (plus project 51/51); upstream_only security 5/8 (base, helper and provider routes fail); miss_continue security 7/8 (base route); miss_helper security 7/8 (helper route); miss_provider security 7/8 (provider route); miss_external security 7/8 (request-supplied proof on a non-external flow); ff_refuse_all functional 1/9; ff_refuse_external functional 8/9 (out-of-band completion); sf_crash security 7/8 (crash instead of a refusal); sf_wrong_resource security 3/8; pass_alt_loader and pass_hardening reward 1.0.",
+  "environment": "Python 3.13-slim, project fetched from GitHub at build time at the pinned commit, injection.patch applied, dependencies installed at image build, tests run offline as uid 1000",
+  "gate_2026_10_29": {
+   "static": "PASS",
+   "nop": "PASS (security 0/8, functional 9/9 + project 51/51)",
+   "oracle": "PASS (3 runs, reward 1.0 each)",
+   "patches": "PASS (11/11 checks as declared)"
+  },
+  "pattern_b_register": "build/audit/uncovered-routes.tsv rows for T2 (real), T3 and T4 (injected)"
+ },
+ "leak_terms": [
+  "partial_pipeline_data",
+  "partial_pipeline_result",
+  "partial_pipeline_resume_owned",
+  "partial_step",
+  "continue_pipeline",
+  "partial_resume",
+  "partial_load",
+  "do_complete",
+  "do_disconnect",
+  "mail_validation",
+  "allow_external_resume",
+  "external_resume",
+  "verification_code",
+  "session_token",
+  "clean_partial_pipeline",
+  "PARTIAL_TOKEN_SESSION_NAME",
+  "PARTIAL_PIPELINE_TOKEN_NAME",
+  "PARTIAL_PIPELINE_ALLOW_EXTERNAL_RESUME",
+  "AuthForbidden",
+  "social_core",
+  "pipeline",
+  "utils.py",
+  "actions.py",
+  "partial.py",
+  "mail.py",
+  "strategy.py",
+  "base.py",
+  "facebook_limited.py",
+  "open_id.py",
+  "GHSA-VQG6-3FW6-J9JG",
+  "CVE-2026-57179",
+  "PYSEC-2026-4168"
+ ],
+ "patch_checks": [
+  {
+   "patch": "upstream_only.patch",
+   "expect": "security_fail",
+   "note": "published fix applied as shipped: the lower-level resume hook, the pipeline resume helper and the provider override are untouched, so those three security cases still fail; the functional suite passes"
+  },
+  {
+   "patch": "miss_external.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T1"
+   ],
+   "note": "trusts a request-supplied out-of-band proof instead of the allowance recorded on the stored flow"
+  },
+  {
+   "patch": "miss_continue.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T2"
+   ],
+   "note": "shared decision, stored-flow allowance, helper and provider override are correct; the lower-level resume hook is left unguarded"
+  },
+  {
+   "patch": "miss_helper.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T3"
+   ],
+   "note": "all other paths are guarded; the pipeline resume helper is left unguarded"
+  },
+  {
+   "patch": "miss_provider.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "T4"
+   ],
+   "note": "all other paths are guarded; the provider resume override restores the flow without the ownership decision"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "the ownership decision refuses every resume, including the session that started the flow"
+  },
+  {
+   "patch": "ff_refuse_external.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "note": "the out-of-band validation step stops opting in, breaking the emailed validation completion"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "note": "raises an unclean runtime error instead of the library's refusal on the lower-level resume hook"
+  },
+  {
+   "patch": "sf_wrong_resource.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "note": "decides on the backend name (a neighbouring object) instead of the stored flow's ownership"
+  },
+  {
+   "patch": "pass_alt_loader.patch",
+   "kind": "pass",
+   "expect": "pass",
+   "note": "independent design: the ownership decision lives in the stored-flow loader, so every resume path inherits it"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "note": "reference fix plus defensive type and empty-value checks on the same paths"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "sf_wrong_resource.patch",
+  "one_role_or_direction": "n/a: the library continues one kind of stored flow; there is no role, peer or direction variant in this operation",
+  "reads_only": "n/a: continuing a stored flow is one state-changing operation; there is no read/write pair to guard separately",
+  "check_after_adjustment": "n/a: the identifier is an exact storage key resolved from three sources, not normalised or adjusted",
+  "unlisted_route": "miss_helper.patch",
+  "malformed_identity": "n/a: the identifier is an exact storage key; a malformed value does not resolve to a stored flow, so the lookup fails closed",
+  "missing_authority": "n/a: the decision uses the caller's own session and the stored flow; there is no external authority whose empty answer could fail open",
+  "adjacent_api": "ff_refuse_all.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "type": "how-type",
+   "origin": "advisory_route",
+   "shape": "producer off the check's path plus a coupled must-keep-working value: the resume decision needs the out-of-band completion allowance recorded on the stored flow when it halted; the check reads the saved allowance and never calls the producer, and a plain session-equality rule breaks the emailed validation completion",
+   "where": "social_core/utils.py:289-397 (check); social_core/pipeline/partial.py:45-58 and social_core/pipeline/mail.py:13-37 (producer)",
+   "security_tests": [
+    "tests/security/test_resume_ownership.py::ResumeOwnershipTest::test_request_proof_alone_does_not_authorise_a_foreign_flow"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_resume_flows.py::ResumeFlowsTest::test_out_of_band_flow_completes_from_a_fresh_session",
+    "tests/functional/test_resume_flows.py::ResumeFlowsTest::test_session_token_resumes_the_flow"
+   ],
+   "security_fail_patch": "miss_external.patch",
+   "realistic_because": "the advisory's own route: the public resume utility takes a token from the request and never binds it to the session that started the flow"
+  },
+  {
+   "id": "T2",
+   "type": "how-type",
+   "origin": "uncovered_route",
+   "shape": "route where the protection never existed: the public backend resume hook continues any partial it is handed, with no ownership decision; the published fix never touches it",
+   "where": "social_core/backends/base.py:269-275",
+   "security_tests": [
+    "tests/security/test_resume_ownership.py::ResumeOwnershipTest::test_low_level_resume_hook_refuses_another_sessions_flow"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_resume_flows.py::ResumeFlowsTest::test_low_level_resume_hook_resumes_the_owning_session"
+   ],
+   "security_fail_patch": "miss_continue.patch",
+   "realistic_because": "real, unmodified upstream code: a lower-level library API used by framework integrations, not a user-facing view"
+  },
+  {
+   "id": "T3",
+   "type": "where-type",
+   "origin": "injected_sibling",
+   "shape": "second implementation of the resume operation: a public pipeline helper loads a stored flow by identifier and continues it through the authentication entry point, bypassing the shared utility",
+   "where": "social_core/pipeline/utils.py:107-135",
+   "security_tests": [
+    "tests/security/test_resume_ownership.py::ResumeOwnershipTest::test_pipeline_helper_refuses_another_sessions_token"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_resume_flows.py::ResumeFlowsTest::test_pipeline_helper_resumes_the_owning_session"
+   ],
+   "security_fail_patch": "miss_helper.patch",
+   "realistic_because": "maintainer-plausible: sits next to the existing stored-flow loader and store helpers, reads like internal storage plumbing, and framework integrations are the intended callers"
+  },
+  {
+   "id": "T4",
+   "type": "where-type",
+   "origin": "injected_sibling",
+   "shape": "second implementation behind a subclass override: a provider backend restores its saved identity claims and runs the stored flow itself rather than delegating to the base resume hook",
+   "where": "social_core/backends/facebook_limited.py:35-50",
+   "security_tests": [
+    "tests/security/test_resume_ownership.py::ResumeOwnershipTest::test_provider_resume_override_refuses_another_sessions_flow"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_resume_flows.py::ResumeFlowsTest::test_provider_resume_override_resumes_the_owning_session"
+   ],
+   "security_fail_patch": "miss_provider.patch",
+   "realistic_because": "maintainer-plausible: the project already has one provider with its own resume override, and this backend validates an ID token once and then restores the claims on resume"
+  }
+ ],
+ "status": "built; gate PASS (static, nop, oracle x3, patches); target-model trials not run"
+}

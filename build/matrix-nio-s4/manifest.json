@@ -1,0 +1,199 @@
+{
+ "slug": "matrix-nio-s4",
+ "candidate": {
+  "entry_id": "6061",
+  "advisory_ids": [
+   "GHSA-WCHH-9X6H-7F6P"
+  ],
+  "repo": "matrix-nio/matrix-nio",
+  "pinned_commit": "13e77bb8fce48c4abc6fa7f334f1a797bf33052c",
+  "fix_commits": [
+   "71a1c808bc2ae6ea2a6e8effa7c11bd09796c626"
+  ],
+  "cwe_id": "CWE-1395",
+  "pattern": "A",
+  "track": "injected"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "Library public API on the injected vulnerable tree. With the deprecated backend absent, `import nio.crypto` succeeds but reports ENCRYPTION_ENABLED False and exports none of the encryption classes, so every account/session/group/store/verification operation fails (reproduced: 20/20 hidden security tests fail). With the deprecated backend present, the sibling trust-store signature check and the fallback-key publication run through it (reproduced: 13/13 hidden functional tests pass at the pinned commit and on the reference fix).",
+  "sites": [
+   "src/nio/crypto/__init__.py:23 import gate",
+   "src/nio/store/__init__.py:18 import gate",
+   "src/nio/crypto/sessions.py:21-120 account wrapper and pickle format",
+   "src/nio/crypto/sessions.py:155-360 session/group wrappers, import/export, pickle",
+   "src/nio/crypto/olm_machine.py:23-26 engine imports and exceptions",
+   "src/nio/crypto/olm_machine.py:289-354 key publication incl. fallback keys (sibling)",
+   "src/nio/crypto/olm_machine.py:358-394 to-device encrypt and wire encoding",
+   "src/nio/crypto/olm_machine.py:1461-1545 to-device decrypt and message types",
+   "src/nio/crypto/olm_machine.py:1858-1880 signed-object verification",
+   "src/nio/crypto/olm_machine.py:1892-1995 key export/import",
+   "src/nio/crypto/sas.py:46-720 SAS state machine",
+   "src/nio/store/database.py:170-300 stored-state load/save",
+   "src/nio/store/file_trustdb.py:65-92 trust-store signature check (sibling)"
+  ],
+  "variants": [
+   "account identity/signing/one-time keys/pickle roundtrip",
+   "one-to-one session roundtrip and reply, session pickle",
+   "group session encrypt/decrypt and export/import",
+   "store save/reload of account and session",
+   "state saved by earlier releases (account v4, account v2, session v1, inbound group v1)",
+   "to-device wire body encoding and pre-key/normal message decryption",
+   "signed device object and trust-store key verification",
+   "SAS handshake (both devices verified)",
+   "room-key export/import file",
+   "key publication including fallback keys"
+  ],
+  "services": [
+   "none"
+  ],
+  "project_tests_run": "tests/sessions_test.py tests/encryption_test.py tests/sas_test.py tests/store_test.py tests/key_export_test.py: 113 passed at the pinned (injected) commit with the deprecated backend importable from /opt/legacy-e2e; the environment image build runs the same suite."
+ },
+ "leak_terms": [
+  "libolm",
+  "olm",
+  "python-olm",
+  "vodozemac",
+  "pickle",
+  "GHSA-WCHH-9X6H-7F6P",
+  "CVE-2022-39255",
+  "CVE-2024-45193",
+  "derive_pickle_key",
+  "from_libolm_pickle",
+  "upgrade_pickle",
+  "fallback_key",
+  "AnyOlmMessage",
+  "PreKeyMessage",
+  "olm_machine",
+  "sessions.py",
+  "sas.py",
+  "database.py",
+  "file_trustdb.py"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-legacy-via-olm.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-wire-normal.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-fail-open.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-refuse-all.patch",
+   "expect": "security_fail",
+   "kind": "catalogue"
+  },
+  {
+   "patch": "ff-remove-legacy.patch",
+   "expect": "functional_fail",
+   "kind": "catalogue"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "sf-refuse-all.patch",
+  "crash_as_refusal": "n/a: a crash and a clean refusal are the same observable outcome here - the encryption operation does not happen - so sf-refuse-all covers this class",
+  "wrong_resource": "n/a: the property is about which backend performs the work, not an authorization decision over a resource",
+  "one_role_or_direction": "n/a: encryption and decryption are both required by the functional roundtrips, so a one-direction fix fails functional as well and is not a distinct class here",
+  "reads_only": "n/a: there is no read/write split; both encryption and decryption are required",
+  "check_after_adjustment": "n/a: no normalising or adjusting step sits between the input and the protected operation",
+  "unlisted_route": "sf-legacy-via-olm.patch",
+  "malformed_identity": "n/a: the protected object is backend availability, not a parsed identity that a malformed spelling can hide",
+  "missing_authority": "sf-fail-open.patch",
+  "adjacent_api": "ff-remove-legacy.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-legacy-state",
+   "shape": "coupled must-keep-working + producer/consumer: state persisted by earlier releases must still load and be usable on a deployment without the deprecated backend",
+   "where": "src/nio/crypto/sessions.py:67-120,186-210,330-362; src/nio/store/database.py:170-300",
+   "security_tests": [
+    "security/test_store_state.py::test_state_saved_by_an_earlier_version_loads",
+    "security/test_store_state.py::test_saved_group_session_loads"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legacy_state.py::test_account_saved_by_an_earlier_release_loads",
+    "functional/test_legacy_state.py::test_group_session_saved_by_an_earlier_release_loads",
+    "functional/test_legacy_state.py::test_oldest_supported_account_pickle_loads"
+   ],
+   "security_fail_patch": "sf-legacy-via-olm.patch",
+   "realistic_because": "the natural port reads new-format state only, or upgrades old state by round-tripping through the engine being removed; the maintained backend can read the newer legacy formats itself, which is the mechanism a solver must understand",
+   "how_type": true,
+   "reason_to_dismiss": "old stored state belongs to the engine that is being removed, so it is treated as out of scope"
+  },
+  {
+   "id": "T2-wire-shape",
+   "shape": "input shape a plausible port mishandles: the encrypted body is text on the JSON wire and normal (non pre-key) messages must be recognised, not just the first pre-key message",
+   "where": "src/nio/crypto/olm_machine.py:358-394, 1495-1520",
+   "security_tests": [
+    "security/test_wire_messages.py::test_ciphertext_body_is_text_on_the_wire",
+    "security/test_wire_messages.py::test_prekey_and_normal_messages_decrypt"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_wire_and_trust.py::test_group_key_sharing_over_the_wire"
+   ],
+   "security_fail_patch": "sf-wire-normal.patch",
+   "realistic_because": "a self-contained roundtrip between the two new objects passes with raw bytes and with pre-key messages only; the wire form and the established-session message type are what a protocol-level port must preserve",
+   "how_type": true,
+   "reason_to_dismiss": "the in-memory encrypt/decrypt roundtrip already passes, so the encoding and the second message type are assumed fine"
+  },
+  {
+   "id": "T3-trust-verify-fail-open",
+   "shape": "route where the protection never existed plus fail-open: the trust database's signature check must still verify on a deployment without the deprecated backend and must not accept anything when it is missing",
+   "where": "src/nio/store/file_trustdb.py:65-92 (injected sibling)",
+   "security_tests": [
+    "security/test_signature_checks.py::test_trusted_device_key_verifies_messages",
+    "security/test_signature_checks.py::test_trusted_device_key_rejects_another_signers_message"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_wire_and_trust.py::test_trust_store_persists_and_verifies"
+   ],
+   "security_fail_patch": "sf-fail-open.patch",
+   "realistic_because": "a trust database that stores device fingerprints plausibly grows a small verification helper; it sits outside the crypto package and is easy to leave on the deprecated backend",
+   "how_type": false,
+   "reason_to_dismiss": "the trust database is treated as fingerprint bookkeeping, so its verification helper is not considered part of the crypto migration"
+  },
+  {
+   "id": "T4-fallback-key-publication",
+   "shape": "coupled must-keep-working next to the key-upload sink: the account wrapper must keep exposing the fallback key that key publication uploads",
+   "where": "src/nio/crypto/olm_machine.py:334-372 (injected sibling); src/nio/crypto/sessions.py:63-78",
+   "security_tests": [
+    "security/test_key_publication.py::test_one_time_and_fallback_keys_are_published"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_wire_and_trust.py::test_key_publication_includes_every_key"
+   ],
+   "security_fail_patch": "n/a: coupled functional trap - the wrong fix that skips the missing method breaks the functional check, which is its intended effect",
+   "realistic_because": "fallback keys are a normal part of Matrix key publication and the deprecated wrapper exposed them for free; a hand-written adapter that only ports the calls the engine itself mentions loses them",
+   "how_type": true,
+   "reason_to_dismiss": "the migration is read as a crypto-engine swap, so key publication is assumed to be unaffected"
+  }
+ ],
+ "status": "built",
+ "notes": "Pinned + injected tree: environment/injection.patch adds fallback-key publication to Olm.share_keys and an Ed25519 verification helper to the trust-database entry class. Reference fix = upstream source migration plus those two sibling ports. The verifier keeps the deprecated backend out of the default import path (/opt/legacy-e2e) and adds it only for the functional group; the security group therefore runs on the deployment the report describes. No pattern B (real, unmodified uncovered) route was found: all crypto in src funnels through the three modules the published fix rewrites, and the screener's docker/ and contrib/ leads are outside the protected source. The injected siblings are listed in manifest.traps; every other injected/real candidate considered is recorded in notes.md."
+}

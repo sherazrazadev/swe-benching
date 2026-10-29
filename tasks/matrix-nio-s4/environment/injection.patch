@@ -1,0 +1,72 @@
+diff --git a/src/nio/crypto/olm_machine.py b/src/nio/crypto/olm_machine.py
+index 40b46ca..1b6d58c 100644
+--- a/src/nio/crypto/olm_machine.py
++++ b/src/nio/crypto/olm_machine.py
+@@ -336,6 +336,24 @@ class Olm:
+ 
+             return one_time_key_dict
+ 
++        def fallback_keys():
++            fallback_key_dict = {}
++
++            keys = self.account.fallback_key["curve25519"]
++
++            for key_id, key in keys.items():
++                key_dict = {"key": key}
++                signature = self.sign_json(key_dict)
++
++                fallback_key_dict["signed_curve25519:" + key_id] = {
++                    "key": key_dict.pop("key"),
++                    "signatures": {
++                        self.user_id: {"ed25519:" + self.device_id: signature}
++                    },
++                }
++
++            return fallback_key_dict
++
+         content: Dict[Any, Any] = {}
+ 
+         # We're sharing our account for the first time, upload the identity
+@@ -345,6 +363,12 @@ class Olm:
+             generate_one_time_keys(0)
+             content["one_time_keys"] = one_time_keys()
+ 
++            # Publish a fallback key so that devices can start a session with
++            # us once all of our one-time keys have been claimed.
++            if not self.account.fallback_key["curve25519"]:
++                self.account.generate_fallback_key()
++            content["fallback_keys"] = fallback_keys()
++
+         # Just upload one-time keys.
+         else:
+             if self.uploaded_key_count is None:
+diff --git a/src/nio/store/file_trustdb.py b/src/nio/store/file_trustdb.py
+index 06dd068..26b57c5 100644
+--- a/src/nio/store/file_trustdb.py
++++ b/src/nio/store/file_trustdb.py
+@@ -62,6 +62,25 @@ class Ed25519Key(Key):
+ 
+         return False
+ 
++    def verify(self, message: str, signature: str) -> bool:
++        """Check that a message was signed by the key in this entry.
++
++        Args:
++            message (str): The message that was signed.
++            signature (str): The unpadded base64 encoded signature.
++
++        Returns:
++            True if the signature is valid, False otherwise.
++        """
++        import olm
++
++        try:
++            olm.ed25519_verify(self.key, message, signature)
++        except olm.utility.OlmVerifyError:
++            return False
++
++        return True
++
+ 
+ class KeyStore:
+     def __init__(self, filename: str):

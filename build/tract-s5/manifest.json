@@ -1,0 +1,308 @@
+{
+ "slug": "tract-s5",
+ "candidate": "screener entry 21634: unchecked integer overflow in header-derived tensor sizes while reading models (sonos/tract), pattern B with injected sibling containers",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "bee4349bee53862f52e4db13fb2ee0278770c94d (git rev-parse 34c7df2c9bd2a36583e09b52f3e6319bf23102e8^ == this commit; the pinned tree carries no regression test for the advisory)",
+  "injected_siblings": "Two weight containers added to the tree by environment/injection.patch: a TensorBundleLoader registered beside the existing resource loaders (nnef/src/bundle.rs) and a LegacyTensorLoader for the pre-1.0 single-tensor file (nnef/src/legacy.rs). Both are ordinary-looking maintainer code, reachable through model_for_path, and untouched by the published fix.",
+  "entry_points": [
+   "library API: tract_nnef::nnef().model_for_path on a model directory holding graph.nnef and weight files",
+   "library API: tract_nnef::tensors::read_tensor for one NNEF tensor file",
+   "library API: tract_onnx::onnx().model_for_path on an ONNX model file"
+  ],
+  "sites": [
+   "nnef/src/tensors.rs:61-84 (read_tensor: element count, bool bit count and plain byte count)",
+   "nnef/src/tensors.rs:274-295 (read_block_quant_value: block byte count)",
+   "nnef/src/ops/nnef/deser.rs:105-122 (variable: the graph-declared shape of a block-quantized constant)",
+   "onnx/src/tensor.rs:113-134 (create_tensor: model-declared initializer dimensions)",
+   "nnef/src/bundle.rs:45-80 (read_bundle: a bundle entry's declared byte length) [injected]",
+   "nnef/src/legacy.rs:33-70 (try_load: a legacy tensor file's declared byte length) [injected]"
+  ],
+  "routes": [
+   "plain tensor file, f32 dimensions whose byte count overflows (confirmed: security test fails on the pinned+injected copy)",
+   "plain tensor file, f64 dimensions whose byte count overflows (confirmed)",
+   "plain tensor file, u8 element count that overflows a usize (confirmed)",
+   "the same plain tensor file reached through a model directory (confirmed)",
+   "block-quantized tensor file whose block byte count overflows (confirmed; survives the published fix)",
+   "block-quantized constant whose graph-declared shape does not match its payload (confirmed; survives the published fix)",
+   "ONNX model whose initializer dimensions overflow its byte size (confirmed; survives the published fix)",
+   "bundled weight whose element count matches its shape but whose byte count overflows (confirmed; injected, survives the published fix)",
+   "legacy single-tensor file whose element count matches its shape but whose byte count overflows (confirmed; injected, survives the published fix)",
+   "screener O8b String route: NOT a route at the pinned commit. Behavioural test showed read_tensor reaches Tensor::zero_dt, which rejects String ('String doesn't implement num_traits::Zero'), so no tensor is allocated and no unchecked multiply is reached. Also legitimate String tensors cannot be read back at this commit, so it was dropped rather than built on."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "cargo test -p tract-nnef -p tract-data -p tract-linalg at the pinned+injected tree: 135 + 2850 + 9 + 36 + 4 + 2 tests passed, 0 failed (run in a rust:1.95-slim-bookworm container under the same harness profile)"
+  ],
+  "local_runs": "Built the pinned+injected tree and every checks/ patch in a rust:1.95-slim-bookworm container and ran both hidden suites against each: nop 0/9 security pass (all 9 fail) and 11/11 functional pass; oracle 9/9 + 11/11; each miss_* patch fails exactly its own security test with functional green; sf_crash fails a security test by panicking; ff_unconditional_size and ff_refuse_all fail functional tests; pass_hardening and pass_alt score 20/20; upstream_fix alone closes only the four plain-reader tests and leaves five security tests failing.",
+  "gate": {
+   "static": "PASS (2026-10-29T00:11Z)",
+   "nop": "PASS at 00:23:35Z: security 9 (all fail on the pinned+injected tree), functional 11 (all pass)",
+   "oracle": "PASS at 00:25:59Z: 3 trials, reward 1.0 each, identical results",
+   "patches": "PASS at 00:33:13Z: 12/12 declared checks (6 miss_* each fail exactly their own security test with functional green; sf_crash security_fail; ff_unconditional_size and ff_refuse_all functional_fail; pass_hardening and pass_alt reward 1.0; upstream_fix leaves 5 security tests failing)"
+  }
+ },
+ "leak_terms": [
+  "read_tensor",
+  "write_tensor",
+  "create_tensor",
+  "model_for_path",
+  "read_block_quant_value",
+  "DatLoader",
+  "TensorBundleLoader",
+  "LegacyTensorLoader",
+  "GraphNnefLoader",
+  "SafeTensorsLoader",
+  "BlockQuantStorage",
+  "block_quant",
+  "block-quantized",
+  "Q4_0",
+  "Q8_1",
+  "expected_bytes",
+  "from_raw_dt",
+  "uninitialized_aligned_dt",
+  "tensors.rs",
+  "deser.rs",
+  "tensor.rs",
+  "resource.rs",
+  "bundle.rs",
+  "legacy.rs",
+  "storage.rs",
+  "tract_nnef",
+  "tract_onnx",
+  "tract_data",
+  "tract_linalg",
+  "onnx",
+  "safetensors",
+  "tbundle"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_t1.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T1_dat_byte_size_overflow"
+   ],
+   "note": "the reported plain tensor-file reader stays unchecked; every far site is fixed"
+  },
+  {
+   "patch": "miss_t4.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T4_block_quant_byte_size_overflow"
+   ],
+   "note": "the block-quantized file reader keeps its own unchecked block byte formula"
+  },
+  {
+   "patch": "miss_t5.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T5_block_quant_graph_shape"
+   ],
+   "note": "the graph-declared shape of a block-quantized constant is still taken on trust"
+  },
+  {
+   "patch": "miss_t6.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T6_other_format_overflow"
+   ],
+   "note": "the other format crate's tensor deserializer stays unchecked"
+  },
+  {
+   "patch": "miss_i1.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T7_bundle_byte_size_overflow"
+   ],
+   "note": "the injected bundle container keeps its unchecked byte multiply"
+  },
+  {
+   "patch": "miss_i2.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "misses": [
+    "T8_legacy_byte_size_overflow"
+   ],
+   "note": "the injected legacy container keeps its unchecked byte multiply"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail",
+   "note": "refuses an overflowing element count by panicking instead of returning an error"
+  },
+  {
+   "patch": "ff_unconditional_size.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: requires the declared byte count to equal the payload for every weight file, which rejects the library's own block-quantized payloads"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every tensor file"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: bound the shared allocator's byte product, bound the block-quantized storage constructor, and require the graph shape to hold the same number of values as the tensor file"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "the reference fix plus defensive checked arithmetic in the shared allocator and the block-quantized storage constructor"
+  },
+  {
+   "patch": "upstream_fix.patch",
+   "expect": "security_fail",
+   "note": "recall: the published fix applied alone closes only the plain tensor-file route and leaves five security tests failing"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the property is about a tensor's own declared shape and the data it carries; there is no neighbouring or proxy object whose authority could be confused",
+  "one_role_or_direction": "n/a: every route reads a model or weight file; there is no role, peer or direction pair to fix separately",
+  "reads_only": "n/a: the sink is reading a weight file on every route; there is no write direction to guard",
+  "check_after_adjustment": "n/a: the declared dimensions reach the size computation as they are declared; the block-length division is part of that computation, not an adjustment applied before a check",
+  "unlisted_route": "upstream_fix.patch",
+  "malformed_identity": "n/a: no name, spelling or identity is parsed in the decision; it is arithmetic over the numbers the model or weight file declares",
+  "missing_authority": "n/a: the decision depends only on the numbers in the file; there is no authority or secret lookup that could return nothing",
+  "adjacent_api": "ff_unconditional_size.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_dat_byte_size_overflow",
+   "type": "both",
+   "origin": "advisory_route",
+   "shape": "a tensor file whose header declares dimensions whose product times the element size overflows the byte count the reader uses",
+   "where": "nnef/src/tensors.rs:61-84 (read_tensor), reached from nnef/src/resource.rs:103 (the tensor-file loader) through the model directory reader",
+   "security_tests": [
+    "security/security.rs::sec_dat_plain_byte_size_overflow_is_refused",
+    "security/security.rs::sec_dat_wide_element_overflow_is_refused",
+    "security/security.rs::sec_dat_element_count_overflow_is_refused",
+    "security/security.rs::sec_nnef_model_dat_overflow_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_dat_packed_bool_loads",
+    "functional/functional.rs::fun_dat_zero_length_dimension_loads",
+    "functional/functional.rs::fun_dat_rank_zero_loads",
+    "functional/functional.rs::fun_dat_plain_round_trip"
+   ],
+   "security_fail_patch": "miss_t1.patch",
+   "realistic_because": "the reported route: the published fix is exactly this site"
+  },
+  {
+   "id": "T2_legitimate_tensor_forms",
+   "type": "mimo",
+   "origin": "advisory_route",
+   "shape": "legitimate weight files that an unconditional byte-size rule rejects: packed one-bit booleans with a partial trailing byte, an empty tensor, a rank-0 scalar, and block-quantized payloads whose stored size is not the element count times the element size",
+   "where": "nnef/src/tensors.rs:66-84 (the byte-size equality) and nnef/src/tensors.rs:286-295 (the block formula)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_dat_packed_bool_loads",
+    "functional/functional.rs::fun_dat_zero_length_dimension_loads",
+    "functional/functional.rs::fun_dat_rank_zero_loads",
+    "functional/functional.rs::fun_dat_plain_round_trip",
+    "functional/functional.rs::fun_dat_block_quant_q4_0_loads",
+    "functional/functional.rs::fun_dat_block_quant_q8_1_loads",
+    "functional/functional.rs::fun_nnef_model_block_quant_unflattened_shape_loads"
+   ],
+   "security_fail_patch": "ff_unconditional_size.patch",
+   "realistic_because": "the library's own writer emits the sentinel bits-per-item for block-quantized tensors and packs booleans one bit at a time, so the tempting unconditional equality rejects files the product produces"
+  },
+  {
+   "id": "T4_block_quant_byte_size_overflow",
+   "type": "deepseek",
+   "origin": "uncovered_upstream",
+   "shape": "a block-quantized tensor file whose declared dimensions fit the element count but overflow the block byte count",
+   "where": "nnef/src/tensors.rs:274-295 (read_block_quant_value), mirrored by linalg/src/frame/block_quant/storage.rs:20-39",
+   "security_tests": [
+    "security/security.rs::sec_block_quant_header_byte_size_overflow_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_dat_block_quant_q4_0_loads",
+    "functional/functional.rs::fun_dat_block_quant_q8_1_loads",
+    "functional/functional.rs::fun_nnef_model_block_quant_unflattened_shape_loads"
+   ],
+   "security_fail_patch": "miss_t4.patch",
+   "realistic_because": "real, unmodified upstream code: a second, independent size computation in the same file for the internal block-quantized item types, with its own formula; the published fix never touches it and the element count does not overflow, so a fix at the plain reader cannot close it"
+  },
+  {
+   "id": "T5_block_quant_graph_shape",
+   "type": "mimo",
+   "origin": "uncovered_upstream",
+   "shape": "a block-quantized constant whose payload matches its tensor-file header but not the shape the model declares, which replaces the stored shape",
+   "where": "nnef/src/ops/nnef/deser.rs:105-122 (variable), constructor data/src/tensor.rs:196-210",
+   "security_tests": [
+    "security/security.rs::sec_block_quant_graph_shape_mismatch_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_nnef_model_block_quant_unflattened_shape_loads"
+   ],
+   "security_fail_patch": "miss_t5.patch",
+   "realistic_because": "real, unmodified upstream code: the plain branch checks shape equality, while the block-quantized branch deliberately takes the graph's shape because the file stores a flattened matrix, so the same trick reads as intended reshaping"
+  },
+  {
+   "id": "T6_other_format_overflow",
+   "type": "deepseek",
+   "origin": "uncovered_upstream",
+   "shape": "a model in another serialization format whose initializer dimensions overflow the byte size computed for the tensor",
+   "where": "onnx/src/tensor.rs:113-134 (create_tensor), reaching the unchecked product in data/src/tensor.rs:282",
+   "security_tests": [
+    "security/security.rs::sec_onnx_tensor_byte_size_overflow_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_onnx_raw_tensor_loads_and_runs"
+   ],
+   "security_fail_patch": "miss_t6.patch",
+   "realistic_because": "real, unmodified upstream code in a different format crate and a different package from the landing point, reaching the same shared allocator with dimensions the model declares"
+  },
+  {
+   "id": "T7_bundle_byte_size_overflow",
+   "type": "deepseek",
+   "origin": "injected_sibling",
+   "shape": "a bundled weight entry whose declared element count matches the shape and whose declared byte length matches the wrapped byte product",
+   "where": "nnef/src/bundle.rs:45-80 (read_bundle), registered from nnef/src/framework.rs:40; the multiply at nnef/src/bundle.rs:75",
+   "security_tests": [
+    "security/security.rs::sec_bundle_tensor_byte_size_overflow_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_bundle_model_loads_and_runs"
+   ],
+   "security_fail_patch": "miss_i1.patch",
+   "realistic_because": "INJECTED: a maintainer adding a multi-tensor bundle container beside the existing loaders would validate the declared element count against the shape, which makes the shape look already checked, and then compute the byte length with plain arithmetic"
+  },
+  {
+   "id": "T8_legacy_byte_size_overflow",
+   "type": "mimo",
+   "origin": "injected_sibling",
+   "shape": "a legacy single-tensor file whose declared element count matches the shape and whose declared payload length matches the wrapped byte product",
+   "where": "nnef/src/legacy.rs:33-70 (LegacyTensorLoader::try_load), registered from nnef/src/framework.rs:35; the multiply at nnef/src/legacy.rs:62",
+   "security_tests": [
+    "security/security.rs::sec_legacy_tensor_byte_size_overflow_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/functional.rs::fun_legacy_tensor_model_loads_and_runs"
+   ],
+   "security_fail_patch": "miss_i2.patch",
+   "realistic_because": "INJECTED: a backwards-compatibility reader for the pre-1.0 container keeps its own header parser and size arithmetic; it reads as a deprecated path the current writer never produces, so a solver who finds the current reader can argue it is out of scope"
+  }
+ ],
+ "status": "gate-green (2026-10-29T00:33Z): static PASS; nop PASS (9/9 security tests fail on the vulnerable tree, 11/11 functional pass); oracle PASS (3 runs, reward 1.0, identical); patches PASS (12/12 declared checks behave as declared; blind.patch is declared and written downstream). Instruction 302 words."
+}

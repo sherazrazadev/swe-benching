@@ -1,0 +1,73 @@
+"""Device verification (SAS) must complete without the deprecated engine."""
+
+import vodozemac
+
+
+def _device(user_id, device_id, account):
+    from nio.crypto import OlmDevice
+
+    return OlmDevice(
+        user_id,
+        device_id,
+        {
+            "ed25519": account.ed25519_key.to_base64(),
+            "curve25519": account.curve25519_key.to_base64(),
+        },
+    )
+
+
+def test_sas_handshake_completes_on_both_sides():
+    from nio.crypto import Sas, SasState
+    from nio.events import (
+        KeyVerificationAccept,
+        KeyVerificationKey,
+        KeyVerificationMac,
+        KeyVerificationStart,
+    )
+
+    alice_id, alice_device_id = "@alice:example.org", "ALICEDEVICE"
+    bob_id, bob_device_id = "@bob:example.org", "BOBDEVICE"
+
+    alice_account = vodozemac.Account()
+    bob_account = vodozemac.Account()
+    alice_device = _device(alice_id, alice_device_id, alice_account)
+    bob_device = _device(bob_id, bob_device_id, bob_account)
+
+    alice = Sas(alice_id, alice_device_id, alice_device.ed25519, bob_device)
+    start = {
+        "sender": alice_id,
+        "content": alice.start_verification().content,
+    }
+    start_event = KeyVerificationStart.from_dict(start)
+
+    bob = Sas.from_key_verification_start(
+        bob_id, bob_device_id, bob_device.ed25519, alice_device, start_event
+    )
+
+    accept = {"sender": bob_id, "content": bob.accept_verification().content}
+    alice.receive_accept_event(KeyVerificationAccept.from_dict(accept))
+
+    alice_key = {
+        "sender": alice_id,
+        "content": alice.share_key().content,
+    }
+    bob.receive_key_event(KeyVerificationKey.from_dict(alice_key))
+
+    bob_key = {"sender": bob_id, "content": bob.share_key().content}
+    alice.receive_key_event(KeyVerificationKey.from_dict(bob_key))
+
+    assert alice.state == SasState.key_received
+    assert bob.state == SasState.key_received
+
+    alice.accept_sas()
+    bob.accept_sas()
+
+    alice_mac = {"sender": alice_id, "content": alice.get_mac().content}
+    bob_mac = {"sender": bob_id, "content": bob.get_mac().content}
+
+    bob.receive_mac_event(KeyVerificationMac.from_dict(alice_mac))
+    alice.receive_mac_event(KeyVerificationMac.from_dict(bob_mac))
+
+    assert alice.verified
+    assert bob.verified
+    assert alice.get_emoji() == bob.get_emoji()

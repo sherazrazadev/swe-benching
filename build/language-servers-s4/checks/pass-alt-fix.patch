@@ -1,0 +1,348 @@
+diff --git a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsentStore.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsentStore.ts
+new file mode 100644
+index 000000000..d07054512
+--- /dev/null
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsentStore.ts
+@@ -0,0 +1,141 @@
++/*!
++ * Copyright Amazon.com, Inc. or its affiliates.
++ * All Rights Reserved. SPDX-License-Identifier: Apache-2.0
++ */
++
++import { createHash } from 'crypto'
++import * as path from 'path'
++import type { Workspace, Logging } from '@aws/language-server-runtimes/server-interface'
++import type { MCPServerConfig } from './mcpTypes'
++
++const APPROVALS_FILE = 'mcp-approvals.json'
++const STORE_VERSION = 1
++
++interface Approval {
++    serverName: string
++    fingerprint: string
++    workspaceHash: string
++    approvedAt: string
++}
++
++interface ApprovalStore {
++    version: number
++    approvals: Approval[]
++}
++
++function sortedRecord(rec?: Record<string, string>): Record<string, string> {
++    return rec ? Object.fromEntries(Object.entries(rec).sort(([a], [b]) => a.localeCompare(b))) : {}
++}
++
++/** The environment the stdio transport will spawn with, as far as the config controls it. */
++export function effectiveEnv(cfg: MCPServerConfig): Record<string, string> {
++    return sortedRecord({ ...(cfg.env ?? {}), ...(cfg.__additionalEnv__ ?? {}) })
++}
++
++/** The headers the HTTP/SSE transport will send, as far as the config controls it. */
++export function effectiveHeaders(cfg: MCPServerConfig): Record<string, string> {
++    return sortedRecord({ ...(cfg.headers ?? {}), ...(cfg.__additionalHeaders__ ?? {}) })
++}
++
++/**
++ * SHA-256 over a canonical form of everything the configuration can make the
++ * server do: the command, its arguments, the merged environment, the address and
++ * the merged headers. Any change yields a new fingerprint, so a prior approval no
++ * longer covers it.
++ */
++export function fingerprintServerConfig(cfg: MCPServerConfig): string {
++    const canonical = {
++        argv: [cfg.command ?? null, ...(cfg.args ?? [])],
++        env: effectiveEnv(cfg),
++        endpoint: cfg.url ?? null,
++        headers: effectiveHeaders(cfg),
++    }
++    return JSON.stringify(canonical)
++}
++
++/** Approval is scoped to the workspace directory that supplied the configuration. */
++export function fingerprintWorkspace(configPath: string): string {
++    return path.resolve(path.dirname(configPath)).replace(/\\/g, '/')
++}
++
++function getStorePath(workspace: Workspace): string {
++    return path.join(workspace.fs.getUserHomeDir(), '.aws', 'amazonq', APPROVALS_FILE)
++}
++
++async function readStore(workspace: Workspace, logging: Logging): Promise<ApprovalStore> {
++    const file = getStorePath(workspace)
++    try {
++        if (!(await workspace.fs.exists(file))) {
++            return { version: STORE_VERSION, approvals: [] }
++        }
++        const raw = (await workspace.fs.readFile(file)).toString()
++        const parsed = JSON.parse(raw) as ApprovalStore
++        if (parsed?.version !== STORE_VERSION || !Array.isArray(parsed.approvals)) {
++            logging.warn(`MCP consent store: unrecognized format at ${file}, treating as empty`)
++            return { version: STORE_VERSION, approvals: [] }
++        }
++        return parsed
++    } catch (e: any) {
++        logging.warn(`MCP consent store: failed to read ${file}: ${e?.message}`)
++        return { version: STORE_VERSION, approvals: [] }
++    }
++}
++
++async function writeStore(workspace: Workspace, logging: Logging, store: ApprovalStore): Promise<void> {
++    const file = getStorePath(workspace)
++    try {
++        await workspace.fs.mkdir(path.dirname(file), { recursive: true })
++        await workspace.fs.writeFile(file, JSON.stringify(store, null, 2))
++    } catch (e: any) {
++        logging.warn(`MCP consent store: failed to write ${file}: ${e?.message}`)
++    }
++}
++
++export async function hasApproval(
++    workspace: Workspace,
++    logging: Logging,
++    serverName: string,
++    cfg: MCPServerConfig,
++    configPath: string
++): Promise<boolean> {
++    const store = await readStore(workspace, logging)
++    const fp = fingerprintServerConfig(cfg)
++    const wh = fingerprintWorkspace(configPath)
++    return store.approvals.some(a => a.serverName === serverName && a.fingerprint === fp && a.workspaceHash === wh)
++}
++
++export async function recordApproval(
++    workspace: Workspace,
++    logging: Logging,
++    serverName: string,
++    cfg: MCPServerConfig,
++    configPath: string
++): Promise<void> {
++    const store = await readStore(workspace, logging)
++    const fp = fingerprintServerConfig(cfg)
++    const wh = fingerprintWorkspace(configPath)
++    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
++    store.approvals.push({
++        serverName,
++        fingerprint: fp,
++        workspaceHash: wh,
++        approvedAt: new Date().toISOString(),
++    })
++    await writeStore(workspace, logging, store)
++}
++
++export async function removeApproval(
++    workspace: Workspace,
++    logging: Logging,
++    serverName: string,
++    configPath: string
++): Promise<void> {
++    const store = await readStore(workspace, logging)
++    const wh = fingerprintWorkspace(configPath)
++    const before = store.approvals.length
++    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
++    if (store.approvals.length < before) {
++        await writeStore(workspace, logging, store)
++        logging.info(`MCP consent store: removed approval for '${serverName}'`)
++    }
++}
+diff --git a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
+index 6532745cd..68e47a35f 100644
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts
+@@ -27,10 +27,12 @@ import {
+ import {
+     isEmptyEnv,
+     loadAgentConfig,
++    normalizePathFromUri,
+     saveAgentConfig,
+     saveServerSpecificAgentConfig,
+     sanitizeName,
+     getGlobalAgentConfigPath,
++    getGlobalPersonaConfigPath,
+     getWorkspaceMcpConfigPaths,
+     getGlobalMcpConfigPath,
+ } from './mcpUtils'
+@@ -39,6 +41,13 @@ import { EventEmitter } from 'events'
+ import { Mutex } from 'async-mutex'
+ import path = require('path')
+ import { URI } from 'vscode-uri'
++import { MessageType } from '@aws/language-server-runtimes/protocol'
++import {
++    fingerprintServerConfig,
++    hasApproval,
++    recordApproval,
++    removeApproval,
++} from './mcpConsentStore'
+ import { sanitizeInput } from '../../../../shared/utils'
+ import { ProfileStatusMonitor } from './profileStatusMonitor'
+ import { OAuthClient } from './mcpOauthClient'
+@@ -78,6 +87,7 @@ export class McpManager {
+     private currentRegistry: McpRegistryData | null = null
+     private registryUrlProvided: boolean = false
+     private isPeriodicSync: boolean = false
++    private sessionDeniedConsent = new Set<string>()
+ 
+     private constructor(
+         private agentPaths: string[],
+@@ -392,7 +402,16 @@ export class McpManager {
+             const folders = this.features.workspace.getAllWorkspaceFolders()
+             if (folders.length > 0) cwd = URI.parse(folders[0].uri).fsPath
+         } catch {}
++        const trustedHookPaths = new Set([
++            getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir()),
++            getGlobalMcpConfigPath(this.features.workspace.fs.getUserHomeDir()),
++            getGlobalPersonaConfigPath(this.features.workspace.fs.getUserHomeDir()),
++        ])
+         for (const hook of hooks) {
++            const hookPath = (hook as any)?.__configPath__
++            if (!hookPath || !trustedHookPaths.has(hookPath)) {
++                continue
++            }
+             if (!hook || typeof hook.command !== 'string' || hook.command.trim() === '') {
+                 continue
+             }
+@@ -417,6 +436,77 @@ export class McpManager {
+         cfg: MCPServerConfig,
+         authIntent: AuthIntent = AuthIntent.Silent
+     ): Promise<void> {
++        // Consent gate. Only configuration the user authored in their own global
++        // settings is trusted implicitly. Anything else, including configuration whose
++        // source cannot be established, needs an approval that covers this exact
++        // execution configuration in this workspace.
++        const home = this.features.workspace.fs.getUserHomeDir()
++        const configPath = cfg.__configPath__
++            ? normalizePathFromUri(cfg.__configPath__, this.features.logging)
++            : undefined
++        const trustedPaths = new Set([
++            getGlobalMcpConfigPath(home),
++            getGlobalAgentConfigPath(home),
++            getGlobalPersonaConfigPath(home),
++        ])
++        if (!configPath || !trustedPaths.has(configPath)) {
++            if (!configPath) {
++                this.features.logging.warn(
++                    `MCP: refusing to start '${serverName}': configuration source is unknown`
++                )
++                this.setState(serverName, McpServerStatus.FAILED, 0, 'consent source unknown')
++                return
++            }
++            const denyKey = `${serverName}|${configPath}|${fingerprintServerConfig(cfg)}`
++            if (this.sessionDeniedConsent.has(denyKey)) {
++                this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
++                return
++            }
++            const approved = await hasApproval(
++                this.features.workspace,
++                this.features.logging,
++                serverName,
++                cfg,
++                configPath
++            )
++            if (!approved) {
++                const cmdLine = [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').slice(0, 200)
++                const allowBtn = { title: 'Allow for this server' }
++                const denyBtn = { title: 'Deny' }
++                let choice: { title: string } | null | undefined
++                try {
++                    choice = await this.features.lsp.window.showMessageRequest({
++                        type: MessageType.Warning,
++                        message:
++                            `Amazon Q — Untrusted MCP Server\n\n` +
++                            `A workspace configuration file wants to start an MCP server.\n` +
++                            `Server: ${serverName}\n` +
++                            `Command: ${cmdLine}\n` +
++                            `Source: ${configPath}\n\n` +
++                            `Running this server executes the above command on your machine. ` +
++                            `Only allow if you trust the authors of this workspace.\n\n` +
++                            `Your choice will be remembered for this workspace. ` +
++                            `If you allow, you won't be asked again unless the server configuration changes.`,
++                        actions: [allowBtn, denyBtn],
++                    })
++                } catch (e: any) {
++                    this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
++                    this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
++                    return
++                }
++                if (choice?.title !== allowBtn.title) {
++                    this.features.logging.info(
++                        `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
++                    )
++                    this.sessionDeniedConsent.add(denyKey)
++                    this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
++                    return
++                }
++                await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
++                this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
++            }
++        }
++
+         // Get or create mutex for this server to prevent concurrent initialization
+         if (!this.serverInitMutexes.has(serverName)) {
+             this.serverInitMutexes.set(serverName, new Mutex())
+@@ -1105,6 +1195,12 @@ export class McpManager {
+         this.mcpTools = this.mcpTools.filter(t => t.serverName !== serverName)
+         this.mcpServerStates.delete(serverName)
+ 
++        // A removed server's approval must not be reusable by a later configuration.
++        if (cfg.__configPath__) {
++            const normalizedPath = normalizePathFromUri(cfg.__configPath__, this.features.logging)
++            await removeApproval(this.features.workspace, this.features.logging, serverName, normalizedPath)
++        }
++
+         // Check if this is a legacy MCP server (from MCP config file)
+         const isLegacyMcpServer = cfg.__configPath__?.endsWith('mcp.json')
+         let agentPath: string | undefined
+@@ -1317,6 +1413,7 @@ export class McpManager {
+         this.mcpTools = []
+         this.mcpServers.clear()
+         this.mcpServerStates.clear()
++        this.sessionDeniedConsent.clear()
+         this.agentConfig = {
+             name: 'q_ide_default',
+             description: 'Agent configuration',
+diff --git a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
+index 3b30a1f30..e4bf9dddc 100644
+--- a/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
++++ b/server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts
+@@ -402,16 +402,21 @@ export async function loadAgentConfig(
+             }
+         }
+ 
+-        // 5c) Collect the lifecycle hooks declared by this agent configuration
++        // 5c) Collect the lifecycle hooks declared by this agent configuration,
++        // remembering which file declared each one.
+         if (json.hooks && typeof json.hooks === 'object') {
+             if (!agentConfig.hooks) {
+                 agentConfig.hooks = { agentSpawn: [], userPromptSubmit: [] }
+             }
+             if (Array.isArray(json.hooks.agentSpawn)) {
+-                agentConfig.hooks.agentSpawn!.push(...json.hooks.agentSpawn)
++                agentConfig.hooks.agentSpawn!.push(
++                    ...json.hooks.agentSpawn.map((h: any) => ({ ...h, __configPath__: fsPath }) as any)
++                )
+             }
+             if (Array.isArray(json.hooks.userPromptSubmit)) {
+-                agentConfig.hooks.userPromptSubmit!.push(...json.hooks.userPromptSubmit)
++                agentConfig.hooks.userPromptSubmit!.push(
++                    ...json.hooks.userPromptSubmit.map((h: any) => ({ ...h, __configPath__: fsPath }) as any)
++                )
+             }
+         }
+ 
+@@ -625,15 +630,7 @@ export async function loadAgentConfig(
+         for (const [sanitizedName, mcpConfig] of mcpResult.servers) {
+             const originalName = mcpResult.serverNameMapping.get(sanitizedName)
+             if (originalName) {
+-                // If the agent configuration already had this server, keep the
+-                // bookkeeping recorded for it (permissions and management actions
+-                // are keyed on the agent file) while the legacy entry supplies the
+-                // execution settings.
+-                const prior = servers.get(sanitizedName)
+-                const mergedConfig = prior
+-                    ? { ...mcpConfig, __configPath__: prior.__configPath__ }
+-                    : mcpConfig
+-                servers.set(sanitizedName, mergedConfig)
++                servers.set(sanitizedName, mcpConfig)
+                 serverNameMapping.set(sanitizedName, originalName)
+ 
+                 // Add MCP server tools to agent config for permission management

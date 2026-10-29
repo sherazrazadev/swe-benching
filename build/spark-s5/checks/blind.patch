@@ -1,0 +1,120 @@
+diff -ruN a/core/src/main/resources/org/apache/spark/ui/static/historypage-template.html b/core/src/main/resources/org/apache/spark/ui/static/historypage-template.html
+--- a/core/src/main/resources/org/apache/spark/ui/static/historypage-template.html	2026-10-29 00:03:40.000000000 +0000
++++ b/core/src/main/resources/org/apache/spark/ui/static/historypage-template.html	2026-10-29 00:21:25.440368874 +0000
+@@ -81,6 +81,6 @@
+ 
+ <script id="history-notice-template" type="text/html">
+ <div id="history-notice" class="alert alert-info">
+-  Applications with multiple attempts: {{{appNames}}}
++  Applications with multiple attempts: {{appNames}}
+ </div>
+ </script>
+diff -ruN a/core/src/main/resources/org/apache/spark/ui/static/historypage.js b/core/src/main/resources/org/apache/spark/ui/static/historypage.js
+--- a/core/src/main/resources/org/apache/spark/ui/static/historypage.js	2026-10-29 00:03:40.000000000 +0000
++++ b/core/src/main/resources/org/apache/spark/ui/static/historypage.js	2026-10-29 00:21:25.068596869 +0000
+@@ -17,7 +17,7 @@
+ 
+ /* global $, Mustache, jQuery, uiRoot */
+ 
+-import {formatDuration, formatTimeMillis, stringAbbreviate} from "./utils.js";
++import {escapeHtml, formatDuration, formatTimeMillis, stringAbbreviate} from "./utils.js";
+ 
+ export {setAppLimit};
+ 
+@@ -183,12 +183,13 @@
+       var conf = {
+         "data": array,
+         "columns": [
+-          {name: 'version', data: 'version' },
++          {name: 'version', data: 'version', render: (version) => escapeHtml(version) },
+           {
+             name: 'appId',
+             type: "appid-numeric",
+             data: 'id',
+-            render: (id, type, row) => `<span title="${id}"><a href="${row.attemptUrl}">${id}</a></span>`
++            render: (id, type, row) =>
++              `<span title="${escapeHtml(id)}"><a href="${escapeHtml(row.attemptUrl)}">${escapeHtml(id)}</a></span>`
+           },
+           {
+             name: 'appName',
+@@ -198,7 +199,8 @@
+           {
+             name: attemptIdColumnName,
+             data: 'attemptId',
+-            render: (attemptId, type, row) => (attemptId ? `<a href="${row.attemptUrl}">${attemptId}</a>` : '')
++            render: (attemptId, type, row) =>
++              (attemptId ? `<a href="${escapeHtml(row.attemptUrl)}">${escapeHtml(attemptId)}</a>` : '')
+           },
+           {name: startedColumnName, data: 'startTime' },
+           {name: completedColumnName, data: 'endTime' },
+@@ -208,13 +210,13 @@
+             data: 'duration',
+             render: (id, type, row) => `<span title="${row.durationMillisec}">${row.duration}</span>`
+           },
+-          {name: 'user', data: 'sparkUser' },
++          {name: 'user', data: 'sparkUser', render: (user) => escapeHtml(user) },
+           {name: 'lastUpdated', data: 'lastUpdated' },
+           {
+             name: 'eventLog',
+             data: 'log',
+             render: (log, _ignored_type, row) =>
+-              `<a href="${log}" title="Download the event log for ${row.name}" class="btn btn-info btn-mini">Download</a>`
++              `<a href="${escapeHtml(log)}" title="Download the event log for ${escapeHtml(row.name)}" class="btn btn-info btn-mini">Download</a>`
+           },
+         ],
+         "aoColumnDefs": [
+diff -ruN a/core/src/main/resources/org/apache/spark/ui/static/utils.js b/core/src/main/resources/org/apache/spark/ui/static/utils.js
+--- a/core/src/main/resources/org/apache/spark/ui/static/utils.js	2025-11-14 20:32:37.000000000 +0000
++++ b/core/src/main/resources/org/apache/spark/ui/static/utils.js	2026-10-29 00:21:21.147530595 +0000
+@@ -18,12 +18,32 @@
+ export {
+   ConvertDurationString, createRESTEndPointForExecutorsPage, createRESTEndPointForMiscellaneousProcess, createTemplateURI,
+   errorMessageCell, errorSummary,
++  escapeHtml,
+   formatBytes, formatDate, formatDuration, formatLogsCells, formatTimeMillis,
+   getBaseURI, getStandAloneAppId, getTimeZone,
+   setDataTableDefaults, stringAbbreviate
+ };
+ 
+ /* global $, uiRoot */
++
++const HTML_ESCAPE_ENTITIES = {
++  "&": "&amp;",
++  "<": "&lt;",
++  ">": "&gt;",
++  "\"": "&quot;",
++  "'": "&#39;"
++};
++
++// Make `value` safe to place in HTML text or in a quoted attribute: what it holds is shown
++// literally and can neither open an element nor close/escape the attribute it sits in. Values
++// that are not strings are handed back untouched so callers keep their existing handling of
++// null/undefined/numeric data.
++function escapeHtml(value) {
++  if (typeof value !== "string") {
++    return value;
++  }
++  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPE_ENTITIES[ch]);
++}
+ // this function works exactly the same as UIUtils.formatDuration
+ function formatDuration(milliseconds) {
+   if (milliseconds < 100) {
+@@ -275,13 +295,15 @@
+ 
+ function stringAbbreviate(content, limit) {
+   if (content && content.length > limit) {
+-    const summary = content.substring(0, limit) + '...';
++    // This function returns markup, so the pieces it cuts from `content` must be escaped
++    // before they are composed into it; the summary and the details are separate insertions.
++    const summary = escapeHtml(content.substring(0, limit)) + '...';
+     // TODO: Reused stacktrace-details* style for convenience, but it's not really a stacktrace
+     // Consider creating a new style for this case if stacktrace-details is not appropriate in
+     // the future.
+-    const details = detailsUINode(true, content);
++    const details = detailsUINode(true, escapeHtml(content));
+     return summary + details;
+   } else {
+-    return content;
++    return escapeHtml(content);
+   }
+ }

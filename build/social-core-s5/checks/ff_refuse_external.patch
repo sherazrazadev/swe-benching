@@ -1,0 +1,619 @@
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/actions.py b/social_core/actions.py
+--- a/social_core/actions.py	2026-10-28 23:50:58.847467748 +0000
++++ b/social_core/actions.py	2026-10-28 23:58:27.854849564 +0000
+@@ -1,10 +1,10 @@
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING, cast
++from typing import TYPE_CHECKING, Any, cast
+ from urllib.parse import quote
+ 
+ from .utils import (
+-    partial_pipeline_data,
++    partial_pipeline_result,
+     sanitize_redirect,
+     setting_url,
+     user_is_active,
+@@ -15,7 +15,7 @@
+     from collections.abc import Callable
+ 
+     from .backends.base import BaseAuth
+-    from .storage import PipelineUserProtocol, UserMixin, UserProtocol
++    from .storage import PartialMixin, PipelineUserProtocol, UserMixin, UserProtocol
+     from .strategy import HttpResponseProtocol
+ 
+ 
+@@ -51,6 +51,31 @@
+     return url
+ 
+ 
++def _handle_partial(
++    backend: BaseAuth,
++    user: UserProtocol | None,
++    resume_partial: Callable[[PartialMixin], Any],
++    halt_url_names: tuple[str, ...],
++    halt_error: str,
++    *args,
++    **kwargs,
++) -> tuple[bool, Any]:
++    partial = partial_pipeline_result(backend, user, *args, **kwargs)
++    if partial.response is not None:
++        return True, partial.response
++    if partial.partial:
++        response = resume_partial(partial.partial)
++        backend.strategy.clean_partial_pipeline(partial.partial.token)
++        return True, response
++    if partial.halt:
++        halt_url = setting_url(backend, *halt_url_names)
++        if not halt_url:
++            raise ValueError(halt_error)
++        halt_url = _sanitize_redirect_url(backend, halt_url)
++        return True, backend.strategy.redirect(halt_url)
++    return False, None
++
++
+ def do_auth(backend: BaseAuth, redirect_name: str = "next") -> HttpResponseProtocol:
+     # Save any defined next value into session
+     data = backend.strategy.request_data(merge=False)
+@@ -93,11 +118,19 @@
+     partial_user = user if is_authenticated else None
+     authenticated_user: UserProtocol | HttpResponseProtocol | None = partial_user
+ 
+-    partial = partial_pipeline_data(backend, partial_user, *args, **kwargs)
+-    if partial:
+-        authenticated_user = backend.continue_pipeline(partial)
+-        # clean partial data after usage
+-        backend.strategy.clean_partial_pipeline(partial.token)
++    partial_handled, partial_response = _handle_partial(
++        backend,
++        partial_user,
++        backend.continue_pipeline,
++        ("LOGIN_ERROR_URL", "LOGIN_URL"),
++        "By this point URL has to have been set",
++        *args,
++        **kwargs,
++    )
++    if partial_handled:
++        authenticated_user = cast(
++            "UserProtocol | HttpResponseProtocol | None", partial_response
++        )
+     else:
+         authenticated_user = backend.complete(
+             *args, user=authenticated_user, redirect_name=redirect_name, **kwargs
+@@ -173,13 +206,24 @@
+     *args,
+     **kwargs,
+ ):
+-    partial = partial_pipeline_data(backend, user, *args, **kwargs)
+-    if partial:
++    response: dict | HttpResponseProtocol
++
++    def resume_disconnect(partial: PartialMixin):
+         if association_id and not partial.kwargs.get("association_id"):
+             partial.extend_kwargs({"association_id": association_id})
+-        response = backend.disconnect(*partial.args, **partial.kwargs)
+-        # clean partial data after usage
+-        backend.strategy.clean_partial_pipeline(partial.token)
++        return backend.disconnect(*partial.args, **partial.kwargs)
++
++    partial_handled, partial_response = _handle_partial(
++        backend,
++        user,
++        resume_disconnect,
++        ("DISCONNECT_REDIRECT_URL", "LOGIN_REDIRECT_URL"),
++        "Disallowed URL",
++        *args,
++        **kwargs,
++    )
++    if partial_handled:
++        response = cast("dict | HttpResponseProtocol", partial_response)
+     else:
+         response = backend.disconnect(
+             *args, user=user, association_id=association_id, **kwargs
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/backends/base.py b/social_core/backends/base.py
+--- a/social_core/backends/base.py	2026-10-28 23:50:58.847574497 +0000
++++ b/social_core/backends/base.py	2026-10-28 23:58:27.855096073 +0000
+@@ -6,9 +6,20 @@
+ 
+ import requests
+ 
+-from social_core.exceptions import AuthConnectionError, AuthUnknownError
++from social_core.exceptions import (
++    AuthConnectionError,
++    AuthForbidden,
++    AuthUnknownError,
++)
+ from social_core.registry import REGISTRY
+-from social_core.utils import module_member, parse_qs, social_logger, user_agent
++from social_core.utils import (
++    consume_partial_pipeline_resume,
++    module_member,
++    parse_qs,
++    partial_pipeline_resume_owned,
++    social_logger,
++    user_agent,
++)
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Mapping
+@@ -270,6 +281,9 @@
+         self, partial: PartialMixin
+     ) -> UserProtocol | HttpResponseProtocol | None:
+         """Continue previous halted pipeline"""
++        if not partial_pipeline_resume_owned(self.strategy, partial):
++            raise AuthForbidden(self)
++        consume_partial_pipeline_resume(self.strategy, partial)
+         return self.strategy.authenticate(
+             self, *partial.args, pipeline_index=partial.next_step, **partial.kwargs
+         )
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/backends/facebook_limited.py b/social_core/backends/facebook_limited.py
+--- a/social_core/backends/facebook_limited.py	2026-10-28 23:55:37.554892542 +0000
++++ b/social_core/backends/facebook_limited.py	2026-10-28 23:58:27.855263645 +0000
+@@ -35,6 +35,15 @@
+     def continue_pipeline(self, partial):
+         # The ID token was validated when the flow started; restore the claims
+         # kept on the stored flow and resume from the step it stopped at.
++        from social_core.exceptions import AuthForbidden
++        from social_core.utils import (
++            consume_partial_pipeline_resume,
++            partial_pipeline_resume_owned,
++        )
++
++        if not partial_pipeline_resume_owned(self.strategy, partial):
++            raise AuthForbidden(self)
++        consume_partial_pipeline_resume(self.strategy, partial)
+         self.id_token = partial.kwargs.get("id_token")
+         return self.pipeline(
+             self.strategy.get_pipeline(self),
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/pipeline/mail.py b/social_core/pipeline/mail.py
+--- a/social_core/pipeline/mail.py	2026-10-28 23:50:58.856098022 +0000
++++ b/social_core/pipeline/mail.py	2026-10-28 23:58:27.856487296 +0000
+@@ -4,13 +4,13 @@
+ 
+ from social_core.exceptions import InvalidEmail
+ 
+-from .partial import partial
++from .partial import partial_step
+ 
+ if TYPE_CHECKING:
+     from social_core.backends.base import BaseAuth
+ 
+ 
+-@partial
++@partial_step(save_to_session=True, allow_external_resume=False)
+ def mail_validation(backend: BaseAuth, details, is_new=False, *args, **kwargs):
+     requires_validation = backend.REQUIRES_EMAIL_VALIDATION or backend.setting(
+         "FORCE_EMAIL_VALIDATION", False
+@@ -19,7 +19,9 @@
+         is_new or backend.setting("PASSWORDLESS", False)
+     )
+     if requires_validation and send_validation:
+-        data = backend.strategy.request_data()
++        # External partial resumes may replay the original validation-link data
++        # after a local confirmation request.
++        data = kwargs.get("request") or backend.strategy.request_data()
+         if "verification_code" in data:
+             backend.strategy.session_pop("email_validation_address")
+             if not backend.strategy.validate_email(
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/pipeline/partial.py b/social_core/pipeline/partial.py
+--- a/social_core/pipeline/partial.py	2026-10-28 23:50:58.856098022 +0000
++++ b/social_core/pipeline/partial.py	2026-10-28 23:58:27.855523118 +0000
+@@ -1,11 +1,14 @@
+ from functools import wraps
+ 
+-from social_core.utils import PARTIAL_TOKEN_SESSION_NAME
++from social_core.utils import (
++    PARTIAL_PIPELINE_ALLOW_EXTERNAL_RESUME,
++    PARTIAL_TOKEN_SESSION_NAME,
++)
+ 
+ from .utils import partial_prepare
+ 
+ 
+-def partial_step(save_to_session):
++def partial_step(save_to_session, allow_external_resume=False):
+     """Wraps func to behave like a partial pipeline step, any output
+     that's not None or {} will be considered a response object and
+     will be returned to user.
+@@ -21,6 +24,9 @@
+     The token is also stored in the session under the
+     PARTIAL_TOKEN_SESSION_NAME (partial_pipeline_token) key when the
+     save_to_session parameter is True.
++
++    Set allow_external_resume=True only for flows that intentionally resume
++    from an external validation link, such as email validation.
+     """
+ 
+     def decorator(func):
+@@ -43,6 +49,9 @@
+             )
+ 
+             if not isinstance(out, dict):
++                current_partial.data[PARTIAL_PIPELINE_ALLOW_EXTERNAL_RESUME] = (
++                    allow_external_resume
++                )
+                 strategy.storage.partial.store(current_partial)
+                 if save_to_session:
+                     strategy.session_set(
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/pipeline/utils.py b/social_core/pipeline/utils.py
+--- a/social_core/pipeline/utils.py	2026-10-28 23:55:41.773883409 +0000
++++ b/social_core/pipeline/utils.py	2026-10-28 23:58:27.855640266 +0000
+@@ -114,7 +114,11 @@
+     Integrations that expose their own resume URL use this to hand a token
+     back to the pipeline without rebuilding the partial object themselves.
+     """
+-    from social_core.utils import PARTIAL_TOKEN_SESSION_NAME
++    from social_core.utils import (
++        PARTIAL_TOKEN_SESSION_NAME,
++        consume_partial_pipeline_resume,
++        partial_pipeline_resume_owned,
++    )
+ 
+     token = token or strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
+     if not token:
+@@ -122,6 +126,9 @@
+     partial = partial_load(strategy, token)
+     if partial is None or partial.backend != backend.name:
+         return None
++    if not partial_pipeline_resume_owned(strategy, partial):
++        return None
++    consume_partial_pipeline_resume(strategy, partial)
+     return strategy.authenticate(
+         backend, *partial.args, pipeline_index=partial.next_step, **partial.kwargs
+     )
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/strategy.py b/social_core/strategy.py
+--- a/social_core/strategy.py	2026-10-28 23:50:58.856098022 +0000
++++ b/social_core/strategy.py	2026-10-28 23:58:27.855773705 +0000
+@@ -12,7 +12,14 @@
+ from .pipeline import DEFAULT_AUTH_PIPELINE, DEFAULT_DISCONNECT_PIPELINE
+ from .pipeline.utils import partial_load
+ from .store import OpenIdSessionWrapper, OpenIdStore
+-from .utils import PARTIAL_TOKEN_SESSION_NAME, module_member, setting_name
++from .utils import (
++    PARTIAL_TOKEN_PENDING_CONFIRMATION_SESSION_NAME,
++    PARTIAL_TOKEN_PENDING_REQUEST_SESSION_NAME,
++    PARTIAL_TOKEN_PENDING_SESSION_NAME,
++    PARTIAL_TOKEN_SESSION_NAME,
++    module_member,
++    setting_name,
++)
+ 
+ if TYPE_CHECKING:
+     from .backends.base import BaseAuth
+@@ -132,6 +139,26 @@
+         current_token_in_session = self.session_get(PARTIAL_TOKEN_SESSION_NAME)
+         if current_token_in_session == token:
+             self.session_pop(PARTIAL_TOKEN_SESSION_NAME)
++        pending_token_in_session = self.session_get(PARTIAL_TOKEN_PENDING_SESSION_NAME)
++        if pending_token_in_session == token:
++            self.session_pop(PARTIAL_TOKEN_PENDING_SESSION_NAME)
++            self.session_pop(PARTIAL_TOKEN_PENDING_REQUEST_SESSION_NAME)
++            self.session_pop(PARTIAL_TOKEN_PENDING_CONFIRMATION_SESSION_NAME)
++
++    def partial_pipeline_external_resume_confirmation(
++        self,
++        backend: BaseAuth,
++        partial: PartialMixin,
++        request_data: dict[str, Any],
++    ) -> HttpResponseProtocol | None:
++        return None
++
++    def partial_pipeline_external_resume_confirmed(
++        self,
++        backend: BaseAuth,
++        request_data: dict[str, Any],
++    ) -> bool:
++        return False
+ 
+     def openid_store(self) -> OpenIdStore:
+         return OpenIdStore(self)
+diff -ruN -x __pycache__ -x '*.pyc' a/social_core/utils.py b/social_core/utils.py
+--- a/social_core/utils.py	2026-10-28 23:50:58.863539474 +0000
++++ b/social_core/utils.py	2026-10-28 23:58:27.856001238 +0000
+@@ -7,6 +7,7 @@
+ import re
+ import time
+ import unicodedata
++from dataclasses import dataclass
+ from importlib import import_module
+ from typing import TYPE_CHECKING, Any, cast
+ from urllib.parse import parse_qs as battery_parse_qs
+@@ -15,6 +16,7 @@
+ import requests
+ 
+ import social_core
++from social_core.pipeline.utils import is_dict_type, to_plain_dict
+ 
+ from .exceptions import (
+     AuthCanceled,
+@@ -26,16 +28,36 @@
+ if TYPE_CHECKING:
+     from .backends.base import BaseAuth
+     from .storage import PartialMixin, UserProtocol
+-    from .strategy import BaseStrategy
++    from .strategy import BaseStrategy, HttpResponseProtocol
+ 
+ SETTING_PREFIX = "SOCIAL_AUTH"
+ 
+ PARTIAL_TOKEN_SESSION_NAME = "partial_pipeline_token"
++PARTIAL_TOKEN_PENDING_SESSION_NAME = "partial_pipeline_pending_token"
++PARTIAL_TOKEN_PENDING_REQUEST_SESSION_NAME = "partial_pipeline_pending_request"
++PARTIAL_TOKEN_PENDING_CONFIRMATION_SESSION_NAME = (
++    "partial_pipeline_pending_confirmation"
++)
++PARTIAL_PIPELINE_ALLOW_EXTERNAL_RESUME = "allow_external_resume"
+ 
+ 
+ social_logger = logging.getLogger("social")
+ 
+ 
++@dataclass
++class PartialPipelineResult:
++    partial: PartialMixin | None = None
++    response: HttpResponseProtocol | None = None
++    halt: bool = False
++
++
++@dataclass
++class PartialPipelineSelection:
++    token: str | None = None
++    owns_token: bool = False
++    pending_resume: bool = False
++
++
+ def module_member(name):
+     mod, member = name.rsplit(".", 1)
+     module = import_module(mod)
+@@ -170,51 +192,217 @@
+     return out
+ 
+ 
+-def partial_pipeline_data(
++def _partial_pipeline_matches_request(
++    backend: BaseAuth, partial: PartialMixin | None, request_data: dict[str, Any]
++) -> bool:
++    if not partial or partial.backend != backend.name:
++        return False
++
++    # Normally when resuming a pipeline, request_data will be empty. We only
++    # need to check for a uid match if new data was provided (i.e. if current
++    # request specifies the ID_KEY).
++    id_key = backend.id_key()
++    if id_key and id_key in request_data:
++        id_from_partial = partial.kwargs.get("uid")
++        id_from_request = request_data.get(id_key)
++
++        return id_from_partial == id_from_request
++
++    return True
++
++
++def _extend_partial_pipeline(
++    partial: PartialMixin,
++    request_data: dict[str, Any],
++    user: UserProtocol | None,
++    kwargs: dict[str, Any],
++) -> PartialMixin:
++    if user:  # don't update user if it's None
++        kwargs.setdefault("user", user)
++    kwargs["request"] = request_data
++    partial.extend_kwargs(kwargs)
++    return partial
++
++
++def _select_partial_pipeline_token(
++    request_token: str | None,
++    session_token: str | None,
++    pending_token: str | None,
++    confirmation_requested: bool,
++) -> PartialPipelineSelection:
++    if request_token and request_token == session_token:
++        return PartialPipelineSelection(token=request_token, owns_token=True)
++
++    if confirmation_requested and pending_token:
++        selected_token = request_token or pending_token
++        pending_resume = selected_token == pending_token
++        return PartialPipelineSelection(
++            token=selected_token,
++            owns_token=pending_resume,
++            pending_resume=pending_resume,
++        )
++
++    if request_token:
++        return PartialPipelineSelection(token=request_token)
++
++    return PartialPipelineSelection(token=session_token, owns_token=bool(session_token))
++
++
++def _confirmed_partial_pipeline_request_data(
++    backend: BaseAuth,
++    request_data: dict[str, Any],
++) -> dict[str, Any] | None:
++    if not backend.strategy.partial_pipeline_external_resume_confirmed(
++        backend, request_data
++    ):
++        return None
++
++    pending_request_data = backend.strategy.from_session_value(
++        backend.strategy.session_get(PARTIAL_TOKEN_PENDING_REQUEST_SESSION_NAME, {})
++        or {}
++    )
++    return {**pending_request_data, **request_data}
++
++
++def _external_partial_pipeline_result(
++    backend: BaseAuth,
++    partial: PartialMixin,
++    selected_token: str,
++    request_data: dict[str, Any],
++) -> PartialPipelineResult:
++    response = backend.strategy.partial_pipeline_external_resume_confirmation(
++        backend, partial, request_data
++    )
++    if response is None:
++        return PartialPipelineResult(halt=True)
++
++    backend.strategy.session_set(PARTIAL_TOKEN_PENDING_SESSION_NAME, selected_token)
++    backend.strategy.session_set(
++        PARTIAL_TOKEN_PENDING_REQUEST_SESSION_NAME,
++        backend.strategy.to_session_value(
++            to_plain_dict(request_data) if is_dict_type(request_data) else request_data
++        ),
++    )
++    return PartialPipelineResult(response=response)
++
++
++_PARTIAL_RESUME_APPROVED_ATTR = "_partial_pipeline_resume_approved"
++
++
++def _approve_partial_pipeline_resume(strategy: BaseStrategy, token: str) -> None:
++    approved = getattr(strategy, _PARTIAL_RESUME_APPROVED_ATTR, None)
++    if approved is None:
++        approved = set()
++        setattr(strategy, _PARTIAL_RESUME_APPROVED_ATTR, approved)
++    approved.add(token)
++
++
++def partial_pipeline_resume_owned(
++    strategy: BaseStrategy, partial: PartialMixin
++) -> bool:
++    """True when this request may continue the stored flow: this session
++    started it, or the shared resume decision approved it after the flow's
++    recorded out-of-band proof was confirmed."""
++    token = getattr(partial, "token", None)
++    if not token:
++        return False
++    session_token = strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
++    if session_token and session_token == token:
++        return True
++    approved = getattr(strategy, _PARTIAL_RESUME_APPROVED_ATTR, None) or set()
++    return token in approved
++
++
++def consume_partial_pipeline_resume(
++    strategy: BaseStrategy, partial: PartialMixin
++) -> None:
++    approved = getattr(strategy, _PARTIAL_RESUME_APPROVED_ATTR, None)
++    if approved is not None:
++        approved.discard(getattr(partial, "token", None))
++
++
++def partial_pipeline_result(
+     backend: BaseAuth,
+     user: UserProtocol | None = None,
+     partial_token: str | None = None,
+     *args,
+     **kwargs,
+-) -> PartialMixin | None:
++) -> PartialPipelineResult:
+     request_data = backend.strategy.request_data()
+ 
+     partial_argument_name = backend.setting(
+         "PARTIAL_PIPELINE_TOKEN_NAME", "partial_token"
+     )
+-    partial_token = (
+-        partial_token
+-        or request_data.get(partial_argument_name)
+-        or backend.strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
+-    )
+-
+-    if partial_token:
+-        partial: PartialMixin | None = backend.strategy.partial_load(partial_token)
+-        partial_matches_request = False
+-
+-        if partial and partial.backend == backend.name:
+-            partial_matches_request = True
+-
+-            # Normally when resuming a pipeline, request_data will be empty. We
+-            # only need to check for a uid match if new data was provided (i.e.
+-            # if current request specifies the ID_KEY).
+-            id_key = backend.id_key()
+-            if id_key and id_key in request_data:
+-                id_from_partial = partial.kwargs.get("uid")
+-                id_from_request = request_data.get(id_key)
+-
+-                if id_from_partial != id_from_request:
+-                    partial_matches_request = False
+-
+-        if partial and partial_matches_request:
+-            if user:  # don't update user if it's None
+-                kwargs.setdefault("user", user)
+-            kwargs.setdefault("request", request_data)
+-            partial.extend_kwargs(kwargs)
+-            return partial
+-        backend.strategy.clean_partial_pipeline(partial_token)
+-        return None
+-    return None
++    request_token = cast(
++        "str | None", partial_token or request_data.get(partial_argument_name)
++    )
++    session_token = backend.strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
++    pending_token = backend.strategy.session_get(
++        PARTIAL_TOKEN_PENDING_SESSION_NAME, None
++    )
++
++    confirmation_parameter = backend.setting(
++        "PARTIAL_PIPELINE_EXTERNAL_RESUME_CONFIRMATION_PARAMETER",
++        "partial_pipeline_confirm",
++    )
++    confirmation_requested = (
++        bool(confirmation_parameter) and confirmation_parameter in request_data
++    )
++
++    selection = _select_partial_pipeline_token(
++        request_token=request_token,
++        session_token=session_token,
++        pending_token=pending_token,
++        confirmation_requested=confirmation_requested,
++    )
++    if not selection.token:
++        return PartialPipelineResult()
++
++    result = PartialPipelineResult(halt=bool(request_token or confirmation_requested))
++    effective_request_data = request_data
++    if selection.pending_resume:
++        confirmed_request_data = _confirmed_partial_pipeline_request_data(
++            backend, request_data
++        )
++        if confirmed_request_data is None:
++            return PartialPipelineResult(halt=True)
++        effective_request_data = confirmed_request_data
++
++    partial: PartialMixin | None = backend.strategy.partial_load(selection.token)
++    partial_matches = _partial_pipeline_matches_request(
++        backend, partial, effective_request_data
++    )
++    if partial and partial_matches:
++        if selection.owns_token:
++            result = PartialPipelineResult(
++                partial=_extend_partial_pipeline(
++                    partial, effective_request_data, user, kwargs
++                )
++            )
++        elif partial.data.get(PARTIAL_PIPELINE_ALLOW_EXTERNAL_RESUME):
++            result = _external_partial_pipeline_result(
++                backend, partial, selection.token, effective_request_data
++            )
++        else:
++            result = PartialPipelineResult(halt=True)
++    elif selection.owns_token:
++        backend.strategy.clean_partial_pipeline(selection.token)
++
++    if result.partial is not None:
++        _approve_partial_pipeline_resume(backend.strategy, result.partial.token)
++    return result
++
++
++def partial_pipeline_data(
++    backend: BaseAuth,
++    user: UserProtocol | None = None,
++    partial_token: str | None = None,
++    *args,
++    **kwargs,
++) -> PartialMixin | None:
++    return partial_pipeline_result(
++        backend, user, partial_token, *args, **kwargs
++    ).partial
+ 
+ 
+ def build_absolute_uri(host_url: str, path: str | None = None) -> str:

@@ -1,0 +1,144 @@
+diff --git a/registry/remote/auth/client.go b/registry/remote/auth/client.go
+index 826cf0f..8fd2e73 100644
+--- a/registry/remote/auth/client.go
++++ b/registry/remote/auth/client.go
+@@ -137,7 +137,51 @@ func (c *Client) send(req *http.Request) (*http.Response, error) {
+ 	for key, values := range c.Header {
+ 		req.Header[key] = append(req.Header[key], values...)
+ 	}
+-	return c.client().Do(req)
++	// Drop the Authorization header when a redirect crosses an HTTP origin
++	// (scheme, host, or port). The standard library only strips sensitive
++	// headers when the hostname changes, so a redirect to a different port on
++	// the same host would otherwise forward credentials to an unintended
++	// endpoint. Any caller-provided CheckRedirect is preserved.
++	client := c.client()
++	clientCopy := *client
++	checkRedirect := client.CheckRedirect
++	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
++		if len(via) > 0 && !sameHTTPOrigin(via[len(via)-1].URL, req.URL) {
++			req.Header.Del("Authorization")
++			req.Header.Del("Proxy-Authorization")
++			req.Header.Del("Cookie")
++		}
++		if checkRedirect != nil {
++			return checkRedirect(req, via)
++		}
++		return nil
++	}
++	return clientCopy.Do(req)
++}
++
++// sameHTTPOrigin reports whether a and b share the same HTTP origin, i.e. the
++// same scheme and host. Default ports are normalized so that, for example,
++// "example.com" and "example.com:443" compare equal over https.
++func sameHTTPOrigin(a, b *url.URL) bool {
++	if !strings.EqualFold(a.Scheme, b.Scheme) {
++		return false
++	}
++	return canonicalHost(a) == canonicalHost(b)
++}
++
++// canonicalHost returns the lower-cased host of u with the default port for its
++// scheme applied when no explicit port is present.
++func canonicalHost(u *url.URL) string {
++	port := u.Port()
++	if port == "" {
++		switch strings.ToLower(u.Scheme) {
++		case "https":
++			port = "443"
++		case "http":
++			port = "80"
++		}
++	}
++	return strings.ToLower(u.Hostname()) + ":" + port
+ }
+ 
+ // credential resolves the credential for the given registry.
+@@ -226,6 +270,9 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
+ 	var attemptedKey string
+ 	cache := c.cache()
+ 	host := originalReq.Host
++	if host == "" {
++		host = originalReq.URL.Host
++	}
+ 	scheme, err := cache.GetScheme(ctx, host)
+ 	if err == nil {
+ 		switch scheme {
+@@ -251,6 +298,12 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
+ 	if resp.StatusCode != http.StatusUnauthorized {
+ 		return resp, nil
+ 	}
++	// If the challenge came from a different origin than originally requested
++	// (e.g. the request was redirected to another host or port), do not resolve
++	// or send the registry credentials to that origin.
++	if resp.Request != nil && !sameHTTPOrigin(originalReq.URL, resp.Request.URL) {
++		return resp, nil
++	}
+ 
+ 	// attempt again with credentials for recognized schemes
+ 	challenge := resp.Header.Get("Www-Authenticate")
+diff --git a/registry/remote/repository.go b/registry/remote/repository.go
+index 20e0cbf..d7e7217 100644
+--- a/registry/remote/repository.go
++++ b/registry/remote/repository.go
+@@ -999,6 +999,17 @@ func (s *blobStore) completeChunkedUpload(ctx context.Context, initResp *http.Re
+ 	if err != nil {
+ 		return err
+ 	}
++	// Validate the continuation Location stays on the same origin before the
++	// credential copied from the chunk request can be sent there.
++	if next.User != nil {
++		return fmt.Errorf("chunked upload Location %q carries user information", next.Host)
++	}
++	if !sameUploadHost(next, req.URL) {
++		return fmt.Errorf("chunked upload Location %q is on a different host than the registry %q", next.Host, req.URL.Host)
++	}
++	if req.URL.Scheme == "https" && next.Scheme != "https" {
++		return fmt.Errorf("chunked upload Location %q downgrades scheme from https", next.Host)
++	}
+ 	url := next.String()
+ 	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, nil)
+ 	if err != nil {
+diff --git a/registry/remote/retry/client.go b/registry/remote/retry/client.go
+index 80c9f0e..07ffac6 100644
+--- a/registry/remote/retry/client.go
++++ b/registry/remote/retry/client.go
+@@ -17,6 +17,7 @@ package retry
+ 
+ import (
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"time"
+ )
+@@ -41,7 +42,7 @@ func keepAuthorizationOnRedirect(req *http.Request, via []*http.Request) error {
+ 		return nil
+ 	}
+ 	prev := via[len(via)-1]
+-	if !strings.EqualFold(req.URL.Hostname(), prev.URL.Hostname()) {
++	if !sameOrigin(req.URL, prev.URL) {
+ 		return nil
+ 	}
+ 	if auth := prev.Header.Get("Authorization"); auth != "" {
+@@ -132,3 +133,20 @@ func (t *Transport) policy() Policy {
+ 	}
+ 	return t.Policy()
+ }
++
++// sameOrigin reports whether a and b have the same scheme, host name and port.
++func sameOrigin(a, b *url.URL) bool {
++	if !strings.EqualFold(a.Scheme, b.Scheme) {
++		return false
++	}
++	port := func(u *url.URL) string {
++		if p := u.Port(); p != "" {
++			return p
++		}
++		if strings.ToLower(u.Scheme) == "https" {
++			return "443"
++		}
++		return "80"
++	}
++	return strings.EqualFold(a.Hostname(), b.Hostname()) && port(a) == port(b)
++}

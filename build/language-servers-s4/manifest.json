@@ -1,0 +1,199 @@
+{
+ "slug": "language-servers-s4",
+ "candidate": {
+  "advisory_ids": [
+   "GHSA-XHCR-J4J9-3GH7",
+   "CVE-2026-12957"
+  ],
+  "repo": "amazon-q-developer/language-servers",
+  "pinned_commit": "ae7d3fcd26f57d6cc5d3d26dd5ec79983c4103df",
+  "fix_commits": [
+   "7b8595a4e638562f79d5f71dcf22b0c700490458",
+   "f5aa1a3b25aa38bfe8dd0e830b5839e1cea1d410"
+  ],
+  "screener_version": "screener-v2",
+  "entry_id": "14914",
+  "cwe": "CWE-732",
+  "pattern_fit": "A+B"
+ },
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "McpManager.init(agentPaths, features) + discoverAllServers() with a real-filesystem workspace whose .amazonq/mcp.json names a /bin/sh command; the command writes a marker file, proving the program ran. Confirmed on the pinned+injected tree (0 dialogs, marker present) and blocked after the reference fix (dialog offered, denial leaves no marker).",
+  "sites": [
+   "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpManager.ts: initOneServerInternal start gate (all start routes funnel through initOneServer); close(); removeServer()",
+   "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsentStore.ts: persisted approval store, execution-configuration identity, workspace binding",
+   "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts: loadAgentConfig hook collection and legacy-MCP merge provenance",
+   "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpServerConfigConverter.ts: registry execution config that receives workspace env"
+  ],
+  "routes": [
+   "discoverAllServers -> workspace mcp.json legacy entry",
+   "discoverAllServers -> workspace agent config entry",
+   "discoverAllServers -> registry entry with workspace-supplied env",
+   "addServer (agent-file route)",
+   "updateServer after an approval",
+   "remote (streamable HTTP/SSE) entry",
+   "workspace-declared agentSpawn hook (injected sibling)",
+   "workspace legacy entry overriding a global agent-config entry (injected sibling)",
+   "changed configuration / other workspace / edited saved server (identity routes)",
+   "dialog unavailable (fail-closed route)"
+  ],
+  "services": [],
+  "project_tests_run": "server/aws-lsp-codewhisperer ts-mocha mcpUtils.test.ts (59 passing) and mcpManager.test.ts (44 passing): 103 passing at the pinned+injected commit and 103 passing after the reference fix."
+ },
+ "leak_terms": [
+  "GHSA-XHCR-J4J9-3GH7",
+  "CVE-2026-12957",
+  "mcpManager",
+  "mcpUtils",
+  "mcpConsentStore",
+  "McpManager",
+  "initOneServerInternal",
+  "loadMcpServerConfigs",
+  "discoverAllServers",
+  "addServer",
+  "updateServer",
+  "addRegistryServer",
+  "configPath",
+  "__configPath__",
+  "__additionalEnv__",
+  "__additionalHeaders__",
+  "fingerprintServerConfig",
+  "hasApproval",
+  "recordApproval",
+  "agentSpawn",
+  "userPromptSubmit",
+  "mcp.json",
+  "hooks",
+  "registry"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-fix.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-env-overlay-missed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-workspace-only-identity.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-merge-provenance.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-hooks-untouched.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-loader-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-fail-open-dialog.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-crash.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt-fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "ff-crash.patch",
+  "wrong_resource": "sf-merge-provenance.patch",
+  "one_role_or_direction": "n/a: the decision has no roles, peers or directions; every start route reaches one trust decision.",
+  "reads_only": "n/a: the protected outcome is starting work, not a read or a write, so there is no verb split to miss.",
+  "check_after_adjustment": "sf-env-overlay-missed.patch",
+  "unlisted_route": "sf-loader-only.patch",
+  "malformed_identity": "sf-workspace-only-identity.patch",
+  "missing_authority": "sf-fail-open-dialog.patch",
+  "adjacent_api": "n/a: the fix adds an internal consent module and does not change a shared helper's contract for another public API."
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "producer off the check's path: the approval identity is computed from the config entry, but the workspace-supplied environment for registry servers is produced by the loader into a separate overlay and merged only at spawn, so a change after approval is invisible to the check",
+   "where": "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts:485-487 (loader) and mcpManager.ts:452-455 (spawn merge)",
+   "security_tests": [
+    "security/04-registry-environment-change.test.ts",
+    "security/05-registry-environment-first-load.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "functional/03-approved-reload.test.ts",
+    "functional/04-settings-order.test.ts"
+   ],
+   "security_fail_patch": "sf-env-overlay-missed.patch",
+   "realistic_because": "real, unmodified upstream code; upstream fixed exactly this gap later at 529aed432595 (merged env/headers in the consent fingerprint)"
+  },
+  {
+   "id": "T2",
+   "shape": "identity shape: matching an approval on server name and workspace alone lets one approved configuration authorise a different one and silently covers edits through the saved-server route",
+   "where": "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpConsentStore.ts:96-109 (hasApproval)",
+   "security_tests": [
+    "security/02-changed-configuration.test.ts",
+    "security/03-other-workspace.test.ts",
+    "security/09-update-server-entry-point.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "functional/02-allowed-workspace-server.test.ts",
+    "functional/03-approved-reload.test.ts"
+   ],
+   "security_fail_patch": "sf-workspace-only-identity.patch",
+   "realistic_because": "the published second fix commit (f5aa1a3) weakened the match to an OR with the workspace hash for exactly this reason; upstream restored the full triple later at 1c84ba6c89a2"
+  },
+  {
+   "id": "T3",
+   "shape": "merged/defaults route with a proxy object: when a workspace legacy entry overlays a same-named global agent-config entry, the merged record keeps the global source path, so the trust decision is made on the record's origin instead of the file that supplied the execution settings",
+   "where": "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts:625-640 (injected sibling in loadAgentConfig)",
+   "security_tests": [
+    "security/06-override-user-setting.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "functional/07-override-allowed.test.ts"
+   ],
+   "security_fail_patch": "sf-merge-provenance.patch",
+   "realistic_because": "the loader already merges global and workspace sources with explicit precedence and records a source path; keeping the existing record's bookkeeping while the legacy entry supplies execution settings is a natural merge"
+  },
+  {
+   "id": "T4",
+   "shape": "route where the protection never existed: lifecycle commands declared by a workspace agent configuration are executed at discovery outside the server-start gate",
+   "where": "server/aws-lsp-codewhisperer/src/language-server/agenticChat/tools/mcp/mcpUtils.ts:405-418 and mcpManager.ts:381-410 (injected sibling)",
+   "security_tests": [
+    "security/07-workspace-startup-command.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "functional/05-global-startup-command.test.ts"
+   ],
+   "security_fail_patch": "sf-hooks-untouched.patch",
+   "realistic_because": "AgentConfig.hooks is a documented field that the legacy migrator already copies, and nothing in the package executed it; wiring the documented field at agent spawn is what a maintainer would add"
+  }
+ ],
+ "notes": "Entry-point coverage beyond the levers (pattern A): addServer (08), updateServer (09), remote endpoint (10), dialog-unavailable fail-closed (11). Registry data is seeded directly in the tests (trusted input normally fetched by the registry service) so the suite is offline. The workspace-agent-config route the screener listed as O8 #2 is covered by the published fix and is tested functionally (06-global-agent-server). Headers are included in the reference identity defensively but are not scored as an attack route.",
+ "status": "built; gate PASSED in stages on 2026-10-29: static green except the pipeline-written blind pass patch; nop PASSED (12/12 security tests fail on the vulnerable tree, 110/110 functional pass); oracle PASSED (3 identical runs, reward 1.0, 12/12 security + 110/110 functional each); patches PASSED (11/11 as declared: published upstream fix and each per-lever miss leave security tests failing with functional green; refuse-all breaks 2 and crash breaks 4 functional tests; hardening and alternative fix score 1.0)."
+}
