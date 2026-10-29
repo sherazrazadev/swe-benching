@@ -1,0 +1,23 @@
+diff --git a/mcpgateway/main.py b/mcpgateway/main.py
+index 06071a5..f8fbf91 100644
+--- a/mcpgateway/main.py
++++ b/mcpgateway/main.py
+@@ -6395,6 +6395,18 @@ async def get_prompt(
+     """
+     logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested prompt: {prompt_id} with args={args}")
+ 
++    # Shallow guard: refuse stored templates that traverse into objects on this route.
++    from sqlalchemy import or_ as _or, select as _select  # pylint: disable=import-outside-toplevel
++
++    from mcpgateway.db import Prompt as _DbPrompt  # pylint: disable=import-outside-toplevel
++
++    try:
++        _stored = db.execute(_select(_DbPrompt).where(_or(_DbPrompt.name == prompt_id, _DbPrompt.custom_name == prompt_id))).scalars().first()
++    except Exception:
++        _stored = None
++    if _stored is not None and _stored.template and any(token in _stored.template for token in ("__", "[", "|attr")):
++        return ORJSONResponse(content={"message": "Template refused"}, status_code=422)
++
+     # Get plugin contexts from request.state for cross-hook sharing
+     plugin_context_table = getattr(request.state, "plugin_context_table", None)
+     plugin_global_context = getattr(request.state, "plugin_global_context", None)

@@ -1,0 +1,48 @@
+{
+ "trial": "mcp-context-forge-mm__YpkFSuC",
+ "task": "mcp-context-forge-mm",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-28T20:45:57+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T01:51:43+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.0 comes from the threshold rule in score.py: any failing functional test gives 0. One functional test failed, test_literal_braces_are_preserved, and the model caused that failure itself. It replaced the original argument scanner, which was string.Formatter().parse and yielded the field name ' and ' for the prose '{ and }'. The new extract_simple_field_names strips whitespace, so it yields 'and'. The prompt's derived required-argument schema therefore changes. The same request that works on the unpatched code (it passes ' and ' as a key) no longer satisfies the schema and is refused. The instruction says 'Legitimate template use keeps working exactly as today', and the reference fix leaves argument derivation unchanged, so this is a genuine regression. One security test also failed: test_resource_body_is_not_evaluated. That failure is a test fault. The model refused the malicious resource body at creation with HTTP 400, which the instruction explicitly allows ('refused with a client error and leaves no prompt, resource or other state created'). The test instead hard-asserts that creation returns 200. The prompt security tests tolerate refusal at creation, so the resource test is inconsistent with them. This fault does not change the 0.0, because the functional failure alone forces it. Under a fair resource test the result would still be 0.0. The other 4 security tests passed, and so did all of the remaining functional and project tests. The agent ran out of its 3-hour limit (AgentTimeoutError) while it was still doing verification, and it made no tool calls inside the grading window. No sign of contamination.",
+  "items": [
+   {
+    "test": "functional.test_prompt_features::test_literal_braces_are_preserved",
+    "outcome": "fail",
+    "model_behaviour": "The model changed _get_required_arguments to use its new extract_simple_field_names (changes.patch:66-75, template_security.py _SIMPLE_FIELD_RE '^\\s*(name)\\s*$'). That function trims whitespace inside braces, so '{ and }' becomes a required argument named 'and' instead of ' and ', which is what the original Formatter-based scanner produced. The test supplies {'name':'X',' and ':''}, which works today. With the patch, the required argument 'and' is missing, so the render is refused. The model's own probes showed it knew the scanner reads brace text as argument names (transcript.md:153-155), but it did not keep that behaviour.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "security.test_resource_body_isolation::test_resource_body_is_not_evaluated",
+    "outcome": "fail",
+    "model_behaviour": "The model added _ensure_resource_template_is_safe to register_resource (changes.patch:243-249). As a result, POST /resources/ with '{{ ''.__class__.__mro__[1].__subclasses__ }}' raises ResourceValidationError, which main.py maps to HTTP 400 ('except ResourceError ... status_code=400', transcript.md:614). The model also added a check when the body is read. The test fails at `assert created.status_code == 200` (test_resource_body_isolation.py:8) because the test requires the malicious body to be stored and refused only when read. The instruction allows refusal at creation and asks for no state to be left, and the prompt security tests accept refusal at creation. So this is a stricter correct fix that the test wrongly rejects.",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript shows the agent reading only the repository's own /workspace/tests (project unit tests), not the hidden verifier tests. There were no web fetches or searches. The only 'curl' hit is documentation text inside a file the agent read. No netguard.log is present. The model wrote its own template_security module, which does not match the upstream or reference fix.",
+  "evidence": [
+   "evidence/grading/results.json:6 resource security test 'fail'; :13 test_literal_braces_are_preserved 'fail'; all other entries pass",
+   "evidence/tests/score.py:61-62 'elif not all_fun: reward = 0.0' (any functional failure gives 0)",
+   "evidence/tests/functional/test_prompt_features.py:41-46 template 'Use { and } for JSON: {{ name }}' with arguments {'name':'X',' and ':''}",
+   "evidence/final-code/changes.patch:72-75 Formatter-based field extraction replaced by extract_simple_field_names; :340-341 _SIMPLE_FIELD_RE strips whitespace",
+   "evidence/transcript.md:155 the model saw that Formatter yields raw brace bodies (e.g. '% if x %') as argument names",
+   "evidence/instruction.md:24-25 'Legitimate template use keeps working exactly as today'",
+   "evidence/tests/security/test_resource_body_isolation.py:8 'assert created.status_code == 200' (refusal at creation not accepted)",
+   "evidence/tests/security/test_prompt_render_isolation.py:23 refusal at creation tolerated for prompts ('missing-prompt' fallback)",
+   "evidence/instruction.md:20-21 'refused with a client error and leaves no prompt, resource or other state created'",
+   "evidence/final-code/changes.patch:243-249 resource body refused at creation; transcript.md:614 ResourceError mapped to HTTP 400",
+   "evidence/run.json timing: tool_calls_during_grading [] ; AgentTimeoutError after 10800 s",
+   "evidence/solution/fix.patch keeps Formatter-based _get_required_arguments and sandboxes the resource environment only (refusal at render time)"
+  ],
+  "recommended_action": "Keep the 0.0 reward. It is driven by a genuine functional regression the model introduced (argument-name derivation changed for prose braces). Separately, fix test_resource_body_is_not_evaluated so it accepts a 4xx refusal at creation, the same way the prompt security tests do: if creation is refused, treat the test as passed or read a nonexistent ID. As written, it penalises a fix that matches the instruction's 'no state created' wording. Re-score partial-credit views (passed_total) with the corrected test if those numbers are reported."
+ }
+}

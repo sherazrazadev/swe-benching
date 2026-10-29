@@ -1,0 +1,253 @@
+diff -ruN a/mcpgateway/services/import_service.py b/mcpgateway/services/import_service.py
+--- a/mcpgateway/services/import_service.py	2026-10-28 15:27:25.000000000 +0000
++++ b/mcpgateway/services/import_service.py	2026-10-28 16:00:56.678951944 +0000
+@@ -26,7 +26,6 @@
+ import uuid
+ 
+ # Third-Party
+-from jinja2 import Environment, select_autoescape
+ from sqlalchemy.orm import Session
+ 
+ # First-Party
+@@ -38,16 +37,14 @@
+ from mcpgateway.services.server_service import ServerNameConflictError
+ from mcpgateway.services.tool_service import ToolNameConflictError
+ from mcpgateway.utils.services_auth import decode_auth, encode_auth
++from mcpgateway.utils.template_safety import sandboxed_environment
+ 
+ logger = logging.getLogger(__name__)
+ 
+ # The import preview renders prompt templates so the administrator can see what an
+-# imported prompt will look like.
+-_PREVIEW_TEMPLATE_ENV = Environment(
+-    autoescape=select_autoescape(["html", "xml"]),
+-    trim_blocks=True,
+-    lstrip_blocks=True,
+-)
++# imported prompt will look like. Import files are untrusted data, so the
++# environment is sandboxed.
++_PREVIEW_TEMPLATE_ENV = sandboxed_environment()
+ 
+ 
+ class ConflictStrategy(str, Enum):
+diff -ruN a/mcpgateway/services/prompt_service.py b/mcpgateway/services/prompt_service.py
+--- a/mcpgateway/services/prompt_service.py	2026-10-28 15:27:22.000000000 +0000
++++ b/mcpgateway/services/prompt_service.py	2026-10-28 16:00:46.352989740 +0000
+@@ -24,7 +24,9 @@
+ import uuid
+ 
+ # Third-Party
+-from jinja2 import Environment, meta, select_autoescape, Template
++from jinja2 import meta, Template
++from jinja2.exceptions import SecurityError as JinjaSecurityError
++from jinja2.sandbox import SandboxedEnvironment
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -66,6 +68,7 @@
+ from mcpgateway.utils.pagination import unified_paginate
+ from mcpgateway.utils.services_auth import decode_auth
+ from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
++from mcpgateway.utils.template_safety import UnsafeTemplateError, render_legacy_placeholders, sandboxed_environment
+ from mcpgateway.utils.trace_context import format_trace_team_scope
+ from mcpgateway.utils.trace_redaction import is_input_capture_enabled, is_output_capture_enabled, serialize_trace_payload
+ from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception_message
+@@ -73,23 +76,20 @@
+ # Cache import (lazy to avoid circular dependencies)
+ _REGISTRY_CACHE = None
+ 
+-# Module-level Jinja environment singleton for template caching
+-_JINJA_ENV: Optional[Environment] = None
++# Module-level Jinja environment singleton for template caching. Prompt templates are
++# stored text, so the environment is sandboxed and refuses access to Python internals.
++_JINJA_ENV: Optional[SandboxedEnvironment] = None
+ 
+ 
+-def _get_jinja_env() -> Environment:
++def _get_jinja_env() -> SandboxedEnvironment:
+     """Get or create the module-level Jinja environment singleton.
+ 
+     Returns:
+-        Jinja2 Environment with autoescape and trim settings.
++        Sandboxed Jinja2 environment with autoescape and trim settings.
+     """
+     global _JINJA_ENV  # pylint: disable=global-statement
+     if _JINJA_ENV is None:
+-        _JINJA_ENV = Environment(
+-            autoescape=select_autoescape(["html", "xml"]),
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-        )
++        _JINJA_ENV = sandboxed_environment()
+     return _JINJA_ENV
+ 
+ 
+@@ -2887,11 +2887,16 @@
+         try:
+             jinja_template = _compile_jinja_template(template)
+             return jinja_template.render(**arguments)
++        except JinjaSecurityError as exc:
++            # The sandbox rejected attribute access or a call. Falling back to any
++            # other interpreter of the same text would reopen the hole.
++            raise PromptError(f"Failed to render template: refused unsafe operation ({exc})") from exc
+         except Exception:
++            # Legacy single-brace templates: substitute plain {name} arguments only.
+             try:
+-                return template.format(**arguments)
+-            except Exception as e:
+-                raise PromptError(f"Failed to render template: {str(e)}")
++                return render_legacy_placeholders(template, arguments)
++            except UnsafeTemplateError as exc:
++                raise PromptError(f"Failed to render template: {exc}") from exc
+ 
+     def _parse_messages(self, text: str) -> List[Message]:
+         """Parse rendered text into messages.
+diff -ruN a/mcpgateway/services/resource_service.py b/mcpgateway/services/resource_service.py
+--- a/mcpgateway/services/resource_service.py	2026-10-28 15:27:25.000000000 +0000
++++ b/mcpgateway/services/resource_service.py	2026-10-28 16:00:53.448964246 +0000
+@@ -35,7 +35,6 @@
+ 
+ # Third-Party
+ import httpx
+-from jinja2 import Environment, select_autoescape
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -82,6 +81,7 @@
+ from mcpgateway.utils.services_auth import decode_auth
+ from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
+ from mcpgateway.utils.ssl_context_cache import get_cached_ssl_context
++from mcpgateway.utils.template_safety import sandboxed_environment
+ from mcpgateway.utils.trace_context import format_trace_team_scope
+ from mcpgateway.utils.trace_redaction import is_input_capture_enabled, is_output_capture_enabled, serialize_trace_payload
+ from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception_message
+@@ -114,11 +114,8 @@
+ structured_logger = get_structured_logger("resource_service")
+ 
+ # Text resources may reference their own metadata through {{ placeholder }} expressions.
+-_RESOURCE_TEXT_ENV = Environment(
+-    autoescape=select_autoescape(["html", "xml"]),
+-    trim_blocks=True,
+-    lstrip_blocks=True,
+-)
++# Resource bodies are data, so the environment is sandboxed.
++_RESOURCE_TEXT_ENV = sandboxed_environment()
+ 
+ 
+ def _render_resource_text(text: str, context: Dict[str, Any]) -> str:
+diff -ruN a/mcpgateway/utils/template_safety.py b/mcpgateway/utils/template_safety.py
+--- a/mcpgateway/utils/template_safety.py	1970-01-01 00:00:00.000000000 +0000
++++ b/mcpgateway/utils/template_safety.py	2026-10-28 16:00:34.704041318 +0000
+@@ -0,0 +1,112 @@
++# -*- coding: utf-8 -*-
++"""Location: ./mcpgateway/utils/template_safety.py
++Copyright 2025
++SPDX-License-Identifier: Apache-2.0
++
++Safe rendering of template text the gateway stores or previews.
++
++Prompt templates, stored resource bodies and import previews are data supplied by
++users, federated servers or import files. Rendering such text must never let it
++reach into Python objects, call dunder methods or read module internals, so every
++renderer in the gateway builds its Jinja environment through
++:func:`sandboxed_environment` and turns a sandbox rejection into its own client
++error.
++
++The legacy single-brace syntax (``{name}``) is still supported by
++:func:`render_legacy_placeholders`, but only for plain argument names. Python's
++format language would otherwise honour ``{x.attr}``, ``{x[index]}`` and nested
++fields, which walk into objects and stringify them with their memory address.
++"""
++
++# Standard
++import re
++from string import Formatter
++from typing import Any, Mapping
++
++# Third-Party
++from jinja2 import select_autoescape
++from jinja2.sandbox import SandboxedEnvironment
++
++
++class UnsafeTemplateError(ValueError):
++    """Raised when template text asks for an operation the gateway refuses."""
++
++
++# A legacy placeholder may only name a top-level argument.
++_LEGACY_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
++_LEGACY_CONVERSIONS = {"s": str, "r": repr, "a": ascii}
++
++
++def sandboxed_environment(**overrides: Any) -> SandboxedEnvironment:
++    """Build a sandboxed Jinja environment with the gateway's shared settings.
++
++    Args:
++        **overrides: Options that replace the defaults.
++
++    Returns:
++        A :class:`~jinja2.sandbox.SandboxedEnvironment` whose attribute and call
++        access is checked by the sandbox.
++    """
++    options = {
++        "autoescape": select_autoescape(["html", "xml"]),
++        "trim_blocks": True,
++        "lstrip_blocks": True,
++    }
++    options.update(overrides)
++    return SandboxedEnvironment(**options)
++
++
++def render_legacy_placeholders(template: str, values: Mapping[str, Any]) -> str:
++    """Substitute ``{name}`` placeholders using plain argument names only.
++
++    This is the fallback for templates that use the single-brace syntax instead of
++    Jinja expressions. Attribute access (``{x.__class__}``), index access
++    (``{x[0]}``) and nested fields are refused before any substitution happens, so
++    stored text cannot reach the objects held by the renderer.
++
++    Args:
++        template: Template text that could not be rendered as a Jinja template.
++        values: Argument values keyed by argument name.
++
++    Returns:
++        The template with its ``{name}`` placeholders replaced.
++
++    Raises:
++        UnsafeTemplateError: If the text uses a placeholder the gateway will not
++            evaluate, or a value is missing.
++    """
++    try:
++        pieces = list(Formatter().parse(template))
++    except ValueError as exc:
++        raise UnsafeTemplateError(f"malformed placeholder syntax: {exc}") from exc
++
++    rendered = []
++    for literal, field_name, format_spec, conversion in pieces:
++        rendered.append(literal)
++        if field_name is None:
++            continue
++
++        if not _LEGACY_FIELD_NAME.match(field_name):
++            raise UnsafeTemplateError(f"placeholder {field_name!r} is not a plain argument name")
++        try:
++            value = values[field_name]
++        except KeyError:
++            raise UnsafeTemplateError(f"missing value for placeholder {field_name!r}") from None
++
++        if conversion is not None:
++            converter = _LEGACY_CONVERSIONS.get(conversion)
++            if converter is None:
++                raise UnsafeTemplateError(f"placeholder {field_name!r} uses an unsupported conversion")
++            value = converter(value)
++
++        if format_spec:
++            if "{" in format_spec or "}" in format_spec:
++                raise UnsafeTemplateError(f"placeholder {field_name!r} uses a nested format field")
++            try:
++                value = format(value, format_spec)
++            except (TypeError, ValueError) as exc:
++                raise UnsafeTemplateError(f"placeholder {field_name!r} has an invalid format specifier: {exc}") from exc
++
++        rendered.append(str(value))
++
++    return "".join(rendered)

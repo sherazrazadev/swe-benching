@@ -1,0 +1,206 @@
+diff --git a/mcpgateway/common/validators.py b/mcpgateway/common/validators.py
+index 3da406f..032820b 100644
+--- a/mcpgateway/common/validators.py
++++ b/mcpgateway/common/validators.py
+@@ -134,6 +134,11 @@ _SSTI_DANGEROUS_OPERATORS: tuple[str, ...] = (
+ )
+ _SSTI_SIMPLE_TEMPLATE_PREFIXES: tuple[str, ...] = ("${", "#{", "%{")
+ 
++# Names a stored template may call and filters it may use when it is validated before
++# rendering with a plain Jinja environment.
++_SAFE_JINJA_CALLS = frozenset({"range", "dict", "list", "tuple", "str", "int", "float", "len", "namespace", "cycler", "joiner", "lipsum", "max", "min", "abs", "round"})
++_UNSAFE_JINJA_FILTERS = frozenset({"attr", "selectattr", "rejectattr"})
++
+ 
+ def _iter_template_expressions(value: str, start: str, end: str) -> Iterable[str]:
+     """Yield template expression contents for a start/end delimiter, skipping delimiters inside quotes.
+@@ -875,6 +880,43 @@ class SecurityValidator:
+ 
+         return value
+ 
++    @classmethod
++    def assert_safe_jinja_template(cls, value: str) -> str:
++        """Reject a template that could reach Python internals when rendered.
++
++        Args:
++            value: Template text.
++
++        Returns:
++            The template, unchanged, when it is safe to render.
++
++        Raises:
++            ValueError: When the template uses attribute/index access, a dynamic
++                import/include, a call outside the allowed names, or an unsafe filter.
++        """
++        if not value:
++            return value
++        # Third-Party
++        from jinja2 import Environment, nodes  # pylint: disable=import-outside-toplevel
++
++        try:
++            ast = Environment().parse(value)
++        except Exception:
++            return value
++        for _node in ast.find_all((nodes.Getattr, nodes.Getitem, nodes.Import, nodes.FromImport, nodes.Include, nodes.Extends)):
++            raise ValueError("Template reaches into objects")
++        for call in ast.find_all(nodes.Call):
++            target = call.node
++            if not isinstance(target, nodes.Name) or target.name not in _SAFE_JINJA_CALLS:
++                raise ValueError("Template calls an unsupported name")
++        for filt in ast.find_all(nodes.Filter):
++            if filt.name in _UNSAFE_JINJA_FILTERS:
++                raise ValueError("Template uses an unsupported filter")
++            for kw in filt.kwargs:
++                if kw.key in ("attribute", "attr"):
++                    raise ValueError("Template uses an unsupported filter argument")
++        return value
++
+     @classmethod
+     def sanitize_log_message(cls, message: Optional[Any], max_length: int = 10000) -> str:
+         """Sanitize log message to prevent log injection attacks.
+diff --git a/mcpgateway/services/import_service.py b/mcpgateway/services/import_service.py
+index 008d22d..84d38b4 100644
+--- a/mcpgateway/services/import_service.py
++++ b/mcpgateway/services/import_service.py
+@@ -30,6 +30,7 @@ from jinja2 import Environment, select_autoescape
+ from sqlalchemy.orm import Session
+ 
+ # First-Party
++from mcpgateway.common.validators import SecurityValidator
+ from mcpgateway.db import A2AAgent, EmailUser, Gateway, Prompt, Resource, Server, Tool
+ from mcpgateway.schemas import AuthenticationValues, GatewayCreate, GatewayUpdate, PromptCreate, PromptUpdate, ResourceCreate, ResourceUpdate, ServerCreate, ServerUpdate, ToolCreate, ToolUpdate
+ from mcpgateway.services.gateway_service import GatewayNameConflictError
+@@ -111,6 +112,7 @@ def _render_import_preview(template: str, context: Dict[str, Any]) -> str:
+         ImportValidationError: If the template cannot be rendered.
+     """
+     try:
++        SecurityValidator.assert_safe_jinja_template(template)
+         return _PREVIEW_TEMPLATE_ENV.from_string(template).render(**context)
+     except Exception as exc:
+         raise ImportValidationError(f"Could not preview prompt template: {exc}") from exc
+diff --git a/mcpgateway/services/prompt_service.py b/mcpgateway/services/prompt_service.py
+index 88e59d2..162e359 100644
+--- a/mcpgateway/services/prompt_service.py
++++ b/mcpgateway/services/prompt_service.py
+@@ -16,6 +16,7 @@ It handles:
+ 
+ # Standard
+ import binascii
++import re
+ from datetime import datetime, timezone
+ from functools import lru_cache
+ from string import Formatter
+@@ -25,6 +26,8 @@ import uuid
+ 
+ # Third-Party
+ from jinja2 import Environment, meta, select_autoescape, Template
++from jinja2.exceptions import SecurityError as JinjaSecurityError
++from jinja2.sandbox import SandboxedEnvironment
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -38,6 +41,7 @@ from sqlalchemy.orm import joinedload, selectinload, Session
+ # First-Party
+ from mcpgateway.common.models import Message, PromptResult, Role, TextContent
+ from mcpgateway.common.validators import validate_meta_data as _validate_meta_data
++from mcpgateway.common.validators import SecurityValidator
+ from mcpgateway.config import settings
+ from mcpgateway.db import EmailTeam
+ from mcpgateway.db import EmailTeamMember as DbEmailTeamMember
+@@ -73,11 +77,55 @@ from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception
+ # Cache import (lazy to avoid circular dependencies)
+ _REGISTRY_CACHE = None
+ 
++# Python format() field names accepted by the legacy {name} fallback: a plain
++# argument name, no attribute or index traversal.
++_SAFE_FORMAT_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
++_SAFE_FORMAT_SPEC = re.compile(r"^[^{}]*$")
++_SAFE_FORMAT_CONVERSIONS = (None, "s", "r", "a")
++
++
++def _safe_str_format(template: str, arguments: Dict[str, str]) -> str:
++    """Format ``{name}`` placeholders without attribute or index traversal.
++
++    The fallback exists for legacy templates that use single-brace placeholders.
++    Python's format language also supports ``{x.attr}`` and ``{x[key]}``, which
++    would let stored text walk into Python objects, so those fields are refused.
++
++    Args:
++        template: Template text that Jinja could not render.
++        arguments: Argument values.
++
++    Returns:
++        The formatted template.
++
++    Raises:
++        PromptError: If the template uses an unsupported field.
++    """
++    try:
++        fields = list(Formatter().parse(template))
++    except Exception as exc:
++        raise PromptError(f"Failed to render template: {str(exc)}")
++    for _, field_name, format_spec, conversion in fields:
++        if field_name is None:
++            continue
++        if not _SAFE_FORMAT_FIELD.match(field_name):
++            raise PromptError("Failed to render template: unsupported format field")
++        if format_spec and not _SAFE_FORMAT_SPEC.match(format_spec):
++            raise PromptError("Failed to render template: unsupported format specifier")
++        if conversion not in _SAFE_FORMAT_CONVERSIONS:
++            raise PromptError("Failed to render template: unsupported conversion")
++    try:
++        return template.format(**arguments)
++    except Exception as exc:
++        raise PromptError(f"Failed to render template: {str(exc)}")
++
++
++
+ # Module-level Jinja environment singleton for template caching
+-_JINJA_ENV: Optional[Environment] = None
++_JINJA_ENV: Optional[SandboxedEnvironment] = None
+ 
+ 
+-def _get_jinja_env() -> Environment:
++def _get_jinja_env() -> SandboxedEnvironment:
+     """Get or create the module-level Jinja environment singleton.
+ 
+     Returns:
+@@ -2884,14 +2932,19 @@ class PromptService(BaseService):
+             >>> service._render_template("No variables", {})
+             'No variables'
+         """
++        try:
++            SecurityValidator.assert_safe_jinja_template(template)
++        except ValueError as exc:
++            raise PromptError(f"Failed to render template: {exc}")
+         try:
+             jinja_template = _compile_jinja_template(template)
+             return jinja_template.render(**arguments)
++        except JinjaSecurityError as sec_err:
++            # The sandbox refused an unsafe attribute or call. Do not fall back:
++            # Python format() supports attribute traversal of its own.
++            raise PromptError(f"Failed to render template: sandbox rejected unsafe operation ({sec_err})")
+         except Exception:
+-            try:
+-                return template.format(**arguments)
+-            except Exception as e:
+-                raise PromptError(f"Failed to render template: {str(e)}")
++            return _safe_str_format(template, arguments)
+ 
+     def _parse_messages(self, text: str) -> List[Message]:
+         """Parse rendered text into messages.
+diff --git a/mcpgateway/services/resource_service.py b/mcpgateway/services/resource_service.py
+index 0712611..2c94feb 100644
+--- a/mcpgateway/services/resource_service.py
++++ b/mcpgateway/services/resource_service.py
+@@ -136,6 +136,10 @@ def _render_resource_text(text: str, context: Dict[str, Any]) -> str:
+     """
+     if "{{" not in text:
+         return text
++    try:
++        SecurityValidator.assert_safe_jinja_template(text)
++    except ValueError as exc:
++        raise ResourceError(f"Failed to render resource text: {exc}")
+     try:
+         return _RESOURCE_TEXT_ENV.from_string(text).render(**context)
+     except Exception as exc:

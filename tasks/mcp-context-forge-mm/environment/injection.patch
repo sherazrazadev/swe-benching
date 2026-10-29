@@ -1,0 +1,131 @@
+diff --git a/mcpgateway/services/import_service.py b/mcpgateway/services/import_service.py
+index eeb387c..008d22d 100644
+--- a/mcpgateway/services/import_service.py
++++ b/mcpgateway/services/import_service.py
+@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
+ import uuid
+ 
+ # Third-Party
++from jinja2 import Environment, select_autoescape
+ from sqlalchemy.orm import Session
+ 
+ # First-Party
+@@ -40,6 +41,14 @@ from mcpgateway.utils.services_auth import decode_auth, encode_auth
+ 
+ logger = logging.getLogger(__name__)
+ 
++# The import preview renders prompt templates so the administrator can see what an
++# imported prompt will look like.
++_PREVIEW_TEMPLATE_ENV = Environment(
++    autoescape=select_autoescape(["html", "xml"]),
++    trim_blocks=True,
++    lstrip_blocks=True,
++)
++
+ 
+ class ConflictStrategy(str, Enum):
+     """Strategies for handling conflicts during import.
+@@ -87,6 +96,26 @@ class ImportValidationError(ImportError):
+     """
+ 
+ 
++
++def _render_import_preview(template: str, context: Dict[str, Any]) -> str:
++    """Render a prompt template for the import preview.
++
++    Args:
++        template: Prompt template text from the import file.
++        context: Values made available to the template.
++
++    Returns:
++        The rendered preview text.
++
++    Raises:
++        ImportValidationError: If the template cannot be rendered.
++    """
++    try:
++        return _PREVIEW_TEMPLATE_ENV.from_string(template).render(**context)
++    except Exception as exc:
++        raise ImportValidationError(f"Could not preview prompt template: {exc}") from exc
++
++
+ class ImportConflictError(ImportError):
+     """Raised when import conflicts cannot be resolved.
+ 
+@@ -1665,6 +1694,9 @@ class ImportService:
+         except Exception:
+             item_info["conflicts_with"] = False
+ 
++        if entity_type == "prompts" and isinstance(entity.get("template"), str) and entity["template"]:
++            item_info["template_preview"] = _render_import_preview(entity["template"], {"name": item_name})
++
+         # Add metadata for smart selection
+         if entity_type == "servers":
+             item_info["dependencies"] = {"tools": entity.get("associated_tools", []), "resources": entity.get("associated_resources", []), "prompts": entity.get("associated_prompts", [])}
+diff --git a/mcpgateway/services/resource_service.py b/mcpgateway/services/resource_service.py
+index 5702cc8..0712611 100644
+--- a/mcpgateway/services/resource_service.py
++++ b/mcpgateway/services/resource_service.py
+@@ -35,6 +35,7 @@ import uuid
+ 
+ # Third-Party
+ import httpx
++from jinja2 import Environment, select_autoescape
+ from mcp import ClientSession, types
+ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamablehttp_client
+@@ -111,6 +112,35 @@ logger = logging_service.get_logger(__name__)
+ 
+ # Initialize structured logger, audit trail, and metrics buffer for resource operations
+ structured_logger = get_structured_logger("resource_service")
++
++# Text resources may reference their own metadata through {{ placeholder }} expressions.
++_RESOURCE_TEXT_ENV = Environment(
++    autoescape=select_autoescape(["html", "xml"]),
++    trim_blocks=True,
++    lstrip_blocks=True,
++)
++
++
++def _render_resource_text(text: str, context: Dict[str, Any]) -> str:
++    """Expand ``{{ placeholder }}`` expressions in a text resource body.
++
++    Args:
++        text: Stored resource text.
++        context: Values made available to the body.
++
++    Returns:
++        The expanded text. Text without placeholders is returned unchanged.
++
++    Raises:
++        ResourceError: If the body cannot be rendered.
++    """
++    if "{{" not in text:
++        return text
++    try:
++        return _RESOURCE_TEXT_ENV.from_string(text).render(**context)
++    except Exception as exc:
++        raise ResourceError(f"Failed to render resource text: {exc}") from exc
++
+ audit_trail = get_audit_trail_service()
+ metrics_buffer = get_metrics_buffer_service()
+ 
+@@ -2572,6 +2602,18 @@ class ResourceService(BaseService):
+                     # Fallback to stringified content
+                     content = ResourceContent(type="resource", id=str(resource_id) or str(content.id), uri=original_uri or content.uri, text=str(content))
+ 
++                # Text resources may reference their own metadata with {{ placeholder }}.
++                text_value = getattr(content, "text", None)
++                if isinstance(text_value, str):
++                    render_context = {"id": str(resource_id), "uri": original_uri or getattr(content, "uri", None), "name": resource_db.name if resource_db else ""}
++                    rendered_text = _render_resource_text(text_value, render_context)
++                    if isinstance(content, ResourceContent):
++                        content.text = rendered_text
++                    elif isinstance(content, TextContent):
++                        content = content.model_copy(update={"text": rendered_text})
++                    else:
++                        setattr(content, "text", rendered_text)
++
+                 # ═══════════════════════════════════════════════════════════════════════════
+                 # POST-FETCH HOOKS: Now called AFTER content is resolved from gateway
+                 # ═══════════════════════════════════════════════════════════════════════════
