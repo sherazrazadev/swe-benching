@@ -1,0 +1,84 @@
+package com.izforge.izpack.installer.bench.security;
+
+import com.izforge.izpack.api.data.Blockable;
+import com.izforge.izpack.api.data.OverrideType;
+import com.izforge.izpack.api.data.PackFile;
+import com.izforge.izpack.api.data.PackInfo;
+import com.izforge.izpack.installer.bench.support.InstallerFixture;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Collections;
+
+import static org.junit.Assert.assertFalse;
+
+/**
+ * Target locations read from a compiled installer's metadata must not escape through a
+ * parent-directory segment, in every shape the metadata can carry one.
+ */
+public class UnpackerTargetSecurityTest
+{
+    @Rule
+    public TemporaryFolder tmp = new TemporaryFolder();
+
+    @Test
+    public void installRefusesTraversingTarget() throws Exception
+    {
+        InstallerFixture fixture = new InstallerFixture(tmp);
+        fixture.payload("owned");
+        File src = InstallerFixture.source("l1src", "owned");
+        PackInfo pack = fixture.pack("pack1", false);
+        pack.addFile(src.getParentFile(), src, "${INSTALL_PATH}/ok.txt", null, OverrideType.OVERRIDE_TRUE,
+                     null, Blockable.BLOCKABLE_NONE, null, null, null);
+        PackFile file = pack.getPackFiles().iterator().next();
+        InstallerFixture.target(file, fixture.installDir().getAbsolutePath() + "/../escape/l1.txt");
+        fixture.prepare(Collections.singletonList(pack));
+
+        fixture.unpacker().run();
+
+        assertFalse(new File(fixture.root(), "escape/l1.txt").exists());
+    }
+
+    @Test
+    public void installRefusesTraversalIntroducedByVariable() throws Exception
+    {
+        InstallerFixture fixture = new InstallerFixture(tmp);
+        fixture.payload("owned");
+        fixture.variable("TARGET_DIR", fixture.installDir().getAbsolutePath() + "/../escape");
+        File src = InstallerFixture.source("varsrc", "owned");
+        PackInfo pack = fixture.pack("pack1", false);
+        pack.addFile(src.getParentFile(), src, "${INSTALL_PATH}/ok.txt", null, OverrideType.OVERRIDE_TRUE,
+                     null, Blockable.BLOCKABLE_NONE, null, null, null);
+        PackFile file = pack.getPackFiles().iterator().next();
+        InstallerFixture.target(file, "${TARGET_DIR}/var.txt");
+        fixture.prepare(Collections.singletonList(pack));
+
+        fixture.unpacker().run();
+
+        assertFalse(new File(fixture.root(), "escape/var.txt").exists());
+    }
+
+    @Test
+    public void installRefusesTraversingDirectoryTarget() throws Exception
+    {
+        InstallerFixture fixture = new InstallerFixture(tmp);
+        File dir = new File(tmp.getRoot(), "source-dir");
+        if (!dir.mkdirs() && !dir.isDirectory())
+        {
+            throw new IOException("cannot create source directory");
+        }
+        PackInfo pack = fixture.pack("pack1", false);
+        pack.addFile(dir.getParentFile(), dir, "${INSTALL_PATH}/made", null, OverrideType.OVERRIDE_TRUE,
+                     null, Blockable.BLOCKABLE_NONE, null, null, null);
+        PackFile file = pack.getPackFiles().iterator().next();
+        InstallerFixture.target(file, "${INSTALL_PATH}/../escape/made");
+        fixture.prepare(Collections.singletonList(pack));
+
+        fixture.unpacker().run();
+
+        assertFalse(new File(fixture.root(), "escape/made").exists());
+    }
+}
