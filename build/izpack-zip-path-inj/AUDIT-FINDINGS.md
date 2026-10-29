@@ -10,3 +10,7 @@ Required:
 1. Widen instruction.md with ONE neutral scope sentence (do not list classes, methods or test names): the rule applies to every file-system location the installer creates, writes or deletes that comes from the compiled installer metadata or installer variables — not only pack entries, but also the installer's own outputs and the post-install steps it runs.
 2. Keep that sentence honest: every site it covers must be guarded by the reference fix. Sites the reference leaves unguarded (notes list ConfigurableFileCopyTask, OptionFileCopyTask, IniFileCopyTask, readExecutableFiles, update-check deletions) must either be guarded in solution/ (with tests) or be excluded by the sentence's wording in a way that does not hint at the tested routes.
 3. Do not change the 7 tests' assertions (they check behaviour only and are fair once scoped). Re-gate; the oracle and pass_alt checks must still reach 1.0.
+
+## Instruction tone (owner rule, applies to every change above)
+Write instruction.md as an issue report from the project: "In this codebase, <the exact bug and its impact>. Please fix it." State the bug, what must stop happening and what must keep working, plainly and completely, so a careful maintainer knows exactly WHAT to fix.
+Never say WHERE: no file names, paths, directories, modules, class/function/method/variable names, line numbers, test names, lists of routes or variants, or counts. Describe behaviour only. Any new sentence must follow this rule; if an existing sentence breaks it, rewrite it to behaviour.
