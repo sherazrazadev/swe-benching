@@ -1,0 +1,93 @@
+name: blind-check
+# Blind solvability check of a built task (before it goes to a client): Claude Opus gets ONLY what the trial models
+# get (instruction.md + the repository at /workspace), no tests, no reference fix, no web and no shell, and writes a
+# fix. The task's own gate then grades that fix (common/gate/gate.py --only patches). Opus solving it shows the hidden
+# tests accept an independent correct fix; a failing test is then read to tell a test fault from a hard route.
+on:
+  workflow_dispatch:
+    inputs:
+      slug: { description: "task slug", required: true }
+      run: { description: "run id whose branch runs/<id> holds the task (its latest version)", required: true }
+      minutes: { description: "time limit for the Opus fix", default: "90" }
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env: { SLUG: "${{ inputs.slug }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: ./.github/actions/setup-runner
+        with: { deepseek_key: "${{ secrets.DEEPSEEK_API_KEY }}", mimo_key: "${{ secrets.MIMO_API_KEY }}", gate_slots: "2" }
+      - name: Task from branch runs/<run>
+        run: git fetch -q origin "runs/${{ inputs.run }}" && git checkout -q FETCH_HEAD -- "build/$SLUG" "tasks/$SLUG"
+      - name: The repository the models see
+        run: |
+          docker build -q -t "blind-$SLUG" "tasks/$SLUG/environment" >/dev/null
+          cid=$(docker create "blind-$SLUG"); docker cp "$cid:/workspace" /tmp/ws; docker rm -f "$cid" >/dev/null
+          git -C /tmp/ws log --oneline -1 && echo "$(find /tmp/ws -type f -not -path '*/.git/*' | wc -l) files"
+      - name: Opus writes a fix from the instruction alone
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          k=$(printf %s "$ANTHROPIC_API_KEY" | tr -d "[:space:]\"'")
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -n "$k" ] && [[ "$k" != sk-ant-api* ]]; then
+            export CLAUDE_CODE_OAUTH_TOKEN="$k"; unset ANTHROPIC_API_KEY; fi
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.302 >/dev/null
+          { cat "tasks/$SLUG/instruction.md"; printf '\n\n---\nYou are working in this repository (the current directory). Make the code change that fixes the problem described above, completely and correctly, as a careful maintainer would for real deployments. You cannot run commands; read the code, then edit it. Do not look up the upstream fix or advisory. When the fix is complete, reply with a short summary of what you changed.\n'; } > /tmp/prompt.md
+          cd /tmp/ws
+          timeout "$(( ${{ inputs.minutes }} * 60 ))" "$HOME/.local/bin/claude" -p "$(cat /tmp/prompt.md)" \
+            --model claude-opus-5-5 --tools "Read,Edit,Write,Glob,Grep" --permission-mode acceptEdits \
+            --no-session-persistence --output-format json 2>/dev/null | grep '^{' > /tmp/opus.json || true
+          echo "opus: $(jq -r '.stop_reason // "-"' /tmp/opus.json) turns=$(jq -r '.num_turns // "-"' /tmp/opus.json)"
+          jq -r '.result // empty' /tmp/opus.json | head -c 3000
+      - name: Grade the fix with the task's gate
+        run: |
+          mkdir -p "build/$SLUG/checks" /tmp/out
+          git -C /tmp/ws add -A && git -C /tmp/ws diff --cached > "build/$SLUG/checks/opus_blind.patch"
+          echo "Opus fix: $(grep -c '^[+-][^+-]' "build/$SLUG/checks/opus_blind.patch") changed lines in $(grep -c '^diff --git' "build/$SLUG/checks/opus_blind.patch") files" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os
+          p = f"build/{os.environ['SLUG']}/manifest.json"; m = json.load(open(p))
+          m["patch_checks"] = [c for c in m.get("patch_checks", []) if c.get("patch") != "opus_blind.patch"]
+          m["patch_checks"].append({"patch": "opus_blind.patch", "expect": "pass", "kind": "opus_blind",
+                                    "why": "blind solvability check: Claude Opus, instruction + repo only"})
+          json.dump(m, open(p, "w"), indent=1)
+          PY
+          python3 -I common/gate/gate.py "$SLUG" --only patches --patch opus_blind.patch --report opus_blind_report.json || true
+          cp "build/$SLUG/checks/opus_blind.patch" "build/$SLUG/opus_blind_report.json" /tmp/opus.json /tmp/out/ 2>/dev/null || true
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os, glob
+          slug = os.environ["SLUG"]
+          try:
+              r = json.load(open(f"build/{slug}/opus_blind_report.json"))
+          except Exception as e:
+              print(f"{slug}: no gate report ({e})"); raise SystemExit
+          print(f"{slug} blind check: verdict={r.get('verdict')} {str(r.get('failure') or '')[:600]}")
+          # per-test results of the graded trial
+          for f in glob.glob(os.path.expanduser("~/.tb-graders/cwe/gate-jobs/*chk-opus-blind*/**/verifier/**/results.json"), recursive=True) + \
+                   glob.glob(os.path.expanduser("~/.tb-graders/cwe/gate-jobs/*chk-opus-blind*/**/grading/results.json"), recursive=True):
+              d = json.load(open(f))
+              for g, t in d.items():
+                  if isinstance(t, dict):
+                      fails = [k.split("::")[-1] for k, v in t.items() if v != "pass"]
+                      print(f"  {g}: {len(t) - len(fails)}/{len(t)} pass" + (f"; FAIL: {', '.join(fails)}" if fails else ""))
+              break
+          else:
+              import xml.etree.ElementTree as ET
+              for f in sorted(glob.glob(os.path.expanduser("~/.tb-graders/cwe/gate-jobs/*chk-opus-blind*/**/verifier/**/*.xml"), recursive=True)):
+                  root = ET.parse(f).getroot(); cases = root.iter("testcase")
+                  tot = fails = 0; names = []
+                  for c in cases:
+                      tot += 1
+                      if c.find("failure") is not None or c.find("error") is not None:
+                          fails += 1; names.append(c.get("name"))
+                  print(f"  {f.split('/verifier/')[-1]}: {tot - fails}/{tot} pass" + (f"; FAIL: {', '.join(names)}" if names else ""))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "blind-check-${{ inputs.slug }}", path: /tmp/out/, retention-days: 30, if-no-files-found: warn }
