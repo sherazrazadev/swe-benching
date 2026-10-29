@@ -1,0 +1,123 @@
+diff --git a/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts b/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts
+index c65ba18dd..0f14e787d 100644
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts
+@@ -35,6 +35,14 @@ export function buildSignableTransaction (
+   // output is echoed back by storage unchanged before anything is signed.
+   verifyRequestedOutputsUnchanged(storageOutputs, args)
+ 
++  // SECURITY: verifyRequestedOutputsUnchanged only protects the caller's own
++  // outputs. Storage could instead inject an ADDITIONAL output paying an
++  // attacker (funded by reducing change), which the loop below signs verbatim.
++  // Every output beyond the caller's must be either a change output (script
++  // re-derived client-side, so it can only pay the client) or the single
++  // bounded commission output. Anything else is rejected before signing.
++  verifyUnrequestedOutputsAreChangeOrCommission(storageOutputs, args)
++
+   const tx = new Transaction(args.version, [], [], args.lockTime)
+ 
+   // The order of outputs in storageOutputs is always:
+@@ -234,6 +242,80 @@ export function verifyRequestedOutputsUnchanged (
+   }
+ }
+ 
++/**
++ * Default ceiling for a storage-provided commission (service-charge) output.
++ */
++export const MAX_STORAGE_COMMISSION_SATOSHIS = 500000
++
++/**
++ * Verify that every storage output beyond the caller's requested outputs is
++ * either a change output or the single, bounded commission output.
++ */
++export function verifyUnrequestedOutputsAreChangeOrCommission (
++  storageOutputs: StorageCreateTransactionSdkOutput[],
++  args: Validation.ValidCreateActionArgs,
++  maxCommission: number = MAX_STORAGE_COMMISSION_SATOSHIS
++): void {
++  let commissionCount = 0
++  for (let i = args.outputs.length; i < storageOutputs.length; i++) {
++    const out = storageOutputs[i]
++    const isChange = out.providedBy === 'storage' && out.purpose === 'change'
++    if (isChange) continue
++
++    const isCommission =
++      out.providedBy === 'storage' && (out.purpose === 'storage-commission' || out.purpose === 'service-charge')
++    if (isCommission) {
++      commissionCount++
++      if (commissionCount > 1) {
++        throw new WERR_INVALID_PARAMETER(
++          'storage outputs',
++          `at most one commission output. Storage returned an extra commission output at index ${i}.`
++        )
++      }
++      if (out.satoshis > maxCommission) {
++        throw new WERR_INVALID_PARAMETER(
++          'output.satoshis',
++          `a commission no greater than ${maxCommission}. Storage returned a commission of ${out.satoshis} at index ${i}.`
++        )
++      }
++      continue
++    }
++
++    throw new WERR_INVALID_PARAMETER(
++      'storage outputs',
++      'only change or commission beyond the requested outputs. Storage returned an unrecognized output ' +
++        `(providedBy='${out.providedBy}' purpose='${out.purpose ?? ''}') at index ${i}.`
++    )
++  }
++}
++
++/**
++ * Verify a service charge returned separately from the output list.
++ */
++export function verifyStorageServiceCharge (
++  serviceCharge: StorageCreateTransactionSdkOutput | undefined,
++  storageOutputs: StorageCreateTransactionSdkOutput[],
++  maxCommission: number = MAX_STORAGE_COMMISSION_SATOSHIS
++): void {
++  if (serviceCharge == null) return
++
++  const isCommission =
++    serviceCharge.providedBy === 'storage' &&
++    (serviceCharge.purpose === 'storage-commission' || serviceCharge.purpose === 'service-charge')
++  if (!isCommission) {
++    throw new WERR_INVALID_PARAMETER('serviceCharge', 'a storage-provided service charge.')
++  }
++
++  const listedCommission = storageOutputs.some(
++    o => o.providedBy === 'storage' && (o.purpose === 'storage-commission' || o.purpose === 'service-charge')
++  )
++  if (listedCommission) {
++    throw new WERR_INVALID_PARAMETER('serviceCharge', 'the only service charge.')
++  }
++
++  if (serviceCharge.satoshis > maxCommission) {  throw new WERR_INVALID_PARAMETER('serviceCharge.satoshis', `a service charge no greater than ${maxCommission}.`) }
++}
++
+ /**
+  * Derive a change output locking script
+  */
+diff --git a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+index 1731ad456..392b47434 100644
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+@@ -10,7 +10,7 @@ import {
+   Transaction,
+   Validation
+ } from '@bsv/sdk'
+-import { buildSignableTransaction } from './buildSignableTransaction'
++import { buildSignableTransaction, verifyStorageServiceCharge } from './buildSignableTransaction'
+ import { buildRemixSignableTransaction } from './buildRemixSignableTransaction'
+ import {
+   AuthId,
+@@ -90,7 +90,8 @@ async function createNewTx (wallet: Wallet, vargs: Validation.ValidCreateActionA
+   const { tx, amount, pdi } = built
+ 
+   // Some providers return the storage service charge separately from the output
+-  // list. Include it in the transaction before it is signed.
++  // list. Verify it under the same single, bounded rule before including it.
++  verifyStorageServiceCharge(dcr.serviceCharge, dcr.outputs)
+   if (dcr.serviceCharge != null) {
+     tx.addOutput({
+       satoshis: dcr.serviceCharge.satoshis,

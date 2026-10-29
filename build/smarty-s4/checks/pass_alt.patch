@@ -1,0 +1,102 @@
+diff --git a/src/FunctionHandler/Fetch.php b/src/FunctionHandler/Fetch.php
+index d10ef668..4b839641 100644
+--- a/src/FunctionHandler/Fetch.php
++++ b/src/FunctionHandler/Fetch.php
+@@ -189,7 +189,14 @@ class Fetch extends Base {
+ 				return;
+ 			}
+ 		} else {
+-			$content = @file_get_contents($params['file']);
++			if ($protocol && isset($template->getSmarty()->security_policy)) {
++				$content = @file_get_contents(
++					$params['file'], false,
++					$template->getSmarty()->security_policy->getRemoteStreamContext()
++				);
++			} else {
++				$content = @file_get_contents($params['file']);
++			}
+ 			if ($content === false) {
+ 				throw new Exception("{fetch} cannot read resource '" . $params['file'] . "'");
+ 			}
+diff --git a/src/FunctionHandler/HtmlImage.php b/src/FunctionHandler/HtmlImage.php
+index 9cb08745..4698d5fd 100644
+--- a/src/FunctionHandler/HtmlImage.php
++++ b/src/FunctionHandler/HtmlImage.php
+@@ -111,8 +111,20 @@ class HtmlImage extends Base {
+ 			}
+ 		}
+ 		if (!isset($params['width']) || !isset($params['height'])) {
+-			// FIXME: (rodneyrehm) getimagesize() loads the complete file off a remote resource, use custom [jpg,png,gif]header reader!
+-			if (!$_image_data = @getimagesize($_image_path)) {
++			$_image_data = false;
++			$_image_raw = false;
++			if ($protocol && isset($template->getSmarty()->security_policy)) {
++				$_image_raw = @file_get_contents(
++					$_image_path, false,
++					$template->getSmarty()->security_policy->getRemoteStreamContext()
++				);
++			} else {
++				$_image_raw = @file_get_contents($_image_path);
++			}
++			if ($_image_raw !== false) {
++				$_image_data = @getimagesizefromstring($_image_raw);
++			}
++			if ($_image_data === false) {
+ 				if (!file_exists($_image_path)) {
+ 					trigger_error("html_image: unable to find '{$_image_path}'", E_USER_NOTICE);
+ 					return;
+diff --git a/src/Resource/HttpPlugin.php b/src/Resource/HttpPlugin.php
+index 48a38c9b..e58c1995 100644
+--- a/src/Resource/HttpPlugin.php
++++ b/src/Resource/HttpPlugin.php
+@@ -31,7 +31,11 @@ class HttpPlugin extends RecompiledPlugin {
+ 		if (is_object($smarty->security_policy)) {
+ 			$smarty->security_policy->isTrustedUri($url);
+ 		}
+-		$content = @file_get_contents($url);
++		if (is_object($smarty->security_policy)) {
++			$content = @file_get_contents($url, false, $smarty->security_policy->getRemoteStreamContext());
++		} else {
++			$content = @file_get_contents($url);
++		}
+ 		$source->uid = sha1($url);
+ 		$source->content = $content === false ? '' : $content;
+ 		$source->timestamp = $source->exists = $content !== false;
+diff --git a/src/Resource/StreamPlugin.php b/src/Resource/StreamPlugin.php
+index f8b36bf5..f00f2e62 100644
+--- a/src/Resource/StreamPlugin.php
++++ b/src/Resource/StreamPlugin.php
+@@ -64,8 +64,11 @@ class StreamPlugin extends RecompiledPlugin {
+ 		}
+ 
+ 		$t = '';
+-		// the availability of the stream has already been checked in Smarty\Resource\Base::fetch()
+-		$fp = fopen($filepath, 'r+');
++		if (is_object($smarty->security_policy) && !empty($smarty->security_policy->trusted_uri)) {
++			$fp = fopen($filepath, 'r+', false, $smarty->security_policy->getRemoteStreamContext());
++		} else {
++			$fp = fopen($filepath, 'r+');
++		}
+ 		if ($fp) {
+ 			while (!feof($fp) && ($current_line = fgets($fp)) !== false) {
+ 				$t .= $current_line;
+diff --git a/src/Security.php b/src/Security.php
+index e2d2ab29..a7068408 100644
+--- a/src/Security.php
++++ b/src/Security.php
+@@ -429,6 +429,15 @@ class Security {
+ 	 * @throws Exception if URI is not trusted
+ 	 * @uses   $trusted_uri for list of patterns to match against $uri
+ 	 */
++	public function getRemoteStreamContext() {
++		return stream_context_create([
++			'http' => [
++				'follow_location' => 0,
++				'max_redirects' => 1,
++			],
++		]);
++	}
++
+ 	public function isTrustedUri($uri) {
+ 		$_uri = parse_url($uri);
+ 		if (!empty($_uri['scheme']) && !empty($_uri['host'])) {

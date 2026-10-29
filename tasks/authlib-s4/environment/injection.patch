@@ -1,0 +1,44 @@
+diff --git a/authlib/oauth2/rfc6749/grants/base.py b/authlib/oauth2/rfc6749/grants/base.py
+index bd1de087..d9686fb1 100644
+--- a/authlib/oauth2/rfc6749/grants/base.py
++++ b/authlib/oauth2/rfc6749/grants/base.py
+@@ -142,7 +142,11 @@ class AuthorizationEndpointMixin:
+         for param in parameters:
+             if len(datalist.get(param, [])) > 1:
+                 raise InvalidRequestError(
+-                    f"Multiple '{param}' in request.", state=request.payload.state
++                    f"Multiple '{param}' in request.",
++                    state=request.payload.state,
++                    redirect_uri=(
++                        request.payload.redirect_uri if param == "redirect_uri" else None
++                    ),
+                 )
+ 
+     @hooked
+diff --git a/authlib/oauth2/rfc9101/authorization_server.py b/authlib/oauth2/rfc9101/authorization_server.py
+index 988c003d..1b209630 100644
+--- a/authlib/oauth2/rfc9101/authorization_server.py
++++ b/authlib/oauth2/rfc9101/authorization_server.py
+@@ -71,9 +71,22 @@ class JWTAuthenticationRequest:
+         request_object = self._decode_request_object(
+             request, client, raw_request_object
+         )
++        self._validate_request_object_redirect_uri(request, request_object)
+         payload = BasicOAuth2Payload(request_object)
+         request.payload = payload
+ 
++    def _validate_request_object_redirect_uri(self, request, request_object):
++        """The redirect_uri claim and the redirect_uri parameter must agree."""
++        claim_uri = request_object.get("redirect_uri")
++        if claim_uri and request.payload.redirect_uri:
++            if claim_uri != request.payload.redirect_uri:
++                raise InvalidRequestError(
++                    "The 'redirect_uri' claim from the request object does not "
++                    "match the 'redirect_uri' parameter.",
++                    redirect_uri=claim_uri,
++                    state=request.payload.state,
++                )
++
+     def _shoud_proceed_with_request_object(
+         self,
+         authorization_server: AuthorizationServer,

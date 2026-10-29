@@ -1,0 +1,101 @@
+diff --git a/src/FunctionHandler/Fetch.php b/src/FunctionHandler/Fetch.php
+index d10ef668..af475081 100644
+--- a/src/FunctionHandler/Fetch.php
++++ b/src/FunctionHandler/Fetch.php
+@@ -189,7 +189,22 @@ class Fetch extends Base {
+ 				return;
+ 			}
+ 		} else {
+-			$content = @file_get_contents($params['file']);
++			if ($protocol) {
++				// Remote resource (e.g. https://) reached through file_get_contents().
++				// isTrustedUri() only validates the initial URL, but file_get_contents()
++				// follows redirects by default, so an open redirect on an otherwise
++				// trusted host could be used to reach a non-trusted target (SSRF).
++				// Disable redirect-following while a security policy is in effect.
++				$context = stream_context_create([
++					'http' => [
++						'follow_location' => 0,
++						'max_redirects' => 1,
++					],
++				]);
++				$content = @file_get_contents($params['file'], false, $context);
++			} else {
++				$content = @file_get_contents($params['file']);
++			}
+ 			if ($content === false) {
+ 				throw new Exception("{fetch} cannot read resource '" . $params['file'] . "'");
+ 			}
+diff --git a/src/FunctionHandler/HtmlImage.php b/src/FunctionHandler/HtmlImage.php
+index 9cb08745..155b4972 100644
+--- a/src/FunctionHandler/HtmlImage.php
++++ b/src/FunctionHandler/HtmlImage.php
+@@ -112,7 +112,25 @@ class HtmlImage extends Base {
+ 		}
+ 		if (!isset($params['width']) || !isset($params['height'])) {
+ 			// FIXME: (rodneyrehm) getimagesize() loads the complete file off a remote resource, use custom [jpg,png,gif]header reader!
+-			if (!$_image_data = @getimagesize($_image_path)) {
++			$_image_data = false;
++			$_image_raw = false;
++			if ($protocol) {
++				// getimagesize() cannot be given a stream context and follows redirects;
++				// read the bytes ourselves without following redirects, then parse them.
++				$_context = stream_context_create([
++					'http' => [
++						'follow_location' => 0,
++						'max_redirects' => 1,
++					],
++				]);
++				$_image_raw = @file_get_contents($_image_path, false, $_context);
++			} else {
++				$_image_raw = @file_get_contents($_image_path);
++			}
++			if ($_image_raw !== false) {
++				$_image_data = @getimagesizefromstring($_image_raw);
++			}
++			if ($_image_data === false) {
+ 				if (!file_exists($_image_path)) {
+ 					trigger_error("html_image: unable to find '{$_image_path}'", E_USER_NOTICE);
+ 					return;
+diff --git a/src/Resource/HttpPlugin.php b/src/Resource/HttpPlugin.php
+index 48a38c9b..b582af66 100644
+--- a/src/Resource/HttpPlugin.php
++++ b/src/Resource/HttpPlugin.php
+@@ -31,7 +31,13 @@ class HttpPlugin extends RecompiledPlugin {
+ 		if (is_object($smarty->security_policy)) {
+ 			$smarty->security_policy->isTrustedUri($url);
+ 		}
+-		$content = @file_get_contents($url);
++		$context = stream_context_create([
++			'http' => [
++				'follow_location' => 0,
++				'max_redirects' => 1,
++			],
++		]);
++		$content = @file_get_contents($url, false, $context);
+ 		$source->uid = sha1($url);
+ 		$source->content = $content === false ? '' : $content;
+ 		$source->timestamp = $source->exists = $content !== false;
+diff --git a/src/Resource/StreamPlugin.php b/src/Resource/StreamPlugin.php
+index f8b36bf5..944c2c85 100644
+--- a/src/Resource/StreamPlugin.php
++++ b/src/Resource/StreamPlugin.php
+@@ -65,7 +65,17 @@ class StreamPlugin extends RecompiledPlugin {
+ 
+ 		$t = '';
+ 		// the availability of the stream has already been checked in Smarty\Resource\Base::fetch()
+-		$fp = fopen($filepath, 'r+');
++		if (strpos($filepath, '://') !== false) {
++			$context = stream_context_create([
++				'http' => [
++					'follow_location' => 0,
++					'max_redirects' => 1,
++				],
++			]);
++			$fp = fopen($filepath, 'r+', false, $context);
++		} else {
++			$fp = fopen($filepath, 'r+');
++		}
+ 		if ($fp) {
+ 			while (!feof($fp) && ($current_line = fgets($fp)) !== false) {
+ 				$t .= $current_line;

@@ -1,0 +1,218 @@
+diff --git a/packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts b/packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts
+index c95c9448c..4e06f0009 100644
+--- a/packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts
++++ b/packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts
+@@ -248,6 +248,12 @@ export interface StorageCreateActionResult {
+   inputBeef?: number[]
+   inputs: StorageCreateTransactionSdkInput[]
+   outputs: StorageCreateTransactionSdkOutput[]
++  /**
++   * Service charge returned separately from `outputs` by providers that report
++   * the charge outside the output list. When present it is included in the
++   * transaction that is built for signing.
++   */
++  serviceCharge?: StorageCreateTransactionSdkOutput
+   noSendChangeOutputVouts?: number[]
+   derivationPrefix: string
+   version: number
+diff --git a/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts b/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts
+new file mode 100644
+index 000000000..93f312edf
+--- /dev/null
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts
+@@ -0,0 +1,153 @@
++import { Beef, Script, Transaction, TransactionInput, TransactionOutput, Validation } from '@bsv/sdk'
++import { Wallet, PendingStorageInput } from '../../Wallet'
++import {
++  StorageCreateActionResult,
++  StorageCreateTransactionSdkInput,
++  StorageCreateTransactionSdkOutput
++} from '../../sdk/WalletStorage.interfaces'
++import { WERR_INVALID_PARAMETER } from '../../sdk/WERR_errors'
++import { asBsvSdkScript, verifyTruthy } from '../../utility/utilityHelpers'
++import { makeChangeLock } from './buildSignableTransaction'
++
++/**
++ * Build the transaction for a remix-change action.
++ *
++ * A remix-change action is an action with neither caller inputs nor caller
++ * outputs: the wallet spends its own coins and storage returns the change it
++ * derived. There are no caller-requested outputs to reconcile, so this builder
++ * assembles the transaction from the storage response directly. Change outputs
++ * are re-derived from the caller's change key; every other output is used as
++ * returned by storage.
++ */
++export function buildRemixSignableTransaction (
++  dctr: StorageCreateActionResult,
++  args: Validation.ValidCreateActionArgs,
++  wallet: Wallet
++): {
++    tx: Transaction
++    amount: number
++    pdi: PendingStorageInput[]
++    log: string
++  } {
++  const changeKeys = wallet.getClientChangeKeyPair()
++
++  const inputBeef = (args.inputBEEF != null) ? Beef.fromBinary(args.inputBEEF) : undefined
++
++  const { inputs: storageInputs, outputs: storageOutputs } = dctr
++
++  const tx = new Transaction(args.version, [], [], args.lockTime)
++
++  // The order of outputs in storageOutputs is storage order; vout values may be
++  // randomized independently.
++  const voutToIndex = new Array<number>(storageOutputs.length)
++  for (let vout = 0; vout < storageOutputs.length; vout++) {
++    const i = storageOutputs.findIndex(o => o.vout === vout)
++    if (i < 0) throw new WERR_INVALID_PARAMETER('output.vout', `sequential. ${vout} is missing`)
++    voutToIndex[vout] = i
++  }
++
++  for (let vout = 0; vout < storageOutputs.length; vout++) {
++    const i = voutToIndex[vout]
++    const out = storageOutputs[i]
++    if (vout !== out.vout) { throw new WERR_INVALID_PARAMETER('output.vout', `equal to array index. ${out.vout} !== ${vout}`) }
++
++    const change = out.providedBy === 'storage' && out.purpose === 'change'
++
++    const lockingScript = change
++      ? makeChangeLock(out, dctr, args, changeKeys, wallet)
++      : asBsvSdkScript(out.lockingScript)
++
++    const output: TransactionOutput = {
++      satoshis: out.satoshis,
++      lockingScript,
++      change
++    }
++    tx.addOutput(output)
++  }
++
++  if (storageOutputs.length === 0) {
++    // Add a dummy output to avoid transaction rejection by processors for having no outputs.
++    const output: TransactionOutput = {
++      satoshis: 0,
++      lockingScript: Script.fromASM('OP_FALSE OP_RETURN 42'),
++      change: false
++    }
++    tx.addOutput(output)
++  }
++
++  const inputs: Array<{
++    argsInput: Validation.ValidCreateActionInput | undefined
++    storageInput: StorageCreateTransactionSdkInput
++  }> = []
++  for (const storageInput of storageInputs) {
++    const argsInput =
++      storageInput.vin !== undefined && storageInput.vin < args.inputs.length
++        ? args.inputs[storageInput.vin]
++        : undefined
++    inputs.push({ argsInput, storageInput })
++  }
++  inputs.sort((a, b) => {
++    if (a.storageInput.vin < b.storageInput.vin) return -1
++    if (a.storageInput.vin === b.storageInput.vin) return 0
++    return 1
++  })
++
++  const pendingStorageInputs: PendingStorageInput[] = []
++
++  let totalChangeInputs = 0
++  for (const { storageInput, argsInput } of inputs) {
++    if (argsInput != null) {
++      const hasUnlock = typeof argsInput.unlockingScript === 'string'
++      const unlock = hasUnlock ? asBsvSdkScript(argsInput.unlockingScript!) : new Script()
++      const sourceTransaction = args.isSignAction ? inputBeef?.findTxid(argsInput.outpoint.txid)?.tx : undefined
++      const inputToAdd: TransactionInput = {
++        sourceTXID: argsInput.outpoint.txid,
++        sourceOutputIndex: argsInput.outpoint.vout,
++        sourceTransaction,
++        unlockingScript: unlock,
++        sequence: argsInput.sequenceNumber
++      }
++      tx.addInput(inputToAdd)
++    } else {
++      if (storageInput.type !== 'P2PKH') {
++        throw new WERR_INVALID_PARAMETER(
++          'type',
++          `vin ${storageInput.vin}, "${storageInput.type}" is not a supported unlocking script type.`
++        )
++      }
++
++      pendingStorageInputs.push({
++        vin: tx.inputs.length,
++        derivationPrefix: verifyTruthy(storageInput.derivationPrefix),
++        derivationSuffix: verifyTruthy(storageInput.derivationSuffix),
++        unlockerPubKey: storageInput.senderIdentityKey,
++        sourceSatoshis: storageInput.sourceSatoshis,
++        lockingScript: storageInput.sourceLockingScript
++      })
++
++      const inputToAdd: TransactionInput = {
++        sourceTXID: storageInput.sourceTxid,
++        sourceOutputIndex: storageInput.sourceVout,
++        sourceTransaction: (storageInput.sourceTransaction != null)
++          ? Transaction.fromBinary(storageInput.sourceTransaction)
++          : undefined,
++        unlockingScript: new Script(),
++        sequence: 0xffffffff
++      }
++      tx.addInput(inputToAdd)
++      totalChangeInputs += Validation.validateSatoshis(storageInput.sourceSatoshis, 'storageInput.sourceSatoshis')
++    }
++  }
++
++  const totalChangeOutputs = storageOutputs
++    .filter(x => x.purpose === 'change')
++    .reduce((acc, el) => acc + el.satoshis, 0)
++  const amount = totalChangeInputs - totalChangeOutputs
++
++  return {
++    tx,
++    amount,
++    pdi: pendingStorageInputs,
++    log: ''
++  }
++}
+diff --git a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+index dbb98082a..1731ad456 100644
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+@@ -11,6 +11,7 @@ import {
+   Validation
+ } from '@bsv/sdk'
+ import { buildSignableTransaction } from './buildSignableTransaction'
++import { buildRemixSignableTransaction } from './buildRemixSignableTransaction'
+ import {
+   AuthId,
+   ReviewActionResult,
+@@ -20,6 +21,7 @@ import {
+ import { completeSignedTransaction, verifyUnlockScripts } from './completeSignedTransaction'
+ import { PendingSignAction, Wallet } from '../../Wallet'
+ import { WERR_INTERNAL } from '../../sdk/WERR_errors'
++import { asBsvSdkScript } from '../../utility/utilityHelpers'
+ 
+ export interface CreateActionResultX extends CreateActionResult {
+   txid?: TXIDHexString
+@@ -82,7 +84,20 @@ async function createNewTx (wallet: Wallet, vargs: Validation.ValidCreateActionA
+ 
+   const reference = dcr.reference
+ 
+-  const { tx, amount, pdi } = buildSignableTransaction(dcr, vargs, wallet)
++  const built = vargs.isRemixChange
++    ? buildRemixSignableTransaction(dcr, vargs, wallet)
++    : buildSignableTransaction(dcr, vargs, wallet)
++  const { tx, amount, pdi } = built
++
++  // Some providers return the storage service charge separately from the output
++  // list. Include it in the transaction before it is signed.
++  if (dcr.serviceCharge != null) {
++    tx.addOutput({
++      satoshis: dcr.serviceCharge.satoshis,
++      lockingScript: asBsvSdkScript(dcr.serviceCharge.lockingScript),
++      change: false
++    })
++  }
+   logger?.log('built signable transaction')
+ 
+   const prior: PendingSignAction = { reference, dcr, args: vargs, amount, tx, pdi }

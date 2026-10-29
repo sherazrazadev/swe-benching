@@ -1,0 +1,53 @@
+--- a/ironic/api/controllers/v1/volume_target.py
++++ b/ironic/api/controllers/v1/volume_target.py
+@@ -14,6 +14,7 @@
+ 
+ from http import client as http_client
+ 
++from oslo_utils import strutils
+ from oslo_utils import uuidutils
+ from pecan import rest
+ 
+@@ -90,9 +91,31 @@
+     if not sanitize:
+         return target
+ 
++    target_sanitize(target, fields)
++
++    return target
++
++
++def _protect_target(target):
++    """Withhold or mask the connection settings in an API representation."""
++    if not target.get('properties'):
++        return
++    cdict = api.request.context.to_policy_values()
++    if not policy.check_policy('baremetal:volume:view_target_properties',
++                               cdict, cdict):
++        target['properties'] = {
++            'redacted_contents': ('** Value redacted: Requires permission '
++                                  'baremetal:volume:view_target_properties '
++                                  'access. Permission denied. **')
++        }
++    else:
++        target['properties'] = strutils.mask_dict_password(
++            target['properties'], "******")
++
++
++def target_sanitize(target, fields=None):
++    _protect_target(target)
+     api_utils.sanitize_dict(target, fields)
+-
+-    return target
+ 
+ 
+ def list_convert_with_links(rpc_targets, limit, url, fields=None,
+@@ -106,7 +129,7 @@
+         limit=limit,
+         url=url,
+         fields=fields,
+-        sanitize_func=api_utils.sanitize_dict,
++        sanitize_func=target_sanitize,
+         **kwargs
+     )
+ 

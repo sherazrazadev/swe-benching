@@ -1,0 +1,252 @@
+{
+ "slug": "ts-stack-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "entry_id": "7773",
+  "advisory_ids": [
+   "GHSA-36F9-7RG5-CPF8",
+   "CVE-2026-56744"
+  ],
+  "repo": "bsv-blockchain/ts-stack",
+  "pinned_commit": "eb5e88d95a2afed7a7ec1ab716f7afe3cc08e704",
+  "fix_commits": [
+   "3a11f6111919245a3090e9f3895cfc4f21a80d28",
+   "5492cabbef4ddc7f60cc49cdf5d8c74ed2e5d949",
+   "5ee60395e78e8b822d9a78efeacc6039c249819b"
+  ]
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "eb5e88d95a2afed7a7ec1ab716f7afe3cc08e704 (child of 5492cabbef, the published substitution guard; parent of the published injection fix 3a11f6111). The published fix 3a11f6111 touches only packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts and its unit test; 5ee60395 is a version bump. The pinned tree does not contain the injection guard's regression tests.",
+  "entry_points": [
+   "library API: Wallet.createAction (packages/wallet/wallet-toolbox/src/Wallet.ts:899) with a caller-configured storage provider; the storage response reaches the signing builder through signer/methods/createAction.ts:85"
+  ],
+  "sites": [
+   "packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts:36 (call site of the requested-output guard; injected tree)",
+   "packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts:60-64 (change re-derivation keyed on providedBy+purpose)",
+   "packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts:87-90 (injected remix-change builder branch)",
+   "packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts:92-100 (injected separately-returned service charge appended unvalidated)",
+   "packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts:256 (injected serviceCharge field)"
+  ],
+  "routes": [
+   "injected sibling: a change-remix action (no caller inputs or outputs) is built by a dedicated builder that copies the storage output list verbatim (real_upstream=no)",
+   "injected sibling: a service charge returned outside the output list is appended to the transaction before signing with no count or size bound (real_upstream=no)"
+  ],
+  "real_upstream_routes_verified_not_built": [
+   "WalletPermissionsManager.createAction:7a verifies requested outputs are present but never rejects extra outputs; confirmed by a behavioural probe on the pinned copy. Not built: the wrapper receives only the caller's args and the finished transaction, which contains no information that can distinguish a client-derived change output from an injected recipient, so a wrapper-only rule either rejects legitimate change or cannot detect the injection. The published fix never touched it.",
+   "WalletPermissionsManager.createAction early-returns when the underlying wallet produced no signable transaction; on that path the transaction is already signed and processed, so a wrapper check cannot undo the broadcast."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "packages/wallet/wallet-toolbox/src/signer/methods/__tests/buildSignableTransaction.verify.test.ts (7 tests) passes on the pinned tree, on the pinned+injected tree, on the reference fix and on every pass patch"
+  ],
+  "local_runs": "pinned+injected tree: security 0/15 pass, functional 9/9 pass. Reference fix (oracle): security 15/15, functional 9/9. alternative-fix and hardening: 15/15 + 9/9. published-only: security 9/15 (the six remix/service-charge tests fail), functional 9/9. miss-conjunction: 13/15 (two label tests). miss-zero: 12/15 (three remix tests). miss-cap: 13/15 (two charge tests). miss-remix: 12/15 (three remix tests). miss-sidechannel: 12/15 (three charge tests). over-broad and refuse-all: functional 0/9. All measured with the real jest suites against the restored workspace.",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS (security 0/15, functional 16/16)",
+   "oracle": "PASS 3 runs identical, reward 1.0 (security 15/15, functional 16/16 each)",
+   "patches": "PASS 10/10 listed checks behave as declared (blind.patch missing by design)"
+  }
+ },
+ "leak_terms": [
+  "buildSignableTransaction",
+  "verifyRequestedOutputsUnchanged",
+  "verifyUnrequestedOutputsAreChangeOrCommission",
+  "verifyStorageServiceCharge",
+  "MAX_STORAGE_COMMISSION_SATOSHIS",
+  "makeChangeLock",
+  "buildRemixSignableTransaction",
+  "isRemixChange",
+  "providedBy",
+  "purpose",
+  "vout",
+  "storage-commission",
+  "service-charge",
+  "serviceCharge",
+  "WalletPermissionsManager",
+  "WalletStorage",
+  "StorageCreateActionResult",
+  "StorageCreateTransactionSdkOutput",
+  "createNewTx",
+  "createAction.ts",
+  "buildSignableTransaction.ts",
+  "WalletStorage.interfaces.ts",
+  "signer/methods"
+ ],
+ "patch_checks": [
+  {
+   "patch": "published-only.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "the published upstream fix only: the requested-output list is reconciled, but the remix-change builder and the separately-returned service charge still reach the signed transaction unreconciled"
+  },
+  {
+   "patch": "miss-conjunction.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the provider-label conjunction; outputs are accepted as change or as a charge on purpose label alone"
+  },
+  {
+   "patch": "miss-zero.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the empty-request case; the extra-output check returns early when the caller requested no outputs"
+  },
+  {
+   "patch": "miss-cap.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the service-charge ceiling"
+  },
+  {
+   "patch": "miss-remix.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the change-remix route; remix actions keep using the unreconciled builder"
+  },
+  {
+   "patch": "miss-sidechannel.patch",
+   "expect": "security_fail",
+   "kind": "variant",
+   "note": "reference fix minus the separately-returned service-charge check"
+  },
+  {
+   "patch": "over-broad.patch",
+   "expect": "functional_fail",
+   "kind": "variant",
+   "note": "rejects every output beyond the caller's request, so legitimate change and service charges stop working"
+  },
+  {
+   "patch": "refuse-all.patch",
+   "expect": "functional_fail",
+   "kind": "variant",
+   "note": "refuses every action"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a redundant call-site reconciliation and service-charge check"
+  },
+  {
+   "patch": "alternative-fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: one call-site reconciliation before the builder is chosen, instead of a check inside the builder"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse-all.patch",
+  "crash_as_refusal": "n/a: a refusal here is an in-process thrown error; a process crash aborts the runner and cannot model a refusal without a prior side effect. The security tests assert the call rejects with nothing processed, which is the property.",
+  "wrong_resource": "n/a: no object identity or neighbouring resource is involved; the flaw is in the output list itself.",
+  "one_role_or_direction": "n/a: there are no roles or directions; one output list serves every action.",
+  "reads_only": "n/a: there is no read/write split; the same signing path serves every createAction.",
+  "check_after_adjustment": "n/a: no normalising or adjusting step sits between the storage values and the sink; output-position randomisation changes only positions and is exercised by its own security test.",
+  "unlisted_route": "published-only.patch",
+  "malformed_identity": "n/a: no identifier or spelling is parsed on the path to the sink.",
+  "missing_authority": "n/a: no authority, role or secret lookup feeds the outputs.",
+  "adjacent_api": "over-broad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_change_commission_conjunction",
+   "pattern": "coupled must-keep-working behaviour over real upstream code",
+   "shape": "an extra recipient labelled as change or as a service charge without the storage-provider label; change is safe only when the script is re-derived client-side, which is keyed on the exact provider+label conjunction",
+   "where": "packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts:36,60-64",
+   "security_tests": [
+    "the storage response is reconciled with the caller request::refuses an extra recipient returned alongside the requested outputs",
+    "the storage response is reconciled with the caller request::refuses an extra recipient labelled as change without the storage provider label",
+    "the storage response is reconciled with the caller request::refuses an extra recipient labelled as a service charge without the storage provider label",
+    "the storage response is reconciled with the caller request::refuses an extra recipient carrying an unrelated storage label",
+    "the storage response is reconciled with the caller request::refuses an extra recipient with no provider label at all",
+    "the storage response is reconciled with the caller request::refuses an extra recipient when several outputs were requested",
+    "the storage response is reconciled with the caller request::refuses an extra recipient when output positions are randomised"
+   ],
+   "coupled_functional_tests": [
+    "legitimate actions keep working::signs a requested output together with the caller change",
+    "legitimate actions keep working::derives the change script locally, ignoring the storage-supplied script",
+    "legitimate actions keep working::accepts a change output at any amount",
+    "legitimate actions keep working::signs every requested output faithfully",
+    "legitimate actions keep working::preserves requested outputs when positions are randomised"
+   ],
+   "security_fail_patch": "miss-conjunction.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix never had to distinguish these labels because the reported route used unlabelled outputs"
+  },
+  {
+   "id": "T2_zero_requested_outputs",
+   "pattern": "shape trap over real upstream code",
+   "shape": "the caller requests no outputs at all, so a check written as a loop over requested outputs inspects nothing while the storage response still carries an extra recipient",
+   "where": "packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts:36-72",
+   "security_tests": [
+    "actions with no caller-requested outputs::refuses an extra recipient in a remix-change action",
+    "actions with no caller-requested outputs::refuses an extra recipient listed before the change in a remix-change action",
+    "actions with no caller-requested outputs::refuses an extra recipient in a remix-change action with randomised positions"
+   ],
+   "coupled_functional_tests": [
+    "legitimate actions keep working::signs a remix-change action that only carries change",
+    "legitimate actions keep working::signs a remix-change action with one small service charge"
+   ],
+   "security_fail_patch": "miss-zero.patch",
+   "realistic_because": "real, unmodified upstream code; remix-change actions are a normal API use"
+  },
+  {
+   "id": "T3_remix_selfcheck",
+   "pattern": "B (injected sibling; route where the protection never existed)",
+   "shape": "a change-remix action is sent to a dedicated builder that copies the storage output list verbatim; the main builder's reconciliation never runs on this path",
+   "where": "packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts:87-90 and the injected buildRemixSignableTransaction.ts",
+   "security_tests": [
+    "actions with no caller-requested outputs::refuses an extra recipient in a remix-change action",
+    "actions with no caller-requested outputs::refuses an extra recipient listed before the change in a remix-change action",
+    "actions with no caller-requested outputs::refuses an extra recipient in a remix-change action with randomised positions"
+   ],
+   "coupled_functional_tests": [
+    "legitimate actions keep working::signs a remix-change action that only carries change",
+    "legitimate actions keep working::signs a remix-change action with one small service charge"
+   ],
+   "security_fail_patch": "miss-remix.patch",
+   "realistic_because": "injected sibling: a dedicated builder for the no-caller-outputs case is code a maintainer could have left; the published fix never touches this file's remix branch"
+  },
+  {
+   "id": "T4_separate_service_charge",
+   "pattern": "B (injected sibling; route where the protection never existed)",
+   "shape": "a service charge returned in a separate provider field is appended to the transaction before signing, outside the output list the reconciliation inspects, with no count or size bound",
+   "where": "packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts:92-100 and packages/wallet/wallet-toolbox/src/sdk/WalletStorage.interfaces.ts:256",
+   "security_tests": [
+    "a service charge returned outside the output list::refuses a separately returned service charge larger than a legitimate charge",
+    "a service charge returned outside the output list::refuses a separately returned charge that is not labelled as a storage charge",
+    "a service charge returned outside the output list::refuses a separately returned charge next to a charge in the output list"
+   ],
+   "coupled_functional_tests": [
+    "legitimate actions keep working::includes a small service charge returned outside the output list"
+   ],
+   "security_fail_patch": "miss-sidechannel.patch",
+   "realistic_because": "injected sibling: providers returning the service charge separately is plausible protocol drift; the published fix only reconciles the output list"
+  },
+  {
+   "id": "T5_commission_cap",
+   "pattern": "real upstream code (the single charge's script is signed verbatim)",
+   "shape": "the single allowed service charge is unbounded, so a large charge is an attacker output in disguise",
+   "where": "packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts:60-64",
+   "security_tests": [
+    "the storage response is reconciled with the caller request::refuses a service charge larger than a legitimate charge",
+    "a service charge returned outside the output list::refuses a separately returned service charge larger than a legitimate charge"
+   ],
+   "coupled_functional_tests": [
+    "legitimate actions keep working::signs one small service charge",
+    "legitimate actions keep working::includes a small service charge returned outside the output list"
+   ],
+   "security_fail_patch": "miss-cap.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix's own comment records that the charge script cannot be verified client-side"
+  }
+ ],
+ "status": "gate-green 2026-10-29: static PASS; nop PASS (security 0/15 pass on the pinned+injected tree, functional 16/16 pass); oracle PASS 3/3 identical at reward 1.0 (15/15 security, 16/16 functional each); patches PASS 10/10 declared checks (published-only, miss-conjunction, miss-zero, miss-cap, miss-remix and miss-sidechannel are security_fail with functional green; over-broad and refuse-all are functional_fail; hardening and alternative-fix score 1.0). blind.patch and FAIRNESS.md are produced downstream."
+}

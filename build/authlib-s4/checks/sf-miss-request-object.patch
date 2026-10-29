@@ -1,0 +1,93 @@
+diff --git a/authlib/oauth2/rfc6749/authorization_server.py b/authlib/oauth2/rfc6749/authorization_server.py
+index 928251dc..c484aa6c 100644
+--- a/authlib/oauth2/rfc6749/authorization_server.py
++++ b/authlib/oauth2/rfc6749/authorization_server.py
+@@ -241,10 +241,21 @@ class AuthorizationServer(Hookable):
+             if grant_cls.check_authorization_endpoint(request):
+                 return _create_grant(grant_cls, extensions, request, self)
+ 
++        # Per RFC 6749 §4.1.2.1, only redirect with the error if the client
++        # exists and the redirect_uri has been validated against it.
++        redirect_uri = None
++        if client_id := request.payload.client_id:
++            if client := self.query_client(client_id):
++                if requested_uri := request.payload.redirect_uri:
++                    if client.check_redirect_uri(requested_uri):
++                        redirect_uri = requested_uri
++                else:
++                    redirect_uri = client.get_default_redirect_uri()
++
+         raise UnsupportedResponseTypeError(
+             f"The response type '{request.payload.response_type}' is not supported by the server.",
+             request.payload.response_type,
+-            redirect_uri=request.payload.redirect_uri,
++            redirect_uri=redirect_uri,
+         )
+ 
+     def get_consent_grant(self, request=None, end_user=None):
+diff --git a/authlib/oauth2/rfc6749/grants/base.py b/authlib/oauth2/rfc6749/grants/base.py
+index d9686fb1..49a90bb2 100644
+--- a/authlib/oauth2/rfc6749/grants/base.py
++++ b/authlib/oauth2/rfc6749/grants/base.py
+@@ -144,9 +144,6 @@ class AuthorizationEndpointMixin:
+                 raise InvalidRequestError(
+                     f"Multiple '{param}' in request.",
+                     state=request.payload.state,
+-                    redirect_uri=(
+-                        request.payload.redirect_uri if param == "redirect_uri" else None
+-                    ),
+                 )
+ 
+     @hooked
+diff --git a/authlib/oidc/core/grants/hybrid.py b/authlib/oidc/core/grants/hybrid.py
+index 8c373525..c3605eb8 100644
+--- a/authlib/oidc/core/grants/hybrid.py
++++ b/authlib/oidc/core/grants/hybrid.py
+@@ -49,19 +49,20 @@ class OpenIDHybridGrant(OpenIDImplicitGrant):
+         raise NotImplementedError()
+ 
+     def validate_authorization_request(self):
+-        if not is_openid_scope(self.request.payload.scope):
+-            raise InvalidScopeError(
+-                "Missing 'openid' scope",
+-                redirect_uri=self.request.payload.redirect_uri,
+-                redirect_fragment=True,
+-            )
+         self.register_hook(
+             "after_validate_authorization_request_payload",
+             lambda grant, redirect_uri: validate_nonce(
+                 grant.request, grant.exists_nonce, required=True
+             ),
+         )
+-        return validate_code_authorization_request(self)
++        redirect_uri = validate_code_authorization_request(self)
++        if not is_openid_scope(self.request.payload.scope):
++            raise InvalidScopeError(
++                "Missing 'openid' scope",
++                redirect_uri=redirect_uri,
++                redirect_fragment=True,
++            )
++        return redirect_uri
+ 
+     def create_granted_params(self, grant_user):
+         self.request.user = grant_user
+diff --git a/authlib/oidc/core/grants/implicit.py b/authlib/oidc/core/grants/implicit.py
+index fc76371f..aacdf865 100644
+--- a/authlib/oidc/core/grants/implicit.py
++++ b/authlib/oidc/core/grants/implicit.py
+@@ -82,13 +82,13 @@ class OpenIDImplicitGrant(ImplicitGrant):
+         return [client.get_client_id()]
+ 
+     def validate_authorization_request(self):
++        redirect_uri = super().validate_authorization_request()
+         if not is_openid_scope(self.request.payload.scope):
+             raise InvalidScopeError(
+                 "Missing 'openid' scope",
+-                redirect_uri=self.request.payload.redirect_uri,
++                redirect_uri=redirect_uri,
+                 redirect_fragment=True,
+             )
+-        redirect_uri = super().validate_authorization_request()
+         try:
+             validate_nonce(self.request, self.exists_nonce, required=True)
+         except OAuth2Error as error:

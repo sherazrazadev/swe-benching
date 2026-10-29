@@ -1,0 +1,340 @@
+{
+ "slug": "smarty-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "33901",
+  "advisory_ids": [
+   "GHSA-CQ55-C7WV-PXMQ",
+   "CVE-2026-62993"
+  ],
+  "repo": "smarty-php/smarty",
+  "pinned_commit": "99c048ce7a590c519b79fbd38ad0143a08183a1f",
+  "fix_commits": [
+   "31e06fc087a8b5a9b236c1e5dacc1c2850a2c115",
+   "a1ccdb0518021a559b4066c37b76a42c86bbce90"
+  ],
+  "trust_decision": {
+   "summary": "{fetch} may open a remote resource only if the security policy's trusted_uri regex matches scheme://host of the *initial* URL (isTrustedUri in handle()); the URL then goes to file_get_contents() for every non-'http' scheme, which follows redirects, so the trust decision is never applied to the final destination.",
+   "evidence": [
+    "src/FunctionHandler/Fetch.php:36-48",
+    "src/FunctionHandler/Fetch.php:192",
+    "src/Security.php:432-443"
+   ]
+  },
+  "landing_point": {
+   "where": "src/FunctionHandler/Fetch.php:192",
+   "why": "The summary names {fetch} and a redirect bypass, so an engineer reads the {fetch} handler: the isTrustedUri gate at :36-48 and the file_get_contents() call that follows redirects at :192."
+  },
+  "fix_sites": [
+   {
+    "where": "src/FunctionHandler/Fetch.php:189-196",
+    "entry_point": "{fetch} template function tag (compiled handler used by Smarty::fetch()/display())",
+    "module_kind": "function handler (template tag), Smarty\\FunctionHandler\\Fetch"
+   },
+   {
+    "where": "fix.diff:164-193 (libs/plugins/function.fetch.php, v4 branch port; file not present at the pinned commit)",
+    "entry_point": "{fetch} template function on Smarty v4 (smarty_function_fetch)",
+    "module_kind": "legacy plugin function (second implementation, other major branch)"
+   }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+   "kind": "second_implementation",
+   "where": "src/FunctionHandler/HtmlImage.php:100-115"
+  },
+  "O3_reason_to_dismiss": "{html_image} is a different tag from the {fetch} named in the advisory, its remote path already has its own isTrustedUri() branch and uses getimagesize(), which takes no stream context, so a solver can call redirect handling there a separate feature/rewrite rather than part of this bug.",
+  "O4_distance": {
+   "files": 2,
+   "packages": 1,
+   "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+   "what": "Without a security policy, remote {fetch} of a redirecting URL must keep following redirects (PHP default), and http:// URLs must keep using the manual fsockopen branch (which also populates assign_headers); an over-broad fix that disables redirects unconditionally or routes every scheme through file_get_contents breaks both.",
+   "where": "src/FunctionHandler/Fetch.php:192 and src/FunctionHandler/Fetch.php:50-190; expected behaviour asserted by fix.diff:77-89"
+  },
+  "O6_input_shapes": [
+   "https:// (only the exact scheme 'http' takes the fsockopen branch at src/FunctionHandler/Fetch.php:50, so every other scheme reaches file_get_contents at :192)",
+   "other 'scheme://' forms: ftp://, and custom/PHP stream wrappers (e.g. a registered ssrftest:// wrapper)",
+   "uppercase scheme (lowercased for detection at src/FunctionHandler/Fetch.php:32-35)",
+   "file:// prefixed path (stripped at src/FunctionHandler/Fetch.php:29-31, then treated as local)",
+   "local path with no scheme (local branch, isTrustedResourceDir)",
+   "no security policy at all (redirects remain enabled, backwards compatible)"
+  ],
+  "O7_producer": {
+   "kind": "none",
+   "where": "",
+   "check_calls_producer": null
+  },
+  "O8_uncovered_routes": [
+   {
+    "route": "{html_image file=\"https://trusted/...\"} without width/height passes isTrustedUri() and then fetches through getimagesize(), which uses PHP's default http context and follows redirects to a non-trusted host",
+    "where": "src/FunctionHandler/HtmlImage.php:103-115",
+    "reason_to_dismiss": "Different tag from the {fetch} in the advisory; getimagesize() accepts no stream context, so making it redirect-safe means fetching with file_get_contents() + getimagesizefromstring(), i.e. a rewrite of a neighbouring feature.",
+    "distance": "same package (Smarty\\FunctionHandler) but a different file from the landing point; reachable from any template",
+    "present_in_latest": "unknown",
+    "latest_where": ""
+   },
+   {
+    "route": "Remote template source resolved through the stream resource path (e.g. {include file=\"https://host/tpl\"}): fopen() at :59 is called with no context, so redirects are followed, and the only check is isTrustedStream() on the scheme",
+    "where": "src/Resource/StreamPlugin.php:51-59 (dispatch at src/Resource/BasePlugin.php:85-93)",
+    "reason_to_dismiss": "Remote streams are governed by the separate $streams allow-list, which defaults to ['file'], so this route throws unless a deployment explicitly opts in to the https stream; it never was a trusted_uri route.",
+    "distance": "one package away (Smarty\\Resource vs Smarty\\FunctionHandler), and reached from the resource loader rather than a tag handler",
+    "present_in_latest": "unknown",
+    "latest_where": ""
+   }
+  ],
+  "O8b_injection_room": [
+   {
+    "where": "src/Resource/StreamPlugin.php:49-59",
+    "sibling": "a redirect-safe stream fetch (add a no-redirect stream context to the fopen() call, or an isTrustedUri check on the resource name)",
+    "why_realistic": "Smarty already lets templates load sources via PHP stream wrappers and this class is the only place that opens them; a maintainer hardening remote fetches would plausibly patch it while still missing redirects because the gate here is isTrustedStream, not trusted_uri."
+   },
+   {
+    "where": "src/FunctionHandler/BCPluginWrapper.php:16-19",
+    "sibling": "a legacy smarty_function_fetch-style implementation delegated through the BC wrapper (the v4 branch still ships libs/plugins/function.fetch.php)",
+    "why_realistic": "v5 keeps a compatibility wrapper for old-style plugin callbacks and addPluginsDir() still loads user plugin directories, so an old fetch implementation calling @file_get_contents() can sit next to the new handler."
+   },
+   {
+    "where": "src/Template.php:556-568",
+    "sibling": "deprecated stream-variable reader that fopen()s a 'scheme://name' string with no security check",
+    "why_realistic": "The parser still emits getStreamVariable() for {$x:y} syntax and the code predates the security policy, so a maintainer could add a trusted_uri/stream check here without touching redirects."
+   }
+  ],
+  "O9_family": "SSRF (CWE-918): server-side request forgery via HTTP redirects bypassing a trusted_uri allow-list",
+  "O9_dos": false,
+  "O10_build": {
+   "language": "PHP",
+   "toolchain": "Composer (require: php ^7.2 || ^8.0, symfony/polyfill-mbstring; require-dev: phpunit ^8.5 || ^7.5, smarty/smarty-lexer), tests run via phpunit.xml with bootstrap tests/Bootstrap.php",
+   "services": [],
+   "offline_after_build": true,
+   "project_tests": "tests/UnitTests/TemplateSource/TagTests/PluginFunction/PluginFunctionFetchTest.php (local-file and security-dir cases at :17-65); tests/UnitTests/SecurityTests/SecurityTest.php (isTrustedUri at :376); the fix's own redirect tests use a registered stream wrapper, so the behaviour is exercisable without network"
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+   "j_multi_site": 1,
+   "j_sites_touched": "src/FunctionHandler/Fetch.php (v5); libs/plugins/function.fetch.php (v4 port, absent from the pinned tree)",
+   "j_sibling_sites": "yes",
+   "j_cause_other_layer": 0,
+   "j_defence_ineffective": 1,
+   "j_overbroad_breaks_legit": 1,
+   "j_tempting_wrong_fix": "Add the follow_location=0 context only for the https scheme, or only in {fetch}, and stop there without touching {html_image} or the stream resource path."
+  },
+  "out_of_scope_notes": [
+   "The v4 port commit a1ccdb05 bundles unrelated published fixes (html_image/html_select_date output escaping, CWE-79) and re-applies the secure_dir symlink fix (CWE-22) already present at the pinned commit; they belong to other advisories and were not assessed."
+  ],
+  "unverified": [
+   "Repository size in MB (no shell available in this session); repo_mb left null.",
+   "Whether the {html_image} and stream-resource routes are still open in a later release (no latest tree supplied for O8).",
+   "Build/install and PHPUnit execution were not run (no execution against the project permitted)."
+  ]
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "Smarty::fetch()/display() rendering an untrusted template while a security policy is active; an origin approved by the policy answers with a redirection to an origin the policy does not approve",
+  "sites": [
+   {
+    "site": "{fetch} remote content",
+    "where": "src/FunctionHandler/Fetch.php:192",
+    "status": "published fix (baseline, tested)"
+   },
+   {
+    "site": "{html_image} remote dimensions",
+    "where": "src/FunctionHandler/HtmlImage.php:115",
+    "status": "real uncovered route, confirmed by test"
+   },
+   {
+    "site": "http(s) template resource",
+    "where": "src/Resource/HttpPlugin.php:32-34 (injected)",
+    "status": "injected sibling, confirmed by test"
+   },
+   {
+    "site": "stream template resource",
+    "where": "src/Resource/StreamPlugin.php:63-68 (check injected)",
+    "status": "injected sibling, confirmed by test"
+   }
+  ],
+  "routes": [
+   "https:// approved origin -> unapproved origin redirect via {fetch} (content and assign forms)",
+   "https:// approved origin -> unapproved origin redirect via {html_image} (no dimensions and one dimension supplied)",
+   "https:// approved origin -> unapproved origin redirect as a rendered template and as an {include} source",
+   "remotex: approved origin -> unapproved origin redirect as a rendered template and as an {include} source"
+  ],
+  "services": [],
+  "network": "none; an offline stream-wrapper origin models redirect following",
+  "project_tests_run": "PluginFunctionFetchTest, StreamResourceTest and SecurityTest (51 tests, 72 assertions) pass at pinned+injection and with the oracle",
+  "reproduced_on_pinned": true
+ },
+ "leak_terms": [
+  "HtmlImage",
+  "HtmlImage.php",
+  "HttpPlugin",
+  "HttpPlugin.php",
+  "StreamPlugin",
+  "StreamPlugin.php",
+  "BasePlugin",
+  "BasePlugin.php",
+  "isTrustedUri",
+  "trusted_uri",
+  "getimagesize",
+  "getimagesizefromstring",
+  "follow_location",
+  "max_redirects",
+  "stream_context_create",
+  "FunctionHandler",
+  "GHSA-CQ55-C7WV-PXMQ",
+  "CVE-2026-62993",
+  "31e06fc0",
+  "a1ccdb05",
+  "99c048ce"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_fetch.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "miss_html_image.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "miss_http_resource.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "miss_stream_resource.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad"
+  },
+  {
+   "patch": "sec_adjacent_api.patch",
+   "expect": "functional_fail",
+   "kind": "adjacent_api"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "n/a: the stated property allows an error as a refusal form, so an error on the attack path is a valid refusal; the catalogue's concern (a crash that is mistaken for a refusal while legitimate use breaks) is caught functionally by func_refuse_all.patch",
+  "wrong_resource": "n/a: no separate authorisation object exists; every site checks and then retrieves the same URL, so there is no neighbouring or proxy resource to authorise instead",
+  "one_role_or_direction": "n/a: the protection has no roles or directions; every site performs the same read",
+  "reads_only": "n/a: every affected operation is a read; there is no write side to guard",
+  "check_after_adjustment": "n/a: the value the trust decision sees is the exact value handed to the retrieval at every site, with no normalising or adjusting step in between",
+  "unlisted_route": "miss_html_image.patch",
+  "malformed_identity": "n/a: no identity or name syntax is parsed by the protection; the URL is passed through unchanged",
+  "missing_authority": "n/a: the authority is a static policy list, not a lookup that can return nothing and fail open",
+  "adjacent_api": "sec_adjacent_api.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-html-image-dimensions",
+   "lever": "real pattern-B route where the protection never existed",
+   "shape": "a documented origin-allow-list consumer reads remote image dimensions through a primitive that takes no stream context: the initial origin is checked and the redirection is still followed",
+   "how_type": true,
+   "where": "src/FunctionHandler/HtmlImage.php:115",
+   "security_tests": [
+    "SmartyS4HtmlImageRedirectTest::testHtmlImageDoesNotFollowRedirectToUnapprovedOrigin",
+    "SmartyS4HtmlImageRedirectTest::testHtmlImageWithOneDimensionDoesNotFollowRedirectToUnapprovedOrigin"
+   ],
+   "coupled_functional_tests": [
+    "SmartyS4HtmlImageFunctionalTest::testHtmlImageReadsDimensionsFromApprovedOrigin",
+    "SmartyS4HtmlImageFunctionalTest::testHtmlImageWithoutSecurityPolicyStillFollowsRedirect",
+    "SmartyS4HtmlImageFunctionalTest::testHtmlImageReadsLocalImage"
+   ],
+   "security_fail_patch": "miss_html_image.patch",
+   "realistic_because": "real, unmodified upstream code; the project documents the origin allow-list as applying to this tag and its automatic dimension read"
+  },
+  {
+   "id": "T2-http-template-resource",
+   "lever": "injected sibling: second implementation in the template resource layer",
+   "shape": "a second implementation of the same guarded operation: it validates the origin of the resource URL, then reads it with a primitive that follows redirections",
+   "how_type": false,
+   "where": "src/Resource/HttpPlugin.php:32-34",
+   "security_tests": [
+    "SmartyS4HttpResourceRedirectTest::testRemoteTemplateDoesNotFollowRedirectToUnapprovedOrigin",
+    "SmartyS4HttpResourceRedirectTest::testIncludedRemoteTemplateDoesNotFollowRedirectToUnapprovedOrigin"
+   ],
+   "coupled_functional_tests": [
+    "SmartyS4ResourceFunctionalTest::testHttpTemplateDirectContent",
+    "SmartyS4ResourceFunctionalTest::testHttpTemplateWithoutSecurityPolicyStillFollowsRedirect"
+   ],
+   "security_fail_patch": "miss_http_resource.patch",
+   "realistic_because": "injected: a maintainer-plausible first-class http(s) template resource; it still calls the origin check, so it looks handled"
+  },
+  {
+   "id": "T3-stream-template-resource",
+   "lever": "injected sibling: origin check added but the open still follows redirections",
+   "shape": "a remote stream template validates its resolved path against the origin allow-list and then opens it with a primitive that follows redirections",
+   "how_type": true,
+   "where": "src/Resource/StreamPlugin.php:63-68",
+   "security_tests": [
+    "SmartyS4StreamResourceRedirectTest::testStreamTemplateDoesNotFollowRedirectToUnapprovedOrigin",
+    "SmartyS4StreamResourceRedirectTest::testIncludedStreamTemplateDoesNotFollowRedirectToUnapprovedOrigin"
+   ],
+   "coupled_functional_tests": [
+    "SmartyS4ResourceFunctionalTest::testStreamTemplateDirectContent",
+    "SmartyS4ResourceFunctionalTest::testStreamTemplateWithoutSecurityPolicyStillFollowsRedirect"
+   ],
+   "security_fail_patch": "miss_stream_resource.patch",
+   "realistic_because": "injected: a maintainer hardening remote stream templates would plausibly validate the resolved path and still call fopen without a stream context"
+  },
+  {
+   "id": "T4-coupled-no-policy-and-direct-reads",
+   "lever": "coupled must-keep-working behaviour (how-type)",
+   "shape": "an over-broad fix that always disables redirects, or refuses remote reads, passes the security tests but breaks documented no-policy redirect following and direct reads from an approved origin",
+   "how_type": true,
+   "where": "src/FunctionHandler/Fetch.php:192, src/FunctionHandler/HtmlImage.php:115, src/Resource/HttpPlugin.php:34, src/Resource/StreamPlugin.php:68",
+   "security_tests": [
+    "the over-broad variants pass every security test; they are caught by the functional group"
+   ],
+   "coupled_functional_tests": [
+    "SmartyS4FetchFunctionalTest::testFetchWithoutSecurityPolicyStillFollowsRedirect",
+    "SmartyS4FetchFunctionalTest::testFetchReadsDirectApprovedOrigin",
+    "SmartyS4HtmlImageFunctionalTest::testHtmlImageWithoutSecurityPolicyStillFollowsRedirect",
+    "SmartyS4HtmlImageFunctionalTest::testHtmlImageReadsDimensionsFromApprovedOrigin",
+    "SmartyS4ResourceFunctionalTest::testHttpTemplateWithoutSecurityPolicyStillFollowsRedirect",
+    "SmartyS4ResourceFunctionalTest::testStreamTemplateWithoutSecurityPolicyStillFollowsRedirect",
+    "SmartyS4ResourceFunctionalTest::testHttpTemplateDirectContent",
+    "SmartyS4ResourceFunctionalTest::testStreamTemplateDirectContent"
+   ],
+   "security_fail_patch": "n/a: this lever fails functionally; see func_overbroad.patch (expect functional_fail)",
+   "realistic_because": "the obvious safe-sounding fix (never follow redirects; refuse remote reads) is a realistic over-hardening"
+  }
+ ],
+ "status": "built",
+ "notes": "Pattern B with real route T1 and two injected siblings (T2, T3). Oracle = published {fetch} fix + HtmlImage manual fetch/parse + no-redirect contexts for the http and stream template resources. The register rows for T1-T3 are in build/audit/uncovered-routes.tsv."
+}

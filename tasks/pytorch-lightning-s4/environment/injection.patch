@@ -1,0 +1,35 @@
+diff --git a/src/lightning/pytorch/cli.py b/src/lightning/pytorch/cli.py
+index 46ecbd1..ef8b75e 100644
+--- a/src/lightning/pytorch/cli.py
++++ b/src/lightning/pytorch/cli.py
+@@ -569,6 +569,12 @@ class LightningCLI:
+             ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+             hparams = ckpt.get("hyper_parameters", {})
+             hparams.pop("_instantiator", None)
++            # older CLI configs stored their arguments in a different layout and record a migration
++            migration_path = hparams.pop("_config_migration", None)
++            if migration_path is not None:
++                module_path, name = migration_path.rsplit(".", 1)
++                migration = getattr(__import__(module_path, fromlist=[name]), name)
++                hparams = migration(hparams)
+             if not hparams:
+                 return
+             if "_class_path" in hparams:
+diff --git a/src/lightning/pytorch/core/saving.py b/src/lightning/pytorch/core/saving.py
+index 391e9dd..0b265b3 100644
+--- a/src/lightning/pytorch/core/saving.py
++++ b/src/lightning/pytorch/core/saving.py
+@@ -210,7 +210,12 @@ def _convert_loaded_hparams(
+         return model_args
+     # if past checkpoint loaded, convert str to callable
+     if isinstance(hparams_type, str):
+-        hparams_type = AttributeDict
++        # older checkpoints record the hparams container by its import path
++        if "." in hparams_type:
++            module_path, name = hparams_type.rsplit(".", 1)
++            hparams_type = getattr(__import__(module_path, fromlist=[name]), name)
++        else:
++            hparams_type = AttributeDict
+     # convert hparams
+     return hparams_type(model_args)
+ 

@@ -1,0 +1,172 @@
+diff -ruN pristine/authlib/oauth2/rfc6749/authorization_server.py app/authlib/oauth2/rfc6749/authorization_server.py
+--- a/authlib/oauth2/rfc6749/authorization_server.py	2026-10-29 05:26:37.000000000 +0000
++++ b/authlib/oauth2/rfc6749/authorization_server.py	2026-10-29 05:43:55.614526517 +0000
+@@ -10,6 +10,7 @@
+ from .hooks import hooked
+ from .requests import JsonRequest
+ from .requests import OAuth2Request
++from .util import resolve_error_redirect_uri
+ from .util import scope_to_list
+ 
+ 
+@@ -244,7 +245,7 @@
+         raise UnsupportedResponseTypeError(
+             f"The response type '{request.payload.response_type}' is not supported by the server.",
+             request.payload.response_type,
+-            redirect_uri=request.payload.redirect_uri,
++            redirect_uri=resolve_error_redirect_uri(request, self.query_client),
+         )
+ 
+     def get_consent_grant(self, request=None, end_user=None):
+diff -ruN pristine/authlib/oauth2/rfc6749/grants/base.py app/authlib/oauth2/rfc6749/grants/base.py
+--- a/authlib/oauth2/rfc6749/grants/base.py	2026-10-29 05:26:39.000000000 +0000
++++ b/authlib/oauth2/rfc6749/grants/base.py	2026-10-29 05:43:58.767537288 +0000
+@@ -4,6 +4,7 @@
+ from ..hooks import Hookable
+ from ..hooks import hooked
+ from ..requests import OAuth2Request
++from ..util import resolve_error_redirect_uri
+ 
+ 
+ class BaseGrant(Hookable):
+@@ -130,8 +131,7 @@
+                 )
+             return redirect_uri
+ 
+-    @staticmethod
+-    def validate_no_multiple_request_parameter(request: OAuth2Request):
++    def validate_no_multiple_request_parameter(self, request: OAuth2Request):
+         """For the Authorization Endpoint, request and response parameters MUST NOT be included
+         more than once. Per `Section 3.1`_.
+ 
+@@ -141,12 +141,15 @@
+         parameters = ["response_type", "client_id", "redirect_uri", "scope", "state"]
+         for param in parameters:
+             if len(datalist.get(param, [])) > 1:
++                redirect_uri = None
++                if param == "redirect_uri":
++                    redirect_uri = resolve_error_redirect_uri(
++                        request, self.server.query_client
++                    )
+                 raise InvalidRequestError(
+                     f"Multiple '{param}' in request.",
+                     state=request.payload.state,
+-                    redirect_uri=(
+-                        request.payload.redirect_uri if param == "redirect_uri" else None
+-                    ),
++                    redirect_uri=redirect_uri,
+                 )
+ 
+     @hooked
+diff -ruN pristine/authlib/oauth2/rfc6749/util.py app/authlib/oauth2/rfc6749/util.py
+--- a/authlib/oauth2/rfc6749/util.py	2026-10-29 05:26:37.000000000 +0000
++++ b/authlib/oauth2/rfc6749/util.py	2026-10-29 05:43:53.476520120 +0000
+@@ -5,6 +5,33 @@
+ from authlib.common.encoding import to_unicode
+ 
+ 
++def resolve_error_redirect_uri(request, query_client):
++    """Return the redirect URI an authorization error may be delivered to.
++
++    Error responses of the authorization endpoint may only be redirected to a
++    URI that is registered for the client identified by the request (RFC 6749
++    section 4.1.2.1).  An unknown client, or a URI the client has not
++    registered, makes this return ``None`` so that the error is returned
++    directly instead of being redirected.  When the request does not name a
++    redirect URI the client's registered default is used.
++    """
++    client_id = request.payload.client_id
++    if not client_id:
++        return None
++
++    client = query_client(client_id)
++    if client is None:
++        return None
++
++    redirect_uri = request.payload.redirect_uri
++    if not redirect_uri:
++        return client.get_default_redirect_uri()
++
++    if client.check_redirect_uri(redirect_uri):
++        return redirect_uri
++    return None
++
++
+ def list_to_scope(scope):
+     """Convert a list of scopes to a space separated string."""
+     if isinstance(scope, (set, tuple, list)):
+diff -ruN pristine/authlib/oauth2/rfc9101/authorization_server.py app/authlib/oauth2/rfc9101/authorization_server.py
+--- a/authlib/oauth2/rfc9101/authorization_server.py	2026-10-29 05:26:39.000000000 +0000
++++ b/authlib/oauth2/rfc9101/authorization_server.py	2026-10-29 05:44:05.748559978 +0000
+@@ -71,19 +71,24 @@
+         request_object = self._decode_request_object(
+             request, client, raw_request_object
+         )
+-        self._validate_request_object_redirect_uri(request, request_object)
++        self._validate_request_object_redirect_uri(request, request_object, client)
+         payload = BasicOAuth2Payload(request_object)
+         request.payload = payload
+ 
+-    def _validate_request_object_redirect_uri(self, request, request_object):
++    def _validate_request_object_redirect_uri(self, request, request_object, client):
+         """The redirect_uri claim and the redirect_uri parameter must agree."""
+         claim_uri = request_object.get("redirect_uri")
+         if claim_uri and request.payload.redirect_uri:
+             if claim_uri != request.payload.redirect_uri:
++                # Only an error that targets a URI registered for this client
++                # may be redirected; a claim naming an arbitrary URI may not.
++                redirect_uri = (
++                    claim_uri if client.check_redirect_uri(claim_uri) else None
++                )
+                 raise InvalidRequestError(
+                     "The 'redirect_uri' claim from the request object does not "
+                     "match the 'redirect_uri' parameter.",
+-                    redirect_uri=claim_uri,
++                    redirect_uri=redirect_uri,
+                     state=request.payload.state,
+                 )
+ 
+diff -ruN pristine/authlib/oidc/core/grants/hybrid.py app/authlib/oidc/core/grants/hybrid.py
+--- a/authlib/oidc/core/grants/hybrid.py	2026-10-29 05:26:37.000000000 +0000
++++ b/authlib/oidc/core/grants/hybrid.py	2026-10-29 05:44:02.991552064 +0000
+@@ -5,6 +5,7 @@
+ from authlib.oauth2.rfc6749.grants.authorization_code import (
+     validate_code_authorization_request,
+ )
++from authlib.oauth2.rfc6749.util import resolve_error_redirect_uri
+ 
+ from .implicit import OpenIDImplicitGrant
+ from .util import is_openid_scope
+@@ -52,7 +53,9 @@
+         if not is_openid_scope(self.request.payload.scope):
+             raise InvalidScopeError(
+                 "Missing 'openid' scope",
+-                redirect_uri=self.request.payload.redirect_uri,
++                redirect_uri=resolve_error_redirect_uri(
++                    self.request, self.server.query_client
++                ),
+                 redirect_fragment=True,
+             )
+         self.register_hook(
+diff -ruN pristine/authlib/oidc/core/grants/implicit.py app/authlib/oidc/core/grants/implicit.py
+--- a/authlib/oidc/core/grants/implicit.py	2026-10-29 05:26:37.000000000 +0000
++++ b/authlib/oidc/core/grants/implicit.py	2026-10-29 05:44:01.915548300 +0000
+@@ -7,6 +7,7 @@
+ from authlib.oauth2.rfc6749 import OAuth2Error
+ from authlib.oauth2.rfc6749.errors import InvalidRequestError
+ from authlib.oauth2.rfc6749.hooks import hooked
++from authlib.oauth2.rfc6749.util import resolve_error_redirect_uri
+ 
+ from .util import create_response_mode_response
+ from .util import generate_id_token
+@@ -85,7 +86,9 @@
+         if not is_openid_scope(self.request.payload.scope):
+             raise InvalidScopeError(
+                 "Missing 'openid' scope",
+-                redirect_uri=self.request.payload.redirect_uri,
++                redirect_uri=resolve_error_redirect_uri(
++                    self.request, self.server.query_client
++                ),
+                 redirect_fragment=True,
+             )
+         redirect_uri = super().validate_authorization_request()

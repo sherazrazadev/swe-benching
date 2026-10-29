@@ -1,0 +1,89 @@
+diff --git a/src/Resource/BasePlugin.php b/src/Resource/BasePlugin.php
+index 6d222223..3af1c3fc 100644
+--- a/src/Resource/BasePlugin.php
++++ b/src/Resource/BasePlugin.php
+@@ -24,6 +24,8 @@ abstract class BasePlugin
+         'string'  => StringPlugin::class,
+         'extends' => ExtendsPlugin::class,
+         'stream'  => StreamPlugin::class,
++        'http'    => HttpPlugin::class,
++        'https'   => HttpPlugin::class,
+         'eval'    => StringEval::class,
+     ];
+ 
+diff --git a/src/Resource/HttpPlugin.php b/src/Resource/HttpPlugin.php
+new file mode 100644
+index 00000000..48a38c9b
+--- /dev/null
++++ b/src/Resource/HttpPlugin.php
+@@ -0,0 +1,50 @@
++<?php
++/**
++ * Smarty Internal Plugin Resource Http
++ *
++ * Implements http(s) URLs as a template resource.
++ */
++
++namespace Smarty\Resource;
++
++use Smarty\Template;
++use Smarty\Template\Source;
++
++/**
++ * Smarty Internal Plugin Resource Http
++ *
++ * Loads template sources directly from an http(s) URL.
++ */
++class HttpPlugin extends RecompiledPlugin {
++
++	/**
++	 * populate Source Object with meta data from Resource
++	 *
++	 * @param Source $source source object
++	 * @param Template|null $_template template object
++	 *
++	 * @return void
++	 */
++	public function populate(Source $source, ?Template $_template = null) {
++		$url = $source->getFullResourceName();
++		$smarty = $source->getSmarty();
++		if (is_object($smarty->security_policy)) {
++			$smarty->security_policy->isTrustedUri($url);
++		}
++		$content = @file_get_contents($url);
++		$source->uid = sha1($url);
++		$source->content = $content === false ? '' : $content;
++		$source->timestamp = $source->exists = $content !== false;
++	}
++
++	/**
++	 * Load template's source from URL into current template object
++	 *
++	 * @param Source $source source object
++	 *
++	 * @return string template source
++	 */
++	public function getContent(Source $source) {
++		return $source->content;
++	}
++}
+diff --git a/src/Resource/StreamPlugin.php b/src/Resource/StreamPlugin.php
+index 9b5b3f57..f8b36bf5 100644
+--- a/src/Resource/StreamPlugin.php
++++ b/src/Resource/StreamPlugin.php
+@@ -54,6 +54,15 @@ class StreamPlugin extends RecompiledPlugin {
+ 			$filepath = str_replace(':', '://', $source->getFullResourceName());
+ 		}
+ 
++		// Remote stream resources are only reachable when the security policy has
++		// been configured with trusted URI patterns; validate the resolved path
++		// against them before opening it.
++		$smarty = $source->getSmarty();
++		if (is_object($smarty->security_policy) && !empty($smarty->security_policy->trusted_uri)
++			&& ($_pos = strpos($filepath, '://')) !== false) {
++			$smarty->security_policy->isTrustedUri($filepath);
++		}
++
+ 		$t = '';
+ 		// the availability of the stream has already been checked in Smarty\Resource\Base::fetch()
+ 		$fp = fopen($filepath, 'r+');

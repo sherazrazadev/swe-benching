@@ -1,0 +1,219 @@
+{
+ "slug": "authlib-s4",
+ "candidate": "screener-v2 entry 6038: GHSA-W8P2-R796-3VMQ / CVE-2026-41479 / PYSEC-2026-2119 (authlib/authlib)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "9266eaa2227ad7e21dc731b2a4a01909aabd934b (release 1.6.9, parent of the published fix 3be08468; the later upstream commit 9babc131 fixes the two OpenID Connect routes)",
+  "entry_points": [
+   "HTTP GET/POST /oauth/authorize wired by authlib.integrations.flask_oauth2.AuthorizationServer (a real Flask test client drives the documented route: get_consent_grant -> grant validation -> create_authorization_response -> handle_error_response)",
+   "public library API AuthorizationServer.get_authorization_grant / get_consent_grant / create_authorization_response"
+  ],
+  "sites": [
+   "authlib/oauth2/rfc6749/authorization_server.py:244-248 (published landing point: UnsupportedResponseTypeError carries request.payload.redirect_uri)",
+   "authlib/oidc/core/grants/implicit.py:84-90 (real uncovered route: missing-openid-scope InvalidScopeError before client/redirect validation)",
+   "authlib/oidc/core/grants/hybrid.py:51-57 (real uncovered route: same error in the hybrid grant)",
+   "authlib/oauth2/rfc9101/authorization_server.py:74,78-89 (injected sibling: request-object consistency error carries the claim redirect_uri)",
+   "authlib/oauth2/rfc6749/grants/base.py:145-150 (injected sibling: repeated-parameter error carries the first raw redirect_uri)"
+  ],
+  "routes": [
+   "unsupported response_type with a registered client and an unregistered redirect_uri (confirmed: 302 to the attacker URI on the pinned+injected tree)",
+   "unsupported response_type with an unknown client or no client_id and an unregistered redirect_uri (confirmed: 302)",
+   "another client's registered URI used with a different client (confirmed: 302)",
+   "OpenID Connect implicit grant, scope without openid, unregistered redirect_uri, known/unknown/absent client (confirmed: 302 to the attacker URI)",
+   "OpenID Connect hybrid grant, scope without openid, unregistered redirect_uri (confirmed: 302)",
+   "signed request-object deployment: outer redirect_uri registered, request-object claim redirect_uri unregistered (injected; confirmed 302 to the claim URI)",
+   "repeated redirect_uri parameter with the unregistered value first (injected; confirmed 302 to the first value)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/flask/test_oauth2 (pinned+injected and oracle): the whole directory is 232 passed + 1 skipped, where the skip is an unrelated unconditional skip in the rfc9068 subtree. The verifier therefore runs the directory with --ignore=tests/flask/test_oauth2/rfc9068: 203 passed, 0 skipped on the pinned+injected tree, under the oracle, and under every security_fail/pass check patch."
+  ],
+  "local_runs": "Local pytest against generated trees: nop (pinned+injected) security 0/11 pass (11 fail), functional 11/11 pass; oracle security 11/11 + functional 11/11; sf-miss-main 4 security fail, functional all pass; sf-miss-oidc 5 security fail; sf-miss-request-object 1; sf-miss-repeated 1; sf-crash 4 (errors); sf-missing-authority 2; ff-overbroad 5 functional fail; pass-hardening 22/22; pass-alt-central 22/22.",
+  "upstream_later_fix": "authlib/authlib commit 9babc131 (2026-05-02, 'fix: redirecting to unvalidated redirect_uri on InvalidScopeError in OIDC grants') confirms the two OpenID Connect routes were real and were fixed separately from the published fix; read-only, not used in the image.",
+  "gate": {
+   "static": "PASSED (only the downstream blind patch and FAIRNESS.md remain, by design)",
+   "nop": "PASSED: security 11 tests, 0 pass; functional 214 tests (11 hidden + 203 project), all pass",
+   "oracle": "PASSED: 3 runs, reward 1.0, identical results",
+   "patches": "PASSED: 9/9 as declared (sf-miss-main 4 security fail, sf-miss-oidc 5, sf-miss-request-object 1, sf-miss-repeated 1, sf-crash 2, sf-missing-authority 2, ff-overbroad 24 functional fail, pass-hardening 1.0, pass-alt-central 1.0)"
+  }
+ },
+ "leak_terms": [
+  "get_authorization_grant",
+  "get_consent_grant",
+  "create_authorization_response",
+  "handle_error_response",
+  "UnsupportedResponseTypeError",
+  "InvalidScopeError",
+  "InvalidRequestError",
+  "check_redirect_uri",
+  "redirect_uris",
+  "get_default_redirect_uri",
+  "OpenIDImplicitGrant",
+  "OpenIDHybridGrant",
+  "JWTAuthenticationRequest",
+  "validate_no_multiple_request_parameter",
+  "rfc9101",
+  "rfc6749",
+  "oidc",
+  "openid",
+  "implicit",
+  "hybrid",
+  "invalid_scope",
+  "unsupported_response_type",
+  "datalist",
+  "client_metadata",
+  "grants",
+  "authorization_server",
+  "request object",
+  "request_object",
+  "nonce",
+  "jwt"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-main.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "note": "everything else fixed; the reported decision point still carries the raw redirect_uri"
+  },
+  {
+   "patch": "sf-miss-oidc.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "note": "published fix plus siblings, but the OpenID Connect grant error paths still carry the raw request value"
+  },
+  {
+   "patch": "sf-miss-request-object.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "note": "every other site fixed; the request-object consistency error still redirects to the claim value"
+  },
+  {
+   "patch": "sf-miss-repeated.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "note": "every other site fixed; a repeated redirect_uri is still reported at its first (attacker-chosen) value"
+  },
+  {
+   "patch": "sf-crash.patch",
+   "expect": "security_fail",
+   "kind": "wrong",
+   "note": "raises instead of returning a clean client error (crash_as_refusal); security tests reject a non-4xx outcome"
+  },
+  {
+   "patch": "sf-missing-authority.patch",
+   "expect": "security_fail",
+   "kind": "wrong",
+   "note": "fail-open when query_client returns no client (missing_authority)"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "wrong",
+   "note": "never redirects any authorization error, so registered clients lose their error responses (refuse_all / adjacent_api)"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus a central belt-and-braces validation in handle_error_response"
+  },
+  {
+   "patch": "pass-alt-central.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "a single central decision in handle_error_response validates every error's redirect target, without the per-site changes"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "n/a: the exposed value is the redirect target itself and its registration is the only authority; there is no neighbouring/proxy object a check could authorise instead (a default-only check is a functional regression, covered by the non-default-URI functional test)",
+  "one_role_or_direction": "sf-miss-oidc.patch",
+  "reads_only": "n/a: the protected operation is a single response decision; the endpoint has no separate read and write paths",
+  "check_after_adjustment": "n/a: the redirect target is not normalised or adjusted before use (parameters are appended to it, which does not change which URI it is)",
+  "unlisted_route": "sf-miss-request-object.patch",
+  "malformed_identity": "sf-miss-repeated.patch",
+  "missing_authority": "sf-missing-authority.patch",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T0_reported",
+   "pattern": "reported landing point",
+   "lever_type": "where (the site the report leads to)",
+   "shape": "unsupported response_type with an unregistered redirect_uri; unknown client; no client_id; another client's registered URI",
+   "where": "authlib/oauth2/rfc6749/authorization_server.py:244-248",
+   "security_tests": [
+    "security/test_unsupported_response_type.py"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_error_redirects.py::test_unsupported_response_type_still_reaches_the_registered_uri",
+    "functional/test_error_redirects.py::test_unsupported_response_type_reaches_a_non_default_registered_uri"
+   ],
+   "security_fail_patch": "sf-miss-main.patch",
+   "reason_to_dismiss": "the reported site",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T1_openid_grants",
+   "pattern": "B (uncovered routes: the protection never existed)",
+   "lever_type": "how (the error must be raised only after the client and redirect target are resolved, in grants whose own validation order puts the scope check first)",
+   "shape": "an implicit or hybrid authorization request whose scope lacks openid, with an unregistered redirect_uri and a known, unknown or absent client",
+   "where": "authlib/oidc/core/grants/implicit.py:84-90; authlib/oidc/core/grants/hybrid.py:51-57",
+   "security_tests": [
+    "security/test_openid_grants.py"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_error_redirects.py::test_implicit_scope_error_still_reaches_the_registered_uri",
+    "functional/test_error_redirects.py::test_hybrid_scope_error_still_reaches_the_registered_uri"
+   ],
+   "security_fail_patch": "sf-miss-oidc.patch",
+   "reason_to_dismiss": "a different specification and a different error code (a scope error in the OpenID Connect package), which reads as scope validation rather than the unsupported-response-type redirect the report names; the published fix never touches it",
+   "realistic_because": "real, unmodified upstream code (fixed later upstream in commit 9babc131)"
+  },
+  {
+   "id": "T2_request_object",
+   "pattern": "injected sibling (merged rewritten request)",
+   "lever_type": "how (the redirect target arrives inside a signed request object that replaces the request payload in a pre-grant hook, so a decision taken in the grant lookup never sees this error)",
+   "shape": "a signed request-object deployment where the outer redirect_uri is registered and the request-object claim names an unregistered URI",
+   "where": "authlib/oauth2/rfc9101/authorization_server.py:74,78-89",
+   "security_tests": [
+    "security/test_request_object.py"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_normal_flows.py::test_request_object_deployment_still_authorizes",
+    "functional/test_normal_flows.py::test_request_object_without_outer_redirect_uri_still_authorizes"
+   ],
+   "security_fail_patch": "sf-miss-request-object.patch",
+   "reason_to_dismiss": "an optional JWT-secured-request extension that rewrites the request before the grant lookup, so the reported decision point appears to cover it",
+   "realistic_because": "maintainer-plausible signed-request consistency check added to our copy; the upstream fix never touches this file"
+  },
+  {
+   "id": "T3_repeated_parameter",
+   "pattern": "injected sibling (multi-valued input shape)",
+   "lever_type": "how (the shared malformed-request guard reads a single value out of a repeated parameter, so the value it reports and the value the request actually names differ)",
+   "shape": "the same authorization parameter repeated twice, with the unregistered value first",
+   "where": "authlib/oauth2/rfc6749/grants/base.py:145-150",
+   "security_tests": [
+    "security/test_repeated_parameters.py"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_error_redirects.py::test_unsupported_response_type_still_reaches_the_registered_uri"
+   ],
+   "security_fail_patch": "sf-miss-repeated.patch",
+   "reason_to_dismiss": "a malformed-request guard about duplicate parameters, which reads as input hygiene rather than a redirect decision",
+   "realistic_because": "maintainer-plausible error-reporting choice added to our copy; the upstream fix never touches the shared base grant"
+  }
+ ],
+ "status": "built and gate-green on 2026-10-29: static PASSED; nop PASSED (security 0/11 pass = all 11 fail on the pinned+injected tree, functional 214/214 pass including 203 project tests); oracle PASSED 3/3 identical at reward 1.0; patches PASSED 9/9 as declared (6 security_fail with all functional passing, 1 functional_fail with 24 functional failing, hardening and central-alternative pass at 1.0). The blind pass patch and FAIRNESS.md are written downstream by the pipeline. Target-model trials not run here."
+}

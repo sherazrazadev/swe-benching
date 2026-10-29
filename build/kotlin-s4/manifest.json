@@ -1,0 +1,248 @@
+{
+ "slug": "kotlin-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "27951",
+  "advisory_ids": [
+   "GHSA-R937-WJX7-W2JP",
+   "CVE-2026-53914"
+  ],
+  "repo": "jetbrains/kotlin",
+  "pinned_commit": "a1c6e2e1092a34ade533fc8d5f50774c3be50309 (verified: sole parent of the fix commit)",
+  "fix_commits": [
+   "bf51df665b458fda7c3eaf436c4d88dc119d7ec6"
+  ],
+  "landing_point": {
+   "where": "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt:139-167"
+  },
+  "O9_family": "CWE-502 deserialization of untrusted data: Java native serialization of build-directory data read back by kapt",
+  "O11_fix_minutes": 45,
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "track": "injected",
+  "j_tempting_wrong_fix": "Add a narrow class filter (or an ObjectInputFilter call, which does not exist at the module's Java level) to the two cache readers named by the report and stop there, leaving the other data kapt reads back from the build directory unfiltered, and derive the allowlist from declared field types rather than from what the producer actually serializes, so legitimate reloads stop working."
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "Real library entry points, exercised directly and through the class the kapt drivers construct: (1) KaptContext(KaptOptions, withJdk, logger), which both the Gradle kapt worker and the command-line runner build and which constructs the incremental-cache component and reads the data left in options.incrementalCache; (2) ProcessorLoaderImpl(options, logger).loadProcessors(), the processor-discovery path Kapt.kapt uses, which reads the processor-info cache from the same build directory; (3) KaptStubLineInformation.parseFileInfo(JCCompilationUnit), the public metadata reader the javac log uses for diagnostic mapping, which reads the .kapt_metadata file next to each stub source. Each poisoned file is written by the test with ObjectOutputStream and the probe class sets a marker only from its private readObject hook.",
+  "sites": [
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt:139-167 [published sink: apt-cache.bin and java-cache.bin readers]",
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/KaptContext.kt:58-60 [published: logger forwarded]",
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt:31-52 [injected sibling, read from ProcessorLoaderImpl]",
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/ProcessorLoader.kt:66-70 [injected sibling wiring]",
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt:44-70 [injected sibling, object payload in .kapt_metadata]",
+   "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KotlinPosition.kt:9 [injected sibling: position value made serializable]",
+   "plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt:47-50 [injected sibling producer, writer kept in step]"
+  ],
+  "routes": [
+   "incremental cache directory -> apt-cache.bin and java-cache.bin (published sink; root object and nested-object shapes)",
+   "incremental cache directory -> processor-info.bin (injected sibling; reached through processor discovery)",
+   "stub output -> <source>.kapt_metadata serialized payload (injected sibling; reached through parseFileInfo)"
+  ],
+  "services": "none",
+  "project_tests_run": "plugins/kapt/kapt-base test+testFixtures compiled with the module and the whole org.jetbrains.kotlin.kapt.base.test.incremental package run at image build time on the pinned+injected tree: 41/41 pass. The image build fails if they do not.",
+  "offline": "All dependencies (Kotlin 2.5.0-Beta2 compiler distribution, JUnit platform console standalone 1.12.2) are vendored into both images at build time; no network at test time.",
+  "no_pretest_leak": "The pinned tree does not contain the published fix's regression tests (testRejectedJavaCacheDoesNotDeserializePayload, testRejectedAptCacheDoesNotDeserializePayload, testJavaCacheCanDeserializeClassFileStructure, DeserializationProbe); the fix commit adds them."
+ },
+ "leak_terms": [
+  "JavaClassCacheManager",
+  "JavaClassCache",
+  "IncrementalAptCache",
+  "ClassFileStructure",
+  "SourceFileStructure",
+  "ProcessorInfoCache",
+  "ProcessorInfoCacheManager",
+  "ProcessorLoaderImpl",
+  "KaptStubLineInformation",
+  "KotlinPosition",
+  "KaptLineMappingCollector",
+  "KaptContext",
+  "KaptOptions",
+  "cache.kt",
+  "classStructureCache.kt",
+  "processorInfoCache.kt",
+  "ProcessorLoader.kt",
+  "KaptStubLineInformation.kt",
+  "KotlinPosition.kt",
+  "apt-cache.bin",
+  "java-cache.bin",
+  "processor-info.bin",
+  ".kapt_metadata",
+  "kapt_metadata",
+  "ObjectInputStream",
+  "ObjectOutputStream",
+  "readObject",
+  "resolveClass",
+  "resolveProxyClass",
+  "whitelist",
+  "allowlist",
+  "SingletonSet",
+  "LinkedHashMap",
+  "LinkedHashSet",
+  "DeclaredProcType",
+  "FilteringObjectInputStream",
+  "DeserializationProbe",
+  "kapt-base",
+  "incrementalCache",
+  "incremental cache"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_main_missing.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T0",
+   "why": "the sibling readers are filtered but the two published incremental-cache readers are left as they were"
+  },
+  {
+   "patch": "sf_sibling_processor.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T1",
+   "why": "full fix except the processor-info reader"
+  },
+  {
+   "patch": "sf_sibling_metadata.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T2",
+   "why": "full fix except the stub-metadata reader"
+  },
+  {
+   "patch": "sf_check_after_read.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T0-shape",
+   "why": "reads the data first and checks the root type afterwards, so a nested object runs"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T0-refusal",
+   "why": "filters correctly but lets the rejection escape instead of discarding and continuing"
+  },
+  {
+   "patch": "sf_published_only.patch",
+   "expect": "security_fail",
+   "kind": "security_fail",
+   "lever": "T1,T2",
+   "why": "the published fix's behaviour only: the incremental caches are filtered, both other readers stay open"
+  },
+  {
+   "patch": "ff_over_tight.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail",
+   "lever": "T0-coupled",
+   "why": "allowlist misses a JDK-internal value class the producer emits, so legitimate caches are discarded"
+  },
+  {
+   "patch": "ff_shared_whitelist.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail",
+   "lever": "T0-coupled,T1,T2",
+   "why": "one allowlist copied to every reader; the readers with different value shapes stop working"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "functional_fail",
+   "lever": "T0,T1,T2",
+   "why": "never reads any build-directory data back"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "reference fix plus size and regular-file guards on every reader"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "reference fix with the filter hook moved to readClassDescriptor instead of resolveClass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the sink has no ownership or authorization decision; it deserializes whatever build-directory file it is pointed at",
+  "one_role_or_direction": "n/a: no roles or directions exist on this path; the two read sites of the published sink are covered by sf_main_missing.patch",
+  "reads_only": "n/a: reading is the only operation performed on untrusted data; the write side is the trusted producer",
+  "check_after_adjustment": "sf_check_after_read.patch",
+  "unlisted_route": "sf_published_only.patch",
+  "malformed_identity": "n/a: class descriptors are exact JVM names; there is no parsing or normalisation step a malformed spelling could dodge",
+  "missing_authority": "n/a: no authority or secret lookup happens on this path",
+  "adjacent_api": "ff_shared_whitelist.patch"
+ },
+ "traps": [
+  {
+   "id": "T0",
+   "pattern": "B",
+   "shape": "the value classes actually emitted by the incremental-cache producer (JDK-internal collection classes, java.net.URI, java.io.File, the project's cache value classes) must stay readable, while any other class must be refused before it is constructed, including when it sits inside a container that is itself acceptable",
+   "where": "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt:139-167; classStructureCache.kt:74-77 and 183-200",
+   "reason_to_dismiss": "the report shows one container shape and a plain re-implementation reproduces it with only obvious value classes; the exact serialized value set is only visible from the producer, and a type check after deserialization looks equivalent",
+   "security_tests": [
+    "CacheDeserializationTest.poisonedAptCacheIsNotDeserialized",
+    "CacheDeserializationTest.poisonedJavaCacheIsNotDeserialized",
+    "CacheDeserializationTest.deserializationHappensBeforeAnyRootTypeCheck",
+    "CacheDeserializationTest.nestedObjectInJavaCacheIsNotDeserialized",
+    "CacheDeserializationTest.rejectedCacheDoesNotStopTheNextBuild"
+   ],
+   "coupled_functional_tests": [
+    "CacheRoundTripTest.classFileStructureSurvivesCacheReload",
+    "CacheRoundTripTest.sourceFileDependenciesSurviveCacheReload",
+    "CacheRoundTripTest.aptCacheIncrementalStateSurvivesReload",
+    "CacheRoundTripTest.largeJavaCacheSurvivesReload",
+    "CacheRoundTripTest.unrelatedWhitelistedRootIsDiscarded"
+   ],
+   "security_fail_patch": "sf_main_missing.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix's sink and both of its readers"
+  },
+  {
+   "id": "T1",
+   "pattern": "B",
+   "shape": "the processor-info cache the same build directory holds has its own serialized value shape (a map plus a declared-kind enum that resolves java.lang.Enum), reached through processor discovery rather than through the incremental-cache component",
+   "where": "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt:31-52; ProcessorLoader.kt:66-70",
+   "reason_to_dismiss": "it is a different, smaller cache for a different feature (processor discovery metadata), written to its own file, and a reporter fixing the incremental cache has no reason to open processor loading",
+   "security_tests": [
+    "ProcessorInfoDeserializationTest.poisonedProcessorInfoCacheIsNotDeserialized",
+    "ProcessorInfoDeserializationTest.poisonedProcessorInfoCacheDoesNotStopProcessorLoading"
+   ],
+   "coupled_functional_tests": [
+    "ProcessorInfoRoundTripTest.declaredProcessorKindSurvivesReload",
+    "ProcessorInfoRoundTripTest.processorWithoutSavedKindIsStillLoaded"
+   ],
+   "security_fail_patch": "sf_sibling_processor.patch",
+   "realistic_because": "injected within the module's existing pattern: a maintainer-added cache would copy JavaClassCacheManager's read/write idiom and put it in the same build directory to avoid rescanning processor jars"
+  },
+  {
+   "id": "T2",
+   "pattern": "B",
+   "shape": "the stub-line metadata reader next to the stubs reads a serialized object payload (a map of position values) from a file whose old format held only primitives; the position value class and the resolved map classes must stay readable",
+   "where": "plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt:44-70; KotlinPosition.kt:9; plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt:47-50",
+   "reason_to_dismiss": "it is diagnostic line-mapping metadata next to stub sources, not the incremental cache, and its format was primitives-only for years; a reader of the report would treat it as unrelated",
+   "security_tests": [
+    "StubMetadataDeserializationTest.poisonedStubMetadataIsNotDeserialized",
+    "StubMetadataDeserializationTest.poisonedStubMetadataNestedPayloadIsNotDeserialized"
+   ],
+   "coupled_functional_tests": [
+    "StubMetadataRoundTripTest.stubPositionsSurviveReload",
+    "StubMetadataRoundTripTest.manyStubPositionsSurviveReload"
+   ],
+   "security_fail_patch": "sf_sibling_metadata.patch",
+   "realistic_because": "injected as a coordinated format extension: the reader in kapt-base and the writer in kapt-compiler move together, the shape an added-field change takes"
+  }
+ ],
+ "status": "built; gate PASSED on 2026-10-29: static PASSED; nop PASSED (9/9 security tests fail on the pinned+injected tree, 9/9 functional pass); oracle PASSED 3/3 (reward 1.0, identical results); patches PASSED 11/11 as declared (6 security_fail each with functional green, 3 functional_fail, hardening pass 1.0, alternative pass 1.0). The blind pass patch and FAIRNESS.md are left for the downstream steps. Image build runs the project's 41 incremental kapt-base tests and requires them to pass."
+}

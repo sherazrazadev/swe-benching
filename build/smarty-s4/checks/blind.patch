@@ -1,0 +1,120 @@
+diff -ruN a/src/FunctionHandler/Fetch.php b/src/FunctionHandler/Fetch.php
+--- a/src/FunctionHandler/Fetch.php	2026-10-29 05:32:27.000000000 +0000
++++ b/src/FunctionHandler/Fetch.php	2026-10-29 05:42:03.145031298 +0000
+@@ -189,7 +189,17 @@
+ 				return;
+ 			}
+ 		} else {
+-			$content = @file_get_contents($params['file']);
++			if ($protocol && is_object($template->getSmarty()->security_policy)) {
++				// A remote retrieval governed by an origin allow-list must not be diverted
++				// by a redirection to an origin the policy does not allow.
++				$content = @file_get_contents(
++					$params['file'],
++					false,
++					$template->getSmarty()->security_policy->getRemoteStreamContext()
++				);
++			} else {
++				$content = @file_get_contents($params['file']);
++			}
+ 			if ($content === false) {
+ 				throw new Exception("{fetch} cannot read resource '" . $params['file'] . "'");
+ 			}
+diff -ruN a/src/FunctionHandler/HtmlImage.php b/src/FunctionHandler/HtmlImage.php
+--- a/src/FunctionHandler/HtmlImage.php	2026-10-29 05:32:27.000000000 +0000
++++ b/src/FunctionHandler/HtmlImage.php	2026-10-29 05:42:10.440173341 +0000
+@@ -112,7 +112,24 @@
+ 		}
+ 		if (!isset($params['width']) || !isset($params['height'])) {
+ 			// FIXME: (rodneyrehm) getimagesize() loads the complete file off a remote resource, use custom [jpg,png,gif]header reader!
+-			if (!$_image_data = @getimagesize($_image_path)) {
++			$_image_data = false;
++			if ($protocol && is_object($template->getSmarty()->security_policy)) {
++				// getimagesize() cannot be given a stream context, so a remote read approved
++				// on the strength of its origin could still follow a redirection to an origin
++				// the policy does not allow. Fetch the bytes under the policy's restriction
++				// and read the dimensions from memory instead.
++				$_image_bytes = @file_get_contents(
++					$_image_path,
++					false,
++					$template->getSmarty()->security_policy->getRemoteStreamContext()
++				);
++				if ($_image_bytes !== false) {
++					$_image_data = @getimagesizefromstring($_image_bytes);
++				}
++			} else {
++				$_image_data = @getimagesize($_image_path);
++			}
++			if (!$_image_data) {
+ 				if (!file_exists($_image_path)) {
+ 					trigger_error("html_image: unable to find '{$_image_path}'", E_USER_NOTICE);
+ 					return;
+diff -ruN a/src/Resource/HttpPlugin.php b/src/Resource/HttpPlugin.php
+--- a/src/Resource/HttpPlugin.php	2026-10-29 05:32:30.000000000 +0000
++++ b/src/Resource/HttpPlugin.php	2026-10-29 05:42:13.880240488 +0000
+@@ -30,8 +30,12 @@
+ 		$smarty = $source->getSmarty();
+ 		if (is_object($smarty->security_policy)) {
+ 			$smarty->security_policy->isTrustedUri($url);
++			// The origin is approved, but the response must not be allowed to redirect this
++			// retrieval to an origin the policy does not allow.
++			$content = @file_get_contents($url, false, $smarty->security_policy->getRemoteStreamContext());
++		} else {
++			$content = @file_get_contents($url);
+ 		}
+-		$content = @file_get_contents($url);
+ 		$source->uid = sha1($url);
+ 		$source->content = $content === false ? '' : $content;
+ 		$source->timestamp = $source->exists = $content !== false;
+diff -ruN a/src/Resource/StreamPlugin.php b/src/Resource/StreamPlugin.php
+--- a/src/Resource/StreamPlugin.php	2026-10-29 05:32:30.000000000 +0000
++++ b/src/Resource/StreamPlugin.php	2026-10-29 05:42:16.430290580 +0000
+@@ -65,7 +65,14 @@
+ 
+ 		$t = '';
+ 		// the availability of the stream has already been checked in Smarty\Resource\Base::fetch()
+-		$fp = fopen($filepath, 'r+');
++		if (strpos($filepath, '://') !== false && is_object($smarty->security_policy)
++			&& !empty($smarty->security_policy->trusted_uri)) {
++			// An origin allow-list governs this remote retrieval: the approved origin must
++			// not be able to move the read to another origin by answering with a redirection.
++			$fp = fopen($filepath, 'r+', false, $smarty->security_policy->getRemoteStreamContext());
++		} else {
++			$fp = fopen($filepath, 'r+');
++		}
+ 		if ($fp) {
+ 			while (!feof($fp) && ($current_line = fgets($fp)) !== false) {
+ 				$t .= $current_line;
+diff -ruN a/src/Security.php b/src/Security.php
+--- a/src/Security.php	2026-10-29 05:32:27.000000000 +0000
++++ b/src/Security.php	2026-10-29 05:42:00.423977853 +0000
+@@ -443,6 +443,29 @@
+ 	}
+ 
+ 	/**
++	 * Create the stream context used for a remote retrieval made while this policy is active.
++	 *
++	 * isTrustedUri() approves a single origin (scheme and host). PHP's remote stream wrappers
++	 * follow redirections on their own, so a resource on an approved origin could answer with
++	 * a redirection to an origin the policy was never asked about; the wrapper would then
++	 * contact that origin and hand back its content. Reads governed by this policy therefore
++	 * use a context that stops the wrapper at the first response, so a retrieval that was
++	 * approved for one origin cannot be diverted to another one.
++	 *
++	 * @return resource stream context for a single, non-redirected remote response
++	 */
++	public function getRemoteStreamContext() {
++		return stream_context_create(
++			[
++				'http' => [
++					'follow_location' => 0,
++					'max_redirects' => 1,
++				],
++			]
++		);
++	}
++
++	/**
+ 	 * Remove old directories and its sub folders, add new directories
+ 	 *
+ 	 * @param array $oldDir

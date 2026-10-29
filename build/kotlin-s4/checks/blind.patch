@@ -1,0 +1,334 @@
+diff -ruN a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt	2026-10-29 05:38:49.000000000 +0000
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/cache.kt	2026-10-29 06:01:02.775746466 +0000
+@@ -5,6 +5,8 @@
+ 
+ package org.jetbrains.kotlin.kapt.base.incremental
+ 
++import org.jetbrains.kotlin.kapt.base.util.GuardedObjectInputStream
++import org.jetbrains.kotlin.kapt.base.util.SerializedValueClasses
+ import java.io.*
+ 
+ // TODO(gavra): switch away from Java serialization
+@@ -136,34 +138,38 @@
+         return impactedTypes
+     }
+ 
+-    private fun maybeGetAptCacheFromFile(): IncrementalAptCache {
++    private fun maybeGetAptCacheFromFile(): IncrementalAptCache =
++        restoreCache(aptCacheFile, APT_CACHE_VALUE_CLASSES, IncrementalAptCache::class.java) ?: IncrementalAptCache()
+ 
+-        return if (aptCacheFile.exists()) {
+-            try {
+-                ObjectInputStream(BufferedInputStream(aptCacheFile.inputStream())).use {
+-                    it.readObject() as IncrementalAptCache
+-                }
+-            } catch (_: Throwable) {
+-                // cache corrupt
+-                IncrementalAptCache()
++    private fun maybeGetJavaCacheFromFile(): JavaClassCache =
++        restoreCache(javaCacheFile, JAVA_CACHE_VALUE_CLASSES, JavaClassCache::class.java) ?: JavaClassCache()
++
++    /**
++     * Reads the cache stored in [file] and returns it when it holds a value of [cacheClass] built
++     * only from [valueClasses]. Data of any other shape, or data naming any other class, is
++     * rejected and the file is discarded, so the caller starts from an empty cache exactly as if
++     * the file had never been there. Rejection is not a build failure.
++     */
++    private fun <T : Any> restoreCache(
++        file: File,
++        valueClasses: SerializedValueClasses,
++        cacheClass: Class<T>
++    ): T? {
++        val restored = try {
++            GuardedObjectInputStream(BufferedInputStream(file.inputStream()), valueClasses).use {
++                it.readObject()
+             }
+-        } else {
+-            IncrementalAptCache()
++        } catch (_: Exception) {
++            // Corrupt data, or a class outside the value types this cache may contain.
++            null
+         }
+-    }
+ 
+-    private fun maybeGetJavaCacheFromFile(): JavaClassCache {
+-        return if (javaCacheFile.exists()) {
+-            try {
+-                ObjectInputStream(BufferedInputStream(javaCacheFile.inputStream())).use {
+-                    it.readObject() as JavaClassCache
+-                }
+-            } catch (e: Throwable) {
+-                JavaClassCache()
+-            }
+-        } else {
+-            JavaClassCache()
++        if (restored != null && cacheClass.isInstance(restored)) {
++            return cacheClass.cast(restored)
+         }
++
++        file.delete()
++        return null
+     }
+ 
+     override fun close() {
+@@ -226,3 +232,33 @@
+ 
+     return cnt
+ }
++
++/**
++ * The value types an `IncrementalAptCache` is built from: the cache class itself, the JDK
++ * collections its fields use, and [File] for generated sources/classes.
++ */
++private val APT_CACHE_VALUE_CLASSES = SerializedValueClasses(
++    "java.io.File",
++    "java.util.HashMap",
++    "java.util.HashSet",
++    "java.util.LinkedHashMap",
++    "java.util.LinkedHashSet",
++    IncrementalAptCache::class.java.name
++)
++
++/**
++ * The value types a `JavaClassCache` is built from: the cache class, [ClassFileStructure] and
++ * [SourceFileStructure], the JDK collections their fields use, [java.net.URI] for source files and
++ * `Collections$SingletonSet` for the single-element `setOf` each class structure holds.
++ */
++private val JAVA_CACHE_VALUE_CLASSES = SerializedValueClasses(
++    "java.net.URI",
++    "java.util.Collections\$SingletonSet",
++    "java.util.HashMap",
++    "java.util.HashSet",
++    "java.util.LinkedHashMap",
++    "java.util.LinkedHashSet",
++    JavaClassCache::class.java.name,
++    ClassFileStructure::class.java.name,
++    SourceFileStructure::class.java.name
++)
+diff -ruN a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt	2026-10-29 05:38:51.000000000 +0000
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt	2026-10-29 05:58:37.329814351 +0000
+@@ -5,11 +5,12 @@
+ 
+ package org.jetbrains.kotlin.kapt.base.incremental
+ 
++import org.jetbrains.kotlin.kapt.base.util.GuardedObjectInputStream
++import org.jetbrains.kotlin.kapt.base.util.SerializedValueClasses
+ import java.io.BufferedInputStream
+ import java.io.BufferedOutputStream
+ import java.io.Closeable
+ import java.io.File
+-import java.io.ObjectInputStream
+ import java.io.ObjectOutputStream
+ import java.io.Serializable
+ 
+@@ -45,18 +46,25 @@
+     }
+ 
+     private fun maybeGetCacheFromFile(): ProcessorInfoCache {
+-        return if (cacheFile.exists()) {
+-            try {
+-                ObjectInputStream(BufferedInputStream(cacheFile.inputStream())).use {
+-                    it.readObject() as ProcessorInfoCache
+-                }
+-            } catch (_: Throwable) {
+-                // cache corrupt
+-                ProcessorInfoCache()
++        if (!cacheFile.exists()) {
++            return ProcessorInfoCache()
++        }
++
++        val restored = try {
++            GuardedObjectInputStream(BufferedInputStream(cacheFile.inputStream()), PROCESSOR_INFO_VALUE_CLASSES).use {
++                it.readObject()
+             }
+-        } else {
+-            ProcessorInfoCache()
++        } catch (_: Exception) {
++            // Corrupt data, or a class outside the value types this cache may contain.
++            null
++        }
++
++        if (restored is ProcessorInfoCache) {
++            return restored
+         }
++
++        cacheFile.delete()
++        return ProcessorInfoCache()
+     }
+ 
+     override fun close() {
+@@ -71,3 +79,15 @@
+         closed = true
+     }
+ }
++
++/**
++ * The value types a `ProcessorInfoCache` is built from: the cache class, its map of processor name
++ * to [DeclaredProcType], and the `java.lang.Enum` descriptor every serialized enum resolves.
++ */
++private val PROCESSOR_INFO_VALUE_CLASSES = SerializedValueClasses(
++    "java.lang.Enum",
++    "java.util.HashMap",
++    "java.util.LinkedHashMap",
++    DeclaredProcType::class.java.name,
++    ProcessorInfoCache::class.java.name
++)
+diff -ruN a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt	2026-10-29 05:38:51.000000000 +0000
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt	2026-10-29 05:58:55.119307765 +0000
+@@ -7,10 +7,11 @@
+ 
+ import com.sun.tools.javac.tree.JCTree
+ import com.sun.tools.javac.tree.TreeScanner
++import org.jetbrains.kotlin.kapt.base.util.GuardedObjectInputStream
++import org.jetbrains.kotlin.kapt.base.util.SerializedValueClasses
+ import org.jetbrains.kotlin.kapt.base.util.getPackageNameJava9Aware
+ import java.io.ByteArrayInputStream
+ import java.io.File
+-import java.io.ObjectInputStream
+ import java.nio.file.FileSystemNotFoundException
+ import java.nio.file.Paths
+ 
+@@ -43,20 +44,32 @@
+         }
+ 
+         private fun deserialize(data: ByteArray): FileInfo {
+-            val ois = ObjectInputStream(ByteArrayInputStream(data))
+-
+-            val version = ois.readInt()
+-            if (version != METADATA_VERSION) {
+-                return FileInfo.EMPTY
+-            }
++            return try {
++                GuardedObjectInputStream(ByteArrayInputStream(data), METADATA_VALUE_CLASSES).use { ois ->
++                    val version = ois.readInt()
++                    if (version != METADATA_VERSION) {
++                        return FileInfo.EMPTY
++                    }
+ 
+-            @Suppress("UNCHECKED_CAST")
+-            val lineInfo = ois.readObject() as LineInfoMap
++                    val lineInfo = ois.readObject() as? Map<*, *> ?: return FileInfo.EMPTY
++                    val signatureInfo = ois.readObject() as? Map<*, *> ?: return FileInfo.EMPTY
+ 
+-            @Suppress("UNCHECKED_CAST")
+-            val signatureInfo = ois.readObject() as MutableMap<String, String>
++                    // The classes are fixed by METADATA_VALUE_CLASSES; also refuse a payload whose
++                    // entries are shaped differently from what the writer emits.
++                    if (lineInfo.any { (name, position) -> name !is String || position !is KotlinPosition }) {
++                        return FileInfo.EMPTY
++                    }
++                    if (signatureInfo.any { (signature, descriptor) -> signature !is String || descriptor !is String }) {
++                        return FileInfo.EMPTY
++                    }
+ 
+-            return FileInfo(lineInfo, signatureInfo)
++                    @Suppress("UNCHECKED_CAST")
++                    FileInfo(lineInfo as LineInfoMap, signatureInfo as MutableMap<String, String>)
++                }
++            } catch (_: Exception) {
++                // The metadata is corrupt or names a class that is not part of kapt's value types.
++                FileInfo.EMPTY
++            }
+         }
+     }
+ 
+@@ -178,3 +191,13 @@
+         return found
+     }
+ }
++
++/**
++ * The value types a stub's line-mapping metadata is built from: the two JDK maps the writer
++ * serializes and [KotlinPosition] for the values of the position map.
++ */
++private val METADATA_VALUE_CLASSES = SerializedValueClasses(
++    "java.util.HashMap",
++    "java.util.LinkedHashMap",
++    KotlinPosition::class.java.name
++)
+diff -ruN a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/util/SerializedValueClasses.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/util/SerializedValueClasses.kt
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/util/SerializedValueClasses.kt	1970-01-01 00:00:00.000000000 +0000
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/util/SerializedValueClasses.kt	2026-10-29 05:58:20.951894031 +0000
+@@ -0,0 +1,79 @@
++/*
++ * Copyright 2010-2025 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++package org.jetbrains.kotlin.kapt.base.util
++
++import java.io.InputStream
++import java.io.InvalidClassException
++import java.io.ObjectInputStream
++import java.io.ObjectStreamClass
++
++/**
++ * The fixed set of value classes whose instances kapt is prepared to recreate from data it left in
++ * a project's build outputs.
++ *
++ * Data in a build directory is untrusted: it may come from a shared cache, from an external tool,
++ * or from an attacker. Java serialization resolves and instantiates whatever class a stream names,
++ * running that class's serialization callbacks on the way. Recreating only the value types of one
++ * particular on-disk structure keeps a tampered file from turning into code execution inside the
++ * build.
++ */
++internal class SerializedValueClasses(vararg classNames: String) {
++    private val names: Set<String> = classNames.toHashSet()
++
++    /**
++     * Whether a class or array descriptor may be resolved. Array descriptors name their component
++     * type (`[I`, `[[Ljava.lang.String;`), and resolving an array still has to load that component
++     * type, so the component type has to be admitted by the same rules.
++     */
++    fun permits(className: String): Boolean {
++        var componentType = className
++        var arrayDepth = 0
++        while (componentType.startsWith("[")) {
++            componentType = componentType.substring(1)
++            arrayDepth++
++        }
++
++        if (arrayDepth == 0) {
++            return componentType in names
++        }
++        if (componentType.length == 1) {
++            // A one-letter component descriptor denotes a primitive, e.g. "[I" for int[].
++            return componentType in PRIMITIVE_COMPONENT_CODES
++        }
++        if (!componentType.startsWith("L") || !componentType.endsWith(";")) {
++            return false
++        }
++        return componentType.substring(1, componentType.length - 1) in names
++    }
++
++    private companion object {
++        val PRIMITIVE_COMPONENT_CODES = setOf("Z", "B", "C", "S", "I", "J", "F", "D")
++    }
++}
++
++/**
++ * An [ObjectInputStream] that resolves only the classes admitted by [allowedClasses].
++ *
++ * The check happens in [resolveClass], i.e. while the class is still being looked up. A class that
++ * is not admitted is therefore never loaded and never instantiated, no matter how deeply it is
++ * nested in an otherwise acceptable container, and its serialization callbacks never run.
++ */
++internal class GuardedObjectInputStream(
++    input: InputStream,
++    private val allowedClasses: SerializedValueClasses
++) : ObjectInputStream(input) {
++
++    override fun resolveClass(desc: ObjectStreamClass): Class<*> {
++        if (!allowedClasses.permits(desc.name)) {
++            throw InvalidClassException(desc.name, "Class is not one of kapt's serialized value types")
++        }
++        return super.resolveClass(desc)
++    }
++
++    override fun resolveProxyClass(interfaces: Array<out String>): Class<*> {
++        throw InvalidClassException("proxy", "Proxy classes are not one of kapt's serialized value types")
++    }
++}

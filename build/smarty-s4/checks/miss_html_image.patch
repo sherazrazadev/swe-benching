@@ -1,0 +1,74 @@
+diff --git a/src/FunctionHandler/Fetch.php b/src/FunctionHandler/Fetch.php
+index d10ef668..fb633716 100644
+--- a/src/FunctionHandler/Fetch.php
++++ b/src/FunctionHandler/Fetch.php
+@@ -189,7 +189,22 @@ class Fetch extends Base {
+ 				return;
+ 			}
+ 		} else {
+-			$content = @file_get_contents($params['file']);
++			if ($protocol && isset($template->getSmarty()->security_policy)) {
++				// Remote resource (e.g. https://) reached through file_get_contents().
++				// isTrustedUri() only validates the initial URL, but file_get_contents()
++				// follows redirects by default, so an open redirect on an otherwise
++				// trusted host could be used to reach a non-trusted target (SSRF).
++				// Disable redirect-following while a security policy is in effect.
++				$context = stream_context_create([
++					'http' => [
++						'follow_location' => 0,
++						'max_redirects' => 1,
++					],
++				]);
++				$content = @file_get_contents($params['file'], false, $context);
++			} else {
++				$content = @file_get_contents($params['file']);
++			}
+ 			if ($content === false) {
+ 				throw new Exception("{fetch} cannot read resource '" . $params['file'] . "'");
+ 			}
+diff --git a/src/Resource/HttpPlugin.php b/src/Resource/HttpPlugin.php
+index 48a38c9b..8510f602 100644
+--- a/src/Resource/HttpPlugin.php
++++ b/src/Resource/HttpPlugin.php
+@@ -31,7 +31,17 @@ class HttpPlugin extends RecompiledPlugin {
+ 		if (is_object($smarty->security_policy)) {
+ 			$smarty->security_policy->isTrustedUri($url);
+ 		}
+-		$content = @file_get_contents($url);
++		if (is_object($smarty->security_policy)) {
++			$context = stream_context_create([
++				'http' => [
++					'follow_location' => 0,
++					'max_redirects' => 1,
++				],
++			]);
++			$content = @file_get_contents($url, false, $context);
++		} else {
++			$content = @file_get_contents($url);
++		}
+ 		$source->uid = sha1($url);
+ 		$source->content = $content === false ? '' : $content;
+ 		$source->timestamp = $source->exists = $content !== false;
+diff --git a/src/Resource/StreamPlugin.php b/src/Resource/StreamPlugin.php
+index f8b36bf5..86f4d502 100644
+--- a/src/Resource/StreamPlugin.php
++++ b/src/Resource/StreamPlugin.php
+@@ -65,7 +65,17 @@ class StreamPlugin extends RecompiledPlugin {
+ 
+ 		$t = '';
+ 		// the availability of the stream has already been checked in Smarty\Resource\Base::fetch()
+-		$fp = fopen($filepath, 'r+');
++		if (is_object($smarty->security_policy) && !empty($smarty->security_policy->trusted_uri)) {
++			$context = stream_context_create([
++				'http' => [
++					'follow_location' => 0,
++					'max_redirects' => 1,
++				],
++			]);
++			$fp = fopen($filepath, 'r+', false, $context);
++		} else {
++			$fp = fopen($filepath, 'r+');
++		}
+ 		if ($fp) {
+ 			while (!feof($fp) && ($current_line = fgets($fp)) !== false) {
+ 				$t .= $current_line;

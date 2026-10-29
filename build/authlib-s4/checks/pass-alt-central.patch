@@ -1,0 +1,50 @@
+diff --git a/authlib/oauth2/rfc6749/authorization_server.py b/authlib/oauth2/rfc6749/authorization_server.py
+index 928251dc..3e1281d7 100644
+--- a/authlib/oauth2/rfc6749/authorization_server.py
++++ b/authlib/oauth2/rfc6749/authorization_server.py
+@@ -349,6 +349,16 @@ class AuthorizationServer(Hookable):
+             return self.handle_error_response(request, error)
+ 
+     def handle_error_response(self, request, error):
++        if not isinstance(request, OAuth2Request):
++            request = self.create_oauth2_request(request)
++        redirect_uri = getattr(error, "redirect_uri", None)
++        if redirect_uri:
++            client = None
++            client_id = request.payload.client_id
++            if client_id:
++                client = self.query_client(client_id)
++            if not client or not client.check_redirect_uri(redirect_uri):
++                error.redirect_uri = None
+         return self.handle_response(*error(self.get_error_uri(request, error)))
+ 
+ 
+diff --git a/authlib/oidc/core/grants/hybrid.py b/authlib/oidc/core/grants/hybrid.py
+index 8c373525..302118aa 100644
+--- a/authlib/oidc/core/grants/hybrid.py
++++ b/authlib/oidc/core/grants/hybrid.py
+@@ -49,18 +49,18 @@ class OpenIDHybridGrant(OpenIDImplicitGrant):
+         raise NotImplementedError()
+ 
+     def validate_authorization_request(self):
+-        if not is_openid_scope(self.request.payload.scope):
+-            raise InvalidScopeError(
+-                "Missing 'openid' scope",
+-                redirect_uri=self.request.payload.redirect_uri,
+-                redirect_fragment=True,
+-            )
+         self.register_hook(
+             "after_validate_authorization_request_payload",
+             lambda grant, redirect_uri: validate_nonce(
+                 grant.request, grant.exists_nonce, required=True
+             ),
+         )
++        if not is_openid_scope(self.request.payload.scope):
++            raise InvalidScopeError(
++                "Missing 'openid' scope",
++                redirect_uri=self.request.payload.redirect_uri,
++                redirect_fragment=True,
++            )
+         return validate_code_authorization_request(self)
+ 
+     def create_granted_params(self, grant_user):

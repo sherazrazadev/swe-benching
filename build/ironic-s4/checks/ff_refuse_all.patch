@@ -1,0 +1,91 @@
+--- a/ironic/api/controllers/v1/volume_target.py
++++ b/ironic/api/controllers/v1/volume_target.py
+@@ -14,6 +14,7 @@
+ 
+ from http import client as http_client
+ 
++from oslo_utils import strutils
+ from oslo_utils import uuidutils
+ from pecan import rest
+ 
+@@ -90,9 +91,16 @@
+     if not sanitize:
+         return target
+ 
++    target_sanitize(target, fields)
++
++    return target
++
++
++def target_sanitize(target, fields=None):
+     api_utils.sanitize_dict(target, fields)
+-
+-    return target
++    if target.get('properties'):
++        target['properties'] = strutils.mask_dict_password(
++            target['properties'], "******")
+ 
+ 
+ def list_convert_with_links(rpc_targets, limit, url, fields=None,
+@@ -106,7 +114,7 @@
+         limit=limit,
+         url=url,
+         fields=fields,
+-        sanitize_func=api_utils.sanitize_dict,
++        sanitize_func=target_sanitize,
+         **kwargs
+     )
+ 
+@@ -226,6 +234,12 @@
+                 api.request.context, volume_id,
+                 limit=api_utils.validate_limit(limit),
+                 sort_key=sort_key, sort_dir=sort_dir, project=project)
++            cdict = api.request.context.to_policy_values()
++            if not policy.check_policy(
++                    'baremetal:volume:view_target_properties',
++                    cdict, cdict):
++                for target in targets:
++                    self._redact_target_properties(target)
+             return list_convert_with_links(targets,
+                                            api_utils.validate_limit(limit),
+                                            url=resource_url,
+@@ -327,6 +341,10 @@
+         # Set the HTTP Location Header
+         api.response.location = link.build_url('volume/targets',
+                                                new_target.uuid)
++        cdict = api.request.context.to_policy_values()
++        if not policy.check_policy('baremetal:volume:view_target_properties',
++                                   cdict, cdict):
++            self._redact_target_properties(new_target)
+         return convert_with_links(new_target)
+ 
+     @METRICS.timer('VolumeTargetsController.patch')
+@@ -408,6 +426,11 @@
+         )
+ 
+         if dry_run:
++            cdict = api.request.context.to_policy_values()
++            if not policy.check_policy(
++                    'baremetal:volume:view_target_properties',
++                    cdict, cdict):
++                self._redact_target_properties(rpc_target)
+             return convert_with_links(rpc_target)
+ 
+         notify.emit_start_notification(context, rpc_target, 'update',
+@@ -418,9 +441,15 @@
+             new_target = api.request.rpcapi.update_volume_target(
+                 context, rpc_target, topic)
+ 
+-        api_target = convert_with_links(new_target)
+         notify.emit_end_notification(context, new_target, 'update',
+                                      node_uuid=rpc_node.uuid)
++
++        cdict = api.request.context.to_policy_values()
++        if not policy.check_policy('baremetal:volume:view_target_properties',
++                                   cdict, cdict):
++            raise exception.HTTPForbidden(resource='target properties')
++
++        api_target = convert_with_links(new_target)
+         return api_target
+ 
+     @METRICS.timer('VolumeTargetsController.delete')

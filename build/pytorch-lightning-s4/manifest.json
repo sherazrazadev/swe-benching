@@ -1,0 +1,233 @@
+{
+ "slug": "pytorch-lightning-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "entry_id": "5197",
+  "advisory_ids": [
+   "GHSA-QQMF-GPG7-G8GW",
+   "CVE-2026-58659",
+   "PYSEC-2026-3624",
+   "PYSEC-2026-3967"
+  ],
+  "repo": "lightning-ai/pytorch-lightning",
+  "pinned_commit": "8116c5d7fed26994c0d4f10f0e56e57386ab0949 (verified: sole parent of the fix; published fix adds two tests under tests/tests_pytorch/core/test_saving.py)",
+  "fix_commits": [
+   "d710d689510d50e800f53b3cd773cbca20b1f86f"
+  ],
+  "landing_point": {
+   "where": "src/lightning/pytorch/core/saving.py:157"
+  },
+  "O1_entry_points": 2,
+  "O9_family": "unsafe reflection: externally controlled input selects the class/code to import and run (CWE-470, checkpoint deserialization)",
+  "O11_fix_minutes": 40,
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "note": "Full screener record is in BUILD-PROMPT.md of this directory; O8 routes 1 and 2 (_class_path class selection) were assessed and deliberately excluded, see notes.md."
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "8116c5d7fed26994c0d4f10f0e56e57386ab0949 = parent of d710d689; the fix's regression tests are absent at pinned, so nothing leaks",
+  "entry_points": [
+   "library API: LightningModule.load_from_checkpoint (module checkpoints)",
+   "library API: LightningDataModule.load_from_checkpoint (datamodule checkpoints)",
+   "library API: LightningCLI construction with --ckpt_path (checkpoint configuration restore)"
+  ],
+  "sites": [
+   "src/lightning/pytorch/core/saving.py:156-161 (_load_state: the single construction-argument sink; reached from the current settings key, both legacy keys and the datamodule key)",
+   "src/lightning/pytorch/core/saving.py:212-218 (_convert_loaded_hparams, injected legacy container conversion)",
+   "src/lightning/pytorch/cli.py:573-577 (_parse_ckpt_path, injected configuration restore hook)"
+  ],
+  "routes": [
+   "hyper_parameters['_instantiator'] (published landing; confirmed executing on pinned)",
+   "hparams['_instantiator'] (legacy key; confirmed executing on pinned)",
+   "module_arguments['_instantiator'] (legacy key; confirmed executing on pinned)",
+   "datamodule_hyper_parameters['_instantiator'] (confirmed executing on pinned)",
+   "checkpoint hparams_type dotted name (injected gap; confirmed executing on injected baseline)",
+   "checkpoint _config_migration in LightningCLI --ckpt_path (injected gap; confirmed executing on injected baseline)",
+   "DROPPED (assessed, not a route): checkpoint _class_path / dict_kwargs class selection. Upstream's own tests require it (tests/tests_pytorch/test_cli.py::test_lightning_cli_load_from_checkpoint_dependency_injection_subclass_mode), so blocking it contradicts the preservation contract. It stays a coupled must-keep-working behaviour instead."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/tests_pytorch/core/test_saving.py: 16 passed, 16 skipped (injected baseline and oracle, offline)"
+  ],
+  "local_runs": "gate: static PASS; nop PASS (security 0/6, functional 24/24: 8 hidden + 16 project); oracle PASS 3x (security 6/6, functional 24/24, reward 1.0 each); patches PASS 9/9 (sf-published-only security 4/6, sf-new-key-only 1/6, sf-no-hparams-type 5/6, sf-no-cli-hook 5/6, sf-exit 2/6; ff-ignore-instantiator 3 functional fail; ff-dotted-scan 6 functional fail; pass-hardening 1.0; pass-alt 1.0)"
+ },
+ "leak_terms": [
+  "_instantiator",
+  "_class_path",
+  "class_path",
+  "hparams_type",
+  "_config_migration",
+  "_ALLOWED_INSTANTIATORS",
+  "instantiate_module",
+  "pytorch_lightning.cli.instantiate_module",
+  "_load_state",
+  "_load_from_checkpoint",
+  "_convert_loaded_hparams",
+  "_parse_ckpt_path",
+  "save_hyperparameters",
+  "_given_hyperparameters_context",
+  "hparams",
+  "hyper_parameters",
+  "datamodule_hyper_parameters",
+  "module_arguments",
+  "CHECKPOINT_HYPER_PARAMS",
+  "AttributeDict",
+  "saving.py",
+  "cli.py",
+  "checkpoint_connector.py",
+  "hparams_mixin.py",
+  "revil",
+  "evil_instantiator",
+  "pl_sec_helper",
+  "d710d689",
+  "8116c5d7",
+  "GHSA-QQMF-GPG7-G8GW",
+  "CVE-2026-58659",
+  "PYSEC-2026-3624",
+  "PYSEC-2026-3967"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "the published upstream fix only: allowlists the instantiator but leaves the injected container conversion and CLI migration open"
+  },
+  {
+   "patch": "sf-new-key-only.patch",
+   "expect": "security_fail",
+   "note": "tempting fix: validates the current settings key in the checkpoint read, before the legacy and datamodule sources merge"
+  },
+  {
+   "patch": "sf-no-hparams-type.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the checkpoint container conversion (injected sibling)"
+  },
+  {
+   "patch": "sf-no-cli-hook.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the CLI configuration restore hook (injected sibling)"
+  },
+  {
+   "patch": "sf-exit.patch",
+   "expect": "security_fail",
+   "note": "crash-as-refusal: SystemExit instead of an ordinary error"
+  },
+  {
+   "patch": "ff-ignore-instantiator.patch",
+   "expect": "functional_fail",
+   "note": "uses the allowlist but never calls the product's instantiator and drops the saved class, breaking the CLI checkpoint round-trip"
+  },
+  {
+   "patch": "ff-dotted-scan.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: refuses any dotted string value in the construction arguments, breaking plain data and the round-trip"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a shared trusted-instantiator helper and defensive dropping of the restore hook"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "resolves only the fixed built-in instantiator objects instead of comparing the path, and drops the CLI hook"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written later by the blind-fix stage"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-dotted-scan.patch",
+  "crash_as_refusal": "sf-exit.patch",
+  "wrong_resource": "sf-new-key-only.patch",
+  "one_role_or_direction": "n/a: checkpoint restoration has no role, peer or direction; the guarded value is one construction hook",
+  "reads_only": "n/a: the guarded operation is object construction; there is no read/write or verb split to guard one of",
+  "check_after_adjustment": "n/a: the attacker's value is not normalised or adjusted; the check runs where the merged construction arguments are consumed",
+  "unlisted_route": "sf-published-only.patch",
+  "malformed_identity": "n/a: the guarded value is a plain dotted string compared against a fixed set; a malformed path neither passes the set nor resolves",
+  "missing_authority": "n/a: the allowlist is static; there is no authority or secret lookup that can return nothing and fail open",
+  "adjacent_api": "ff-ignore-instantiator.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_instantiator_sink_sources",
+   "pattern": "B (real published landing, merged sources)",
+   "shape": "dotted import path under the current settings key, under either legacy settings key, or under the datamodule's settings key",
+   "where": "src/lightning/pytorch/core/saving.py:156-161",
+   "security_tests": [
+    "tests/security/test_instantiator_routes.py::test_instantiator_in_the_current_settings_key",
+    "tests/security/test_instantiator_routes.py::test_instantiator_in_the_legacy_hparams_key",
+    "tests/security/test_instantiator_routes.py::test_instantiator_in_the_legacy_module_arguments_key",
+    "tests/security/test_instantiator_routes.py::test_instantiator_in_a_datamodule_checkpoint"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_the_model_class_and_typed_arguments",
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_the_datamodule"
+   ],
+   "security_fail_patch": "sf-new-key-only.patch",
+   "realistic_because": "real, unmodified upstream code: one construction-argument dict is fed by the current key, two legacy keys and the datamodule key before the value is used"
+  },
+  {
+   "id": "T2_coupled_roundtrip",
+   "pattern": "coupled must-keep-working (how-type)",
+   "shape": "a checkpoint the library's command line tool produced: it records the concrete class and nested typed constructor arguments, and reloading must still resolve them",
+   "where": "src/lightning/pytorch/core/saving.py:158-161 and src/lightning/pytorch/cli.py:886-903",
+   "security_tests": [
+    "tests/security/test_instantiator_routes.py::test_instantiator_in_the_current_settings_key"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_the_model_class_and_typed_arguments",
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_through_the_model_class",
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_the_datamodule",
+    "tests/functional/project/test_saving.py"
+   ],
+   "security_fail_patch": "n/a: coupled lever; its over-broad failure is ff-ignore-instantiator.patch (functional_fail)",
+   "realistic_because": "real, unmodified upstream code: the product writes the reserved marker into its own checkpoints and its loader consumes it to restore the class and typed arguments"
+  },
+  {
+   "id": "T3_hparams_container",
+   "pattern": "injected (route where the protection never existed)",
+   "shape": "a checkpoint's recorded hyperparameter-container name is a dotted import path",
+   "where": "src/lightning/pytorch/core/saving.py:212-218",
+   "security_tests": [
+    "tests/security/test_hparams_container.py::test_dotted_hparams_container_is_not_imported"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_checkpoint_reload.py::test_an_older_checkpoint_container_name_still_loads"
+   ],
+   "security_fail_patch": "sf-no-hparams-type.patch",
+   "realistic_because": "a maintainer could plausibly extend the legacy container conversion to import a container recorded by its path; it is not upstream and the published fix never touches it"
+  },
+  {
+   "id": "T4_cli_config_restore_hook",
+   "pattern": "injected (second entry point, different module)",
+   "shape": "a checkpoint used to restore a run's configuration records a configuration-migration import path",
+   "where": "src/lightning/pytorch/cli.py:573-577",
+   "security_tests": [
+    "tests/security/test_cli_config_hook.py::test_checkpoint_config_migration_is_not_imported"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_checkpoint_reload.py::test_cli_checkpoint_restores_the_model_class_and_typed_arguments"
+   ],
+   "security_fail_patch": "sf-no-cli-hook.patch",
+   "realistic_because": "a maintainer could plausibly record a compatibility migration next to the existing restore logic; it is not upstream and the published fix never touches cli.py"
+  }
+ ],
+ "status": "built; full gate PASSED (static, nop, oracle 3x reward 1.0, patches 9/9); blind patch and FAIRNESS.md pending, written by later stages; not trialled"
+}

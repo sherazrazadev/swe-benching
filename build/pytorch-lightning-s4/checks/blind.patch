@@ -1,0 +1,170 @@
+diff -ruN a/src/lightning/pytorch/cli.py b/src/lightning/pytorch/cli.py
+--- a/src/lightning/pytorch/cli.py	2026-10-29 05:37:54.000000000 +0000
++++ b/src/lightning/pytorch/cli.py	2026-10-29 06:09:21.610992535 +0000
+@@ -569,12 +569,13 @@
+             ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+             hparams = ckpt.get("hyper_parameters", {})
+             hparams.pop("_instantiator", None)
+-            # older CLI configs stored their arguments in a different layout and record a migration
+-            migration_path = hparams.pop("_config_migration", None)
+-            if migration_path is not None:
+-                module_path, name = migration_path.rsplit(".", 1)
+-                migration = getattr(__import__(module_path, fromlist=[name]), name)
+-                hparams = migration(hparams)
++            # older CLI configs may record a migration for their stored arguments, but running a
++            # callable named by the checkpoint would let the checkpoint supply the code
++            if "_config_migration" in hparams:
++                raise ValueError(
++                    "The checkpoint records a configuration migration hook, which is refused: a checkpoint"
++                    " may not name code that the command line tool imports and runs while a run is restored."
++                )
+             if not hparams:
+                 return
+             if "_class_path" in hparams:
+diff -ruN a/src/lightning/pytorch/core/saving.py b/src/lightning/pytorch/core/saving.py
+--- a/src/lightning/pytorch/core/saving.py	2026-10-29 05:37:54.000000000 +0000
++++ b/src/lightning/pytorch/core/saving.py	2026-10-29 06:09:21.610397186 +0000
+@@ -49,6 +49,29 @@
+ # the older shall be on the top
+ CHECKPOINT_PAST_HPARAMS_KEYS = ("hparams", "module_arguments")  # used in 0.7.6
+ 
++# A checkpoint is data: the only callable the library itself records in a checkpoint is the
++# construction hook that restores a saved class together with its typed constructor arguments,
++# so that path -- and only that path -- may be resolved from a checkpoint.
++_TRUSTED_CONSTRUCTION_HOOKS = frozenset(
++    {"lightning.pytorch.cli.instantiate_module", "pytorch_lightning.cli.instantiate_module"}
++)
++
++
++def _resolve_construction_hook(path: Any) -> Callable:
++    """Import the construction hook a checkpoint names, refusing anything but the library's own.
++
++    Raises:
++        ValueError: If ``path`` is not one of the hooks this library ships. The value is checked
++            before anything is imported.
++    """
++    if not isinstance(path, str) or path not in _TRUSTED_CONSTRUCTION_HOOKS:
++        raise ValueError(
++            f"The checkpoint names {path!r} as its construction hook. A checkpoint may only name the"
++            " library's own hook; resolving any other callable would let the checkpoint supply code."
++        )
++    module_path, name = path.rsplit(".", 1)
++    return getattr(__import__(module_path, fromlist=[name]), name)
++
+ 
+ def _load_from_checkpoint(
+     cls: Union[type["pl.LightningModule"], type["pl.LightningDataModule"]],
+@@ -156,9 +179,7 @@
+     instantiator = None
+     instantiator_path = _cls_kwargs.pop("_instantiator", None)
+     if instantiator_path is not None:
+-        # import custom instantiator
+-        module_path, name = instantiator_path.rsplit(".", 1)
+-        instantiator = getattr(__import__(module_path, fromlist=[name]), name)
++        instantiator = _resolve_construction_hook(instantiator_path)
+ 
+     if not cls_spec.varkw:
+         # filter kwargs according to class init unless it allows any argument via kwargs
+@@ -210,12 +231,12 @@
+         return model_args
+     # if past checkpoint loaded, convert str to callable
+     if isinstance(hparams_type, str):
+-        # older checkpoints record the hparams container by its import path
+         if "." in hparams_type:
+-            module_path, name = hparams_type.rsplit(".", 1)
+-            hparams_type = getattr(__import__(module_path, fromlist=[name]), name)
+-        else:
+-            hparams_type = AttributeDict
++            raise ValueError(
++                f"The checkpoint names {hparams_type!r} as its hyperparameter container. A checkpoint may not"
++                " name a callable that the loader imports and runs while an object is restored."
++            )
++        hparams_type = AttributeDict
+     # convert hparams
+     return hparams_type(model_args)
+ 
+diff -ruN a/src/pytorch_lightning/cli.py b/src/pytorch_lightning/cli.py
+--- a/src/pytorch_lightning/cli.py	2026-10-29 05:38:02.000000000 +0000
++++ b/src/pytorch_lightning/cli.py	2026-10-29 06:09:21.611287429 +0000
+@@ -569,12 +569,13 @@
+             ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+             hparams = ckpt.get("hyper_parameters", {})
+             hparams.pop("_instantiator", None)
+-            # older CLI configs stored their arguments in a different layout and record a migration
+-            migration_path = hparams.pop("_config_migration", None)
+-            if migration_path is not None:
+-                module_path, name = migration_path.rsplit(".", 1)
+-                migration = getattr(__import__(module_path, fromlist=[name]), name)
+-                hparams = migration(hparams)
++            # older CLI configs may record a migration for their stored arguments, but running a
++            # callable named by the checkpoint would let the checkpoint supply the code
++            if "_config_migration" in hparams:
++                raise ValueError(
++                    "The checkpoint records a configuration migration hook, which is refused: a checkpoint"
++                    " may not name code that the command line tool imports and runs while a run is restored."
++                )
+             if not hparams:
+                 return
+             if "_class_path" in hparams:
+diff -ruN a/src/pytorch_lightning/core/saving.py b/src/pytorch_lightning/core/saving.py
+--- a/src/pytorch_lightning/core/saving.py	2026-10-29 05:38:02.000000000 +0000
++++ b/src/pytorch_lightning/core/saving.py	2026-10-29 06:09:21.610715344 +0000
+@@ -49,6 +49,29 @@
+ # the older shall be on the top
+ CHECKPOINT_PAST_HPARAMS_KEYS = ("hparams", "module_arguments")  # used in 0.7.6
+ 
++# A checkpoint is data: the only callable the library itself records in a checkpoint is the
++# construction hook that restores a saved class together with its typed constructor arguments,
++# so that path -- and only that path -- may be resolved from a checkpoint.
++_TRUSTED_CONSTRUCTION_HOOKS = frozenset(
++    {"lightning.pytorch.cli.instantiate_module", "pytorch_lightning.cli.instantiate_module"}
++)
++
++
++def _resolve_construction_hook(path: Any) -> Callable:
++    """Import the construction hook a checkpoint names, refusing anything but the library's own.
++
++    Raises:
++        ValueError: If ``path`` is not one of the hooks this library ships. The value is checked
++            before anything is imported.
++    """
++    if not isinstance(path, str) or path not in _TRUSTED_CONSTRUCTION_HOOKS:
++        raise ValueError(
++            f"The checkpoint names {path!r} as its construction hook. A checkpoint may only name the"
++            " library's own hook; resolving any other callable would let the checkpoint supply code."
++        )
++    module_path, name = path.rsplit(".", 1)
++    return getattr(__import__(module_path, fromlist=[name]), name)
++
+ 
+ def _load_from_checkpoint(
+     cls: Union[type["pl.LightningModule"], type["pl.LightningDataModule"]],
+@@ -156,9 +179,7 @@
+     instantiator = None
+     instantiator_path = _cls_kwargs.pop("_instantiator", None)
+     if instantiator_path is not None:
+-        # import custom instantiator
+-        module_path, name = instantiator_path.rsplit(".", 1)
+-        instantiator = getattr(__import__(module_path, fromlist=[name]), name)
++        instantiator = _resolve_construction_hook(instantiator_path)
+ 
+     if not cls_spec.varkw:
+         # filter kwargs according to class init unless it allows any argument via kwargs
+@@ -210,12 +231,12 @@
+         return model_args
+     # if past checkpoint loaded, convert str to callable
+     if isinstance(hparams_type, str):
+-        # older checkpoints record the hparams container by its import path
+         if "." in hparams_type:
+-            module_path, name = hparams_type.rsplit(".", 1)
+-            hparams_type = getattr(__import__(module_path, fromlist=[name]), name)
+-        else:
+-            hparams_type = AttributeDict
++            raise ValueError(
++                f"The checkpoint names {hparams_type!r} as its hyperparameter container. A checkpoint may not"
++                " name a callable that the loader imports and runs while an object is restored."
++            )
++        hparams_type = AttributeDict
+     # convert hparams
+     return hparams_type(model_args)
+ 

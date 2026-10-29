@@ -1,0 +1,191 @@
+diff --git a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/ProcessorLoader.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/ProcessorLoader.kt
+index 0f925168..f74ca52d 100644
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/ProcessorLoader.kt
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/ProcessorLoader.kt
+@@ -7,6 +7,7 @@ package org.jetbrains.kotlin.kapt.base
+ 
+ import org.jetbrains.kotlin.kapt.base.incremental.DeclaredProcType
+ import org.jetbrains.kotlin.kapt.base.incremental.IncrementalProcessor
++import org.jetbrains.kotlin.kapt.base.incremental.ProcessorInfoCacheManager
+ import org.jetbrains.kotlin.kapt.base.incremental.getIncrementalProcessorsFromClasspath
+ import org.jetbrains.kotlin.kapt.base.util.KaptLogger
+ import org.jetbrains.kotlin.kapt.base.util.info
+@@ -61,7 +62,9 @@ open class ProcessorLoaderImpl(private val options: KaptOptions, private val log
+ 
+         val processorNames = processors.map { it.javaClass.name }.toSet()
+ 
+-        val processorsInfo: Map<String, DeclaredProcType> = getIncrementalProcessorsFromClasspath(processorNames, classpath)
++        val processorsInfo: Map<String, DeclaredProcType> = options.incrementalCache?.let { cacheDir ->
++            ProcessorInfoCacheManager(cacheDir).use { it.load(processorNames, classpath) }
++        } ?: getIncrementalProcessorsFromClasspath(processorNames, classpath)
+ 
+         val nonIncremental = processorNames.filter { !processorsInfo.containsKey(it) }
+         return processors.map { processor ->
+diff --git a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt
+new file mode 100644
+index 00000000..6f14c105
+--- /dev/null
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/incremental/processorInfoCache.kt
+@@ -0,0 +1,73 @@
++/*
++ * Copyright 2010-2025 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++package org.jetbrains.kotlin.kapt.base.incremental
++
++import java.io.BufferedInputStream
++import java.io.BufferedOutputStream
++import java.io.Closeable
++import java.io.File
++import java.io.ObjectInputStream
++import java.io.ObjectOutputStream
++import java.io.Serializable
++
++/** Declared incremental kinds of the annotation processors found on the processing classpath. */
++class ProcessorInfoCache : Serializable {
++    private val declaredTypes: MutableMap<String, DeclaredProcType> = linkedMapOf()
++
++    fun getDeclaredType(processorName: String): DeclaredProcType? = declaredTypes[processorName]
++
++    fun putAll(types: Map<String, DeclaredProcType>) {
++        declaredTypes.putAll(types)
++    }
++}
++
++class ProcessorInfoCacheManager(file: File) : Closeable {
++    private val cacheFile = file.resolve("processor-info.bin")
++    private var closed = false
++    private val cache = maybeGetCacheFromFile()
++
++    /**
++     * Returns the declared kinds for [names], reusing the values saved by an earlier build and
++     * scanning [classpath] only for the names that are not there yet.
++     */
++    fun load(names: Set<String>, classpath: Iterable<File>): Map<String, DeclaredProcType> {
++        val cached = names.mapNotNull { name -> cache.getDeclaredType(name)?.let { name to it } }.toMap()
++        if (cached.size == names.size) {
++            return cached
++        }
++
++        val scanned = getIncrementalProcessorsFromClasspath(names, classpath)
++        cache.putAll(scanned)
++        return scanned
++    }
++
++    private fun maybeGetCacheFromFile(): ProcessorInfoCache {
++        return if (cacheFile.exists()) {
++            try {
++                ObjectInputStream(BufferedInputStream(cacheFile.inputStream())).use {
++                    it.readObject() as ProcessorInfoCache
++                }
++            } catch (_: Throwable) {
++                // cache corrupt
++                ProcessorInfoCache()
++            }
++        } else {
++            ProcessorInfoCache()
++        }
++    }
++
++    override fun close() {
++        if (closed) return
++
++        cacheFile.delete()
++        cacheFile.parentFile.mkdirs()
++        ObjectOutputStream(BufferedOutputStream(cacheFile.outputStream())).use {
++            it.writeObject(cache)
++        }
++
++        closed = true
++    }
++}
+diff --git a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt
+index bf8fe3d3..86a7cdb9 100644
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KaptStubLineInformation.kt
+@@ -20,7 +20,7 @@ class KaptStubLineInformation {
+ 
+     companion object {
+         const val KAPT_METADATA_EXTENSION = ".kapt_metadata"
+-        const val METADATA_VERSION = 1
++        const val METADATA_VERSION = 2
+ 
+         fun parseFileInfo(file: JCTree.JCCompilationUnit): FileInfo {
+             val uri = file.sourcefile?.toUri() ?: return FileInfo.EMPTY
+@@ -43,9 +43,6 @@ class KaptStubLineInformation {
+         }
+ 
+         private fun deserialize(data: ByteArray): FileInfo {
+-            val lineInfo: LineInfoMap = mutableMapOf()
+-            val signatureInfo = mutableMapOf<String, String>()
+-
+             val ois = ObjectInputStream(ByteArrayInputStream(data))
+ 
+             val version = ois.readInt()
+@@ -53,23 +50,11 @@ class KaptStubLineInformation {
+                 return FileInfo.EMPTY
+             }
+ 
+-            val lineInfoCount = ois.readInt()
+-            repeat(lineInfoCount) {
+-                val fqName = ois.readUTF()
+-                val path = ois.readUTF()
+-                val isRelative = ois.readBoolean()
+-                val pos = ois.readInt()
+-
+-                lineInfo[fqName] = KotlinPosition(path, isRelative, pos)
+-            }
++            @Suppress("UNCHECKED_CAST")
++            val lineInfo = ois.readObject() as LineInfoMap
+ 
+-            val signatureCount = ois.readInt()
+-            repeat(signatureCount) {
+-                val javacSignature = ois.readUTF()
+-                val methodDesc = ois.readUTF()
+-
+-                signatureInfo[javacSignature] = methodDesc
+-            }
++            @Suppress("UNCHECKED_CAST")
++            val signatureInfo = ois.readObject() as MutableMap<String, String>
+ 
+             return FileInfo(lineInfo, signatureInfo)
+         }
+diff --git a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KotlinPosition.kt b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KotlinPosition.kt
+index 38a4fed4..2a650d03 100644
+--- a/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KotlinPosition.kt
++++ b/plugins/kapt/kapt-base/src/org/jetbrains/kotlin/kapt/base/stubs/KotlinPosition.kt
+@@ -5,4 +5,6 @@
+ 
+ package org.jetbrains.kotlin.kapt.base.stubs
+ 
+-data class KotlinPosition(val path: String, val isRelativePath: Boolean, val pos: Int)
++import java.io.Serializable
++
++data class KotlinPosition(val path: String, val isRelativePath: Boolean, val pos: Int) : Serializable
+diff --git a/plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt b/plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt
+index 7c99fa87..b7e6f135 100644
+--- a/plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt
++++ b/plugins/kapt/kapt-compiler/src/org/jetbrains/kotlin/kapt/stubs/KaptLineMappingCollector.kt
+@@ -49,19 +49,8 @@ class KaptLineMappingCollector(private val kaptContext: KaptContextForStubGenera
+ 
+         oos.writeInt(KaptStubLineInformation.METADATA_VERSION)
+ 
+-        oos.writeInt(lineInfo.size)
+-        for ([fqName, kotlinPosition] in lineInfo) {
+-            oos.writeUTF(fqName)
+-            oos.writeUTF(kotlinPosition.path)
+-            oos.writeBoolean(kotlinPosition.isRelativePath)
+-            oos.writeInt(kotlinPosition.pos)
+-        }
+-
+-        oos.writeInt(signatureInfo.size)
+-        for ([javacSignature, methodDesc] in signatureInfo) {
+-            oos.writeUTF(javacSignature)
+-            oos.writeUTF(methodDesc)
+-        }
++        oos.writeObject(lineInfo)
++        oos.writeObject(signatureInfo)
+ 
+         oos.flush()
+         return os.toByteArray()

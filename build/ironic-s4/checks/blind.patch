@@ -1,0 +1,124 @@
+diff -ruN a/ironic/api/controllers/v1/volume_target.py b/ironic/api/controllers/v1/volume_target.py
+--- a/ironic/api/controllers/v1/volume_target.py	2026-10-29 05:42:15.000000000 +0000
++++ b/ironic/api/controllers/v1/volume_target.py	2026-10-29 06:03:28.233008764 +0000
+@@ -14,6 +14,7 @@
+ 
+ from http import client as http_client
+ 
++from oslo_utils import strutils
+ from oslo_utils import uuidutils
+ from pecan import rest
+ 
+@@ -70,6 +71,48 @@
+ ]
+ 
+ 
++_REDACTED_PROPERTIES = {
++    'redacted_contents': '** Value redacted: Requires permission '
++                         'baremetal:volume:view_target_properties '
++                         'access. Permission denied. **'
++}
++
++
++def _may_view_target_properties():
++    """Whether the current request may see a target's connection settings."""
++    creds = api.request.context.to_policy_values()
++    return policy.check_policy('baremetal:volume:view_target_properties',
++                               creds, creds)
++
++
++def _protect_target_properties(target):
++    """Keep a serialized target's connection settings from leaking.
++
++    ``target`` is an API dict, never the RPC object, so the stored values and
++    the notification payloads are left untouched.  Callers without the
++    separate view permission get the settings withheld; callers that may see
++    them still get password-like values masked.
++
++    :param target: API dict as produced by ``api_utils.object_to_dict``.
++    :returns: the same dict, protected in place.
++    """
++    if 'properties' not in target:
++        return target
++
++    if not _may_view_target_properties():
++        target['properties'] = dict(_REDACTED_PROPERTIES)
++    elif isinstance(target['properties'], dict):
++        target['properties'] = strutils.mask_dict_password(
++            target['properties'], '******')
++    return target
++
++
++def _sanitize_target(target, fields=None):
++    """Drop unrequested fields, then protect the connection settings."""
++    api_utils.sanitize_dict(target, fields)
++    return _protect_target_properties(target)
++
++
+ def convert_with_links(rpc_target, fields=None, sanitize=True):
+     target = api_utils.object_to_dict(
+         rpc_target,
+@@ -90,9 +133,7 @@
+     if not sanitize:
+         return target
+ 
+-    api_utils.sanitize_dict(target, fields)
+-
+-    return target
++    return _sanitize_target(target, fields)
+ 
+ 
+ def list_convert_with_links(rpc_targets, limit, url, fields=None,
+@@ -106,7 +147,7 @@
+         limit=limit,
+         url=url,
+         fields=fields,
+-        sanitize_func=api_utils.sanitize_dict,
++        sanitize_func=_sanitize_target,
+         **kwargs
+     )
+ 
+@@ -120,18 +161,6 @@
+         super(VolumeTargetsController, self).__init__()
+         self.parent_node_ident = node_ident
+ 
+-    def _redact_target_properties(self, target):
+-        # Filters what could contain sensitive information. For iSCSI
+-        # volumes this can include iscsi connection details which may
+-        # be sensitive.
+-        redacted = ('** Value redacted: Requires permission '
+-                    'baremetal:volume:view_target_properties '
+-                    'access. Permission denied. **')
+-        redacted_message = {
+-            'redacted_contents': redacted
+-        }
+-        target.properties = redacted_message
+-
+     def _get_volume_targets_collection(self, node_ident, marker, limit,
+                                        sort_key, sort_dir, resource_url=None,
+                                        fields=None, detail=None,
+@@ -165,12 +194,6 @@
+                                                 sort_key=sort_key,
+                                                 sort_dir=sort_dir,
+                                                 project=project)
+-        cdict = api.request.context.to_policy_values()
+-        if not policy.check_policy('baremetal:volume:view_target_properties',
+-                                   cdict, cdict):
+-            for target in targets:
+-                self._redact_target_properties(target)
+-
+         return list_convert_with_links(targets, limit,
+                                        url=resource_url,
+                                        fields=fields,
+@@ -265,11 +288,6 @@
+         if self.parent_node_ident:
+             raise exception.MalformedRequestURI()
+ 
+-        cdict = api.request.context.to_policy_values()
+-        if not policy.check_policy('baremetal:volume:view_target_properties',
+-                                   cdict, cdict):
+-            self._redact_target_properties(rpc_target)
+-
+         return convert_with_links(rpc_target, fields=fields)
+ 
+     @METRICS.timer('VolumeTargetsController.post')

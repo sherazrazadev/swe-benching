@@ -1,0 +1,259 @@
+{
+ "slug": "ironic-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "4034",
+  "advisory_ids": [
+   "GHSA-J4CW-MCG2-2Q78",
+   "CVE-2026-54421",
+   "PYSEC-2026-3852"
+  ],
+  "repo": "openstack/ironic",
+  "pinned_commit": "00eda8b9c6391574ec8226a8c560aa51651d2019",
+  "fix_commits": [
+   "dd2df520fe0ae019cb247a8295542abc2d4b46dd"
+  ],
+  "landing_point": {
+   "where": "ironic/api/controllers/v1/volume_target.py (PATCH handler response)"
+  },
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "note": "The screener record is a lead; the routes and siblings were verified behaviourally here."
+ },
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The project's real pecan API application (the same app its API unit tests build) with real oslo.policy and keystone-style role headers over in-memory SQLite. On the pinned+injected tree every security test fails by its disclosure assertion: the iSCSI target IQN, portal, CHAP login and/or CHAP password appear in the HTTP response. PATCH by a member who may update but not view the properties returns them all; GET/list/update-preview by a permitted admin returns the password in clear text; POST, the volume-id filtered listing and the update preview return the settings to callers without the view permission.",
+  "sites": [
+   "ironic/api/controllers/v1/volume_target.py:73 convert_with_links (single-object serializer) [published]",
+   "ironic/api/controllers/v1/volume_target.py:109 list_convert_with_links sanitize_func (collection serializer path) [published]",
+   "ironic/api/controllers/v1/volume_target.py:409 PATCH response (reported landing point) [published]",
+   "ironic/api/controllers/v1/volume_target.py:330 POST response (no view gate) [uncovered, real upstream]",
+   "ironic/api/controllers/v1/volume_target.py:224 volume-id filtered listing branch [injected sibling]",
+   "ironic/api/controllers/v1/volume_target.py:410 dry-run preview branch [injected sibling]"
+  ],
+  "routes": [
+   "PATCH /v1/volume/targets/{uuid} (reported; confirmed leak on pinned, masked/redacted after the published fix)",
+   "GET /v1/volume/targets/{uuid}, GET /v1/volume/targets?detail=True, GET ?fields=properties (password clear text for a permitted viewer on pinned; published fix masks)",
+   "POST /v1/volume/targets (no view gate at pinned; published fix masks the password but still returns the non-secret settings; confirmed)",
+   "GET /v1/volume/targets?volume_id=X&detail=True (injected; skips the collection helper's permission redaction; published fix masks the password only; confirmed)",
+   "PATCH /v1/volume/targets/{uuid}?dry_run=true (injected; returns stored settings through the shared serializer with no permission redaction; published fix masks the password only; confirmed)"
+  ],
+  "not_a_route": [
+   "Update notifications carry the full properties dict; they are an internal message bus, not a response to an API client, so the stated property does not cover them. They are used as a coupled must-keep-working behaviour (real values must survive) instead.",
+   "DELETE has no response body.",
+   "The object layer's as_dict() is internal and never sent to a client."
+  ],
+  "services": [],
+  "project_tests_run": "ironic/tests/unit/api/controllers/v1/test_volume_target.py (63 tests) and test_volume_connector.py (65 tests) pass offline at the pinned+injected commit and on the oracle; test.sh restores pristine copies and runs them in the functional group. The fix commit's added tests are absent at the pinned commit (the fix is its direct descendant).",
+  "no_leaked_regression_tests": "dd2df520 is the direct child of 00eda8b9 (source diff touched volume_target.py, its test file and one release note); the pinned tree contains none of the fix's added tests.",
+  "local_runs": "Local pytest against the real app: nop security 9/9 fail, functional 15/15 pass plus 128 project tests; oracle 9/9 + 15/15 + 128 pass; published-fix-only 3 security fail; each miss patch fails only its routes; alternative and hardening pass everything; adjacent/refuse/crash patches fail functional as declared."
+ },
+ "leak_terms": [
+  "mask_dict_password",
+  "target_sanitize",
+  "_redact_target_properties",
+  "view_target_properties",
+  "baremetal:volume:view_target_properties",
+  "convert_with_links",
+  "list_convert_with_links",
+  "redacted_contents",
+  "volume_target",
+  "volume_target.py",
+  "list_by_volume_id",
+  "dry_run",
+  "volume_id",
+  "target_iqn",
+  "target_portal",
+  "auth_username",
+  "auth_password",
+  "GHSA-J4CW-MCG2-2Q78",
+  "CVE-2026-54421",
+  "PYSEC-2026-3852"
+ ],
+ "patch_checks": [
+  {
+   "patch": "published_fix_only.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "the upstream fix as published: create, the filtered listing and the update preview still return the non-secret settings to callers without the view permission"
+  },
+  {
+   "patch": "sf_miss_detail.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "T1: masking placed in the single-object serializer only; the detail/field-subset listing bypasses it"
+  },
+  {
+   "patch": "sf_miss_masking.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "the permission redaction is complete but password-like values are never masked for permitted viewers"
+  },
+  {
+   "patch": "sf_miss_patch.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "the reported update response is left ungated"
+  },
+  {
+   "patch": "sf_miss_post.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "T2: create response left without the view gate while everything else is fixed"
+  },
+  {
+   "patch": "sf_miss_filter.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "T3: the volume-id filtered listing keeps its bypass"
+  },
+  {
+   "patch": "sf_miss_dryrun.patch",
+   "expect": "security_fail",
+   "kind": "miss",
+   "why": "T4: the update preview keeps returning the stored settings"
+  },
+  {
+   "patch": "wf_reads_only.patch",
+   "expect": "security_fail",
+   "kind": "wrong",
+   "why": "masks and gates reads but leaves every write response open"
+  },
+  {
+   "patch": "wf_wrong_resource.patch",
+   "expect": "security_fail",
+   "kind": "wrong",
+   "why": "authorises the parent node's project instead of the target's protected property"
+  },
+  {
+   "patch": "wf_request_body_check.patch",
+   "expect": "security_fail",
+   "kind": "wrong",
+   "why": "checks the request document instead of the merged response, so a patch to another field leaks stored settings"
+  },
+  {
+   "patch": "wf_crash.patch",
+   "expect": "functional_fail",
+   "kind": "wrong",
+   "why": "answers a server error for a permitted update instead of withholding the settings"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong",
+   "why": "refuses permitted updates and previews instead of withholding the settings"
+  },
+  {
+   "patch": "wf_adjacent.patch",
+   "expect": "functional_fail",
+   "kind": "wrong",
+   "why": "hardens the shared dict cleaner, changing a field that is not connection configuration"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "the reference fix plus defensive masking of the unsanitized serializer path"
+  },
+  {
+   "patch": "alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "a second design: permission redaction and masking centralised in the serializer helper, so every route inherits them without per-handler checks"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "wf_crash.patch",
+  "wrong_resource": "wf_wrong_resource.patch",
+  "one_role_or_direction": "sf_miss_post.patch",
+  "reads_only": "wf_reads_only.patch",
+  "check_after_adjustment": "wf_request_body_check.patch",
+  "unlisted_route": "sf_miss_filter.patch",
+  "malformed_identity": "n/a: the decision comes from oslo.policy over a server-built credential dict; no caller-supplied identity string is parsed by the task's code, so a malformed spelling cannot change what the guard sees",
+  "missing_authority": "n/a: the authority is the in-process policy engine, which always returns a definite decision; there is no missing-secret or missing-role return path in the tested deployment",
+  "adjacent_api": "wf_adjacent.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "second serialization path: collection items are built unsanitized and cleaned by a separate sanitize_func hook, so masking placed in the single-object converter misses the listing",
+   "where": "ironic/api/controllers/v1/volume_target.py:109",
+   "security_tests": [
+    "tests/security/test_read_paths.py::TestReadPaths::test_detail_listing_masks_secret_for_permitted_caller",
+    "tests/security/test_read_paths.py::TestReadPaths::test_field_subset_listing_masks_secret_for_permitted_caller"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_reads_legitimate.py::TestReadsLegitimate::test_permitted_caller_sees_ordinary_settings",
+    "tests/functional/test_reads_legitimate.py::TestReadsLegitimate::test_default_listing_still_omits_properties"
+   ],
+   "security_fail_patch": "sf_miss_detail.patch",
+   "realistic_because": "published far site: the same resource's listing path, already gated by the permission check at the pinned commit, so it looks protected"
+  },
+  {
+   "id": "MASK",
+   "shape": "a second protection independent of the permission check: password-like values must be masked even for a caller permitted to view the settings",
+   "where": "ironic/api/controllers/v1/volume_target.py:73,109",
+   "security_tests": [
+    "tests/security/test_read_paths.py::TestReadPaths::test_single_read_masks_secret_for_permitted_caller",
+    "tests/security/test_update_response.py::TestUpdateResponse::test_update_masks_secret_for_caller_with_view_permission"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_update_legitimate.py::TestUpdateLegitimate::test_permitted_update_reports_ordinary_settings"
+   ],
+   "security_fail_patch": "sf_miss_masking.patch",
+   "realistic_because": "published far site: defence in depth required by the advisory even where RBAC is unavailable"
+  },
+  {
+   "id": "T2",
+   "shape": "route where the permission check never existed: the create response returns the full target with no view gate",
+   "where": "ironic/api/controllers/v1/volume_target.py:330",
+   "security_tests": [
+    "tests/security/test_create_response.py::TestCreateResponse::test_create_withholds_settings_from_caller_without_view_permission"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_create_legitimate.py::TestCreateLegitimate::test_permitted_create_succeeds_and_stores_real_values"
+   ],
+   "security_fail_patch": "sf_miss_post.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T3",
+   "shape": "second query path: the filtered listing returns the volume's targets through the shared serializer but skips the collection helper where the permission redaction lives",
+   "where": "ironic/api/controllers/v1/volume_target.py:224",
+   "security_tests": [
+    "tests/security/test_filtered_listing.py::TestFilteredListing::test_filtered_listing_withholds_settings_from_unprivileged_caller"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_preview_and_filter.py::TestPreviewAndFilter::test_filter_returns_only_matching_target"
+   ],
+   "security_fail_patch": "sf_miss_filter.patch",
+   "realistic_because": "injected sibling: the object layer already exposed list_by_volume_id but no API route used it; a maintainer adding a volume filter would plausibly query it directly"
+  },
+  {
+   "id": "T4",
+   "shape": "preview assembled from stored state: the dry-run branch returns the merged in-memory target through the shared serializer, outside the update path's redaction",
+   "where": "ironic/api/controllers/v1/volume_target.py:410",
+   "security_tests": [
+    "tests/security/test_update_preview.py::TestUpdatePreview::test_preview_withholds_settings_from_unprivileged_caller"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_preview_and_filter.py::TestPreviewAndFilter::test_preview_does_not_persist_the_change"
+   ],
+   "security_fail_patch": "sf_miss_dryrun.patch",
+   "realistic_because": "injected sibling: a preview feature a maintainer might add, reusing the changed in-memory object; it writes nothing, which reads as harmless"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle x3, patches)"
+}

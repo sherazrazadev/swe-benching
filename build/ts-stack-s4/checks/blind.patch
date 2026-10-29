@@ -1,0 +1,285 @@
+diff -ruN pristine/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts app/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts	2026-10-29 05:32:17.000000000 +0000
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/buildRemixSignableTransaction.ts	2026-10-29 05:53:39.931741700 +0000
+@@ -8,16 +8,18 @@
+ import { WERR_INVALID_PARAMETER } from '../../sdk/WERR_errors'
+ import { asBsvSdkScript, verifyTruthy } from '../../utility/utilityHelpers'
+ import { makeChangeLock } from './buildSignableTransaction'
++import { assertStorageOutputsAllowed, isStorageChange, storageInputSatoshis } from './storageOutputGuard'
+ 
+ /**
+  * Build the transaction for a remix-change action.
+  *
+  * A remix-change action is an action with neither caller inputs nor caller
+  * outputs: the wallet spends its own coins and storage returns the change it
+- * derived. There are no caller-requested outputs to reconcile, so this builder
+- * assembles the transaction from the storage response directly. Change outputs
+- * are re-derived from the caller's change key; every other output is used as
+- * returned by storage.
++ * derived. There are no caller-requested outputs to reconcile, which is exactly
++ * why this route cannot skip reconciliation: with an empty request, only change
++ * and the single bounded service charge are legitimate, so a storage response
++ * carrying any other output is rejected here before it is signed. Change outputs
++ * are re-derived from the caller's change key.
+  */
+ export function buildRemixSignableTransaction (
+   dctr: StorageCreateActionResult,
+@@ -35,6 +37,10 @@
+ 
+   const { inputs: storageInputs, outputs: storageOutputs } = dctr
+ 
++  // A remix action has no caller outputs, so its request is the empty set: only
++  // change and one small service charge may appear in the response.
++  assertStorageOutputsAllowed(storageOutputs, args, storageInputSatoshis(dctr))
++
+   const tx = new Transaction(args.version, [], [], args.lockTime)
+ 
+   // The order of outputs in storageOutputs is storage order; vout values may be
+@@ -51,7 +57,7 @@
+     const out = storageOutputs[i]
+     if (vout !== out.vout) { throw new WERR_INVALID_PARAMETER('output.vout', `equal to array index. ${out.vout} !== ${vout}`) }
+ 
+-    const change = out.providedBy === 'storage' && out.purpose === 'change'
++    const change = isStorageChange(out)
+ 
+     const lockingScript = change
+       ? makeChangeLock(out, dctr, args, changeKeys, wallet)
+diff -ruN pristine/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts app/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts	2026-10-29 05:32:14.000000000 +0000
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/buildSignableTransaction.ts	2026-10-29 05:53:32.616290681 +0000
+@@ -9,6 +9,7 @@
+ import { asBsvSdkScript, verifyTruthy } from '../../utility/utilityHelpers'
+ import { KeyPair } from '../../sdk/types'
+ import { ScriptTemplateBRC29 } from '../../utility/ScriptTemplateBRC29'
++import { assertStorageOutputsAllowed, isStorageChange, storageInputSatoshis } from './storageOutputGuard'
+ 
+ export function buildSignableTransaction (
+   dctr: StorageCreateActionResult,
+@@ -35,6 +36,16 @@
+   // output is echoed back by storage unchanged before anything is signed.
+   verifyRequestedOutputsUnchanged(storageOutputs, args)
+ 
++  // SECURITY: the check above only pins the caller's own outputs. Storage can
++  // still append an ADDITIONAL output paying a script the caller never chose
++  // (funded by reducing change), and this builder would sign it verbatim. Every
++  // output must therefore be reconciled with the request: a requested output, a
++  // change output (its script is re-derived locally), or the single bounded
++  // service charge. Nothing else reaches signing. This also covers actions with
++  // no caller-requested outputs, where the positional check above inspects
++  // nothing.
++  assertStorageOutputsAllowed(storageOutputs, args, storageInputSatoshis(dctr))
++
+   const tx = new Transaction(args.version, [], [], args.lockTime)
+ 
+   // The order of outputs in storageOutputs is always:
+@@ -57,7 +68,7 @@
+     const out = storageOutputs[i]
+     if (vout !== out.vout) { throw new WERR_INVALID_PARAMETER('output.vout', `equal to array index. ${out.vout} !== ${vout}`) }
+ 
+-    const change = out.providedBy === 'storage' && out.purpose === 'change'
++    const change = isStorageChange(out)
+ 
+     const lockingScript = change
+       ? makeChangeLock(out, dctr, args, changeKeys, wallet)
+diff -ruN pristine/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts app/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts	2026-10-29 05:32:17.000000000 +0000
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts	2026-10-29 05:53:44.443973624 +0000
+@@ -12,6 +12,7 @@
+ } from '@bsv/sdk'
+ import { buildSignableTransaction } from './buildSignableTransaction'
+ import { buildRemixSignableTransaction } from './buildRemixSignableTransaction'
++import { assertStorageServiceChargeAllowed, storageInputSatoshis } from './storageOutputGuard'
+ import {
+   AuthId,
+   ReviewActionResult,
+@@ -90,7 +91,11 @@
+   const { tx, amount, pdi } = built
+ 
+   // Some providers return the storage service charge separately from the output
+-  // list. Include it in the transaction before it is signed.
++  // list. It is appended to the transaction before signing, so it must pass the
++  // same single-and-bounded rule as a charge in the list: a storage-declared
++  // charge, no charge already in the list, and a small amount. Otherwise it is
++  // simply an attacker recipient outside the list the builder reconciled.
++  assertStorageServiceChargeAllowed(dcr.serviceCharge, dcr.outputs, storageInputSatoshis(dcr))
+   if (dcr.serviceCharge != null) {
+     tx.addOutput({
+       satoshis: dcr.serviceCharge.satoshis,
+diff -ruN pristine/packages/wallet/wallet-toolbox/src/signer/methods/storageOutputGuard.ts app/packages/wallet/wallet-toolbox/src/signer/methods/storageOutputGuard.ts
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/storageOutputGuard.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/storageOutputGuard.ts	2026-10-29 05:53:26.228211342 +0000
+@@ -0,0 +1,174 @@
++import { Validation } from '@bsv/sdk'
++import { StorageCreateActionResult, StorageCreateTransactionSdkOutput } from '../../sdk/WalletStorage.interfaces'
++import { WERR_INVALID_PARAMETER } from '../../sdk/WERR_errors'
++
++/**
++ * Signing-time reconciliation of the outputs a storage provider returns.
++ *
++ * The wallet signs the locking scripts that storage returns, so a remote or
++ * compromised provider is untrusted: it must not be able to add a recipient the
++ * caller never asked to pay, whatever the response labels, orders, splits or
++ * counts it as. Every output of the transaction the wallet builds may only be:
++ *
++ *   (a) a caller-requested output, echoing the request's script and amount;
++ *   (b) the caller's own change. The change locking script is re-derived from
++ *       the caller's keys (see makeChangeLock), so it can only pay the caller.
++ *       This is why change is accepted by the exact provider/label conjunction
++ *       the builder uses to decide to re-derive it - nothing else;
++ *   (c) at most one storage service charge, small in absolute terms and small
++ *       relative to the value the action spends.
++ *
++ * Anything else is refused before a transaction is built for signing.
++ * (GHSA-36f9-7rg5-cpf8 sibling: additional outputs)
++ */
++
++/** Largest service charge this library will accept from a storage provider. */
++export const MAX_SERVICE_CHARGE_SATOSHIS = 100_000
++
++/** Largest share of the spent input value a service charge may represent. */
++export const MAX_SERVICE_CHARGE_INPUT_SHARE = 0.1
++
++const SERVICE_CHARGE_PURPOSES = new Set(['service-charge', 'storage-commission'])
++
++/**
++ * The exact test the transaction builder uses to decide that a storage output
++ * is change and therefore gets its locking script re-derived client side. The
++ * reconciliation must use the same conjunction: accepting `purpose === 'change'`
++ * on its own would sign a provider-chosen script verbatim.
++ */
++export function isStorageChange (out: StorageCreateTransactionSdkOutput): boolean {
++  return out.providedBy === 'storage' && out.purpose === 'change'
++}
++
++/** True only for a service charge the storage provider declares as its own. */
++export function isStorageServiceCharge (out: StorageCreateTransactionSdkOutput): boolean {
++  return (
++    out.providedBy === 'storage' &&
++    typeof out.purpose === 'string' &&
++    SERVICE_CHARGE_PURPOSES.has(out.purpose)
++  )
++}
++
++function normalizedScript (script: unknown): string {
++  return typeof script === 'string' ? script.toLowerCase() : ''
++}
++
++/** Total satoshis of the coins the action spends, from the storage response. */
++export function storageInputSatoshis (dctr: StorageCreateActionResult): number {
++  let total = 0
++  for (const input of dctr.inputs) {
++    if (typeof input.sourceSatoshis === 'number' && Number.isFinite(input.sourceSatoshis)) {
++      total += input.sourceSatoshis
++    }
++  }
++  return total
++}
++
++function serviceChargeLimit (totalInputSatoshis: number): number {
++  if (!(totalInputSatoshis > 0)) return MAX_SERVICE_CHARGE_SATOSHIS
++  const relative = Math.floor(totalInputSatoshis * MAX_SERVICE_CHARGE_INPUT_SHARE)
++  return Math.min(MAX_SERVICE_CHARGE_SATOSHIS, relative)
++}
++
++function checkServiceChargeAmount (satoshis: number, totalInputSatoshis: number, where: string): void {
++  const limit = serviceChargeLimit(totalInputSatoshis)
++  if (!Number.isFinite(satoshis) || satoshis < 0 || satoshis > limit) {
++    throw new WERR_INVALID_PARAMETER(
++      'output.satoshis',
++      `a service charge no greater than ${limit} satoshis. Storage returned a charge of ${satoshis} (${where}).`
++    )
++  }
++}
++
++/**
++ * Reconcile every output in a storage response with the caller's request.
++ *
++ * Caller-requested outputs are matched as a multiset of (locking script,
++ * satoshis), never by array position, so reordering the response cannot smuggle
++ * an extra recipient into a slot that happens to be inspected. The check also
++ * applies when the caller requested no outputs at all: there is then nothing to
++ * match, so only change and the single bounded service charge are permitted.
++ *
++ * @throws WERR_INVALID_PARAMETER if storage returned anything the caller did
++ *   not authorize.
++ */
++export function assertStorageOutputsAllowed (
++  storageOutputs: StorageCreateTransactionSdkOutput[],
++  args: Validation.ValidCreateActionArgs,
++  totalInputSatoshis = 0
++): void {
++  const unmatched = args.outputs.map(o => ({
++    script: normalizedScript(o.lockingScript),
++    satoshis: o.satoshis
++  }))
++  let serviceChargeCount = 0
++
++  for (let i = 0; i < storageOutputs.length; i++) {
++    const out = storageOutputs[i]
++
++    if (isStorageChange(out)) continue
++
++    if (isStorageServiceCharge(out)) {
++      serviceChargeCount++
++      if (serviceChargeCount > 1) {
++        throw new WERR_INVALID_PARAMETER(
++          'output.purpose',
++          `at most one storage service charge. Storage returned an extra charge at index ${i}.`
++        )
++      }
++      checkServiceChargeAmount(out.satoshis, totalInputSatoshis, `output index ${i}`)
++      continue
++    }
++
++    const script = normalizedScript(out.lockingScript)
++    const match = unmatched.findIndex(r => r.satoshis === out.satoshis && r.script === script)
++    if (match < 0) {
++      throw new WERR_INVALID_PARAMETER(
++        'storage outputs',
++        'only caller-requested outputs, change, or one small service charge. Storage returned an ' +
++          `unrecognized output (providedBy='${String(out.providedBy)}' purpose='${out.purpose ?? ''}' ` +
++          `satoshis=${out.satoshis}) at index ${i}.`
++      )
++    }
++    unmatched.splice(match, 1)
++  }
++
++  if (unmatched.length > 0) {
++    throw new WERR_INVALID_PARAMETER(
++      'storage outputs',
++      `present for every caller-requested output. Storage did not return ${unmatched.length} requested output(s).`
++    )
++  }
++}
++
++/**
++ * Reconcile a service charge that some providers return outside the output list
++ * but which is still appended to the transaction before signing.
++ *
++ * @throws WERR_INVALID_PARAMETER if it is not a storage-declared charge, if the
++ *   output list already carries a charge, or if the amount is too large.
++ */
++export function assertStorageServiceChargeAllowed (
++  serviceCharge: StorageCreateTransactionSdkOutput | undefined,
++  storageOutputs: StorageCreateTransactionSdkOutput[],
++  totalInputSatoshis = 0
++): void {
++  if (serviceCharge == null) return
++
++  if (!isStorageServiceCharge(serviceCharge)) {
++    throw new WERR_INVALID_PARAMETER(
++      'serviceCharge',
++      'a storage-provided service charge. Storage returned a separately supplied ' +
++        `output with providedBy='${String(serviceCharge.providedBy)}' purpose='${serviceCharge.purpose ?? ''}'.`
++    )
++  }
++
++  if (storageOutputs.some(isStorageServiceCharge)) {
++    throw new WERR_INVALID_PARAMETER(
++      'serviceCharge',
++      'the only service charge. Storage also returned a service charge in the output list.'
++    )
++  }
++
++  checkServiceChargeAmount(serviceCharge.satoshis, totalInputSatoshis, 'separate serviceCharge')
++}

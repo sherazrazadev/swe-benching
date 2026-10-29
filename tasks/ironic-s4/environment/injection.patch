@@ -1,0 +1,56 @@
+--- a/ironic/api/controllers/v1/volume_target.py
++++ b/ironic/api/controllers/v1/volume_target.py
+@@ -183,9 +183,10 @@
+     @args.validate(node=args.uuid_or_name, marker=args.uuid,
+                    limit=args.integer, sort_key=args.string,
+                    sort_dir=args.string, fields=args.string_list,
+-                   detail=args.boolean)
++                   detail=args.boolean, volume_id=args.string)
+     def get_all(self, node=None, marker=None, limit=None, sort_key='id',
+-                sort_dir='asc', fields=None, detail=None, project=None):
++                sort_dir='asc', fields=None, detail=None, project=None,
++                volume_id=None):
+         """Retrieve a list of volume targets.
+ 
+         :param node: UUID or name of a node, to get only volume targets
+@@ -220,6 +221,18 @@
+                 _("Can't fetch a subset of fields with 'detail' set"))
+ 
+         resource_url = 'volume/targets'
++        if volume_id:
++            targets = objects.VolumeTarget.list_by_volume_id(
++                api.request.context, volume_id,
++                limit=api_utils.validate_limit(limit),
++                sort_key=sort_key, sort_dir=sort_dir, project=project)
++            return list_convert_with_links(targets,
++                                           api_utils.validate_limit(limit),
++                                           url=resource_url,
++                                           fields=fields,
++                                           sort_key=sort_key,
++                                           sort_dir=sort_dir,
++                                           detail=detail)
+         return self._get_volume_targets_collection(node, marker, limit,
+                                                    sort_key, sort_dir,
+                                                    resource_url=resource_url,
+@@ -319,8 +332,9 @@
+     @METRICS.timer('VolumeTargetsController.patch')
+     @method.expose()
+     @method.body('patch')
+-    @args.validate(target_uuid=args.uuid, patch=args.patch)
+-    def patch(self, target_uuid, patch):
++    @args.validate(target_uuid=args.uuid, patch=args.patch,
++                   dry_run=args.boolean)
++    def patch(self, target_uuid, patch, dry_run=None):
+         """Update an existing volume target.
+ 
+         :param target_uuid: UUID of a volume target.
+@@ -393,6 +407,9 @@
+             schema=TARGET_SCHEMA, id_map={'node_id': rpc_node.id}
+         )
+ 
++        if dry_run:
++            return convert_with_links(rpc_target)
++
+         notify.emit_start_notification(context, rpc_target, 'update',
+                                        node_uuid=rpc_node.uuid)
+         with notify.handle_error_notification(context, rpc_target, 'update',

@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/kotlin-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/kotlin-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 88,
+ "duration_ms": 637263,
+ "total_cost_usd": 2.797312,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "6d083b3e-fe5c-4de6-a39a-4c3296290eb2",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 78819,
+   "outputTokens": 57689,
+   "cacheReadInputTokens": 6641280,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 2.797312,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "Done. All work is in `/home/runner/.tb-graders/cwe/blind/kotlin-s4`.\n\n## Deliverables\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/kotlin-s4/blind.patch` (334 lines, 4 files; verified byte-identical to `diff -ruN pristine app`, and applies cleanly with `patch -p1 --dry-run` to a fresh copy of `pristine`).\n**Mechanisms:** `/home/runner/.tb-graders/cwe/blind/kotlin-s4/mechanisms.md`\n\n### 5-line summary\n\n1. New `util/SerializedValueClasses.kt`: a `GuardedObjectInputStream` whose `resolveClass` refuses any descriptor outside a per-reader allowlist *before* `super.resolveClass`, so the class is never loaded or constructed; array descriptors are admitted only via their component type, and `resolveProxyClass` always throws.\n2. `incremental/cache.kt`: both `apt-cache.bin` and `java-cache.bin` readers go through one `restoreCache(file, allowlist, expectedClass)` helper; any refused class, corruption, or wrong root type deletes the file and yields a fresh empty cache (not a build failure).\n3. `incremental/processorInfoCache.kt`: `processor-info.bin` uses its own allowlist (`ProcessorInfoCache`, `DeclaredProcType`, `java.lang.Enum`, JDK map classes); rejection discards the file and processor loading continues.\n4. `stubs/KaptStubLineInformation.kt`: the `.kapt_metadata` payload is read through the guard with a `KotlinPosition` + JDK-map allowlist, position/signature maps are shape-checked, and any refusal/truncation returns `FileInfo.EMPTY` instead of throwing.\n5. No public entry point or signature changed; legitimate producer data round-trips with identical meaning.\n\n### Mechanisms list (one line per site)\n\n- `incremental/cache.kt` \u2014 guarded read + allowlist for both incremental caches; reject \u2192 delete file \u2192 empty cache.\n- `incremental/processorInfoCache.kt` \u2014 guarded read + allowlist for the processor-info cache; reject \u2192 delete file \u2192 empty cache, discovery continues.\n- `stubs/KaptStubLineInformation.kt` \u2014 guarded read + `KotlinPosition`/map allowlist and shape checks; reject \u2192 `FileInfo.EMPTY`.\n- `util/SerializedValueClasses.kt` (new) \u2014 allowlist predicate, array-component handling, `resolveClass` gate, proxy rejection.\n\n### Verification performed\n\n- Hidden suites on the patched tree: **security 9/9 pass, functional 9/9 pass**, and the same from a freshly patched copy of `pristine`.\n- Baseline confirmed before fixing: 9/9 security fail, 9/9 functional pass.\n- Own probes under `probe/` (13 checks, all pass): deep nesting, class-in-array, proxy payloads, processor-info deep nesting with loading still working, wrong-shaped stub maps, plus full producer-value-set round trips (apt cache with `File` entries, java cache with `URI`/`SingletonSet`/mentioned constants/annotations).\n- Producer class scan confirmed the exact resolved-class sets used to build each allowlist; project tests `JavaClassCacheManagerTest` (6) and `ProcessorLoaderTest`/`IncrementalProcessorDiscoveryTest` (7) pass.\n\nOne caveat: the local toolchain is Kotlin 2.4.21 with `-language-version 2.5` on JDK 8, not the gate's Kotlin 2.5.0-Beta2, so the final gate run remains the authoritative check.",
+ "status": "ok"
+}

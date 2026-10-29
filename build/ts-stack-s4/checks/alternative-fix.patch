@@ -1,0 +1,73 @@
+diff --git a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+index 1731ad456..e3595d167 100644
+--- a/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
++++ b/packages/wallet/wallet-toolbox/src/signer/methods/createAction.ts
+@@ -10,8 +10,7 @@ import {
+   Transaction,
+   Validation
+ } from '@bsv/sdk'
+-import { buildSignableTransaction } from './buildSignableTransaction'
+-import { buildRemixSignableTransaction } from './buildRemixSignableTransaction'
++import { buildSignableTransaction, verifyStorageServiceCharge } from './buildSignableTransaction'
+ import {
+   AuthId,
+   ReviewActionResult,
+@@ -20,7 +19,7 @@ import {
+ } from '../../sdk/WalletStorage.interfaces'
+ import { completeSignedTransaction, verifyUnlockScripts } from './completeSignedTransaction'
+ import { PendingSignAction, Wallet } from '../../Wallet'
+-import { WERR_INTERNAL } from '../../sdk/WERR_errors'
++import { WERR_INTERNAL, WERR_INVALID_PARAMETER } from '../../sdk/WERR_errors'
+ import { asBsvSdkScript } from '../../utility/utilityHelpers'
+ 
+ export interface CreateActionResultX extends CreateActionResult {
+@@ -77,6 +76,35 @@ export async function createAction (
+   return r
+ }
+ 
++function reconcileStorageOutputs (dcr: StorageCreateActionResult, args: Validation.ValidCreateActionArgs): void {
++  const maxCommission = 500000
++  let commissionCount = 0
++  for (let i = args.outputs.length; i < dcr.outputs.length; i++) {
++    const out = dcr.outputs[i]
++    if (out.providedBy === 'storage' && out.purpose === 'change') continue
++    const isCommission =
++      out.providedBy === 'storage' && (out.purpose === 'storage-commission' || out.purpose === 'service-charge')
++    if (!isCommission) {
++      throw new WERR_INVALID_PARAMETER('storage outputs', `unrecognized output at index ${i}.`)
++    }
++    commissionCount++
++    if (commissionCount > 1) {
++      throw new WERR_INVALID_PARAMETER('storage outputs', `at most one commission output, index ${i}.`)
++    }
++    if (out.satoshis > maxCommission) {
++      throw new WERR_INVALID_PARAMETER('output.satoshis', `a commission no greater than ${maxCommission}, index ${i}.`)
++    }
++  }
++  if (dcr.serviceCharge != null) {
++    const charge = dcr.serviceCharge
++    const labelled =
++      charge.providedBy === 'storage' && (charge.purpose === 'storage-commission' || charge.purpose === 'service-charge')
++    if (!labelled) throw new WERR_INVALID_PARAMETER('serviceCharge', 'a storage-provided service charge.')
++    if (commissionCount > 0) throw new WERR_INVALID_PARAMETER('serviceCharge', 'the only service charge.')
++    if (charge.satoshis > maxCommission) throw new WERR_INVALID_PARAMETER('serviceCharge.satoshis', `a service charge no greater than ${maxCommission}.`)
++  }
++}
++
+ async function createNewTx (wallet: Wallet, vargs: Validation.ValidCreateActionArgs): Promise<PendingSignAction> {
+   const logger = vargs.logger
+   const storageArgs = removeUnlockScripts(vargs)
+@@ -84,10 +112,9 @@ async function createNewTx (wallet: Wallet, vargs: Validation.ValidCreateActionA
+ 
+   const reference = dcr.reference
+ 
+-  const built = vargs.isRemixChange
+-    ? buildRemixSignableTransaction(dcr, vargs, wallet)
+-    : buildSignableTransaction(dcr, vargs, wallet)
+-  const { tx, amount, pdi } = built
++  reconcileStorageOutputs(dcr, vargs)
++
++  const { tx, amount, pdi } = buildSignableTransaction(dcr, vargs, wallet)
+ 
+   // Some providers return the storage service charge separately from the output
+   // list. Include it in the transaction before it is signed.
