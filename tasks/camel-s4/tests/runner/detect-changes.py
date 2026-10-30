@@ -38,7 +38,7 @@ def main():
             rel = os.path.relpath(full, ROOT)
             if rel.startswith(".htests/"):
                 continue
-            if name.endswith(".java") or "/src/main/resources/" in "/" + rel:
+            if (name.endswith(".java") and "/src/main/java/" in "/" + rel) or "/src/main/resources/" in "/" + rel:
                 try:
                     if pristine.get(rel) != digest(full):
                         changed.append(rel)
