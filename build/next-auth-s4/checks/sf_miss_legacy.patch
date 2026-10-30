@@ -1,0 +1,75 @@
+diff --git a/packages/core/src/lib/actions/callback/oauth/checks.ts b/packages/core/src/lib/actions/callback/oauth/checks.ts
+index 8d8fac11..c96dc0bd 100644
+--- a/packages/core/src/lib/actions/callback/oauth/checks.ts
++++ b/packages/core/src/lib/actions/callback/oauth/checks.ts
+@@ -15,6 +15,7 @@ import type { WebAuthnProviderType } from "../../../../providers/webauthn.js"
+ 
+ interface CookiePayload {
+   value: string
++  provider?: string
+ }
+ 
+ const COOKIE_TTL = 60 * 15 // 15 minutes
+@@ -40,7 +41,7 @@ async function sealCookie(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: COOKIE_TTL,
+-    token: { value: payload } satisfies CookiePayload,
++    token: { value: payload, provider: options.provider.id } satisfies CookiePayload,
+     salt: cookie.name,
+   })
+   const cookieOptions = { ...cookie.options, expires }
+@@ -62,8 +63,11 @@ async function parseCookie(
+       token: value,
+       salt: cookies[name].name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider && parsed.provider !== options.provider?.id) {
++      throw new Error("cookie was created for a different provider")
++    }
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck(`${name} value could not be parsed`, {
+       cause: error,
+diff --git a/packages/core/src/lib/actions/signin/link-intent.ts b/packages/core/src/lib/actions/signin/link-intent.ts
+index aeec0969..b9f82971 100644
+--- a/packages/core/src/lib/actions/signin/link-intent.ts
++++ b/packages/core/src/lib/actions/signin/link-intent.ts
+@@ -12,6 +12,7 @@ const LINK_INTENT_TTL = 60 * 15 // 15 minutes
+ 
+ interface LinkIntentPayload {
+   value: string
++  provider?: string
+ }
+ 
+ /**
+@@ -30,7 +31,10 @@ export async function sealLinkIntent(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: LINK_INTENT_TTL,
+-    token: { value: userId } satisfies LinkIntentPayload,
++    token: {
++      value: userId,
++      provider: options.provider.id,
++    } satisfies LinkIntentPayload,
+     salt: cookie.name,
+   })
+ 
+@@ -53,8 +57,13 @@ export async function openLinkIntent(
+       token: value,
+       salt: options.cookies.linkIntent.name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider && parsed.provider !== options.provider?.id) {
++      throw new Error(
++        "link intent cookie was created for a different provider than the one handling the callback"
++      )
++    }
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck("link intent value could not be parsed", {
+       cause: error,

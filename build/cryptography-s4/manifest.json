@@ -1,0 +1,195 @@
+{
+ "slug": "cryptography-s4",
+ "candidate": {
+  "entry_id": "4331",
+  "repo": "pyca/cryptography",
+  "advisory_ids": [
+   "GHSA-M2H6-J472-RP4C",
+   "CVE-2026-69248",
+   "PYSEC-2026-3554"
+  ],
+  "screener_pinned_commit": "194c94777d76162f7e162264fabae5dbd106277d",
+  "used_pinned_commit": "b3f077f7bef906383be2bd92c49de10a68ec9659",
+  "fix_commit": "4d035a4225965edeffd312079a510ef25fcfdcb2",
+  "commit_correction": "The screener's pinned commit is the parent of 286c8912, a 2025 compatibility change that first lets wildcard SANs reach DNS constraint evaluation; at that commit wildcard SANs are rejected outright and the advisory's acceptance escape does not reproduce. NVD (CVE-2026-69248) gives affected 45.0.0-48.0.0 and fixed 49.0.0, and the published security fix is 4d035a42, whose parent b3f077f7 contains the exact DNSConstraint wildcard logic the advisory describes. The task is therefore pinned at b3f077f7 and built on 4d035a42."
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "cryptography_x509_verification::verify (the Rust core behind cryptography.x509.verification ClientVerifier.verify / ServerVerifier.verify)",
+  "sites": [
+   "src/rust/cryptography-x509-verification/src/lib.rs:156-180 (evaluate_single_constraint DNS arm)",
+   "src/rust/cryptography-x509-verification/src/lib.rs:235-275 (permitted/excluded loops)",
+   "src/rust/cryptography-x509-verification/src/types.rs:168-212 (DNSConstraint matching primitives)",
+   "src/rust/cryptography-x509-verification/src/lib.rs:366-374 (self-issued guard; injected sibling)",
+   "src/rust/cryptography-x509-verification/src/policy/mod.rs:184-222 (requested-name matching; injected sibling)"
+  ],
+  "routes": [
+   "permittedSubtrees with a wildcard SAN whose expansion set is not contained (reported)",
+   "self-issued CA in the path carrying name constraints (injected)",
+   "requested server name matched against a wildcard SAN (injected)"
+  ],
+  "services": [],
+  "project_tests": "cargo test -p cryptography-x509-verification --lib at the pinned+injected commit: 37 passed, 0 failed; the crate and both hidden test binaries build offline from a pre-warmed cargo cache.",
+  "oracle_local": "6/6 security pass, 8/8 functional pass",
+  "nop_local": "0/6 security pass (all six fail as exploits), 8/8 functional pass",
+  "gate": "static PASS; nop PASS; oracle PASS (3x 1.0, identical); patches PASS (7/7)"
+ },
+ "leak_terms": [
+  "DNSConstraint",
+  "DNSPattern",
+  "evaluate_single_constraint",
+  "evaluate_constraints",
+  "build_chain_inner",
+  "subject_alt_name_matches",
+  "cert_is_self_issued",
+  "permittedSubtrees",
+  "excludedSubtrees",
+  "permits",
+  "excludes",
+  "self-issued",
+  "dns_name_covers",
+  "CWE-295",
+  "CVE-2026-69248",
+  "GHSA-M2H6-J472-RP4C"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-permitted-containment.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "trap": "T1"
+  },
+  {
+   "patch": "sf-selfissued-guard.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "trap": "T2"
+  },
+  {
+   "patch": "sf-hostname-matcher.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "trap": "T3"
+  },
+  {
+   "patch": "ff-excluded-containment.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "trap": "T4"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail",
+   "trap": "catalogue"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "kind": "hardening",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass-alternative.patch",
+   "kind": "alternative",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "kind": "blind",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: validation refuses by returning an error; there is no status or side effect a crash could stand in for",
+  "wrong_resource": "n/a: the protected object is the certificate path itself; there is no neighbouring or proxy resource to authorise instead",
+  "one_role_or_direction": "ff-excluded-containment.patch",
+  "reads_only": "n/a: path validation has no read/write split over a protected store",
+  "check_after_adjustment": "n/a: the constraint comparison reads the SAN and constraint strings directly; no normalising or adjusting step runs between them",
+  "unlisted_route": "sf-selfissued-guard.patch",
+  "malformed_identity": "n/a: wildcard spellings are parsed by one shared constructor, so a second parser cannot see them differently",
+  "missing_authority": "n/a: there is no authority, secret or role service in path validation",
+  "adjacent_api": "sf-hostname-matcher.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "lever": "main",
+   "shape": "shape: a wildcard SAN denotes a set; a permitted subtree must contain the whole set, not merely overlap it",
+   "where": "src/rust/cryptography-x509-verification/src/lib.rs:156-180, src/rust/cryptography-x509-verification/src/types.rs:168-212",
+   "reason_to_dismiss": "The reported route; a model that stops at the advisory's example fixes only this.",
+   "security_tests": [
+    "permitted_wildcard_escape",
+    "permitted_wildcard_escape_multilabel",
+    "permitted_wildcard_escape_mixed_case"
+   ],
+   "coupled_functional_tests": [
+    "wildcard_permitted_by_base",
+    "wildcard_permitted_by_multi_label_base",
+    "wildcard_not_overlapping_excluded"
+   ],
+   "security_fail_patch": "sf-permitted-containment.patch",
+   "functional_fail_patch": "n/a",
+   "realistic_because": "real, unmodified upstream code: at the pinned release a wildcard pattern matches a more specific permitted subtree when the subtree is one of the names the wildcard can expand to"
+  },
+  {
+   "id": "T2",
+   "lever": "injected sibling (route where the check never runs)",
+   "shape": "route: constraint evaluation is skipped for a whole chain shape",
+   "where": "src/rust/cryptography-x509-verification/src/lib.rs:366-374",
+   "reason_to_dismiss": "The guard reads like the RFC's self-issued exemption and sits next to the existing self-issued handling, so it looks deliberate; the report is about wildcard comparison, not about whether the comparison runs.",
+   "security_tests": [
+    "selfissued_wildcard_permitted_escape",
+    "selfissued_exact_permitted_escape"
+   ],
+   "coupled_functional_tests": [
+    "exact_name_permitted",
+    "wildcard_permitted_by_base"
+   ],
+   "security_fail_patch": "sf-selfissued-guard.patch",
+   "functional_fail_patch": "n/a",
+   "realistic_because": "injected sibling: a plausible maintainer misreading of RFC 5280's exemption for self-issued certificates becomes a guard that skips the evaluation for a self-issued CA in the path"
+  },
+  {
+   "id": "T3",
+   "lever": "injected sibling (second implementation of wildcard matching)",
+   "shape": "second implementation: the requested-name match treats a wildcard as a suffix instead of exactly one label",
+   "where": "src/rust/cryptography-x509-verification/src/policy/mod.rs:184-222",
+   "reason_to_dismiss": "The report is about CA name constraints; requested-name matching is a different feature in a different module, and its helper looks like a convenience wrapper.",
+   "security_tests": [
+    "subject_matching_beyond_wildcard_label"
+   ],
+   "coupled_functional_tests": [
+    "subject_matches_single_wildcard_label"
+   ],
+   "security_fail_patch": "sf-hostname-matcher.patch",
+   "functional_fail_patch": "n/a",
+   "realistic_because": "injected sibling: a plausible wrapper that compares the wildcard base as a suffix, which is the classic wildcard-matching mistake and keeps the one-label case working"
+  },
+  {
+   "id": "T4",
+   "lever": "coupled must-keep-working (over-broad fix)",
+   "shape": "coupled: the excluded direction is overlap-based, so applying the permitted containment rule to both directions silently stops excluding wildcard SANs",
+   "where": "src/rust/cryptography-x509-verification/src/types.rs:205-212",
+   "reason_to_dismiss": "Applying one rule to both subtree kinds is the obvious symmetric refactor and looks cleaner than two different matchers.",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "wildcard_overlapping_excluded",
+    "wildcard_not_overlapping_excluded",
+    "exact_name_excluded"
+   ],
+   "security_fail_patch": "n/a: functional lever (see functional_fail_patch)",
+   "functional_fail_patch": "ff-excluded-containment.patch",
+   "realistic_because": "the excluded semantics are already overlap-based at the pinned commit; a fix that unifies the two directions is a natural over-hardening"
+  }
+ ],
+ "status": "built; gate PASSED (2026-10-30): static PASS; nop PASS (security 0/6 \u2014 all six fail as exploits \u2014 functional 8/8); oracle PASS (3 runs, reward 1.0 each, identical); patches PASS (7/7 as declared: 3 security_fail, 2 functional_fail, hardening 1.0, alternative 1.0; the blind pass patch is produced downstream)."
+}

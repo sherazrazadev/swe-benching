@@ -1,0 +1,152 @@
+diff -ruN a/packages/core/src/lib/actions/callback/oauth/checks.ts b/packages/core/src/lib/actions/callback/oauth/checks.ts
+--- a/packages/core/src/lib/actions/callback/oauth/checks.ts	2026-10-30 00:42:59.000000000 +0000
++++ b/packages/core/src/lib/actions/callback/oauth/checks.ts	2026-10-30 01:55:14.934501012 +0000
+@@ -12,6 +12,11 @@
+ } from "../../../../types.js"
+ import type { Cookie } from "../../../utils/cookie.js"
+ import type { WebAuthnProviderType } from "../../../../providers/webauthn.js"
++import {
++  assertMintedFor,
++  stampProvider,
++} from "../../../utils/provider-binding.js"
++import type { ProviderStamped } from "../../../utils/provider-binding.js"
+ 
+ interface CookiePayload {
+   value: string
+@@ -37,10 +42,16 @@
+     expires,
+   })
+ 
++  // The payload records which provider minted the value, so a reader can refuse
++  // a check that was stored during a sign-in for a different provider.
++  const token: ProviderStamped<CookiePayload> = stampProvider(
++    { value: payload },
++    options
++  )
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: COOKIE_TTL,
+-    token: { value: payload } satisfies CookiePayload,
++    token,
+     salt: cookie.name,
+   })
+   const cookieOptions = { ...cookie.options, expires }
+@@ -57,13 +68,15 @@
+     logger.debug(`PARSE_${name.toUpperCase()}`, { cookie: value })
+ 
+     if (!value) throw new InvalidCheck(`${name} cookie was missing`)
+-    const parsed = await decode<CookiePayload>({
++    const parsed = await decode<ProviderStamped<CookiePayload>>({
+       ...jwt,
+       token: value,
+       salt: cookies[name].name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    // A check value is only good for the provider that minted it.
++    assertMintedFor(parsed, options)
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck(`${name} value could not be parsed`, {
+       cause: error,
+diff -ruN a/packages/core/src/lib/actions/signin/link-intent.ts b/packages/core/src/lib/actions/signin/link-intent.ts
+--- a/packages/core/src/lib/actions/signin/link-intent.ts	2026-10-30 00:48:03.000000000 +0000
++++ b/packages/core/src/lib/actions/signin/link-intent.ts	2026-10-30 01:55:15.524497914 +0000
+@@ -4,6 +4,11 @@
+ // sign-in values use, but kept in its own module so the sign-in intent can be
+ // read without pulling in the OAuth check machinery.
+ import { decode, encode } from "../../../jwt.js"
++import {
++  assertMintedFor,
++  stampProvider,
++} from "../../utils/provider-binding.js"
++import type { ProviderStamped } from "../../utils/provider-binding.js"
+ 
+ import type { InternalOptions } from "../../../types.js"
+ import type { Cookie } from "../../utils/cookie.js"
+@@ -27,10 +32,14 @@
+   const expires = new Date()
+   expires.setTime(expires.getTime() + LINK_INTENT_TTL * 1000)
+ 
++  const token: ProviderStamped<LinkIntentPayload> = stampProvider(
++    { value: userId },
++    options
++  )
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: LINK_INTENT_TTL,
+-    token: { value: userId } satisfies LinkIntentPayload,
++    token,
+     salt: cookie.name,
+   })
+ 
+@@ -48,13 +57,15 @@
+ ): Promise<string> {
+   try {
+     if (!value) throw new InvalidCheck("link intent cookie was missing")
+-    const parsed = await decode<LinkIntentPayload>({
++    const parsed = await decode<ProviderStamped<LinkIntentPayload>>({
+       ...options.jwt,
+       token: value,
+       salt: options.cookies.linkIntent.name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    // The intent is only good for the provider whose sign-in stored it.
++    assertMintedFor(parsed, options)
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck("link intent value could not be parsed", {
+       cause: error,
+diff -ruN a/packages/core/src/lib/utils/provider-binding.ts b/packages/core/src/lib/utils/provider-binding.ts
+--- a/packages/core/src/lib/utils/provider-binding.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/core/src/lib/utils/provider-binding.ts	2026-10-30 01:53:08.676157387 +0000
+@@ -0,0 +1,46 @@
++/**
++ * Client-side values that carry an in-progress sign-in — the OAuth state, PKCE verifier and
++ * nonce, the WebAuthn challenge, and the account-link intent — are sealed into cookies by this
++ * library and read back when the provider sends the browser to the callback.
++ *
++ * Such a value belongs to the provider whose sign-in stored it. Every sealer therefore stamps
++ * the minting provider into the sealed payload, and every reader refuses a payload whose stamp
++ * does not name the provider handling the current request. A payload carrying no usable stamp
++ * (for instance one sealed before stamps existed) cannot be attributed to any provider and is
++ * refused the same way.
++ */
++import type { InternalOptions } from "../../types.js"
++
++/** Key under which a sealed sign-in value records the provider that minted it. */
++export const MINTED_FOR = "mintedFor" as const
++
++/** A sealed sign-in value's payload, stamped with the provider that minted it. */
++export type ProviderStamped<T> = T & { [MINTED_FOR]?: string }
++
++/**
++ * Stamps `payload` with the provider handling the current request. Call this immediately before
++ * sealing a value that the callback will read back.
++ */
++export function stampProvider<T extends object>(
++  payload: T,
++  options: InternalOptions
++): ProviderStamped<T> {
++  return { ...payload, [MINTED_FOR]: options.provider?.id }
++}
++
++/**
++ * Throws unless `payload` was stamped by the provider handling the current request. Absent,
++ * non-string, and foreign stamps are all refused; only an exact provider id match passes.
++ */
++export function assertMintedFor(
++  payload: { [MINTED_FOR]?: unknown } | null | undefined,
++  options: InternalOptions
++): void {
++  const stamp = payload?.[MINTED_FOR]
++  const providerId = options.provider?.id
++  if (typeof stamp !== "string" || stamp !== providerId) {
++    throw new Error(
++      "sealed sign-in value was minted for a different provider than the one handling the request"
++    )
++  }
++}

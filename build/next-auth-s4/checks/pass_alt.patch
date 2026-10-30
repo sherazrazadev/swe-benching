@@ -1,0 +1,175 @@
+diff --git a/packages/core/src/lib/actions/callback/index.ts b/packages/core/src/lib/actions/callback/index.ts
+index 4b6459cc..61933b24 100644
+--- a/packages/core/src/lib/actions/callback/index.ts
++++ b/packages/core/src/lib/actions/callback/index.ts
+@@ -133,8 +133,10 @@ export async function callback(
+ 
+       // If the user asked to link the provider account to their existing
+       // account, the callback finishes that link before signing in.
+-      const linkIntentValue =
+-        request.cookies?.[options.cookies.linkIntent.name]
++      const linkIntentName = options.provider?.id
++        ? `${options.cookies.linkIntent.name}.${options.provider.id}`
++        : options.cookies.linkIntent.name
++      const linkIntentValue = request.cookies?.[linkIntentName]
+       if (linkIntentValue) {
+         const linkUserId = await openLinkIntent(linkIntentValue, options)
+         if (adapter) {
+diff --git a/packages/core/src/lib/actions/callback/oauth/checks.ts b/packages/core/src/lib/actions/callback/oauth/checks.ts
+index 8d8fac11..8e15e78e 100644
+--- a/packages/core/src/lib/actions/callback/oauth/checks.ts
++++ b/packages/core/src/lib/actions/callback/oauth/checks.ts
+@@ -15,10 +15,21 @@ import type { WebAuthnProviderType } from "../../../../providers/webauthn.js"
+ 
+ interface CookiePayload {
+   value: string
++  provider?: string
+ }
+ 
+ const COOKIE_TTL = 60 * 15 // 15 minutes
+ 
++/** Cookie names are scoped to the provider that minted them. */
++function providerCookieName(
++  name: keyof CookiesOptions,
++  options: InternalOptions
++): string {
++  const base = options.cookies[name].name
++  const provider = options.provider?.id
++  return provider ? `${base}.${provider}` : base
++}
++
+ /** Returns a cookie with a JWT encrypted payload. */
+ async function sealCookie(
+   name: keyof CookiesOptions,
+@@ -27,11 +38,12 @@ async function sealCookie(
+ ): Promise<Cookie> {
+   const { cookies, logger } = options
+   const cookie = cookies[name]
++  const cookieName = providerCookieName(name, options)
+   const expires = new Date()
+   expires.setTime(expires.getTime() + COOKIE_TTL * 1000)
+ 
+   logger.debug(`CREATE_${name.toUpperCase()}`, {
+-    name: cookie.name,
++    name: cookieName,
+     payload,
+     COOKIE_TTL,
+     expires,
+@@ -40,11 +52,11 @@ async function sealCookie(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: COOKIE_TTL,
+-    token: { value: payload } satisfies CookiePayload,
+-    salt: cookie.name,
++    token: { value: payload, provider: options.provider.id } satisfies CookiePayload,
++    salt: cookieName,
+   })
+   const cookieOptions = { ...cookie.options, expires }
+-  return { name: cookie.name, value: encoded, options: cookieOptions }
++  return { name: cookieName, value: encoded, options: cookieOptions }
+ }
+ 
+ async function parseCookie(
+@@ -60,10 +72,13 @@ async function parseCookie(
+     const parsed = await decode<CookiePayload>({
+       ...jwt,
+       token: value,
+-      salt: cookies[name].name,
++      salt: providerCookieName(name, options),
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider !== options.provider?.id) {
++      throw new Error("cookie was created for a different provider")
++    }
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck(`${name} value could not be parsed`, {
+       cause: error,
+@@ -80,7 +95,7 @@ function clearCookie(
+   const cookie = cookies[name]
+   logger.debug(`CLEAR_${name.toUpperCase()}`, { cookie })
+   resCookies.push({
+-    name: cookie.name,
++    name: providerCookieName(name, options),
+     value: "",
+     options: { ...cookies[name].options, maxAge: 0 },
+   })
+@@ -97,7 +112,7 @@ function useCookie(
+   ) {
+     const { provider, logger } = options
+     if (!provider?.checks?.includes(check)) return
+-    const cookieValue = cookies?.[options.cookies[name].name]
++    const cookieValue = cookies?.[providerCookieName(name, options)]
+     logger.debug(`USE_${name.toUpperCase()}`, { value: cookieValue })
+     const parsed = await parseCookie(name, cookieValue, options)
+     clearCookie(name, options, resCookies)
+@@ -238,7 +253,8 @@ export const webauthnChallenge = {
+     cookies: RequestInternal["cookies"],
+     resCookies: Cookie[]
+   ): Promise<WebAuthnChallengePayload> {
+-    const cookieValue = cookies?.[options.cookies.webauthnChallenge.name]
++    const cookieValue =
++      cookies?.[providerCookieName("webauthnChallenge", options)]
+ 
+     const parsed = await parseCookie("webauthnChallenge", cookieValue, options)
+ 
+diff --git a/packages/core/src/lib/actions/signin/link-intent.ts b/packages/core/src/lib/actions/signin/link-intent.ts
+index aeec0969..14ba4442 100644
+--- a/packages/core/src/lib/actions/signin/link-intent.ts
++++ b/packages/core/src/lib/actions/signin/link-intent.ts
+@@ -10,8 +10,15 @@ import type { Cookie } from "../../utils/cookie.js"
+ 
+ const LINK_INTENT_TTL = 60 * 15 // 15 minutes
+ 
++function linkIntentCookieName(options: InternalOptions): string {
++  const base = options.cookies.linkIntent.name
++  const provider = options.provider?.id
++  return provider ? `${base}.${provider}` : base
++}
++
+ interface LinkIntentPayload {
+   value: string
++  provider?: string
+ }
+ 
+ /**
+@@ -30,12 +37,15 @@ export async function sealLinkIntent(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: LINK_INTENT_TTL,
+-    token: { value: userId } satisfies LinkIntentPayload,
+-    salt: cookie.name,
++    token: {
++      value: userId,
++      provider: options.provider.id,
++    } satisfies LinkIntentPayload,
++    salt: linkIntentCookieName(options),
+   })
+ 
+   return {
+-    name: cookie.name,
++    name: linkIntentCookieName(options),
+     value: encoded,
+     options: { ...cookie.options, expires },
+   }
+@@ -51,10 +61,15 @@ export async function openLinkIntent(
+     const parsed = await decode<LinkIntentPayload>({
+       ...options.jwt,
+       token: value,
+-      salt: options.cookies.linkIntent.name,
++      salt: linkIntentCookieName(options),
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider !== options.provider?.id) {
++      throw new Error(
++        "link intent cookie was created for a different provider than the one handling the callback"
++      )
++    }
++    return parsed.value
+   } catch (error) {
+     throw new InvalidCheck("link intent value could not be parsed", {
+       cause: error,

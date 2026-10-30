@@ -1,0 +1,249 @@
+{
+ "slug": "next-auth-s4",
+ "candidate": "nextauthjs/next-auth a63eee12a1a20cb35209e44195b097868517b9a0 (GHSA-X445-F3H2-J279 / CVE-2026-73419); published fixes 9f7a97fade9b1319bb9ac19fc9828d62e0a2a852 (v5 checks.ts) and 5bca2399a79ba8d116ca5179b4b1ebcd152e7f05 (v4 package)",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "HTTP POST /api/auth/signin/:provider (mints), GET /api/auth/callback/:provider (consumes OAuth check cookies, the account-link intent and, for redirect proxies, forwards before validation), GET /api/auth/webauthn-options/:provider and POST /api/auth/callback/:provider for passkeys; all driven through Auth(request, config) from @auth/core",
+  "sites": [
+   "packages/core/src/lib/actions/callback/oauth/checks.ts:16 (CookiePayload), :23 sealCookie, :50 parseCookie, :89 useCookie, :216 webauthnChallenge",
+   "packages/core/src/lib/actions/signin/link-intent.ts (injected; sealLinkIntent/openLinkIntent)",
+   "packages/core/src/lib/actions/signin/index.ts:30-44 (mints the link intent)",
+   "packages/core/src/lib/actions/callback/index.ts:110-130 (applies the link intent), :69-81 (redirect-proxy hop)",
+   "packages/core/src/lib/utils/cookie.ts:121 default cookie map; packages/core/src/types.ts:191 CookiesOptions"
+  ],
+  "routes": [
+   "state/nonce/PKCE cookie replay from provider A's real sign-in onto provider B's real callback",
+   "a sealed value saved before the provider was recorded (no provider field) presented to the same provider's callback",
+   "a WebAuthn challenge minted by provider A's webauthn-options action presented to provider B's callback",
+   "an account-link intent minted by a real sign-in for provider A presented to provider B's callback",
+   "redirect-proxy forwarding with no browser cookies (must keep working)"
+  ],
+  "services": [],
+  "project_tests": {
+   "command": "vitest run -c packages/utils/vitest.config.ts packages/core/test/actions/callback.test.ts packages/core/test/jwt.test.ts packages/core/test/webauthn-utils.test.ts",
+   "result": "63/63 pass at the pinned+injected commit and with the reference fix; also run as the functional project group in the verifier"
+  },
+  "local_verification": {
+   "pinned_injected": "security 0/9 pass, hidden functional 5/5 pass, project 63/63 pass",
+   "oracle": "security 9/9 pass, hidden functional 5/5 pass, project 63/63 pass",
+   "note": "verified with the project's vitest against the source tree; container gate is the authoritative proof"
+  },
+  "gate": {
+   "static": "pass",
+   "nop": "pass (security 9/9 failing on vulnerable, functional 68/68 passing)",
+   "oracle": "pass (3 runs, reward 1.0, identical)",
+   "patches": {
+    "sf_miss_legacy.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.5556
+    },
+    "sf_miss_webauthn.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.8889
+    },
+    "sf_miss_linkintent.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.7778
+    },
+    "sf_state_only.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.4444
+    },
+    "sf_mint_only.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.0
+    },
+    "sf_crash.patch": {
+     "expect": "security_fail",
+     "ok": true,
+     "reward": 0.0
+    },
+    "ff_refuse_all.patch": {
+     "expect": "functional_fail",
+     "ok": true,
+     "reward": 0.0
+    },
+    "ff_proxy_validation.patch": {
+     "expect": "functional_fail",
+     "ok": true,
+     "reward": 0.0
+    },
+    "pass_hardening.patch": {
+     "expect": "pass",
+     "ok": true,
+     "reward": 1.0
+    },
+    "pass_alt.patch": {
+     "expect": "pass",
+     "ok": true,
+     "reward": 1.0
+    }
+   }
+  }
+ },
+ "leak_terms": [
+  "checks.ts",
+  "sealCookie",
+  "parseCookie",
+  "useCookie",
+  "link-intent",
+  "linkIntent",
+  "link_intent",
+  "webauthnChallenge",
+  "InvalidCheck",
+  "CookiePayload",
+  "redirectProxyUrl",
+  "isOnRedirectProxy",
+  "getAuthorizationUrl",
+  "openLinkIntent",
+  "sealLinkIntent",
+  "providerCookieName",
+  "ProviderMismatch"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_legacy.patch",
+   "expect": "security_fail",
+   "note": "records the provider but only rejects when a provider field is present, so values saved earlier are still honoured (4 security tests fail, functional all pass)"
+  },
+  {
+   "patch": "sf_miss_webauthn.patch",
+   "expect": "security_fail",
+   "note": "binds only the three OAuth checks, leaving the passkey challenge unbound (1 security test fails, functional all pass)"
+  },
+  {
+   "patch": "sf_miss_linkintent.patch",
+   "expect": "security_fail",
+   "note": "the published-shaped fix only; the separately sealed account-link intent in another module stays unbound (2 security tests fail, functional all pass)"
+  },
+  {
+   "patch": "sf_state_only.patch",
+   "expect": "security_fail",
+   "note": "guards only the state check; PKCE, nonce and the passkey challenge stay open (5 security tests fail, functional all pass)"
+  },
+  {
+   "patch": "sf_mint_only.patch",
+   "expect": "security_fail",
+   "note": "records the provider on mint but never checks it on read (all 9 security tests fail, functional all pass)"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail",
+   "note": "answers a foreign value with a server error instead of a clean client-facing refusal (all 9 security tests fail on the status contract, functional all pass)"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every provider callback; the security tests are satisfied but legitimate sign-in breaks"
+  },
+  {
+   "patch": "ff_proxy_validation.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: validates the sign-in cookie at a forwarding hop that cannot hold it, breaking the documented redirect-proxy deployment"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus stricter type validation of the recorded provider"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent correct design: provider-scoped cookie names plus a recorded provider marker"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the protected object is the identity provider handling the request; there is no neighbouring or caller-supplied resource to authorise instead",
+  "one_role_or_direction": "sf_state_only.patch",
+  "reads_only": "sf_mint_only.patch",
+  "check_after_adjustment": "n/a: the provider identity is compared verbatim; no normalising or adjusting step sits between the request value and the decision",
+  "unlisted_route": "sf_miss_linkintent.patch",
+  "malformed_identity": "sf_miss_legacy.patch",
+  "missing_authority": "n/a: every consumer of a sealed sign-in value runs with a provider resolved from the request path, so there is no authority-less path to fail open on",
+  "adjacent_api": "ff_proxy_validation.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "name": "a sealed value that records no provider is treated as matching",
+   "shape": "shape a plausible check mishandles: the provider is recorded on mint, but a value saved before the record existed (no provider field) is accepted by a lenient 'reject only when present' comparison",
+   "where": "packages/core/src/lib/actions/callback/oauth/checks.ts:63-72; packages/core/src/lib/actions/signin/link-intent.ts:55-66",
+   "security_tests": [
+    "security/oauth_checks.test.ts::OAuth state value is bound to its provider > rejects a state value saved before the provider was recorded",
+    "security/oauth_checks.test.ts::OAuth PKCE verifier is bound to its provider > rejects a verifier saved before the provider was recorded",
+    "security/oauth_checks.test.ts::OIDC nonce is bound to its provider > rejects a nonce saved before the provider was recorded",
+    "security/link_intent.test.ts::account-link intent is bound to its provider > does not apply a link intent saved before the provider was recorded"
+   ],
+   "coupled_functional_tests": [
+    "functional/hidden/oauth_flows.test.ts::same-provider OAuth sign-in",
+    "functional/hidden/link_intent.test.ts::same-provider account linking"
+   ],
+   "security_fail_patch": "sf_miss_legacy.patch",
+   "realistic_because": "a backwards-compatibility reading of the published change; the published v4 test explicitly covers legacy cookies, and a lenient 'if (recorded) compare' is a natural way to keep old cookies working"
+  },
+  {
+   "id": "T2",
+   "name": "the passkey challenge is the same kind of stored sign-in value",
+   "shape": "route where the protection never existed: the WebAuthn challenge is minted and read through the same sealed-cookie helpers, but the advisory names only state, nonce and PKCE, so a per-check fix leaves it unbound",
+   "where": "packages/core/src/lib/actions/callback/oauth/checks.ts:216-257 (webauthnChallenge.create/use); consumed at packages/core/src/lib/utils/webauthn-utils.ts:238,343",
+   "security_tests": [
+    "security/webauthn_challenge.test.ts::WebAuthn challenge is bound to its provider > rejects a challenge minted for another provider"
+   ],
+   "coupled_functional_tests": [
+    "functional/hidden/webauthn.test.ts::same-provider WebAuthn registration"
+   ],
+   "security_fail_patch": "sf_miss_webauthn.patch, sf_state_only.patch",
+   "realistic_because": "real, unmodified upstream code: the challenge is a fourth sealed value in the same cookie map, consumed through the same trust decision, and is not one of the three checks the advisory names"
+  },
+  {
+   "id": "T3",
+   "name": "a second sealed sign-in value with its own mint/read helpers",
+   "shape": "second implementation off the reported path (injected): the account-link intent is sealed by its own helper module (the OAuth check helpers are module-private) and is honoured on the callback regardless of which provider stored it",
+   "where": "packages/core/src/lib/actions/signin/link-intent.ts (whole module); applied at packages/core/src/lib/actions/callback/index.ts:110-130",
+   "security_tests": [
+    "security/link_intent.test.ts::account-link intent is bound to its provider > does not apply a link intent minted for another provider",
+    "security/link_intent.test.ts::account-link intent is bound to its provider > does not apply a link intent saved before the provider was recorded"
+   ],
+   "coupled_functional_tests": [
+    "functional/hidden/link_intent.test.ts::same-provider account linking > links the provider account to the target account and signs it in"
+   ],
+   "security_fail_patch": "sf_miss_linkintent.patch",
+   "realistic_because": "maintainer-style parity feature: linking a provider to an existing account needs the target account to survive the OAuth round trip even when the session cookie is not sent, and the existing seal/read helpers are private to the OAuth checks module; the upstream fix never touches this module"
+  },
+  {
+   "id": "T4",
+   "name": "the redirect-proxy hop must not be made to validate browser state",
+   "shape": "coupled must-keep-working: a forwarding service receives the provider callback and redirects to the app that started the sign-in; it cannot hold that app's browser cookies, so validating the sign-in cookie at that hop breaks the documented deployment",
+   "where": "packages/core/src/lib/actions/callback/index.ts:69-81; packages/core/src/lib/actions/signin/authorization-url.ts:56-60; packages/core/src/providers/oauth.ts:286",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/hidden/oauth_flows.test.ts::redirect proxy hop > forwards a callback to the app that started the sign-in, without browser cookies",
+    "project callback.test.ts::assert GET callback action > Redirect Proxy"
+   ],
+   "security_fail_patch": "ff_proxy_validation.patch",
+   "realistic_because": "documented redirectProxyUrl behaviour and a real upstream test; an over-broad 'validate the state as early as possible' fix fails it"
+  }
+ ],
+ "out_of_scope_notes": [
+  "The bundled getToken() malformed-Bearer hardening (GHSA-xmf8-cvqr-rfgj, packages/core/src/jwt.ts:173-176) belongs to a different advisory and is not built on."
+ ],
+ "status": "built; gate PASSED: static; nop 9 security tests failing on the pinned+injected tree with 68 functional passing; oracle 3 runs reward 1.0 with identical results; patches 10/10 as declared (6 security_fail, 2 functional_fail, hardening and alternative pass at 1.0). The blind pass patch and FAIRNESS.md are written downstream."
+}

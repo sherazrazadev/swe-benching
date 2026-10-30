@@ -1,0 +1,239 @@
+diff -ruN a/src/components/chart/ha-chart-base.ts b/src/components/chart/ha-chart-base.ts
+--- a/src/components/chart/ha-chart-base.ts	2026-10-30 00:45:45.000000000 +0000
++++ b/src/components/chart/ha-chart-base.ts	2026-10-30 01:15:27.272105909 +0000
+@@ -45,6 +45,156 @@
+ const LEGEND_OVERFLOW_LIMIT_MOBILE = 6;
+ const DOUBLE_TAP_TIME = 300;
+ 
++// Chart tooltip formatters build an HTML string that the charting library
++// inserts as markup. Those strings mix markup owned by the chart with values
++// Home Assistant holds for registered objects (entity, statistic, device and
++// area names, units, states), which a user or integration can supply. Only
++// presentational markup is kept: an element outside this list is removed
++// together with its attributes, and text is re-created as a text node, so a
++// supplied value can never introduce an element or run.
++const TOOLTIP_ALLOWED_TAGS = new Set([
++  "b",
++  "strong",
++  "i",
++  "em",
++  "u",
++  "s",
++  "small",
++  "sub",
++  "sup",
++  "br",
++  "hr",
++  "wbr",
++  "h1",
++  "h2",
++  "h3",
++  "h4",
++  "h5",
++  "h6",
++  "span",
++  "div",
++  "p",
++  "blockquote",
++  "q",
++  "cite",
++  "abbr",
++  "mark",
++  "kbd",
++  "bdi",
++  "bdo",
++  "code",
++  "pre",
++  "ul",
++  "ol",
++  "li",
++  "dl",
++  "dt",
++  "dd",
++  "table",
++  "thead",
++  "tbody",
++  "tfoot",
++  "tr",
++  "td",
++  "th",
++]);
++
++// Inline styles carry the colour indicators and layout the tooltips use; dir
++// and class are presentational too. Event handler and URL attributes are not
++// part of this list and are therefore discarded.
++const TOOLTIP_ALLOWED_ATTRIBUTES = new Set(["style", "dir", "class"]);
++
++const sanitizeTooltipNode = (node: Node): Node | null => {
++  if (node.nodeType === 3) {
++    return document.createTextNode(node.nodeValue ?? "");
++  }
++  if (node.nodeType !== 1) {
++    return null;
++  }
++  const element = node as Element;
++  const tag = element.tagName.toLowerCase();
++  if (!TOOLTIP_ALLOWED_TAGS.has(tag)) {
++    return null;
++  }
++  const clean = document.createElement(tag);
++  for (const attribute of Array.from(element.attributes)) {
++    if (TOOLTIP_ALLOWED_ATTRIBUTES.has(attribute.name.toLowerCase())) {
++      clean.setAttribute(attribute.name, attribute.value);
++    }
++  }
++  for (const child of Array.from(element.childNodes)) {
++    const cleanedChild = sanitizeTooltipNode(child);
++    if (cleanedChild) {
++      clean.appendChild(cleanedChild);
++    }
++  }
++  return clean;
++};
++
++const sanitizeTooltipHtml = (html: string): string => {
++  // No `<` means there is no tag to parse; the string is already plain text.
++  if (!html.includes("<")) {
++    return html;
++  }
++  const source = document.createElement("template");
++  source.innerHTML = html;
++  const container = document.createElement("div");
++  for (const child of Array.from(source.content.childNodes)) {
++    const cleaned = sanitizeTooltipNode(child);
++    if (cleaned) {
++      container.appendChild(cleaned);
++    }
++  }
++  return container.innerHTML;
++};
++
++// Wrap a tooltip formatter so whatever it returns as a string is reduced to
++// presentational markup before the charting library renders it. Non-string
++// results (null/nothing/Node/TemplateResult) are passed through untouched.
++const wrapTooltipFormatter = <T>(formatter: T): T => {
++  if (typeof formatter !== "function") {
++    return formatter;
++  }
++  const wrapped = (params: any, ticket?: any) => {
++    const result = (formatter as (...args: any[]) => any)(params, ticket);
++    return typeof result === "string" ? sanitizeTooltipHtml(result) : result;
++  };
++  return wrapped as unknown as T;
++};
++
++// Copy a tooltip option object, wrapping its formatter. Copying keeps the
++// caller's (possibly memoized) options free of mutations.
++const processTooltipOption = (tooltip: any): any =>
++  tooltip && typeof tooltip === "object"
++    ? { ...tooltip, formatter: wrapTooltipFormatter(tooltip.formatter) }
++    : tooltip;
++
++// Apply tooltip processing to a series and to any tooltip attached to one of
++// its data items. The series is only copied when it actually carries one.
++const processSeriesTooltips = (series: any): any => {
++  if (!series || typeof series !== "object") {
++    return series;
++  }
++  let next = series;
++  if (series.tooltip?.formatter) {
++    next = { ...next, tooltip: processTooltipOption(series.tooltip) };
++  }
++  if (Array.isArray(series.data)) {
++    let hasItemTooltip = false;
++    const data = series.data.map((item: any) => {
++      if (item && typeof item === "object" && item.tooltip?.formatter) {
++        hasItemTooltip = true;
++        return { ...item, tooltip: processTooltipOption(item.tooltip) };
++      }
++      return item;
++    });
++    if (hasItemTooltip) {
++      next = { ...next, data };
++    }
++  }
++  return next;
++};
++
+ export type CustomLegendOption = ECOption["legend"] & {
+   type: "custom";
+   data?: {
+@@ -757,22 +907,40 @@
+       xAxis,
+     };
+ 
+-    const isMobile = window.matchMedia(
+-      "all and (max-width: 450px), all and (max-height: 500px)"
+-    ).matches;
+-    if (isMobile && options.tooltip) {
+-      // mobile charts are full width so we need to confine the tooltip to the chart
+-      const tooltips = Array.isArray(options.tooltip)
+-        ? options.tooltip
+-        : [options.tooltip];
+-      tooltips.forEach((tooltip) => {
+-        tooltip.confine = true;
+-        tooltip.appendTo = undefined;
+-        tooltip.triggerOn = "click";
+-      });
+-      options.tooltip = tooltips;
++    let processedOptions: any = options;
++
++    // Series supplied through the chart options bypass the `.data` path, so
++    // their tooltips need the same processing here.
++    if (processedOptions.series) {
++      processedOptions = {
++        ...processedOptions,
++        series: ensureArray(processedOptions.series).map(processSeriesTooltips),
++      };
+     }
+-    return options;
++
++    // Tooltip content may be a single option object or a list of them.
++    if (processedOptions.tooltip) {
++      const isMobile = window.matchMedia(
++        "all and (max-width: 450px), all and (max-height: 500px)"
++      ).matches;
++      const processTooltipEntry = (tooltip: any) => {
++        const processedTooltip = processTooltipOption(tooltip);
++        if (isMobile && processedTooltip) {
++          // mobile charts are full width so we need to confine the tooltip to the chart
++          processedTooltip.confine = true;
++          processedTooltip.appendTo = undefined;
++          processedTooltip.triggerOn = "click";
++        }
++        return processedTooltip;
++      };
++      processedOptions = {
++        ...processedOptions,
++        tooltip: Array.isArray(processedOptions.tooltip)
++          ? processedOptions.tooltip.map(processTooltipEntry)
++          : processTooltipEntry(processedOptions.tooltip),
++      };
++    }
++    return processedOptions as ECOption;
+   }
+ 
+   private _createTheme(style: CSSStyleDeclaration) {
+@@ -976,7 +1144,7 @@
+                 ? xAxis.max
+                 : undefined
+             : undefined;
+-          return {
++          return processSeriesTooltips({
+             ...s,
+             sampling: undefined,
+             data: downSampleLineData(
+@@ -985,11 +1153,11 @@
+               minX,
+               maxX
+             ),
+-          };
++          });
+         }
+       }
+       const name = filterXSS(String(s.name ?? s.id ?? ""));
+-      return { ...s, name, data };
++      return processSeriesTooltips({ ...s, name, data });
+     });
+     return series as ECOption["series"];
+   }

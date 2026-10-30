@@ -1,0 +1,112 @@
+diff --git a/packages/core/src/lib/actions/callback/index.ts b/packages/core/src/lib/actions/callback/index.ts
+index 4b6459cc..97c51dd6 100644
+--- a/packages/core/src/lib/actions/callback/index.ts
++++ b/packages/core/src/lib/actions/callback/index.ts
+@@ -550,6 +550,14 @@ export async function callback(
+       `Callback for provider type (${provider.type}) is not supported`
+     )
+   } catch (e) {
++    if ((e as any)?.name === "ProviderMismatch") {
++      return {
++        status: 500,
++        body: { error: "refused" },
++        headers: { "Content-Type": "application/json" },
++        cookies,
++      }
++    }
+     if (e instanceof AuthError) throw e
+     const error = new CallbackRouteError(e as Error, { provider: provider.id })
+     logger.debug("callback route error details", { method, query, body })
+diff --git a/packages/core/src/lib/actions/callback/oauth/checks.ts b/packages/core/src/lib/actions/callback/oauth/checks.ts
+index 8d8fac11..7f9b5ef7 100644
+--- a/packages/core/src/lib/actions/callback/oauth/checks.ts
++++ b/packages/core/src/lib/actions/callback/oauth/checks.ts
+@@ -15,10 +15,15 @@ import type { WebAuthnProviderType } from "../../../../providers/webauthn.js"
+ 
+ interface CookiePayload {
+   value: string
++  provider?: string
+ }
+ 
+ const COOKIE_TTL = 60 * 15 // 15 minutes
+ 
++class ProviderMismatch extends Error {
++  name = "ProviderMismatch"
++}
++
+ /** Returns a cookie with a JWT encrypted payload. */
+ async function sealCookie(
+   name: keyof CookiesOptions,
+@@ -40,7 +45,7 @@ async function sealCookie(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: COOKIE_TTL,
+-    token: { value: payload } satisfies CookiePayload,
++    token: { value: payload, provider: options.provider.id } satisfies CookiePayload,
+     salt: cookie.name,
+   })
+   const cookieOptions = { ...cookie.options, expires }
+@@ -62,9 +67,13 @@ async function parseCookie(
+       token: value,
+       salt: cookies[name].name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider !== options.provider?.id) {
++      throw new ProviderMismatch("cookie was created for a different provider")
++    }
++    return parsed.value
+   } catch (error) {
++    if (error instanceof ProviderMismatch) throw error
+     throw new InvalidCheck(`${name} value could not be parsed`, {
+       cause: error,
+     })
+diff --git a/packages/core/src/lib/actions/signin/link-intent.ts b/packages/core/src/lib/actions/signin/link-intent.ts
+index aeec0969..e2d038a8 100644
+--- a/packages/core/src/lib/actions/signin/link-intent.ts
++++ b/packages/core/src/lib/actions/signin/link-intent.ts
+@@ -10,8 +10,13 @@ import type { Cookie } from "../../utils/cookie.js"
+ 
+ const LINK_INTENT_TTL = 60 * 15 // 15 minutes
+ 
++class ProviderMismatch extends Error {
++  name = "ProviderMismatch"
++}
++
+ interface LinkIntentPayload {
+   value: string
++  provider?: string
+ }
+ 
+ /**
+@@ -30,7 +35,10 @@ export async function sealLinkIntent(
+   const encoded = await encode({
+     ...options.jwt,
+     maxAge: LINK_INTENT_TTL,
+-    token: { value: userId } satisfies LinkIntentPayload,
++    token: {
++      value: userId,
++      provider: options.provider.id,
++    } satisfies LinkIntentPayload,
+     salt: cookie.name,
+   })
+ 
+@@ -53,9 +61,15 @@ export async function openLinkIntent(
+       token: value,
+       salt: options.cookies.linkIntent.name,
+     })
+-    if (parsed?.value) return parsed.value
+-    throw new Error("Invalid cookie")
++    if (!parsed?.value) throw new Error("Invalid cookie")
++    if (parsed.provider !== options.provider?.id) {
++      throw new ProviderMismatch(
++        "link intent cookie was created for a different provider than the one handling the callback"
++      )
++    }
++    return parsed.value
+   } catch (error) {
++    if (error instanceof ProviderMismatch) throw error
+     throw new InvalidCheck("link intent value could not be parsed", {
+       cause: error,
+     })

@@ -1,0 +1,1735 @@
+diff --git a/src/components/chart/ha-chart-base.ts b/src/components/chart/ha-chart-base.ts
+index d239697..38d87b6 100644
+--- a/src/components/chart/ha-chart-base.ts
++++ b/src/components/chart/ha-chart-base.ts
+@@ -14,6 +14,7 @@ import type {
+   ECElementEvent,
+   LegendComponentOption,
+   LineSeriesOption,
++  TooltipOption,
+   XAXisOption,
+   YAXisOption,
+ } from "echarts/types/dist/shared";
+@@ -29,22 +30,59 @@ import type { HASSDomEvent } from "../../common/dom/fire_event";
+ import { fireEvent } from "../../common/dom/fire_event";
+ import { listenMediaQuery } from "../../common/dom/media_query";
+ import { afterNextRender } from "../../common/util/render-status";
+-import { filterXSS } from "../../common/util/xss";
+ import { uiContext } from "../../data/context";
+ import type { Themes } from "../../data/ws-themes";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type {
++  ECOption,
++  HaECOption,
++  HaECSeries,
++  HaECSeriesItem,
++  HaTooltipOption,
++} from "../../resources/echarts/echarts";
+ import type { HomeAssistant, HomeAssistantUI } from "../../types";
+ import { isMac } from "../../util/is_mac";
+ import "../chips/ha-assist-chip";
+ import "../ha-icon-button";
+ import { formatTimeLabel } from "./axis-label";
+ import { downSampleLineData } from "./down-sample";
++import { wrapLitTooltipFormatter } from "./lit-tooltip-formatter";
+ 
+ export const MIN_TIME_BETWEEN_UPDATES = 60 * 5 * 1000;
+ const LEGEND_OVERFLOW_LIMIT = 10;
+ const LEGEND_OVERFLOW_LIMIT_MOBILE = 6;
+ const DOUBLE_TAP_TIME = 300;
+ 
++type RawSeriesOption = Exclude<
++  NonNullable<ECOption["series"]>,
++  readonly unknown[]
++>;
++
++const toEChartsFormatter = (
++  fn: ReturnType<typeof wrapLitTooltipFormatter>
++): NonNullable<TooltipOption["formatter"]> =>
++  fn as NonNullable<TooltipOption["formatter"]>;
++
++const convertHaTooltipFormatter = (tooltip: HaTooltipOption): TooltipOption => {
++  const { formatter, ...rest } = tooltip;
++  const next: TooltipOption = { ...rest };
++  if (typeof formatter === "function") {
++    next.formatter = toEChartsFormatter(wrapLitTooltipFormatter(formatter));
++  } else if (formatter !== undefined) {
++    next.formatter = formatter;
++  }
++  return next;
++};
++
++const processSeriesTooltipFormatter = (s: HaECSeriesItem): RawSeriesOption => {
++  if (s.tooltip && typeof s.tooltip.formatter === "function") {
++    return {
++      ...s,
++      tooltip: convertHaTooltipFormatter(s.tooltip),
++    } as RawSeriesOption;
++  }
++  return s as RawSeriesOption;
++};
++
+ export type CustomLegendOption = ECOption["legend"] & {
+   type: "custom";
+   data?: {
+@@ -66,9 +104,9 @@ export class HaChartBase extends LitElement {
+ 
+   @property({ attribute: false }) public hass!: HomeAssistant;
+ 
+-  @property({ attribute: false }) public data: ECOption["series"] = [];
++  @property({ attribute: false }) public data: HaECSeries = [];
+ 
+-  @property({ attribute: false }) public options?: ECOption;
++  @property({ attribute: false }) public options?: HaECOption;
+ 
+   @property({ type: String }) public height?: string;
+ 
+@@ -614,7 +652,7 @@ export class HaChartBase extends LitElement {
+ 
+   // Return an array of all IDs associated with the legend item of the primaryId
+   private _getAllIdsFromLegend(
+-    options: ECOption | undefined,
++    options: HaECOption | undefined,
+     primaryId: string
+   ): string[] {
+     if (!options) return [primaryId];
+@@ -634,7 +672,7 @@ export class HaChartBase extends LitElement {
+ 
+   // Parses the options structure and adds all ids of unselected legend items to hiddenDatasets.
+   // No known need to remove items at this time.
+-  private _updateHiddenStatsFromOptions(options: ECOption | undefined) {
++  private _updateHiddenStatsFromOptions(options: HaECOption | undefined) {
+     if (!options) return;
+     const legend = ensureArray(this.options?.legend || [])[0] as
+       | LegendComponentOption
+@@ -757,22 +795,42 @@ export class HaChartBase extends LitElement {
+       xAxis,
+     };
+ 
+-    const isMobile = window.matchMedia(
+-      "all and (max-width: 450px), all and (max-height: 500px)"
+-    ).matches;
+-    if (isMobile && options.tooltip) {
+-      // mobile charts are full width so we need to confine the tooltip to the chart
+-      const tooltips = Array.isArray(options.tooltip)
+-        ? options.tooltip
+-        : [options.tooltip];
+-      tooltips.forEach((tooltip) => {
+-        tooltip.confine = true;
+-        tooltip.appendTo = undefined;
+-        tooltip.triggerOn = "click";
+-      });
+-      options.tooltip = tooltips;
+-    }
+-    return options;
++    // Tooltips can also be attached to series handed to the chart through
++    // `options.series`; process those with the same wrapper as `.data` series.
++    if ((options as HaECOption).series) {
++      options.series = ensureArray(
++        (options as HaECOption).series as any
++      ).map(processSeriesTooltipFormatter) as any;
++    }
++
++    if (options.tooltip) {
++      const isMobile = window.matchMedia(
++        "all and (max-width: 450px), all and (max-height: 500px)"
++      ).matches;
++      // Shallow-copy each tooltip object so wrap/mobile mutations don't leak
++      // back into the caller's options.tooltip reference (callers may cache the
++      // options object via memoizeOne, in which case in-place mutation would
++      // pollute that cache across chart instances).
++      const processTooltip = (tooltip: HaTooltipOption): TooltipOption => {
++        const next = convertHaTooltipFormatter(tooltip);
++        if (isMobile) {
++          // mobile charts are full width so we need to confine the tooltip to the chart
++          next.confine = true;
++          next.appendTo = undefined;
++          next.triggerOn = "click";
++        }
++        return next;
++      };
++      const haTooltip = options.tooltip;
++      const processedTooltip = Array.isArray(haTooltip)
++        ? haTooltip.map(processTooltip)
++        : processTooltip(haTooltip);
++      return {
++        ...options,
++        tooltip: processedTooltip,
++      } as ECOption;
++    }
++    return options as ECOption;
+   }
+ 
+   private _createTheme(style: CSSStyleDeclaration) {
+@@ -960,8 +1018,12 @@ export class HaChartBase extends LitElement {
+       const data = this._hiddenDatasets.has(String(s.id ?? s.name))
+         ? undefined
+         : s.data;
++      let result = {
++        ...s,
++        data,
++      } as HaECSeriesItem;
+       if (data && s.type === "line") {
+-        if (s.sampling === "minmax") {
++        if ((s as LineSeriesOption).sampling === "minmax") {
+           const minX = xAxis?.min
+             ? xAxis.min instanceof Date
+               ? xAxis.min.getTime()
+@@ -976,8 +1038,8 @@ export class HaChartBase extends LitElement {
+                 ? xAxis.max
+                 : undefined
+             : undefined;
+-          return {
+-            ...s,
++          result = {
++            ...result,
+             sampling: undefined,
+             data: downSampleLineData(
+               data as LineSeriesOption["data"],
+@@ -985,11 +1047,10 @@ export class HaChartBase extends LitElement {
+               minX,
+               maxX
+             ),
+-          };
++          } as HaECSeriesItem;
+         }
+       }
+-      const name = filterXSS(String(s.name ?? s.id ?? ""));
+-      return { ...s, name, data };
++      return result as RawSeriesOption;
+     });
+     return series as ECOption["series"];
+   }
+@@ -1326,8 +1387,8 @@ export class HaChartBase extends LitElement {
+   }
+ 
+   private _compareCustomLegendOptions(
+-    oldOptions: ECOption | undefined,
+-    newOptions: ECOption | undefined
++    oldOptions: HaECOption | undefined,
++    newOptions: HaECOption | undefined
+   ): boolean {
+     const oldLegends = ensureArray(
+       oldOptions?.legend || []
+diff --git a/src/components/chart/ha-chart-tooltip-marker.ts b/src/components/chart/ha-chart-tooltip-marker.ts
+new file mode 100644
+index 0000000..b5146d1
+--- /dev/null
++++ b/src/components/chart/ha-chart-tooltip-marker.ts
+@@ -0,0 +1,41 @@
++import type { PropertyValues } from "lit";
++import { css, LitElement, nothing } from "lit";
++import { customElement, property } from "lit/decorators";
++
++@customElement("ha-chart-tooltip-marker")
++class HaChartTooltipMarker extends LitElement {
++  @property() public color = "";
++
++  @property({ type: Boolean, reflect: true }) public rtl = false;
++
++  protected willUpdate(changed: PropertyValues) {
++    if (changed.has("color")) {
++      this.style.backgroundColor = this.color;
++    }
++  }
++
++  protected render() {
++    return nothing;
++  }
++
++  static styles = css`
++    :host {
++      display: inline-block;
++      margin-inline-end: 4px;
++      margin-inline-start: initial;
++      border-radius: 10px;
++      width: 10px;
++      height: 10px;
++      vertical-align: middle;
++    }
++    :host([rtl]) {
++      direction: rtl;
++    }
++  `;
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    "ha-chart-tooltip-marker": HaChartTooltipMarker;
++  }
++}
+diff --git a/src/components/chart/ha-network-graph.ts b/src/components/chart/ha-network-graph.ts
+index 1af2110..41e8fa1 100644
+--- a/src/components/chart/ha-network-graph.ts
++++ b/src/components/chart/ha-network-graph.ts
+@@ -1,6 +1,6 @@
+ import type { EChartsType } from "echarts/core";
+ import type { GraphSeriesOption } from "echarts/charts";
+-import type { PropertyValues } from "lit";
++import type { PropertyValues, TemplateResult } from "lit";
+ import { css, html, LitElement, nothing } from "lit";
+ import { customElement, property, state, query } from "lit/decorators";
+ 
+@@ -11,9 +11,10 @@ import type {
+ import { mdiFormatTextVariant, mdiGoogleCirclesGroup } from "@mdi/js";
+ import memoizeOne from "memoize-one";
+ import { listenMediaQuery } from "../../common/dom/media_query";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption } from "../../resources/echarts/echarts";
+ import "./ha-chart-base";
+ import type { HaChartBase } from "./ha-chart-base";
++import { filterXSS } from "../../common/util/xss";
+ import type { HomeAssistant } from "../../types";
+ import { SubscribeMixin } from "../../mixins/subscribe-mixin";
+ import { deepEqual } from "../../common/util/deep-equal";
+@@ -78,7 +79,7 @@ export class HaNetworkGraph extends SubscribeMixin(LitElement) {
+ 
+   @property({ attribute: false }) public tooltipFormatter?: (
+     params: TopLevelFormatterParams
+-  ) => string;
++  ) => TemplateResult | typeof nothing | null;
+ 
+   /**
+    * Optional callback that returns additional searchable strings for a node.
+@@ -182,7 +183,7 @@ export class HaNetworkGraph extends SubscribeMixin(LitElement) {
+   }
+ 
+   private _createOptions = memoizeOne(
+-    (categories?: NetworkData["categories"]): ECOption => ({
++    (categories?: NetworkData["categories"]): HaECOption => ({
+       tooltip: {
+         trigger: "item",
+         confine: true,
+@@ -334,8 +335,10 @@ export class HaNetworkGraph extends SubscribeMixin(LitElement) {
+               formatter: (params: CallbackDataParams) => {
+                 const item = params.data as NetworkNode;
+                 return item.context
+-                  ? `<b>${item.name ?? ""}</b><br>${item.context}`
+-                  : `<b>${item.name ?? ""}</b>`;
++                  ? `<b>${filterXSS(item.name ?? "")}</b><br>${filterXSS(
++                      item.context
++                    )}`
++                  : `<b>${filterXSS(item.name ?? "")}</b>`;
+               },
+             },
+           }) as NonNullable<GraphSeriesOption["data"]>[number]
+diff --git a/src/components/chart/ha-sankey-chart.ts b/src/components/chart/ha-sankey-chart.ts
+index 5233ea5..258edca 100644
+--- a/src/components/chart/ha-sankey-chart.ts
++++ b/src/components/chart/ha-sankey-chart.ts
+@@ -11,10 +11,10 @@ import { ResizeController } from "@lit-labs/observers/resize-controller";
+ import { fireEvent } from "../../common/dom/fire_event";
+ import SankeyChart from "../../resources/echarts/components/sankey/install";
+ import type { HomeAssistant } from "../../types";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption } from "../../resources/echarts/echarts";
+ import { measureTextWidth } from "../../util/text";
+-import { filterXSS } from "../../common/util/xss";
+ import "./ha-chart-base";
++import "./ha-chart-tooltip-marker";
+ import { NODE_SIZE } from "../trace/hat-graph-const";
+ import "../ha-alert";
+ 
+@@ -71,7 +71,7 @@ export class HaSankeyChart extends LitElement {
+   });
+ 
+   render() {
+-    const options = {
++    const options: HaECOption = {
+       grid: {
+         top: 0,
+         bottom: 0,
+@@ -83,7 +83,7 @@ export class HaSankeyChart extends LitElement {
+         formatter: this._renderTooltip,
+         appendTo: document.body,
+       },
+-    } as ECOption;
++    };
+ 
+     return html`<ha-chart-base
+       .hass=${this.hass}
+@@ -103,12 +103,16 @@ export class HaSankeyChart extends LitElement {
+       : data.value;
+     if (data.id) {
+       const node = this.data.nodes.find((n) => n.id === data.id);
+-      return `${params.marker} ${filterXSS(node?.label ?? data.id)}<br>${value}`;
++      return html`<ha-chart-tooltip-marker
++          .color=${String(params.color ?? "")}
++        ></ha-chart-tooltip-marker>
++        ${node?.label ?? data.id}<br />${value}`;
+     }
+     if (data.source && data.target) {
+       const source = this.data.nodes.find((n) => n.id === data.source);
+       const target = this.data.nodes.find((n) => n.id === data.target);
+-      return `${filterXSS(source?.label ?? data.source)} → ${filterXSS(target?.label ?? data.target)}<br>${value}`;
++      return html`${source?.label ?? data.source} →
++        ${target?.label ?? data.target}<br />${value}`;
+     }
+     return null;
+   };
+diff --git a/src/components/chart/ha-sunburst-chart.ts b/src/components/chart/ha-sunburst-chart.ts
+index 921048a..d128922 100644
+--- a/src/components/chart/ha-sunburst-chart.ts
++++ b/src/components/chart/ha-sunburst-chart.ts
+@@ -5,10 +5,10 @@ import { css, html, LitElement, nothing } from "lit";
+ import { customElement, property } from "lit/decorators";
+ import memoizeOne from "memoize-one";
+ import { getGraphColorByIndex } from "../../common/color/colors";
+-import { filterXSS } from "../../common/util/xss";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption } from "../../resources/echarts/echarts";
+ import type { HomeAssistant } from "../../types";
+ import "./ha-chart-base";
++import "./ha-chart-tooltip-marker";
+ 
+ // eslint-disable-next-line @typescript-eslint/naming-convention, @typescript-eslint/consistent-type-imports
+ let SunburstChart: typeof import("echarts/lib/chart/sunburst/install");
+@@ -50,13 +50,13 @@ export class HaSunburstChart extends LitElement {
+       return nothing;
+     }
+ 
+-    const options = {
++    const options: HaECOption = {
+       tooltip: {
+         trigger: "item",
+         formatter: this._renderTooltip,
+         appendTo: document.body,
+       },
+-    } as ECOption;
++    };
+ 
+     return html`<ha-chart-base
+       .data=${this._createData(this.data)}
+@@ -71,7 +71,10 @@ export class HaSunburstChart extends LitElement {
+     const value = this.valueFormatter
+       ? this.valueFormatter(data.value)
+       : data.value;
+-    return `${params.marker} ${filterXSS(data.name)}<br>${value}`;
++    return html`<ha-chart-tooltip-marker
++        .color=${String(params.color ?? "")}
++      ></ha-chart-tooltip-marker>
++      ${data.name}<br />${value}`;
+   };
+ 
+   private _createData = memoizeOne(
+diff --git a/src/components/chart/lit-tooltip-formatter.ts b/src/components/chart/lit-tooltip-formatter.ts
+new file mode 100644
+index 0000000..6debd10
+--- /dev/null
++++ b/src/components/chart/lit-tooltip-formatter.ts
+@@ -0,0 +1,41 @@
++import { nothing, render } from "lit";
++import type { LitTooltipFormatter } from "../../resources/echarts/echarts";
++
++type WrappedTooltipFormatter = (
++  params: unknown,
++  ticket?: string
++) => HTMLElement | null;
++
++export type { WrappedTooltipFormatter };
++
++const litTooltipFormatterCache = new WeakMap<
++  LitTooltipFormatter | WrappedTooltipFormatter,
++  WrappedTooltipFormatter
++>();
++
++export const wrapLitTooltipFormatter = (
++  fn: LitTooltipFormatter | WrappedTooltipFormatter
++): WrappedTooltipFormatter => {
++  const cached = litTooltipFormatterCache.get(fn);
++  if (cached) return cached;
++  const container = document.createElement("div");
++  // display:contents keeps the wrapper layout-invisible so its children act as
++  // direct children of echarts' tooltip box, matching the prior innerHTML behavior.
++  container.style.display = "contents";
++  const wrapped: WrappedTooltipFormatter = (params, ticket) => {
++    const result = (fn as LitTooltipFormatter)(params, ticket);
++    // `nothing` and null/undefined must all suppress the tooltip. Returning
++    // `nothing` to echarts via `render(nothing, container)` leaves a Lit
++    // comment marker behind so echarts would show an empty box; convert it to
++    // null instead so `setContent(null)` clears innerHTML and `show()` hides.
++    if (result === null || result === undefined || result === nothing) {
++      return null;
++    }
++    render(result, container);
++    return container;
++  };
++  litTooltipFormatterCache.set(fn, wrapped);
++  // Idempotent re-wrap: looking up the wrapped fn returns itself.
++  litTooltipFormatterCache.set(wrapped, wrapped);
++  return wrapped;
++};
+diff --git a/src/components/chart/state-history-chart-line.ts b/src/components/chart/state-history-chart-line.ts
+index e25f991..7bc8ea5 100644
+--- a/src/components/chart/state-history-chart-line.ts
++++ b/src/components/chart/state-history-chart-line.ts
+@@ -1,5 +1,5 @@
+-import type { PropertyValues } from "lit";
+-import { html, LitElement } from "lit";
++import type { PropertyValues, TemplateResult } from "lit";
++import { html, LitElement, nothing } from "lit";
+ import { customElement, property, state } from "lit/decorators";
+ import type { VisualMapComponentOption } from "echarts/components";
+ import type { LineSeriesOption } from "echarts/charts";
+@@ -12,8 +12,9 @@ import type { LineChartEntity, LineChartState } from "../../data/history";
+ import type { HomeAssistant } from "../../types";
+ import { MIN_TIME_BETWEEN_UPDATES } from "./ha-chart-base";
+ import { sideTooltipPosition } from "./chart-tooltip-position";
++import "./ha-chart-tooltip-marker";
+ import { computeYAxisFractionDigits } from "./y-axis-fraction-digits";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption } from "../../resources/echarts/echarts";
+ import { formatDateTimeWithSeconds } from "../../common/datetime/format_date_time";
+ import {
+   getNumberFormatOptions,
+@@ -24,7 +25,6 @@ import type { HASSDomEvent } from "../../common/dom/fire_event";
+ import { fireEvent } from "../../common/dom/fire_event";
+ import { CLIMATE_HVAC_ACTION_TO_MODE } from "../../data/climate";
+ import { blankBeforeUnit } from "../../common/translations/blank_before_unit";
+-import { filterXSS } from "../../common/util/xss";
+ import { computeAttributeValueDisplay } from "../../common/entity/compute_attribute_display";
+ 
+ const safeParseFloat = (value) => {
+@@ -108,7 +108,7 @@ export class StateHistoryChartLine extends LitElement {
+ 
+   private _datasetToDataIndex: number[] = [];
+ 
+-  @state() private _chartOptions?: ECOption;
++  @state() private _chartOptions?: HaECOption;
+ 
+   private _hiddenStats = new Set<string>();
+ 
+@@ -141,12 +141,11 @@ export class StateHistoryChartLine extends LitElement {
+ 
+   private _renderTooltip = (params: any) => {
+     const time = params[0].axisValue;
+-    const title =
+-      formatDateTimeWithSeconds(
+-        new Date(time),
+-        this.hass.locale,
+-        this.hass.config
+-      ) + "<br>";
++    const title = formatDateTimeWithSeconds(
++      new Date(time),
++      this.hass.locale,
++      this.hass.config
++    );
+     const datapoints: Record<string, any>[] = [];
+     this._chartData.forEach((dataset, index) => {
+       if (
+@@ -177,52 +176,44 @@ export class StateHistoryChartLine extends LitElement {
+         seriesName: dataset.name,
+         seriesIndex: index,
+         value: lastData,
+-        // HTML copied from echarts. May change based on options
+-        marker: `<span style="display:inline-block;margin-right:4px;margin-inline-end:4px;margin-inline-start:initial;border-radius:10px;width:10px;height:10px;background-color:${dataset.color};"></span>`,
++        color: dataset.color,
+       });
+     });
+     const unit = this.unit
+       ? `${blankBeforeUnit(this.unit, this.hass.locale)}${this.unit}`
+       : "";
+ 
+-    return (
+-      title +
+-      datapoints
+-        .map((param) => {
+-          const entityId = this._entityIds[param.seriesIndex];
+-          const stateObj = this.hass.states[entityId];
+-          const entry = this.hass.entities[entityId];
+-          const stateValue = String(param.value[1]);
+-          let value = stateObj
+-            ? this.hass.formatEntityState(stateObj, stateValue)
+-            : `${formatNumber(
+-                stateValue,
+-                this.hass.locale,
+-                getNumberFormatOptions(undefined, entry)
+-              )}${unit}`;
+-          const dataIndex = this._datasetToDataIndex[param.seriesIndex];
+-          const data = this.data[dataIndex];
+-          if (data.statistics && data.statistics.length > 0) {
+-            value += "<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;";
+-            const source =
+-              data.states.length === 0 ||
+-              param.value[0] < data.states[0].last_changed
+-                ? `${this.hass.localize(
+-                    "ui.components.history_charts.source_stats"
+-                  )}`
+-                : `${this.hass.localize(
+-                    "ui.components.history_charts.source_history"
+-                  )}`;
+-            value += source;
+-          }
+-
+-          if (param.seriesName) {
+-            return `${param.marker} ${filterXSS(param.seriesName)}: ${value}`;
+-          }
+-          return `${param.marker} ${value}`;
+-        })
+-        .join("<br>")
+-    );
++    return html`${title}${datapoints.map((param) => {
++      const entityId = this._entityIds[param.seriesIndex];
++      const stateObj = this.hass.states[entityId];
++      const entry = this.hass.entities[entityId];
++      const stateValue = String(param.value[1]);
++      const value = stateObj
++        ? this.hass.formatEntityState(stateObj, stateValue)
++        : `${formatNumber(
++            stateValue,
++            this.hass.locale,
++            getNumberFormatOptions(undefined, entry)
++          )}${unit}`;
++      const dataIndex = this._datasetToDataIndex[param.seriesIndex];
++      const data = this.data[dataIndex];
++      let statSuffix: TemplateResult | typeof nothing = nothing;
++      if (data.statistics && data.statistics.length > 0) {
++        const source =
++          data.states.length === 0 ||
++          param.value[0] < data.states[0].last_changed
++            ? this.hass.localize("ui.components.history_charts.source_stats")
++            : this.hass.localize("ui.components.history_charts.source_history");
++        // Five non-breaking spaces indent the source label.
++        statSuffix = html`<br />${"\u00a0".repeat(5)}${source}`;
++      }
++      return html`<br /><ha-chart-tooltip-marker
++          .color=${String(param.color ?? "")}
++        ></ha-chart-tooltip-marker>
++        ${param.seriesName
++          ? html`${param.seriesName}: `
++          : nothing}${value}${statSuffix}`;
++    })}`;
+   };
+ 
+   private _datasetHidden(ev: CustomEvent) {
+diff --git a/src/components/chart/state-history-chart-timeline.ts b/src/components/chart/state-history-chart-timeline.ts
+index c0a12fd..80616d4 100644
+--- a/src/components/chart/state-history-chart-timeline.ts
++++ b/src/components/chart/state-history-chart-timeline.ts
+@@ -1,11 +1,10 @@
+ import type { PropertyValues } from "lit";
+-import { css, html, LitElement } from "lit";
++import { css, html, LitElement, nothing } from "lit";
+ import { customElement, property, state } from "lit/decorators";
+ import type {
+   CustomSeriesOption,
+   CustomSeriesRenderItem,
+   ECElementEvent,
+-  TooltipFormatterCallback,
+   TooltipPositionCallbackParams,
+ } from "echarts/types/dist/shared";
+ import { formatDateTimeWithSeconds } from "../../common/datetime/format_date_time";
+@@ -15,8 +14,9 @@ import type { TimelineEntity } from "../../data/history";
+ import type { HomeAssistant } from "../../types";
+ import { MIN_TIME_BETWEEN_UPDATES } from "./ha-chart-base";
+ import { sideTooltipPosition } from "./chart-tooltip-position";
++import "./ha-chart-tooltip-marker";
+ import { computeTimelineColor } from "./timeline-color";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption, HaECSeries } from "../../resources/echarts/echarts";
+ import echarts from "../../resources/echarts/echarts";
+ import { luminosity } from "../../common/color/rgb";
+ import { hex2rgb } from "../../common/color/convert-color";
+@@ -57,7 +57,7 @@ export class StateHistoryChartTimeline extends LitElement {
+ 
+   @state() private _chartData: CustomSeriesOption[] = [];
+ 
+-  @state() private _chartOptions?: ECOption;
++  @state() private _chartOptions?: HaECOption;
+ 
+   @state() private _yWidth = 0;
+ 
+@@ -69,7 +69,7 @@ export class StateHistoryChartTimeline extends LitElement {
+         .hass=${this.hass}
+         .options=${this._chartOptions}
+         .height=${`${this.data.length * 30 + 30}px`}
+-        .data=${this._chartData as ECOption["series"]}
++        .data=${this._chartData as HaECSeries}
+         small-controls
+         @chart-click=${this._handleChartClick}
+         @chart-zoom=${this._handleDataZoom}
+@@ -132,42 +132,35 @@ export class StateHistoryChartTimeline extends LitElement {
+     return rect;
+   };
+ 
+-  private _renderTooltip: TooltipFormatterCallback<TooltipPositionCallbackParams> =
+-    (params: TooltipPositionCallbackParams) => {
+-      const { value, name, marker, seriesName, color } = Array.isArray(params)
+-        ? params[0]
+-        : params;
+-      const title = seriesName
+-        ? `<h4 style="text-align: center; margin: 0;">${seriesName}</h4>`
+-        : "";
+-      const durationInMs = value![2] - value![1];
+-      const formattedDuration = `${this.hass.localize(
+-        "ui.components.history_charts.duration"
+-      )}: ${millisecondsToDuration(durationInMs)}`;
+-
+-      const markerLocalized = !computeRTL(
+-        this.hass.language,
+-        this.hass.translationMetadata.translations
+-      )
+-        ? marker
+-        : `<span style="direction: rtl;display:inline-block;margin-right:4px;margin-inline-end:4px;border-radius:10px;width:10px;height:10px;background-color:${color};"></span>`;
+-
+-      const lines = [
+-        markerLocalized + name,
+-        formatDateTimeWithSeconds(
+-          new Date(value![1]),
+-          this.hass.locale,
+-          this.hass.config
+-        ),
+-        formatDateTimeWithSeconds(
+-          new Date(value![2]),
+-          this.hass.locale,
+-          this.hass.config
+-        ),
+-        formattedDuration,
+-      ].join("<br>");
+-      return [title, lines].join("");
+-    };
++  private _renderTooltip = (params: TooltipPositionCallbackParams) => {
++    const { value, name, seriesName, color } = Array.isArray(params)
++      ? params[0]
++      : params;
++    const durationInMs = value![2] - value![1];
++    const formattedDuration = `${this.hass.localize(
++      "ui.components.history_charts.duration"
++    )}: ${millisecondsToDuration(durationInMs)}`;
++
++    const rtl = computeRTL(
++      this.hass.language,
++      this.hass.translationMetadata.translations
++    );
++    return html`${seriesName
++        ? html`<h4 style="text-align: center; margin: 0;">${seriesName}</h4>`
++        : nothing}<ha-chart-tooltip-marker
++        .color=${String(color ?? "")}
++        .rtl=${rtl}
++      ></ha-chart-tooltip-marker
++      >${name}<br />${formatDateTimeWithSeconds(
++        new Date(value![1]),
++        this.hass.locale,
++        this.hass.config
++      )}<br />${formatDateTimeWithSeconds(
++        new Date(value![2]),
++        this.hass.locale,
++        this.hass.config
++      )}<br />${formattedDuration}`;
++  };
+ 
+   public willUpdate(changedProps: PropertyValues) {
+     if (
+diff --git a/src/components/chart/statistics-chart.ts b/src/components/chart/statistics-chart.ts
+index be2d27a..10b2779 100644
+--- a/src/components/chart/statistics-chart.ts
++++ b/src/components/chart/statistics-chart.ts
+@@ -4,7 +4,7 @@ import type {
+   ZRColor,
+ } from "echarts/types/dist/shared";
+ import type { PropertyValues, TemplateResult } from "lit";
+-import { css, html, LitElement } from "lit";
++import { css, html, LitElement, nothing } from "lit";
+ import { customElement, property, state } from "lit/decorators";
+ import { styleMap } from "lit/directives/style-map";
+ import memoizeOne from "memoize-one";
+@@ -34,12 +34,13 @@ import {
+   isExternalStatistic,
+   statisticsHaveType,
+ } from "../../data/recorder";
+-import type { ECOption } from "../../resources/echarts/echarts";
++import type { HaECOption } from "../../resources/echarts/echarts";
+ import type { HomeAssistant } from "../../types";
+ import { getPeriodicAxisLabelConfig } from "./axis-label";
+ import type { CustomLegendOption } from "./ha-chart-base";
+ import "./ha-chart-base";
+ import { sideTooltipPosition } from "./chart-tooltip-position";
++import "./ha-chart-tooltip-marker";
+ import { fillDataGapsAndRoundCaps } from "./round-caps";
+ import { computeYAxisFractionDigits } from "./y-axis-fraction-digits";
+ 
+@@ -126,7 +127,7 @@ export class StatisticsChart extends LitElement {
+ 
+   @state() private _statisticIds: string[] = [];
+ 
+-  @state() private _chartOptions?: ECOption;
++  @state() private _chartOptions?: HaECOption;
+ 
+   @state() private _hiddenStats = new Set<string>();
+ 
+@@ -251,91 +252,101 @@ export class StatisticsChart extends LitElement {
+     const unit = this.unit
+       ? `${blankBeforeUnit(this.unit, this.hass.locale)}${this.unit}`
+       : "";
+-    return params
+-      .map((param, index: number) => {
+-        if (rendered[param.seriesIndex]) return "";
+-        rendered[param.seriesIndex] = true;
+-
+-        const statisticId = this._statisticIds[param.seriesIndex];
+-        const stateObj = this.hass.states[statisticId];
+-        const entry = this.hass.entities[statisticId];
+-        let rawValue: string;
+-        let rawTime: string;
+-        if (chartIsBar) {
+-          // For bar charts value is always second value.
+-          rawValue = String(param.value[1]);
+-          // Time value is third value (un-shifted date) if given, otherwise first value
+-          let startTime: Date;
+-          let endTime: Date | undefined;
+-          if (param.value[2]) {
+-            startTime = new Date(param.value[2]);
+-            if (param.value[3]) {
+-              endTime = new Date(param.value[3]);
+-            }
+-          } else {
+-            startTime = new Date(param.value[0]);
+-          }
+-          if (
+-            period === "year" ||
+-            period === "month" ||
+-            period === "week" ||
+-            period === "day"
+-          ) {
+-            // For year/month/day periods, show only the date
+-            rawTime =
+-              formatDate(startTime, this.hass.locale, this.hass.config) +
+-              (endTime && period !== "day"
+-                ? ` – ${formatDate(
+-                    endTime,
+-                    this.hass.locale,
+-                    this.hass.config
+-                  )}`
+-                : "") +
+-              "<br>";
+-          } else {
+-            // For other time periods, include time in render, and optionally show range
+-            // if we have an end time.
+-            rawTime =
+-              formatDateTimeWithSeconds(
+-                startTime,
+-                this.hass.locale,
+-                this.hass.config
+-              ) +
+-              (endTime
+-                ? ` – ${formatTimeWithSeconds(
+-                    endTime,
+-                    this.hass.locale,
+-                    this.hass.config
+-                  )}`
+-                : "") +
+-              "<br>";
++    const rows: {
++      time?: string;
++      color: string;
++      seriesName?: string;
++      value: string;
++    }[] = [];
++    for (const param of params) {
++      if (rendered[param.seriesIndex]) continue;
++      rendered[param.seriesIndex] = true;
++
++      const statisticId = this._statisticIds[param.seriesIndex];
++      const stateObj = this.hass.states[statisticId];
++      const entry = this.hass.entities[statisticId];
++      let rawValue: string;
++      let rawTime: string;
++      if (chartIsBar) {
++        // For bar charts value is always second value.
++        rawValue = String(param.value[1]);
++        // Time value is third value (un-shifted date) if given, otherwise first value
++        let startTime: Date;
++        let endTime: Date | undefined;
++        if (param.value[2]) {
++          startTime = new Date(param.value[2]);
++          if (param.value[3]) {
++            endTime = new Date(param.value[3]);
+           }
+         } else {
+-          // For lines max series can have 3 values, as the second value is the max-min to form a band
+-          rawValue = String(param.value[2] ?? param.value[1]);
+-          // Time value is always first value
+-          rawTime = `${formatDateTimeWithSeconds(
+-            new Date(param.value[0]),
+-            this.hass.locale,
+-            this.hass.config
+-          )} <br>`;
++          startTime = new Date(param.value[0]);
++        }
++        if (
++          period === "year" ||
++          period === "month" ||
++          period === "week" ||
++          period === "day"
++        ) {
++          // For year/month/day periods, show only the date
++          rawTime =
++            formatDate(startTime, this.hass.locale, this.hass.config) +
++            (endTime && period !== "day"
++              ? ` – ${formatDate(endTime, this.hass.locale, this.hass.config)}`
++              : "");
++        } else {
++          // For other time periods, include time in render, and optionally show range
++          // if we have an end time.
++          rawTime =
++            formatDateTimeWithSeconds(
++              startTime,
++              this.hass.locale,
++              this.hass.config
++            ) +
++            (endTime
++              ? ` – ${formatTimeWithSeconds(
++                  endTime,
++                  this.hass.locale,
++                  this.hass.config
++                )}`
++              : "");
+         }
++      } else {
++        // For lines max series can have 3 values, as the second value is the max-min to form a band
++        rawValue = String(param.value[2] ?? param.value[1]);
++        // Time value is always first value
++        rawTime = formatDateTimeWithSeconds(
++          new Date(param.value[0]),
++          this.hass.locale,
++          this.hass.config
++        );
++      }
+ 
+-        const options = getNumberFormatOptions(stateObj, entry) ?? {
+-          maximumFractionDigits: 2,
+-        };
++      const options = getNumberFormatOptions(stateObj, entry) ?? {
++        maximumFractionDigits: 2,
++      };
+ 
+-        const value = `${formatNumber(
+-          rawValue,
+-          this.hass.locale,
+-          options
+-        )}${unit}`;
+-
+-        const time = index === 0 ? rawTime : "";
+-        return `${time}${param.marker} ${param.seriesName}: ${value}`;
+-      })
+-      .filter(Boolean)
+-      .join("<br>");
++      const value = `${formatNumber(rawValue, this.hass.locale, options)}${unit}`;
++
++      rows.push({
++        time: rows.length === 0 ? rawTime : undefined,
++        color: String(param.color ?? ""),
++        seriesName: param.seriesName,
++        value,
++      });
++    }
++
++    if (rows.length === 0) return nothing;
++
++    return html`${rows.map(
++      (row, i) =>
++        html`${row.time
++            ? html`${row.time}<br />`
++            : nothing}<ha-chart-tooltip-marker
++            .color=${row.color}
++          ></ha-chart-tooltip-marker>
++          ${row.seriesName}:
++          ${row.value}${i < rows.length - 1 ? html`<br />` : nothing}`
++    )}`;
+   };
+ 
+   private _createOptions() {
+diff --git a/src/panels/config/integrations/integration-panels/bluetooth/bluetooth-network-visualization.ts b/src/panels/config/integrations/integration-panels/bluetooth/bluetooth-network-visualization.ts
+index db8ffc1..366882e 100644
+--- a/src/panels/config/integrations/integration-panels/bluetooth/bluetooth-network-visualization.ts
++++ b/src/panels/config/integrations/integration-panels/bluetooth/bluetooth-network-visualization.ts
+@@ -330,42 +330,48 @@ export class BluetoothNetworkVisualization extends LitElement {
+     return rssi > -33 ? 3 : rssi > -66 ? 2 : 1;
+   }
+ 
+-  private _tooltipFormatter = (params: TopLevelFormatterParams): string => {
++  private _tooltipFormatter = (params: TopLevelFormatterParams) => {
+     const { dataType, data } = params as CallbackDataParams;
+-    let tooltipText = "";
+     if (dataType === "edge") {
+       const { source, target, value } = data as any;
+       const sourceName = this._getBluetoothDeviceName(source);
+       const targetName = this._getBluetoothDeviceName(target);
+-      tooltipText = `${sourceName} → ${targetName}`;
+-      if (source !== CORE_SOURCE_ID) {
+-        tooltipText += ` <b>${this.hass.localize("ui.panel.config.bluetooth.rssi")}:</b> ${value}`;
+-      }
+-    } else {
+-      const { id: address } = data as any;
+-      const name = this._getBluetoothDeviceName(address);
+-      const btDevice = this._data.find((d) => d.address === address);
+-      if (btDevice) {
+-        tooltipText = `<b>${name}</b><br><b>${this.hass.localize("ui.panel.config.bluetooth.address")}:</b> ${address}<br><b>${this.hass.localize("ui.panel.config.bluetooth.rssi")}:</b> ${btDevice.rssi}<br><b>${this.hass.localize("ui.panel.config.bluetooth.source")}:</b> ${btDevice.source}<br><b>${this.hass.localize("ui.panel.config.bluetooth.updated")}:</b> ${relativeTime(new Date(btDevice.time * 1000), this.hass.locale)}`;
+-        const device = this._sourceDevices[address];
+-        if (device) {
+-          const area = getDeviceArea(device, this.hass.areas);
+-          if (area) {
+-            tooltipText += `<br><b>${this.hass.localize("ui.panel.config.bluetooth.area")}: </b>${area.name}`;
+-          }
+-        }
+-      } else {
+-        const device = this._sourceDevices[address];
+-        if (device) {
+-          tooltipText = `<b>${name}</b><br><b>${this.hass.localize("ui.panel.config.bluetooth.address")}:</b> ${address}`;
+-          const area = getDeviceArea(device, this.hass.areas);
+-          if (area) {
+-            tooltipText += `<br><b>${this.hass.localize("ui.panel.config.bluetooth.area")}: </b>${area.name}`;
+-          }
+-        }
+-      }
++      return html`${sourceName} →
++      ${targetName}${source !== CORE_SOURCE_ID
++        ? html` <b>${this.hass.localize("ui.panel.config.bluetooth.rssi")}:</b>
++            ${value}`
++        : nothing}`;
++    }
++    const { id: address } = data as any;
++    const name = this._getBluetoothDeviceName(address);
++    const btDevice = this._data.find((d) => d.address === address);
++    const device = this._sourceDevices[address];
++    const area = device ? getDeviceArea(device, this.hass.areas) : undefined;
++    const areaLine = area
++      ? html`<br /><b
++            >${this.hass.localize("ui.panel.config.bluetooth.area")}: </b
++          >${area.name}`
++      : nothing;
++    if (btDevice) {
++      return html`<b>${name}</b><br />
++        <b>${this.hass.localize("ui.panel.config.bluetooth.address")}:</b>
++        ${address}<br />
++        <b>${this.hass.localize("ui.panel.config.bluetooth.rssi")}:</b>
++        ${btDevice.rssi}<br />
++        <b>${this.hass.localize("ui.panel.config.bluetooth.source")}:</b>
++        ${btDevice.source}<br />
++        <b>${this.hass.localize("ui.panel.config.bluetooth.updated")}:</b>
++        ${relativeTime(
++          new Date(btDevice.time * 1000),
++          this.hass.locale
++        )}${areaLine}`;
++    }
++    if (device) {
++      return html`<b>${name}</b><br />
++        <b>${this.hass.localize("ui.panel.config.bluetooth.address")}:</b>
++        ${address}${areaLine}`;
+     }
+-    return tooltipText;
++    return nothing;
+   };
+ 
+   private _handleChartClick(e: CustomEvent): void {
+diff --git a/src/panels/config/integrations/integration-panels/zha/zha-network-visualization-page.ts b/src/panels/config/integrations/integration-panels/zha/zha-network-visualization-page.ts
+index ba154be..236f200 100644
+--- a/src/panels/config/integrations/integration-panels/zha/zha-network-visualization-page.ts
++++ b/src/panels/config/integrations/integration-panels/zha/zha-network-visualization-page.ts
+@@ -131,7 +131,7 @@ export class ZHANetworkVisualizationPage extends LitElement {
+     this._searchFilter = (ev.target as HaInputSearch).value ?? "";
+   }
+ 
+-  private _tooltipFormatter = (params: TopLevelFormatterParams): string => {
++  private _tooltipFormatter = (params: TopLevelFormatterParams) => {
+     const { dataType, data, name } = params as CallbackDataParams;
+     if (dataType === "edge") {
+       const { source, target, value } = data as any;
+@@ -141,40 +141,45 @@ export class ZHANetworkVisualizationPage extends LitElement {
+       const sourceName = this._networkData.nodes.find(
+         (node) => node.id === source
+       )!.name;
+-      const tooltipText = `${sourceName} → ${targetName}${value ? ` <b>LQI:</b> ${value}` : ""}`;
+-
+       const reverseValue = this._networkData.links.find(
+         (link) => link.source === source && link.target === target
+       )?.reverseValue;
+-      if (reverseValue) {
+-        return `${tooltipText}<br>${targetName} → ${sourceName} <b>LQI:</b> ${reverseValue}`;
+-      }
+-      return tooltipText;
++      return html`${sourceName} →
++      ${targetName}${value
++        ? html` <b>LQI:</b> ${value}`
++        : nothing}${reverseValue
++        ? html`<br />${targetName} → ${sourceName} <b>LQI:</b> ${reverseValue}`
++        : nothing}`;
+     }
+     const device = this._devices.find((d) => d.ieee === (data as any).id);
+     if (!device) {
+-      return name;
+-    }
+-    let label = `<b>IEEE: </b>${device.ieee}`;
+-    label += `<br><b>${this.hass.localize("ui.panel.config.zha.visualization.device_type")}: </b>${device.device_type.replace("_", " ")}`;
+-    if (device.nwk != null) {
+-      label += `<br><b>NWK: </b>${formatAsPaddedHex(device.nwk)}`;
+-    }
+-    if (device.manufacturer != null && device.model != null) {
+-      label += `<br><b>${this.hass.localize("ui.panel.config.zha.visualization.device")}: </b>${device.manufacturer} ${device.model}`;
+-    } else {
+-      label += `<br><b>${this.hass.localize("ui.panel.config.zha.visualization.device_not_in_db")}</b>`;
++      return html`${name}`;
+     }
+     const haDevice = this.hass.devices[device.device_reg_id] as
+       | DeviceRegistryEntry
+       | undefined;
+-    if (haDevice) {
+-      const area = getDeviceArea(haDevice, this.hass.areas);
+-      if (area) {
+-        label += `<br><b>${this.hass.localize("ui.panel.config.zha.visualization.area")}: </b>${area.name}`;
+-      }
+-    }
+-    return label;
++    const area = haDevice
++      ? getDeviceArea(haDevice, this.hass.areas)
++      : undefined;
++    return html`<b>IEEE: </b>${device.ieee}<br /><b
++        >${this.hass.localize("ui.panel.config.zha.visualization.device_type")}: </b
++      >${device.device_type.replace("_", " ")}${device.nwk != null
++        ? html`<br /><b>NWK: </b>${formatAsPaddedHex(device.nwk)}`
++        : nothing}${device.manufacturer != null && device.model != null
++        ? html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zha.visualization.device"
++              )}: </b
++            >${device.manufacturer} ${device.model}`
++        : html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zha.visualization.device_not_in_db"
++              )}</b
++            >`}${area
++        ? html`<br /><b
++              >${this.hass.localize("ui.panel.config.zha.visualization.area")}: </b
++            >${area.name}`
++        : nothing}`;
+   };
+ 
+   private async _refreshTopology(): Promise<void> {
+diff --git a/src/panels/config/integrations/integration-panels/zwave_js/zwave_js-network-visualization.ts b/src/panels/config/integrations/integration-panels/zwave_js/zwave_js-network-visualization.ts
+index 147d392..6c6ab52 100644
+--- a/src/panels/config/integrations/integration-panels/zwave_js/zwave_js-network-visualization.ts
++++ b/src/panels/config/integrations/integration-panels/zwave_js/zwave_js-network-visualization.ts
+@@ -9,6 +9,7 @@ import { getDeviceArea } from "../../../../../common/entity/context/get_device_c
+ import { navigate } from "../../../../../common/navigate";
+ import { debounce } from "../../../../../common/util/debounce";
+ import "../../../../../components/chart/ha-network-graph";
++import "../../../../../components/chart/ha-chart-tooltip-marker";
+ import type {
+   NetworkData,
+   NetworkLink,
+@@ -150,7 +151,7 @@ export class ZWaveJSNetworkVisualization extends SubscribeMixin(LitElement) {
+     this._searchFilter = (ev.target as HaInputSearch).value ?? "";
+   }
+ 
+-  private _tooltipFormatter = (params: TopLevelFormatterParams): string => {
++  private _tooltipFormatter = (params: TopLevelFormatterParams) => {
+     const { dataType, data } = params as CallbackDataParams;
+     if (dataType === "edge") {
+       const { source, target, value } = data as any;
+@@ -160,39 +161,66 @@ export class ZWaveJSNetworkVisualization extends SubscribeMixin(LitElement) {
+         sourceDevice?.name_by_user ?? sourceDevice?.name ?? source;
+       const targetName =
+         targetDevice?.name_by_user ?? targetDevice?.name ?? target;
+-      let tip = `${sourceName} → ${targetName}`;
+       const route =
+         this._nodeStatistics[source]?.lwr || this._nodeStatistics[source]?.nlwr;
+-      if (route?.protocol_data_rate) {
+-        tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.data_rate")}:</b> ${this.hass.localize(`ui.panel.config.zwave_js.protocol_data_rate.${route.protocol_data_rate}`)}`;
+-      }
+-      if (value) {
+-        tip += `<br><b>RSSI:</b> ${value}`;
+-      }
+-      return tip;
++      return html`${sourceName} →
++      ${targetName}${route?.protocol_data_rate
++        ? html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zwave_js.visualization.data_rate"
++              )}:</b
++            >
++            ${this.hass.localize(
++              `ui.panel.config.zwave_js.protocol_data_rate.${route.protocol_data_rate}` as any
++            )}`
++        : nothing}${value ? html`<br /><b>RSSI:</b> ${value}` : nothing}`;
+     }
+     const { id, name } = data as any;
+     const device = this._devices[id] as DeviceRegistryEntry | undefined;
+     const nodeStatus = this._nodeStatuses[id];
+-    let tip = `${(params as any).marker} ${name}`;
+-    tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.node_id")}:</b> ${id}`;
+-    if (device) {
+-      tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.manufacturer")}:</b> ${device.manufacturer || "-"}`;
+-      tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.model")}:</b> ${device.model || "-"}`;
+-    }
+-    if (nodeStatus) {
+-      tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.status")}:</b> ${this.hass.localize(`ui.panel.config.zwave_js.node_status.${nodeStatus.status}`)}`;
+-      if (nodeStatus.zwave_plus_version) {
+-        tip += `<br><b>Z-Wave Plus:</b> ${this.hass.localize("ui.panel.config.zwave_js.visualization.version")} ${nodeStatus.zwave_plus_version}`;
+-      }
+-    }
+-    if (device) {
+-      const area = getDeviceArea(device, this.hass.areas);
+-      if (area) {
+-        tip += `<br><b>${this.hass.localize("ui.panel.config.zwave_js.visualization.area")}:</b> ${area.name}`;
+-      }
+-    }
+-    return tip;
++    const area = device ? getDeviceArea(device, this.hass.areas) : undefined;
++    return html`<ha-chart-tooltip-marker
++        .color=${String((params as CallbackDataParams).color ?? "")}
++      ></ha-chart-tooltip-marker>
++      ${name}<br /><b
++        >${this.hass.localize(
++          "ui.panel.config.zwave_js.visualization.node_id"
++        )}:</b
++      >
++      ${id}${device
++        ? html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zwave_js.visualization.manufacturer"
++              )}:</b
++            >
++            ${device.manufacturer || "-"}<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zwave_js.visualization.model"
++              )}:</b
++            >
++            ${device.model || "-"}`
++        : nothing}${nodeStatus
++        ? html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zwave_js.visualization.status"
++              )}:</b
++            >
++            ${this.hass.localize(
++              `ui.panel.config.zwave_js.node_status.${nodeStatus.status}` as any
++            )}${nodeStatus.zwave_plus_version
++              ? html`<br /><b>Z-Wave Plus:</b> ${this.hass.localize(
++                    "ui.panel.config.zwave_js.visualization.version"
++                  )}
++                  ${nodeStatus.zwave_plus_version}`
++              : nothing}`
++        : nothing}${area
++        ? html`<br /><b
++              >${this.hass.localize(
++                "ui.panel.config.zwave_js.visualization.area"
++              )}:</b
++            >
++            ${area.name}`
++        : nothing}`;
+   };
+ 
+   private _getNetworkData = memoizeOne(
+diff --git a/src/panels/lovelace/cards/energy/common/energy-chart-options.ts b/src/panels/lovelace/cards/energy/common/energy-chart-options.ts
+index 83f1300..07a760a 100644
+--- a/src/panels/lovelace/cards/energy/common/energy-chart-options.ts
++++ b/src/panels/lovelace/cards/energy/common/energy-chart-options.ts
+@@ -1,4 +1,6 @@
+ import type { HassConfig } from "home-assistant-js-websocket";
++import type { TemplateResult } from "lit";
++import { html, nothing } from "lit";
+ import {
+   subHours,
+   differenceInDays,
+@@ -31,10 +33,10 @@ import {
+   formatDateWeekdayVeryShortDate,
+ } from "../../../../../common/datetime/format_date";
+ import { formatTime } from "../../../../../common/datetime/format_time";
+-import type { ECOption } from "../../../../../resources/echarts/echarts";
+-import { filterXSS } from "../../../../../common/util/xss";
++import type { HaECOption } from "../../../../../resources/echarts/echarts";
+ import type { StatisticPeriod } from "../../../../../data/recorder";
+ import { getPeriodicAxisLabelConfig } from "../../../../../components/chart/axis-label";
++import "../../../../../components/chart/ha-chart-tooltip-marker";
+ import { getSuggestedPeriod } from "../../../../../data/energy";
+ 
+ export { fillDataGapsAndRoundCaps } from "../../../../../components/chart/round-caps";
+@@ -110,7 +112,7 @@ export function getCommonOptions(
+   formatTotal?: (total: number) => string,
+   detailedDailyData = false,
+   yAxisFractionDigits = 1
+-): ECOption {
++): HaECOption {
+   const suggestedPeriod = getSuggestedPeriod(start, end, detailedDailyData);
+   let suggestedMax = getSuggestedMax(suggestedPeriod, end, detailedDailyData);
+ 
+@@ -134,7 +136,7 @@ export function getCommonOptions(
+     }
+   }
+ 
+-  const monthTimeAxis: ECOption = {
++  const monthTimeAxis: HaECOption = {
+     xAxis: {
+       type: "time",
+       min: subDays(start, MONTH_TIME_AXIS_PADDING),
+@@ -146,7 +148,7 @@ export function getCommonOptions(
+       splitNumber: Math.min(differenceInCalendarMonths(end, start), 5),
+     },
+   };
+-  const normalTimeAxis: ECOption = {
++  const normalTimeAxis: HaECOption = {
+     xAxis: {
+       type: "time",
+       min: start,
+@@ -154,7 +156,7 @@ export function getCommonOptions(
+     },
+   };
+ 
+-  const options: ECOption = {
++  const options: HaECOption = {
+     ...(suggestedPeriod === "month" ? monthTimeAxis : normalTimeAxis),
+     yAxis: {
+       type: "value",
+@@ -179,7 +181,7 @@ export function getCommonOptions(
+     },
+     tooltip: {
+       trigger: "axis",
+-      formatter: (params: TopLevelFormatterParams): string => {
++      formatter: (params: TopLevelFormatterParams) => {
+         // trigger: "axis" gives an array of params, but "item" gives a single param
+         if (Array.isArray(params)) {
+           const mainItems: CallbackDataParams[] = [];
+@@ -191,7 +193,7 @@ export function getCommonOptions(
+               mainItems.push(param);
+             }
+           });
+-          return [mainItems, compareItems]
++          const sections = [mainItems, compareItems]
+             .map((items) =>
+               formatTooltip(
+                 items,
+@@ -204,8 +206,12 @@ export function getCommonOptions(
+                 formatTotal
+               )
+             )
+-            .filter(Boolean)
+-            .join("<br><br>");
++            .filter((s): s is TemplateResult => s !== nothing);
++          if (sections.length === 0) return nothing;
++          return html`${sections.map(
++            (section, i) =>
++              html`${i > 0 ? html`<br /><br />` : nothing}${section}`
++          )}`;
+         }
+         return formatTooltip(
+           [params],
+@@ -232,9 +238,9 @@ function formatTooltip(
+   showCompareYear: boolean,
+   unit?: string,
+   formatTotal?: (total: number) => string
+-) {
++): TemplateResult | typeof nothing {
+   if (!params[0]?.value) {
+-    return "";
++    return nothing;
+   }
+   // displayX may be shifted from the period start (see EnergyDataPoint);
+   // originalStart has the real date for display. Gap-filled entries lack it.
+@@ -258,43 +264,50 @@ function formatTooltip(
+       period += ` – ${formatTime(addHours(date, 1), locale, config)}`;
+     }
+   }
+-  const title = `<h4 style="text-align: center; margin: 0;">${period}</h4>`;
+ 
+   let sumPositive = 0;
+   let countPositive = 0;
+   let sumNegative = 0;
+   let countNegative = 0;
+-  const values = params
+-    .map((param) => {
+-      const y = param.value?.[1] as number;
+-      const value = formatNumber(
+-        y,
+-        locale,
+-        y < 0.1 ? { maximumFractionDigits: 3 } : undefined
+-      );
+-      if (value === "0") {
+-        return false;
+-      }
+-      if (param.componentSubType === "bar") {
+-        if (y > 0) {
+-          sumPositive += y;
+-          countPositive++;
+-        } else {
+-          sumNegative += y;
+-          countNegative++;
+-        }
++  const rows: TemplateResult[] = [];
++  for (const param of params) {
++    const y = param.value?.[1] as number;
++    const value = formatNumber(
++      y,
++      locale,
++      y < 0.1 ? { maximumFractionDigits: 3 } : undefined
++    );
++    if (value === "0") {
++      continue;
++    }
++    if (param.componentSubType === "bar") {
++      if (y > 0) {
++        sumPositive += y;
++        countPositive++;
++      } else {
++        sumNegative += y;
++        countNegative++;
+       }
+-      return `${param.marker} ${filterXSS(param.seriesName!)}: <div style="direction:ltr; display: inline;">${value} ${unit}</div>`;
+-    })
+-    .filter(Boolean);
+-  let footer = "";
+-  if (sumPositive !== 0 && countPositive > 1 && formatTotal) {
+-    footer += `<br><b>${formatTotal(sumPositive)}</b>`;
++    }
++    rows.push(
++      html`<ha-chart-tooltip-marker
++          .color=${String(param.color ?? "")}
++        ></ha-chart-tooltip-marker>
++        ${param.seriesName}:
++        <div style="direction:ltr; display: inline;">${value} ${unit}</div>`
++    );
+   }
+-  if (sumNegative !== 0 && countNegative > 1 && formatTotal) {
+-    footer += `<br><b>${formatTotal(sumNegative)}</b>`;
++  if (rows.length === 0) {
++    return nothing;
+   }
+-  return values.length > 0 ? `${title}${values.join("<br>")}${footer}` : "";
++  return html`<h4 style="text-align: center; margin: 0;">${period}</h4>
++    ${rows.map(
++      (row, i) => html`${i > 0 ? html`<br />` : nothing}${row}`
++    )}${sumPositive !== 0 && countPositive > 1 && formatTotal
++      ? html`<br /><b>${formatTotal(sumPositive)}</b>`
++      : nothing}${sumNegative !== 0 && countNegative > 1 && formatTotal
++      ? html`<br /><b>${formatTotal(sumNegative)}</b>`
++      : nothing}`;
+ }
+ 
+ function getDatapointX(datapoint: NonNullable<LineSeriesOption["data"]>[0]) {
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-devices-detail-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-devices-detail-graph-card.ts
+index bf8ff89..a9d335f 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-devices-detail-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-devices-detail-graph-card.ts
+@@ -44,7 +44,7 @@ import {
+   getCompareTransform,
+ } from "./common/energy-chart-options";
+ import { storage } from "../../../../common/decorators/storage";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import { formatNumber } from "../../../../common/number/format_number";
+ import type { CustomLegendOption } from "../../../../components/chart/ha-chart-base";
+ 
+@@ -216,7 +216,7 @@ export class HuiEnergyDevicesDetailGraphCard
+       compareStart: Date | undefined,
+       compareEnd: Date | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption => {
++    ): HaECOption => {
+       const commonOptions = getCommonOptions(
+         start,
+         end,
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-devices-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-devices-graph-card.ts
+index c72807e..867f8c8 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-devices-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-devices-graph-card.ts
+@@ -9,10 +9,10 @@ import type { BarSeriesOption, PieSeriesOption } from "echarts/charts";
+ import { PieChart } from "echarts/charts";
+ import type { ECElementEvent } from "echarts/types/dist/shared";
+ import type { PieDataItemOption } from "echarts/types/src/chart/pie/PieSeries";
+-import { filterXSS } from "../../../../common/util/xss";
+ import { getGraphColorByIndex } from "../../../../common/color/colors";
+ import { formatNumber } from "../../../../common/number/format_number";
+ import "../../../../components/chart/ha-chart-base";
++import "../../../../components/chart/ha-chart-tooltip-marker";
+ import type { EnergyData } from "../../../../data/energy";
+ import {
+   computeConsumptionData,
+@@ -30,7 +30,7 @@ import type { HomeAssistant } from "../../../../types";
+ import type { LovelaceCard } from "../../types";
+ import type { EnergyDevicesGraphCardConfig } from "../types";
+ import { hasConfigChanged } from "../../common/has-changed";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import "../../../../components/ha-card";
+ import { fireEvent } from "../../../../common/dom/fire_event";
+ import { measureTextWidth } from "../../../../util/text";
+@@ -198,24 +198,28 @@ export class HuiEnergyDevicesGraphCard
+     `;
+   }
+ 
+-  private _renderTooltip(params: any) {
+-    const deviceName = filterXSS(this._getDeviceName(params.name));
+-    const title = `<h4 style="text-align: center; margin: 0;">${deviceName}</h4>`;
++  private _renderTooltip = (params: any) => {
++    const deviceName = this._getDeviceName(params.name);
+     const value = `${formatNumber(
+       params.value[0] as number,
+       this.hass.locale,
+       params.value < 0.1 ? { maximumFractionDigits: 3 } : undefined
+     )} kWh ${params.percent ? `(${params.percent} %)` : ""}`;
+-    return `${title}${params.marker} ${params.seriesName}: <div style="direction:ltr; display: inline;">${value}</div>`;
+-  }
++    return html`<h4 style="text-align: center; margin: 0;">${deviceName}</h4>
++      <ha-chart-tooltip-marker
++        .color=${String(params.color ?? "")}
++      ></ha-chart-tooltip-marker>
++      ${params.seriesName}:
++      <div style="direction:ltr; display: inline;">${value}</div>`;
++  };
+ 
+   private _createOptions = memoizeOne(
+     (
+       data: (BarSeriesOption | PieSeriesOption)[],
+       chartType: "bar" | "pie",
+       legendData: typeof this._legendData
+-    ): ECOption => {
+-      const options: ECOption = {
++    ): HaECOption => {
++      const options: HaECOption = {
+         grid: {
+           top: 5,
+           left: 5,
+@@ -225,7 +229,7 @@ export class HuiEnergyDevicesGraphCard
+         },
+         tooltip: {
+           show: true,
+-          formatter: this._renderTooltip.bind(this),
++          formatter: this._renderTooltip,
+         },
+         xAxis: { show: false },
+         yAxis: { show: false },
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-gas-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-gas-graph-card.ts
+index e76bd92..63e56a1 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-gas-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-gas-graph-card.ts
+@@ -35,7 +35,7 @@ import {
+   getCommonOptions,
+   getCompareTransform,
+ } from "./common/energy-chart-options";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import "./common/hui-energy-graph-chip";
+ import "../../../../components/ha-tooltip";
+ 
+@@ -177,7 +177,7 @@ export class HuiEnergyGasGraphCard
+       compareStart: Date | undefined,
+       compareEnd: Date | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption =>
++    ): HaECOption =>
+       getCommonOptions(
+         start,
+         end,
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-solar-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-solar-graph-card.ts
+index b2f97b7..1bd9b89 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-solar-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-solar-graph-card.ts
+@@ -37,7 +37,7 @@ import {
+   getCommonOptions,
+   getCompareTransform,
+ } from "./common/energy-chart-options";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import "./common/hui-energy-graph-chip";
+ import "../../../../components/ha-tooltip";
+ 
+@@ -65,7 +65,7 @@ export class HuiEnergySolarGraphCard
+     };
+   }
+ 
+-  @state() private _chartData: ECOption["series"][] = [];
++  @state() private _chartData: (BarSeriesOption | LineSeriesOption)[] = [];
+ 
+   @state() private _yAxisFractionDigits = 1;
+ 
+@@ -175,7 +175,7 @@ export class HuiEnergySolarGraphCard
+       compareStart: Date | undefined,
+       compareEnd: Date | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption =>
++    ): HaECOption =>
+       getCommonOptions(
+         start,
+         end,
+@@ -213,7 +213,7 @@ export class HuiEnergySolarGraphCard
+       }
+     }
+ 
+-    const datasets: ECOption["series"] = [];
++    const datasets: (BarSeriesOption | LineSeriesOption)[] = [];
+ 
+     const computedStyles = getComputedStyle(this);
+ 
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-usage-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-usage-graph-card.ts
+index 2cd24f8..a96859f 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-usage-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-usage-graph-card.ts
+@@ -6,10 +6,7 @@ import { customElement, property, state } from "lit/decorators";
+ import { classMap } from "lit/directives/class-map";
+ import memoizeOne from "memoize-one";
+ import type { BarSeriesOption } from "echarts/charts";
+-import type {
+-  TooltipOption,
+-  TopLevelFormatterParams,
+-} from "echarts/types/dist/shared";
++import type { TopLevelFormatterParams } from "echarts/types/dist/shared";
+ import { getEnergyColor } from "./common/color";
+ import { formatNumber } from "../../../../common/number/format_number";
+ import "../../../../components/chart/ha-chart-base";
+@@ -43,7 +40,7 @@ import {
+   getCommonOptions,
+   getCompareTransform,
+ } from "./common/energy-chart-options";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ 
+ const colorPropertyMap = {
+   to_grid: "--energy-grid-return-color",
+@@ -196,7 +193,7 @@ export class HuiEnergyUsageGraphCard
+       compareStart: Date | undefined,
+       compareEnd: Date | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption => {
++    ): HaECOption => {
+       const commonOptions = getCommonOptions(
+         start,
+         end,
+@@ -209,15 +206,22 @@ export class HuiEnergyUsageGraphCard
+         false,
+         yAxisFractionDigits
+       );
+-      const options: ECOption = {
++      const tooltip = commonOptions.tooltip;
++      const baseFormatter =
++        tooltip &&
++        !Array.isArray(tooltip) &&
++        typeof tooltip.formatter === "function"
++          ? tooltip.formatter
++          : undefined;
++      const options: HaECOption = {
+         ...commonOptions,
+         tooltip: {
+           ...commonOptions.tooltip,
+-          formatter: (params: TopLevelFormatterParams): string => {
++          formatter: (params: TopLevelFormatterParams) => {
+             if (!Array.isArray(params)) {
+-              return "";
++              return nothing;
+             }
+-            params.sort((a, b) => {
++            const sorted = [...params].sort((a, b) => {
+               const aValue = (a.value as number[])?.[1];
+               const bValue = (b.value as number[])?.[1];
+               if (aValue > 0 && bValue < 0) {
+@@ -231,9 +235,7 @@ export class HuiEnergyUsageGraphCard
+               }
+               return a.componentIndex - b.componentIndex;
+             });
+-            return (
+-              (commonOptions.tooltip as TooltipOption)?.formatter as any
+-            )?.(params);
++            return baseFormatter ? baseFormatter(sorted) : nothing;
+           },
+         },
+       };
+diff --git a/src/panels/lovelace/cards/energy/hui-energy-water-graph-card.ts b/src/panels/lovelace/cards/energy/hui-energy-water-graph-card.ts
+index e36e9d1..845dcad 100644
+--- a/src/panels/lovelace/cards/energy/hui-energy-water-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-energy-water-graph-card.ts
+@@ -34,7 +34,7 @@ import {
+   getCommonOptions,
+   getCompareTransform,
+ } from "./common/energy-chart-options";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import { formatNumber } from "../../../../common/number/format_number";
+ import "./common/hui-energy-graph-chip";
+ import "../../../../components/ha-tooltip";
+@@ -177,7 +177,7 @@ export class HuiEnergyWaterGraphCard
+       compareStart: Date | undefined,
+       compareEnd: Date | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption =>
++    ): HaECOption =>
+       getCommonOptions(
+         start,
+         end,
+diff --git a/src/panels/lovelace/cards/energy/hui-power-sources-graph-card.ts b/src/panels/lovelace/cards/energy/hui-power-sources-graph-card.ts
+index 1c9835c..162b140 100644
+--- a/src/panels/lovelace/cards/energy/hui-power-sources-graph-card.ts
++++ b/src/panels/lovelace/cards/energy/hui-power-sources-graph-card.ts
+@@ -24,7 +24,7 @@ import type { LovelaceCard } from "../../types";
+ import type { PowerSourcesGraphCardConfig } from "../types";
+ import { hasConfigChanged } from "../../common/has-changed";
+ import { getCommonOptions, fillLineGaps } from "./common/energy-chart-options";
+-import type { ECOption } from "../../../../resources/echarts/echarts";
++import type { HaECOption } from "../../../../resources/echarts/echarts";
+ import { hex2rgb } from "../../../../common/color/convert-color";
+ import type { CustomLegendOption } from "../../../../components/chart/ha-chart-base";
+ 
+@@ -148,7 +148,7 @@ export class HuiPowerSourcesGraphCard
+       compareEnd: Date | undefined,
+       legendData: CustomLegendOption["data"] | undefined,
+       yAxisFractionDigits: number
+-    ): ECOption => ({
++    ): HaECOption => ({
+       ...getCommonOptions(
+         start,
+         end,
+diff --git a/src/resources/echarts/echarts.ts b/src/resources/echarts/echarts.ts
+index d2a2c5c..e01d1d0 100644
+--- a/src/resources/echarts/echarts.ts
++++ b/src/resources/echarts/echarts.ts
+@@ -67,6 +67,14 @@ export type ECOption = ComposeOption<
+   | SunburstSeriesOption
+ >;
+ 
++export type {
++  HaECOption,
++  HaECSeries,
++  HaECSeriesItem,
++  HaTooltipOption,
++  LitTooltipFormatter,
++} from "./ha-ec-option";
++
+ // Register the required components
+ echarts.use([
+   BarChart,
+diff --git a/src/resources/echarts/ha-ec-option.ts b/src/resources/echarts/ha-ec-option.ts
+new file mode 100644
+index 0000000..690a04d
+--- /dev/null
++++ b/src/resources/echarts/ha-ec-option.ts
+@@ -0,0 +1,33 @@
++import type { TemplateResult, nothing } from "lit";
++import type { TooltipOption } from "echarts/types/dist/shared";
++import type { ECOption } from "./echarts";
++
++export type LitTooltipFormatter<P = any> = (
++  params: P,
++  ticket?: string
++) => TemplateResult | typeof nothing | null | undefined;
++
++export type HaTooltipOption = Omit<TooltipOption, "formatter"> & {
++  formatter?: string | LitTooltipFormatter;
++};
++
++type RawSeriesOption = Exclude<
++  NonNullable<ECOption["series"]>,
++  readonly unknown[]
++>;
++
++/** Single series item with optional Lit tooltip formatter */
++export type HaECSeriesItem = Omit<RawSeriesOption, "tooltip"> & {
++  tooltip?: HaTooltipOption;
++};
++
++/** Series array passed to ha-chart-base `.data` */
++export type HaECSeries = HaECSeriesItem[];
++
++export type HaECOption = {
++  [K in keyof ECOption]: K extends "tooltip"
++    ? HaTooltipOption | HaTooltipOption[] | undefined
++    : K extends "series"
++      ? HaECSeriesItem | HaECSeriesItem[] | undefined
++      : ECOption[K];
++};

@@ -1,0 +1,124 @@
+diff -ruN a/lib/mail/encodings.rb b/lib/mail/encodings.rb
+--- a/lib/mail/encodings.rb	2026-10-30 00:33:01.000000000 +0000
++++ b/lib/mail/encodings.rb	2026-10-30 00:53:22.441219550 +0000
+@@ -136,35 +136,18 @@
+       end.join("")
+     end
+ 
+-    # Decodes a phrase (such as the display name of an address) that consists of
+-    # a single encoded-word. A phrase carrying folding white-space may hold
+-    # several words and is left to the general decoder.
++    # Decodes a phrase (such as the display name of an address). A phrase can
++    # carry literal text around one or more encoded words, so this is the
++    # general decoder: every word is decoded and every literal character is
++    # preserved.
+     def Encodings.value_decode_phrase(str)
+-      return value_decode(str) if str.match?(WSP)
+-      word = /\A(\=\?(.+)\?([QqBb])\?(.*)\?=)\z/m.match(str)
+-      return value_decode(str) unless word
+-      decode_encoded_word(word[2], word[3], word[4])
++      value_decode(str)
+     end
+ 
+-    # Decodes a domain that is carried as a single encoded-word.
++    # Decodes a domain that may be carried as one or more encoded words,
++    # leaving literal characters untouched.
+     def Encodings.value_decode_domain(str)
+-      word = /\A(\=\?(.+)\?([QqBb])\?(.*)\?=)\z/m.match(str)
+-      return value_decode(str) unless word
+-      decode_encoded_word(word[2], word[3], word[4])
+-    end
+-
+-    # Decodes the charset, Q/B marker and payload of one encoded-word.
+-    def Encodings.decode_encoded_word(charset, marker, payload)
+-      string = if marker.match?(/[Qq]/)
+-        Encodings::QuotedPrintable.decode(payload.gsub(/_/, '=20').sub(/\=$/, ''))
+-      else
+-        Utilities.decode_base64(payload)
+-      end
+-      begin
+-        Utilities.charset_encoder.encode(string, charset)
+-      rescue Encoding::UndefinedConversionError, ArgumentError, Encoding::ConverterNotFoundError
+-        string.dup.force_encoding(Encoding::UTF_8)
+-      end
++      value_decode(str)
+     end
+ 
+     # Takes an encoded string of the format =?<encoding>?[QB]?<string>?=
+diff -ruN a/lib/mail/utilities.rb b/lib/mail/utilities.rb
+--- a/lib/mail/utilities.rb	2026-10-30 00:32:59.000000000 +0000
++++ b/lib/mail/utilities.rb	2026-10-30 00:53:56.354874491 +0000
+@@ -415,17 +415,29 @@
+       [Utilities.encode_base64(str), encoding]
+     end
+ 
++    # Converts the bytes carried by one encoded word to UTF-8 using the
++    # charset the word names. A decoder never raises on a header value: an
++    # unknown charset or an impossible conversion falls back to the decoded
++    # bytes as they are.
++    def Utilities.decode_word_charset(bytes, charset)
++      charset_encoder.encode(bytes, charset)
++    rescue Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError,
++           Encoding::ConverterNotFoundError, ArgumentError
++      warn "WARNING: Encoding conversion failed #{$!}"
++      bytes.dup.force_encoding(Encoding::UTF_8)
++    end
++
++    # Decodes every B-encoded word in a value, keeping all literal text
++    # around them. The charset name cannot contain "?" and a B payload is
++    # base64 text, so a word broken by an extra "?" is not a word at all and
++    # is returned literally.
+     def Utilities.b_value_decode(str)
+-      match = str.match(/\=\?(.+)?\?[Bb]\?(.*)\?\=/m)
+-      if match
+-        charset = match[1]
+-        str = Utilities.decode_base64(match[2])
+-        str = charset_encoder.encode(str, charset)
++      decoded = str.gsub(/\=\?([^?]+)\?[Bb]\?([^?]*)\?\=/) do
++        charset = $1
++        payload = $2
++        decode_word_charset(Utilities.decode_base64(payload), charset)
+       end
+-      transcode_to_scrubbed_utf8(str)
+-    rescue Encoding::UndefinedConversionError, ArgumentError, Encoding::ConverterNotFoundError, Encoding::InvalidByteSequenceError
+-      warn "WARNING: Encoding conversion failed #{$!}"
+-      str.dup.force_encoding(Encoding::UTF_8)
++      transcode_to_scrubbed_utf8(decoded)
+     end
+ 
+     def Utilities.q_value_encode(str, encoding = nil)
+@@ -433,23 +445,22 @@
+       [Encodings::QuotedPrintable.encode(str), encoding]
+     end
+ 
++    # Decodes every Q-encoded word in a value, keeping all literal text
++    # around them. The payload ends at the first "?="; a "?" that does not
++    # begin that terminator is ordinary text inside the word.
+     def Utilities.q_value_decode(str)
+-      match = str.match(/\=\?(.+)?\?[Qq]\?(.*)\?\=/m)
+-      if match
+-        charset = match[1]
+-        string = match[2].gsub(/_/, '=20')
++      decoded = str.gsub(/\=\?([^?]+)\?[Qq]\?((?:[^?]|\?(?!\=))*)\?\=/) do
++        charset = $1
++        payload = $2.gsub(/_/, '=20')
+         # Remove trailing = if it exists in a Q encoding
+-        string = string.sub(/\=$/, '')
+-        str = Encodings::QuotedPrintable.decode(string)
+-        str = charset_encoder.encode(str, charset)
++        payload = payload.sub(/\=$/, '')
++        text = decode_word_charset(Encodings::QuotedPrintable.decode(payload), charset)
+         # We assume that binary strings hold utf-8 directly to work around
+         # jruby/jruby#829 which subtly changes String#encode semantics.
+-        str.force_encoding(Encoding::UTF_8) if str.encoding == Encoding::ASCII_8BIT
++        text.force_encoding(Encoding::UTF_8) if text.encoding == Encoding::ASCII_8BIT
++        text
+       end
+-      transcode_to_scrubbed_utf8(str)
+-    rescue Encoding::UndefinedConversionError, ArgumentError, Encoding::ConverterNotFoundError
+-      warn "WARNING: Encoding conversion failed #{$!}"
+-      str.dup.force_encoding(Encoding::UTF_8)
++      transcode_to_scrubbed_utf8(decoded)
+     end
+ 
+     def Utilities.param_decode(str, encoding)

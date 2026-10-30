@@ -1,0 +1,82 @@
+diff --git a/packages/base-driver/lib/express/server.ts b/packages/base-driver/lib/express/server.ts
+index b3033da68749b8416db12abcd29a34685de57e6d..64f916ec3eeda8b256fc96c102c14ead3476d332 100644
+--- a/packages/base-driver/lib/express/server.ts
++++ b/packages/base-driver/lib/express/server.ts
+@@ -23,6 +23,7 @@ import {guineaPig, guineaPigScrollable, guineaPigAppBanner, welcome, STATIC_DIR}
+ import {produceError, produceCrash} from './crash';
+ import {mountCiAssets} from './ci-assets';
+ import {samplePage} from './sample-page';
++import {isLegacyTestPagesEnabled} from './test-pages-env';
+ import {
+   addWebSocketHandler,
+   removeWebSocketHandler,
+@@ -177,21 +178,24 @@ export function configureServer({
+   useLegacyUpgradeHandler = true,
+ }: ConfigureServerOpts): void {
+   basePath = normalizeBasePath(basePath);
++  const testPagesEnabled = isLegacyTestPagesEnabled();
+ 
+   app.use(endLogFormatter);
+   app.use(handleLogContext);
+ 
+-  // Sample assets and a reachability page that driver end-to-end suites use.
+-  mountCiAssets(app);
+-  app.all('/sample-page', samplePage);
++  if (testPagesEnabled) {
++    // Sample assets and a reachability page that driver end-to-end suites use.
++    mountCiAssets(app);
++    app.all('/sample-page', samplePage);
+ 
+-  // set up static assets
+-  app.use(favicon(path.resolve(STATIC_DIR, 'favicon.ico')));
+-  app.use(express.static(STATIC_DIR));
++    // set up static assets
++    app.use(favicon(path.resolve(STATIC_DIR, 'favicon.ico')));
++    app.use(express.static(STATIC_DIR));
+ 
+-  // crash routes, for testing
+-  app.use(`${basePath}/produce_error`, produceError);
+-  app.use(`${basePath}/crash`, produceCrash);
++    // crash routes, for testing
++    app.use(`${basePath}/produce_error`, produceError);
++    app.use(`${basePath}/crash`, produceCrash);
++  }
+ 
+   // Only use legacy Express middleware for WebSocket upgrades if shouldUpgradeCallback is not available.
+   // When shouldUpgradeCallback is available, upgrades are handled directly on the HTTP server
+@@ -218,11 +222,13 @@ export function configureServer({
+ 
+   addRoutes(app, {basePath, extraMethodMap});
+ 
+-  // dynamic routes for testing, etc.
+-  app.all('/welcome', welcome);
+-  app.all('/test/guinea-pig', guineaPig);
+-  app.all('/test/guinea-pig-scrollable', guineaPigScrollable);
+-  app.all('/test/guinea-pig-app-banner', guineaPigAppBanner);
++  if (testPagesEnabled) {
++    // dynamic routes for testing, etc.
++    app.all('/welcome', welcome);
++    app.all('/test/guinea-pig', guineaPig);
++    app.all('/test/guinea-pig-scrollable', guineaPigScrollable);
++    app.all('/test/guinea-pig-app-banner', guineaPigAppBanner);
++  }
+ }
+ 
+ /**
+diff --git a/packages/base-driver/lib/express/test-pages-env.ts b/packages/base-driver/lib/express/test-pages-env.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..56079d0e0b8b64b6344a3d8fb9f9a6dd0289c380
+--- /dev/null
++++ b/packages/base-driver/lib/express/test-pages-env.ts
+@@ -0,0 +1,11 @@
++/** Environment variable that opts into the built-in test pages on the Appium server. */
++export const LEGACY_TEST_PAGES_ENV = 'APPIUM_ENABLE_LEGACY_TEST_PAGES';
++
++const ENABLED_VALUES = new Set(['1', 'true', 'yes']);
++
++/**
++ * @returns Whether the built-in test pages should be mounted on the Appium server.
++ */
++export function isLegacyTestPagesEnabled(): boolean {
++  return ENABLED_VALUES.has(String(process.env[LEGACY_TEST_PAGES_ENV] ?? '').toLowerCase());
++}

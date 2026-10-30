@@ -1,0 +1,97 @@
+--- a/lib/mail/elements/address.rb
++++ b/lib/mail/elements/address.rb
+@@ -87,12 +87,7 @@
+     def display_name(output_type = :decode)
+       parse unless @parsed
+       @display_name ||= get_display_name
+-      return unless @display_name
+-      if output_type == :decode
+-        Encodings.value_decode_phrase(@display_name.to_s)
+-      else
+-        Encodings.decode_encode(@display_name.to_s, output_type)
+-      end
++      Encodings.decode_encode(@display_name.to_s, output_type) if @display_name
+     end
+ 
+     # Provides a way to assign a display name to an already made Mail::Address object.
+@@ -122,9 +117,7 @@
+     #  a.domain #=> 'test.lindsaar.net'
+     def domain(output_type = :decode)
+       parse unless @parsed
+-      return unless get_domain
+-      return Encodings.value_decode_domain(strip_all_comments(get_domain)) if output_type == :decode
+-      Encodings.decode_encode(strip_all_comments(get_domain), output_type)
++      Encodings.decode_encode(strip_all_comments(get_domain), output_type) if get_domain
+     end
+ 
+     # Returns an array of comments that are in the email, or nil if there
+--- a/lib/mail/encodings.rb
++++ b/lib/mail/encodings.rb
+@@ -136,37 +136,6 @@
+       end.join("")
+     end
+ 
+-    # Decodes a phrase (such as the display name of an address) that consists of
+-    # a single encoded-word. A phrase carrying folding white-space may hold
+-    # several words and is left to the general decoder.
+-    def Encodings.value_decode_phrase(str)
+-      return value_decode(str) if str.match?(WSP)
+-      word = /\A(\=\?(.+)\?([QqBb])\?(.*)\?=)\z/m.match(str)
+-      return value_decode(str) unless word
+-      decode_encoded_word(word[2], word[3], word[4])
+-    end
+-
+-    # Decodes a domain that is carried as a single encoded-word.
+-    def Encodings.value_decode_domain(str)
+-      word = /\A(\=\?(.+)\?([QqBb])\?(.*)\?=)\z/m.match(str)
+-      return value_decode(str) unless word
+-      decode_encoded_word(word[2], word[3], word[4])
+-    end
+-
+-    # Decodes the charset, Q/B marker and payload of one encoded-word.
+-    def Encodings.decode_encoded_word(charset, marker, payload)
+-      string = if marker.match?(/[Qq]/)
+-        Encodings::QuotedPrintable.decode(payload.gsub(/_/, '=20').sub(/\=$/, ''))
+-      else
+-        Utilities.decode_base64(payload)
+-      end
+-      begin
+-        Utilities.charset_encoder.encode(string, charset)
+-      rescue Encoding::UndefinedConversionError, ArgumentError, Encoding::ConverterNotFoundError
+-        string.dup.force_encoding(Encoding::UTF_8)
+-      end
+-    end
+-
+     # Takes an encoded string of the format =?<encoding>?[QB]?<string>?=
+     def Encodings.unquote_and_convert_to(str, to_encoding)
+       output = value_decode( str ).to_s # output is already converted to UTF-8
+--- a/lib/mail/utilities.rb
++++ b/lib/mail/utilities.rb
+@@ -416,7 +416,7 @@
+     end
+ 
+     def Utilities.b_value_decode(str)
+-      match = str.match(/\=\?(.+)?\?[Bb]\?(.*)\?\=/m)
++      match = str.match(/=\?([^?]+)\?[Bb]\?([^?]*)\?=/m)
+       if match
+         charset = match[1]
+         str = Utilities.decode_base64(match[2])
+@@ -434,16 +434,12 @@
+     end
+ 
+     def Utilities.q_value_decode(str)
+-      match = str.match(/\=\?(.+)?\?[Qq]\?(.*)\?\=/m)
++      match = str.match(/=\?([^?]+)\?[Qq]\?(.*)\?=/m)
+       if match
+         charset = match[1]
+-        string = match[2].gsub(/_/, '=20')
+-        # Remove trailing = if it exists in a Q encoding
+-        string = string.sub(/\=$/, '')
++        string = match[2].gsub(/_/, '=20').sub(/\=$/, '')
+         str = Encodings::QuotedPrintable.decode(string)
+         str = charset_encoder.encode(str, charset)
+-        # We assume that binary strings hold utf-8 directly to work around
+-        # jruby/jruby#829 which subtly changes String#encode semantics.
+         str.force_encoding(Encoding::UTF_8) if str.encoding == Encoding::ASCII_8BIT
+       end
+       transcode_to_scrubbed_utf8(str)

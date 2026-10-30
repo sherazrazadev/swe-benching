@@ -1,0 +1,122 @@
+diff --git a/src/common/util/xss.ts b/src/common/util/xss.ts
+index bcbc812..b64e756 100644
+--- a/src/common/util/xss.ts
++++ b/src/common/util/xss.ts
+@@ -6,3 +6,20 @@ export const filterXSS = (html: string) =>
+     stripIgnoreTag: true,
+     stripIgnoreTagBody: true,
+   });
++
++// Allow only the presentational markup that chart tooltips use; everything else is
++// removed together with its content, so a value can never turn into active markup.
++export const sanitizeTooltipHtml = (html: string) =>
++  xss(html, {
++    whiteList: {
++      b: [],
++      br: [],
++      strong: [],
++      i: [],
++      h4: ["style"],
++      div: ["style"],
++      span: ["style"],
++    },
++    stripIgnoreTag: true,
++    stripIgnoreTagBody: true,
++  });
+diff --git a/src/components/chart/ha-chart-base.ts b/src/components/chart/ha-chart-base.ts
+index d239697..d29186f 100644
+--- a/src/components/chart/ha-chart-base.ts
++++ b/src/components/chart/ha-chart-base.ts
+@@ -29,7 +29,7 @@ import type { HASSDomEvent } from "../../common/dom/fire_event";
+ import { fireEvent } from "../../common/dom/fire_event";
+ import { listenMediaQuery } from "../../common/dom/media_query";
+ import { afterNextRender } from "../../common/util/render-status";
+-import { filterXSS } from "../../common/util/xss";
++import { filterXSS, sanitizeTooltipHtml } from "../../common/util/xss";
+ import { uiContext } from "../../data/context";
+ import type { Themes } from "../../data/ws-themes";
+ import type { ECOption } from "../../resources/echarts/echarts";
+@@ -40,6 +40,43 @@ import "../ha-icon-button";
+ import { formatTimeLabel } from "./axis-label";
+ import { downSampleLineData } from "./down-sample";
+ 
++type AnyTooltipFormatter = (...args: any[]) => any;
++
++const sanitizeTooltipOption = (tooltip: any): any => {
++  if (!tooltip || typeof tooltip !== "object") {
++    return tooltip;
++  }
++  const next = { ...tooltip };
++  const formatter = next.formatter;
++  if (typeof formatter === "function") {
++    next.formatter = (...args: any[]) => {
++      const result = (formatter as AnyTooltipFormatter)(...args);
++      return typeof result === "string" ? sanitizeTooltipHtml(result) : result;
++    };
++  } else if (typeof formatter === "string") {
++    next.formatter = sanitizeTooltipHtml(formatter);
++  }
++  return next;
++};
++
++const sanitizeSeriesOption = (series: any): any => {
++  if (!series || typeof series !== "object") {
++    return series;
++  }
++  const next = { ...series };
++  if (next.tooltip) {
++    next.tooltip = sanitizeTooltipOption(next.tooltip);
++  }
++  if (Array.isArray(next.data)) {
++    next.data = next.data.map((item: any) =>
++      item && typeof item === "object" && item.tooltip
++        ? { ...item, tooltip: sanitizeTooltipOption(item.tooltip) }
++        : item
++    );
++  }
++  return next;
++};
++
+ export const MIN_TIME_BETWEEN_UPDATES = 60 * 5 * 1000;
+ const LEGEND_OVERFLOW_LIMIT = 10;
+ const LEGEND_OVERFLOW_LIMIT_MOBILE = 6;
+@@ -772,6 +809,16 @@ export class HaChartBase extends LitElement {
+       });
+       options.tooltip = tooltips;
+     }
++    if (options.tooltip) {
++      options.tooltip = (Array.isArray(options.tooltip)
++        ? options.tooltip.map(sanitizeTooltipOption)
++        : sanitizeTooltipOption(options.tooltip)) as any;
++    }
++    if ((options as any).series) {
++      (options as any).series = ensureArray((options as any).series).map(
++        sanitizeSeriesOption
++      );
++    }
+     return options;
+   }
+ 
+@@ -976,7 +1023,7 @@ export class HaChartBase extends LitElement {
+                 ? xAxis.max
+                 : undefined
+             : undefined;
+-          return {
++          return sanitizeSeriesOption({
+             ...s,
+             sampling: undefined,
+             data: downSampleLineData(
+@@ -985,11 +1032,11 @@ export class HaChartBase extends LitElement {
+               minX,
+               maxX
+             ),
+-          };
++          });
+         }
+       }
+       const name = filterXSS(String(s.name ?? s.id ?? ""));
+-      return { ...s, name, data };
++      return sanitizeSeriesOption({ ...s, name, data });
+     });
+     return series as ECOption["series"];
+   }

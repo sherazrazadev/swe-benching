@@ -1,0 +1,97 @@
+diff -ruN a/packages/base-driver/lib/express/builtin-support.ts b/packages/base-driver/lib/express/builtin-support.ts
+--- a/packages/base-driver/lib/express/builtin-support.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/base-driver/lib/express/builtin-support.ts	2026-10-30 01:17:22.464931118 +0000
+@@ -0,0 +1,26 @@
++/**
++ * Operator switch for the server's built-in test and debugging support: the bundled pages,
++ * the fixture files shipped with the package and the deliberate error routes.
++ *
++ * The support is off unless the operator asks for it, so a default server never exposes it.
++ */
++export const BUILTIN_SUPPORT_ENV = 'APPIUM_ENABLE_LEGACY_TEST_PAGES';
++
++/** The only values of {@link BUILTIN_SUPPORT_ENV} that opt in; compared case-insensitively. */
++const ENABLING_VALUES = ['1', 'true', 'yes'];
++
++/**
++ * Decides whether the built-in test and debugging support may be mounted.
++ *
++ * The environment variable is read on every call, so it is evaluated when a server is
++ * assembled rather than once at import time.
++ *
++ * @returns `true` only for one of the documented enabling values, in any letter case.
++ */
++export function isBuiltinSupportEnabled(): boolean {
++  const configured = process.env[BUILTIN_SUPPORT_ENV];
++  if (typeof configured !== 'string') {
++    return false;
++  }
++  return ENABLING_VALUES.includes(configured.toLowerCase());
++}
+diff -ruN a/packages/base-driver/lib/express/server.ts b/packages/base-driver/lib/express/server.ts
+--- a/packages/base-driver/lib/express/server.ts	2026-10-30 00:45:46.000000000 +0000
++++ b/packages/base-driver/lib/express/server.ts	2026-10-30 01:17:29.501017106 +0000
+@@ -23,6 +23,7 @@
+ import {produceError, produceCrash} from './crash';
+ import {mountCiAssets} from './ci-assets';
+ import {samplePage} from './sample-page';
++import {isBuiltinSupportEnabled} from './builtin-support';
+ import {
+   addWebSocketHandler,
+   removeWebSocketHandler,
+@@ -178,20 +179,25 @@
+ }: ConfigureServerOpts): void {
+   basePath = normalizeBasePath(basePath);
+ 
++  // Built-in test and debugging support is opt-in; nothing below is mounted without it.
++  const builtinSupportEnabled = isBuiltinSupportEnabled();
++
+   app.use(endLogFormatter);
+   app.use(handleLogContext);
+ 
+-  // Sample assets and a reachability page that driver end-to-end suites use.
+-  mountCiAssets(app);
+-  app.all('/sample-page', samplePage);
+-
+-  // set up static assets
+-  app.use(favicon(path.resolve(STATIC_DIR, 'favicon.ico')));
+-  app.use(express.static(STATIC_DIR));
+-
+-  // crash routes, for testing
+-  app.use(`${basePath}/produce_error`, produceError);
+-  app.use(`${basePath}/crash`, produceCrash);
++  if (builtinSupportEnabled) {
++    // Sample assets and a reachability page that driver end-to-end suites use.
++    mountCiAssets(app);
++    app.all('/sample-page', samplePage);
++
++    // set up static assets
++    app.use(favicon(path.resolve(STATIC_DIR, 'favicon.ico')));
++    app.use(express.static(STATIC_DIR));
++
++    // crash routes, for testing
++    app.use(`${basePath}/produce_error`, produceError);
++    app.use(`${basePath}/crash`, produceCrash);
++  }
+ 
+   // Only use legacy Express middleware for WebSocket upgrades if shouldUpgradeCallback is not available.
+   // When shouldUpgradeCallback is available, upgrades are handled directly on the HTTP server
+@@ -218,11 +224,13 @@
+ 
+   addRoutes(app, {basePath, extraMethodMap});
+ 
+-  // dynamic routes for testing, etc.
+-  app.all('/welcome', welcome);
+-  app.all('/test/guinea-pig', guineaPig);
+-  app.all('/test/guinea-pig-scrollable', guineaPigScrollable);
+-  app.all('/test/guinea-pig-app-banner', guineaPigAppBanner);
++  if (builtinSupportEnabled) {
++    // dynamic routes for testing, etc.
++    app.all('/welcome', welcome);
++    app.all('/test/guinea-pig', guineaPig);
++    app.all('/test/guinea-pig-scrollable', guineaPigScrollable);
++    app.all('/test/guinea-pig-app-banner', guineaPigAppBanner);
++  }
+ }
+ 
+ /**

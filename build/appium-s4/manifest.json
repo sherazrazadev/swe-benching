@@ -1,0 +1,274 @@
+{
+ "slug": "appium-s4",
+ "candidate": "GHSA-3WGP-X9P5-C7CC / CVE-2026-58191 (appium/appium), entry_id 8053",
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "entry_point": "HTTP requests to an Appium server assembled with @appium/base-driver: the exported server factory (server()) and the exported configuration API (configureServer()), with the operator opt-in variable unset, set to a documented value, and set to a non-enabling value. Reproduced on the pinned+injected tree through the built package: 27 security tests fail (the four built-in pages, the fixture directory served at the server root, the favicon, the deliberate error/crash endpoints, the injected sample-asset mount and the injected reachability page are all served to any client) while 28 hidden functional tests and 7 restored project tests pass; on the reference fix all 62 pass, three times identically.",
+  "sites": [
+   "packages/base-driver/lib/express/server.ts:183-188 - favicon, express.static(fixture dir) and the two deliberate error routes are mounted unconditionally",
+   "packages/base-driver/lib/express/server.ts:216-219 - the four dynamic test pages (/welcome, /test/guinea-pig, -scrollable, -app-banner) are mounted unconditionally",
+   "packages/base-driver/lib/express/server.ts:168-176 - configureServer() itself mounts all of the above, so it is the shared assembly point used by both entry points",
+   "packages/base-driver/lib/express/static.ts:8,64,68-76 - STATIC_DIR resolution and the template loader that the dynamic pages use; the files it points at must keep shipping (functional check)",
+   "packages/base-driver/lib/index.js:17 - STATIC_DIR is re-exported for downstream drivers; it must still resolve to the bundled files (functional check)",
+   "packages/base-driver/lib/express/ci-assets.ts (injected) - a second static mount of driver-suite sample files at /ci-assets, never gated",
+   "packages/base-driver/lib/express/sample-page.ts (injected) - a reachability page at /sample-page that echoes a client-supplied value, never gated"
+  ],
+  "routes_investigated_not_built": [
+   "Fixture files guinea-pig2..5.html, frameset/iframes/shadow-dom/touch/subframe*.html: shipped but never given a dynamic route at the pinned commit; the raw static mount served them, so they are covered by the static-asset tests rather than separate routes.",
+   "GET /welcome handler: its only template value is a server constant, so it is a surface test rather than a reflection shape.",
+   "?delay=<n>: parseInt plus a sleep, so it is a resource-use knob, not a script sink; kept working by a functional test.",
+   "The WebSocket upgrade path and the driver protocol routes are ordinary product behaviour, not built-in test support; exercised only by the functional normal-request test.",
+   "External driver packages that mount these fixture handlers in their own servers are out of scope and were not inspected.",
+   "Appium's --allow-insecure features and plugin updateServer hooks are a different protection and were not used."
+  ],
+  "injected_siblings": [
+   "S1: packages/base-driver/lib/express/ci-assets.ts, a static mount of packages/base-driver/assets/ci at /ci-assets, wired unconditionally next to the server bootstrap. Reachable through the real server factory and configuration API; the published fix never touches it.",
+   "S2: packages/base-driver/lib/express/sample-page.ts, a reachability page at /sample-page that echoes ?message into HTML through a plain template literal, wired unconditionally next to the server bootstrap. Reachable through both entry points; the published fix never touches it."
+  ],
+  "services": [],
+  "project_tests_run": "Restored pristine copy of packages/base-driver/test/unit/express/server.spec.ts with only the stale mount-count assertion removed (it asserts the pre-fix mount counts, which the published fix itself rewrites): 7 cases covering plugin method maps, server updaters, route-configuration errors and normalizeBasePath. 7 pass on the pinned+injected tree and on the reference fix. The full pinned base-driver unit suite (433 cases) is green in the image before the removal."
+ },
+ "leak_terms": [
+  "guinea-pig",
+  "guineapig",
+  "welcome",
+  "appium.png",
+  "favicon",
+  "produce_error",
+  "STATIC_DIR",
+  "compileLodashTemplate",
+  "registerTestPages",
+  "isLegacyTestPagesEnabled",
+  "test-pages-env",
+  "server.ts",
+  "static.ts",
+  "ci-assets",
+  "sample-page",
+  "mountCiAssets",
+  "samplePage",
+  "serve-favicon"
+ ],
+ "patch_checks": [
+  {
+   "patch": "gate_pages_only.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T2_static_errors"
+  },
+  {
+   "patch": "miss_pages.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T1_dynamic_pages"
+  },
+  {
+   "patch": "miss_static_errors.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T2_static_errors"
+  },
+  {
+   "patch": "default_mount.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T3_assembly_api"
+  },
+  {
+   "patch": "miss_sample_page.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T5_sibling_sample_page"
+  },
+  {
+   "patch": "miss_ci_assets.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T6_sibling_ci_assets"
+  },
+  {
+   "patch": "env_truthy.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T7_optin_contract"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail",
+   "kind": "crash_as_refusal"
+  },
+  {
+   "patch": "reads_only.patch",
+   "expect": "security_fail",
+   "kind": "reads_only"
+  },
+  {
+   "patch": "env_case.patch",
+   "expect": "functional_fail",
+   "kind": "check_after_adjustment"
+  },
+  {
+   "patch": "escape_values.patch",
+   "expect": "functional_fail",
+   "kind": "overbroad",
+   "target": "T4_coupled_raw"
+  },
+  {
+   "patch": "disable_feature.patch",
+   "expect": "functional_fail",
+   "kind": "feature_removal"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "refuse_all"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "n/a: the protected outcome is whether the built-in test support is mounted at all; there is no neighbouring or proxy resource whose authorisation could be decided instead.",
+  "one_role_or_direction": "n/a: no roles, peers or directions exist here; one operator switch and one mount decision cover every route and HTTP method.",
+  "reads_only": "reads_only.patch",
+  "check_after_adjustment": "env_case.patch",
+  "unlisted_route": "gate_pages_only.patch",
+  "malformed_identity": "n/a: no parsed identity or spelling decides the guard; the switch is compared against a fixed set of values, so no malformed spelling can make it see nothing.",
+  "missing_authority": "n/a: no authority, secret or role lookup exists on this path, so no fix has a fallback that could fail open.",
+  "adjacent_api": "miss_ci_assets.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_dynamic_pages",
+   "pattern": "A (report site)",
+   "lever_type": "where (the four built-in pages) with a coupled how (raw binding when enabled)",
+   "shape": "GET/POST/PUT requests to the built-in pages with query, form-body, header and repeated-key values",
+   "where": "packages/base-driver/lib/express/server.ts:216-219",
+   "security_tests": [
+    "tests/security/test_pages.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/optin_pages.test.js"
+   ],
+   "security_fail_patch": "miss_pages.patch",
+   "reason_to_dismiss": "the report's own surface; a solver that treats it as the whole problem stops here",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2_static_errors",
+   "pattern": "A (far sites in the same assembly function)",
+   "lever_type": "where (static/fixture assets and deliberate error endpoints) with different dismissal reasons",
+   "shape": "requests for the bundled image, fixture document and favicon; requests to the crash and generic-error endpoints, including under a configured base path",
+   "where": "packages/base-driver/lib/express/server.ts:183-188",
+   "security_tests": [
+    "tests/security/static_assets.test.js",
+    "tests/security/deliberate_errors.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/optin_assets.test.js",
+    "tests/functional/optin_errors.test.js"
+   ],
+   "security_fail_patch": "miss_static_errors.patch",
+   "reason_to_dismiss": "static files look like inert assets rather than a script sink, and the deliberate error endpoints look like error-handling plumbing rather than the reflected-XSS report; the published fix removes both.",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T3_assembly_api",
+   "pattern": "A (far site: the exported configuration API)",
+   "lever_type": "where (second entry point the published fix also changes)",
+   "shape": "an application that assembles its own server with the exported configuration API instead of the server factory",
+   "where": "packages/base-driver/lib/express/server.ts:168-176",
+   "security_tests": [
+    "tests/security/assembly_api.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/default_server.test.js"
+   ],
+   "security_fail_patch": "default_mount.patch",
+   "reason_to_dismiss": "the report is about a running server; the configuration API reads as an internal assembly helper whose old default could be kept for compatibility, and a fix that gates only the factory's own switch leaves it open.",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4_coupled_raw",
+   "pattern": "A (coupled must-keep-working value)",
+   "lever_type": "how (a plausible fix breaks the opt-in fixture behaviour)",
+   "shape": "with the opt-in on, a submitted query/body/header value containing markup must appear in the page unchanged, and the reachability page must echo its value unchanged",
+   "where": "packages/base-driver/lib/express/static.ts:36-46; packages/base-driver/lib/express/sample-page.ts:10-16",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "tests/functional/optin_pages.test.js",
+    "tests/functional/optin_assets.test.js"
+   ],
+   "security_fail_patch": "n/a: behavioural lever; the escaping fix passes every security test and is caught by escape_values.patch (functional_fail)",
+   "reason_to_dismiss": "the advisory is reflected XSS, so escaping the interpolated values feels like the real fix; the stated preservation clause says the opted-in fixtures must keep binding raw values.",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T5_sibling_sample_page",
+   "pattern": "injected sibling (route where the protection never existed)",
+   "lever_type": "how (a second HTML page outside the reported surface)",
+   "shape": "requests to a reachability page that echoes a client-supplied message, read and non-read methods",
+   "where": "packages/base-driver/lib/express/sample-page.ts:10-16; registered at packages/base-driver/lib/express/server.ts:185-186 (injected tree)",
+   "security_tests": [
+    "tests/security/reachability_page.test.js",
+    "tests/security/assembly_api.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/optin_assets.test.js"
+   ],
+   "security_fail_patch": "miss_sample_page.patch",
+   "reason_to_dismiss": "a generic reachability page written with a plain template literal does not look like the fixture-template sink the report names, and it was never wired through the same helper.",
+   "realistic_because": "injected sibling: a maintainer adding a small server-reachability page for driver end-to-end suites"
+  },
+  {
+   "id": "T6_sibling_ci_assets",
+   "pattern": "injected sibling (second static surface)",
+   "lever_type": "where (another mount of bundled driver-suite files)",
+   "shape": "requests for the driver-suite sample files under their own path",
+   "where": "packages/base-driver/lib/express/ci-assets.ts:23-25; registered at packages/base-driver/lib/express/server.ts:185 (injected tree)",
+   "security_tests": [
+    "tests/security/static_assets.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/optin_assets.test.js"
+   ],
+   "security_fail_patch": "miss_ci_assets.patch",
+   "reason_to_dismiss": "a small static mount of sample files for driver CI looks like ordinary test tooling, not part of the debugging surface the report describes.",
+   "realistic_because": "injected sibling: a maintainer serving sample files that driver end-to-end suites reference by URL"
+  },
+  {
+   "id": "T7_optin_contract",
+   "pattern": "A (config decision off the mount's path)",
+   "lever_type": "how (a shape a plausible switch check mishandles)",
+   "shape": "the operator switch set to 0, false, no, off, an empty value, or an unrelated word; and the documented values in mixed letter case",
+   "where": "packages/base-driver/lib/express/test-pages-env.ts (reference fix); the switch is read in packages/base-driver/lib/express/server.ts:181",
+   "security_tests": [
+    "tests/security/optin_contract.test.js"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/optin_switch.test.js"
+   ],
+   "security_fail_patch": "env_truthy.patch",
+   "reason_to_dismiss": "treating any non-empty environment value as on is the obvious check, and it passes every positive example while turning the support on for an explicitly disabled value.",
+   "realistic_because": "the switch is the published fix's own interface; the value contract is stated in the report"
+  }
+ ],
+ "status": "built; static/nop/oracle(3x)/patches PASS"
+}
