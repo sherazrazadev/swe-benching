@@ -22,8 +22,8 @@ build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch, and build/${SLUG}/AUDIT-FI
 (faults that independent audits of the model trials found: treat each like a 'Required' change).
 
 Apply EVERY 'Required' change in FAIRNESS.md (and any 'Recommended' change that is cheap and clearly
-safe). These typically mean: remove sentences in instruction.md that name a file/function/trap/
-mechanism/variant-list/count or otherwise hint the fix; add or loosen/tighten security or functional
+safe). These typically mean: remove words in instruction.md that name a location (file, path,
+module, class/function/method/variable, test, line number) or list traps/variants/counts; add or loosen/tighten security or functional
 tests exactly as the review specifies; add the check patches it names (checks/*.patch) and wire them
 into manifest.patch_checks with the stated expect; extend solution/fix.patch and any alternative
 patch where the review says the oracle is incomplete; align the instruction with what the oracle and
@@ -44,6 +44,11 @@ Hard rules:
   fair when the general property covers it. Repair only real defects: wording that excludes the
   route (widen the property in general terms), or a test that fails a correct fix (make it drive
   the real entry point and assert the outcome, accepting any refusal the instruction allows).
+- Owner rule for instruction.md: it reads as an issue report - in this codebase, this is the exact
+  bug and its impact, please fix it. Keep every sentence that states WHAT the bug is (its effect and
+  how it comes about) and WHAT must keep working, word for word; never shorten or merge the list of
+  behaviour that must keep working into a generic line. Remove only WHERE: names of files, paths,
+  modules, classes, functions, methods, variables, tests or line numbers.
 - Edit only under tasks/${SLUG}/ and build/${SLUG}/. Scratch in ~/.tb-graders/cwe/work/${SLUG}/.
 
 Then run the gate yourself, one stage at a time, and iterate until all pass:
