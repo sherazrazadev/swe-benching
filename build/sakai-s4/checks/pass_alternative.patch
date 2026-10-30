@@ -1,0 +1,126 @@
+diff --git a/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java b/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
+index d03e59e9..273e0d06 100644
+--- a/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
++++ b/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
+@@ -366,16 +366,7 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     @Override
+     public boolean setProfileImage(String userUuid, byte[] imageBytes, String mimeType, String fileName) {
+ 
+-        //check auth and get currentUserUuid
+-        String currentUserUuid = sakaiProxy.getCurrentUserId();
+-        if (currentUserUuid == null) {
+-            throw new SecurityException("You must be logged in to update a user's profile image.");
+-        }
+-
+-        //check admin, or the currentUser and given uuid match
+-        if (!sakaiProxy.isSuperUser() && !StringUtils.equals(currentUserUuid, userUuid)) {
+-            throw new SecurityException("Not allowed to save.");
+-        }
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userUuid, "update a user's profile image");
+ 
+         //check image is actually allowed to be changed
+         if (!sakaiProxy.isProfilePictureChangeEnabled()) {
+@@ -447,6 +438,8 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     @Override
+     public boolean saveOfficialImageUrl(final String userUuid, final String url) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userUuid, "update a user's official profile image");
++
+         ProfileImageOfficial officialImage = new ProfileImageOfficial(userUuid, url);
+ 
+         if (dao.saveOfficialImage(officialImage)) {
+@@ -460,6 +453,8 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     @Override
+     public boolean setProfileLocked(final String userUuid, final boolean locked) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userUuid, "update a user's profile lock");
++
+         return sakaiProxy.toggleProfileLocked(userUuid, locked);
+     }
+ 
+@@ -467,6 +462,8 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     public boolean saveSocialNetworkingLinks(final String userUuid, final String facebookUrl, final String linkedinUrl,
+             final String instagramUrl) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userUuid, "update a user's social networking links");
++
+         SocialNetworkingInfo socialInfo
+           = dao.getSocialNetworkingInfo(userUuid).orElseGet(() -> new SocialNetworkingInfo(userUuid));
+ 
+@@ -480,6 +477,8 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     @Override
+     public boolean removeProfileImage(final String userUuid) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userUuid, "remove a user's profile image");
++
+         if (dao.removeProfileImage(userUuid)) {
+             log.info("Removed profile image for user: {}", userUuid);
+             return true;
+@@ -894,6 +893,8 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+     @Transactional
+     public boolean saveUserProfile(ProfileTransferBean profileBean) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), profileBean.id, "update a user's profile");
++
+         Optional<SakaiPerson> sakaiPerson = sakaiProxy.getSakaiPerson(profileBean.id);
+         sakaiPerson.ifPresent(sp -> {
+             sp.setNickname(profileBean.nickname);
+@@ -929,8 +930,11 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+         }).orElse(false);
+     }
+ 
++    @Override
+     public boolean removePronunciationRecording(String userId) {
+ 
++        checkCanModifyProfile(sakaiProxy.getCurrentUserId(), userId, "remove a user's pronunciation recording");
++
+         String path = getUserNamePronunciationResourceId(userId);
+         sakaiProxy.removeResource(path);
+         ProfileTransferBean userProfile = getUserProfile(userId);
+@@ -939,6 +943,17 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+         return true;
+     }
+ 
++    private void checkCanModifyProfile(String currentUserUuid, String userUuid, String action) {
++
++        if (currentUserUuid == null) {
++            throw new SecurityException("You must be logged in to " + action + ".");
++        }
++
++        if (!sakaiProxy.isSuperUser() && !StringUtils.equals(currentUserUuid, userUuid)) {
++            throw new SecurityException("Not allowed to " + action + ".");
++        }
++    }
++
+     /**
+      * Sends an email notification when a user changes their profile, if enabled.
+      *
+diff --git a/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java b/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
+index 98fb9c20..3543b160 100644
+--- a/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
++++ b/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
+@@ -134,6 +134,8 @@ public class ProfileController extends AbstractSakaiApiController {
+             }
+ 
+             return ResponseEntity.ok(patchedProfile);
++        } catch (SecurityException e) {
++            throw e;
+         } catch (Exception e) {
+             log.error("Failed to patch profile", e.toString());
+             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+diff --git a/webapi/src/main/java/org/sakaiproject/webapi/exception/GlobalExceptionHandler.java b/webapi/src/main/java/org/sakaiproject/webapi/exception/GlobalExceptionHandler.java
+index be241c0a..8f89e1a6 100644
+--- a/webapi/src/main/java/org/sakaiproject/webapi/exception/GlobalExceptionHandler.java
++++ b/webapi/src/main/java/org/sakaiproject/webapi/exception/GlobalExceptionHandler.java
+@@ -49,6 +49,11 @@ public class GlobalExceptionHandler {
+         return createErrorResponse(HttpStatus.FORBIDDEN, "Access forbidden", ex);
+     }
+ 
++    @ExceptionHandler(SecurityException.class)
++    public ResponseEntity<Object> handleSecurityException(SecurityException ex, WebRequest request) {
++        return createErrorResponse(HttpStatus.FORBIDDEN, "Access forbidden", ex);
++    }
++
+     @ExceptionHandler(PermissionException.class)
+     public ResponseEntity<Object> handlePermissionException(PermissionException ex, WebRequest request) {
+         return createErrorResponse(HttpStatus.FORBIDDEN, "Permission denied", ex);

@@ -1,0 +1,49 @@
+diff --git a/src/datamodel_code_generator/parser/jsonschema.py b/src/datamodel_code_generator/parser/jsonschema.py
+index 1b96bec3a..93c6511cf 100644
+--- a/src/datamodel_code_generator/parser/jsonschema.py
++++ b/src/datamodel_code_generator/parser/jsonschema.py
+@@ -1818,6 +1818,19 @@ class JsonSchemaParser(Parser["JSONSchemaParserConfig", "JsonSchemaFeatures"]):
+         self.imports.append(import_)
+         return self.data_type.from_import(import_)
+ 
++    def _inline_python_import_type(self, obj: JsonSchemaObject) -> DataType | None:  # noqa: PLR6301
++        """Return the type named by an x-python-import declared directly on a field."""
++        x_python_import = obj.extras.get("x-python-import")
++        if not isinstance(x_python_import, dict):
++            return None
++        module = x_python_import.get("module")
++        type_name = x_python_import.get("name")
++        if not module or not type_name:
++            return None
++        import_ = Import.from_full_path(f"{module}.{type_name}")
++        self.imports.append(import_)
++        return self.data_type.from_import(import_)
++
+     def get_ref_data_type(self, ref: str) -> DataType:
+         """Get a data type from a reference string.
+ 
+@@ -1929,6 +1942,12 @@ class JsonSchemaParser(Parser["JSONSchemaParserConfig", "JsonSchemaFeatures"]):
+         if obj.extras.get("x-is-base-class"):
+             self.extra_template_data[path]["is_base_class"] = True
+ 
++        additional_imports = obj.extras.get("x-additional-imports")
++        if isinstance(additional_imports, list):
++            for import_path in additional_imports:
++                if isinstance(import_path, str) and import_path:
++                    self.imports.append(Import.from_full_path(import_path))
++
+         # Process model-level metadata and model_extra_keys for json_schema_extra in ConfigDict
+         model_extras: dict[str, Any] = {k: v for k, v in obj.extras.items() if k in DEFAULT_MODEL_EXTRA_KEYS}
+         if self.model_extra_keys or self.model_extra_keys_without_x_prefix:
+@@ -3634,7 +3653,10 @@ class JsonSchemaParser(Parser["JSONSchemaParserConfig", "JsonSchemaFeatures"]):
+             if field.has_ref_with_schema_keywords and not field.is_ref_with_nullable_only:
+                 field = self._merge_ref_with_schema(field)  # noqa: PLW2901
+ 
+-            field_type = self.parse_item(modular_name, field, [*path, field_name])
++            if (inline_import_type := self._inline_python_import_type(field)) is not None:
++                field_type = inline_import_type
++            else:
++                field_type = self.parse_item(modular_name, field, [*path, field_name])
+ 
+             if self.force_optional_for_required_fields:
+                 required: bool = False

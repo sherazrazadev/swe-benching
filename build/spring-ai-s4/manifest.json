@@ -1,0 +1,182 @@
+{
+ "slug": "spring-ai-s4",
+ "candidate": "25244",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "leak_terms": [
+  "AbstractFilterExpressionConverter",
+  "emitLuceneString",
+  "ElasticsearchAiSearchFilterExpressionConverter",
+  "OpenSearchAiSearchFilterExpressionConverter",
+  "GemFireAiSearchFilterExpressionConverter",
+  "FilterExpressionConverter",
+  "doKey",
+  "doSingleValue",
+  "doExists",
+  "withMetaPrefix",
+  "hasOuterQuotes",
+  "removeOuterQuotes",
+  "metadata.",
+  "similaritySearch",
+  "SearchRequest",
+  "spring-ai-vector-store",
+  "Lucene",
+  "GHSA-CMWH-W62W-R2MF",
+  "CVE-2026-47835"
+ ],
+ "verified": {
+  "entry_point": "The public filter-expression conversion API each Lucene-backed vector store uses (FilterExpressionConverter.convertExpression(Filter.Expression)); the same rendered string is consumed by similaritySearch(SearchRequest) and delete(Filter.Expression) on the Elasticsearch, OpenSearch and GemFire stores. Confirmed behaviourally on the pinned tree before any fix: tab, newline, carriage return and U+3000 reach the generated query string unescaped for field names in all three integrations and for values in the two integrations whose values are unquoted, and through the text-filter parser route.",
+  "sites": [
+   "spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java:246 (shared escaper; published-fix site reached from every store)",
+   "vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java:67-78 (injected: existence-query field path)",
+   "vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java:88-98 (injected: compound-key namespace segment)",
+   "vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java:127-138 (injected: already-quoted value form)"
+  ],
+  "routes": [
+   "field name (all three integrations), including the text-filter route through the filter-expression parser",
+   "value (unquoted value positions in OpenSearch and GemFire), scalar and IN/NIN list element",
+   "Elasticsearch existence/absence query field path",
+   "OpenSearch compound (dotted) field name",
+   "GemFire value supplied already quoted"
+  ],
+  "services": "none; the suites are pure JVM unit tests, no server or network",
+  "project_tests_run": "The project's own converter test classes pass at the pinned commit and are run as hidden functional tests: ElasticsearchAiSearchFilterExpressionConverterTest, OpenSearchAiSearchFilterExpressionConverterTest, GemFireAiSearchFilterExpressionConverterTest (47 cases; verified locally, all pass on the pinned tree and on the reference fix)."
+ },
+ "patch_checks": [
+  {
+   "patch": "sf_published_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_misses_values.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_misses_s2.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_misses_s3.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_misses_s4.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: a library API has no transport status; refusal is an ordinary exception, and the blanket-exception patch (ff_refuse_all) is rejected by the functional suite",
+  "wrong_resource": "n/a: there is no authorisation resource; the protected object is the generated query string itself",
+  "one_role_or_direction": "n/a: filters are rendered by one converter per integration with no roles or directions",
+  "reads_only": "n/a: search and delete share the same conversion; a fix cannot gate one without the other",
+  "check_after_adjustment": "n/a: there is no normalising or adjusting step between the caller's text and the sink; escaping happens as the string is emitted",
+  "unlisted_route": "sf_published_only.patch",
+  "malformed_identity": "n/a: the input is filter operand text, not an identity whose malformed spelling could make a guard see nothing",
+  "missing_authority": "n/a: no external authority is consulted",
+  "adjacent_api": "ff_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "pattern": "A",
+   "lever": "published-fix far site and value shape: caller-supplied values share the same escaper as field names",
+   "shape": "a value carrying a tab, newline, carriage return or ideographic space in an unquoted value position (OpenSearch and GemFire), as a scalar and as an IN/NIN list element",
+   "where": "spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java:246; vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java:128-136",
+   "reason_to_dismiss": "the report shows a field name, and a value reads as data rather than query syntax; the quoting integration makes values look already handled",
+   "security_tests": [
+    "LuceneQueryInjectionSecurityTests::openSearchValueWithTab",
+    "LuceneQueryInjectionSecurityTests::openSearchValueWithNewlineAndCarriageReturn",
+    "LuceneQueryInjectionSecurityTests::openSearchValueWithIdeographicSpace",
+    "LuceneQueryInjectionSecurityTests::openSearchListValueWithTab",
+    "LuceneQueryInjectionSecurityTests::gemfireValueWithTab",
+    "LuceneQueryInjectionSecurityTests::gemfireValueWithNewlineAndCarriageReturn",
+    "LuceneQueryInjectionSecurityTests::gemfireListValueWithTab"
+   ],
+   "coupled_functional_tests": [
+    "LuceneQueryFunctionalTests::openSearchPunctuationInIdentifiersAndValuesKeepsWorking",
+    "LuceneQueryFunctionalTests::gemfirePunctuationInIdentifiersAndValuesKeepsWorking",
+    "LuceneQueryFunctionalTests::ordinaryValueStaysLiteralBesideAnUnusualValue"
+   ],
+   "security_fail_patch": "sf_misses_values.patch",
+   "realistic_because": "real, unmodified upstream code: every Lucene store renders values through the same helper, and two of the three do not quote them"
+  },
+  {
+   "id": "T2",
+   "pattern": "B",
+   "lever": "injected sibling: compound-key builder emits the namespace segment before the first dot raw",
+   "shape": "an OpenSearch field name with a dot whose namespace segment (before the dot) carries a tab or newline",
+   "where": "vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java:88-98",
+   "reason_to_dismiss": "dotted field names look structural; the segment after the dot is escaped, so the key path reads as handled",
+   "security_tests": [
+    "LuceneQueryInjectionSecurityTests::openSearchCompoundFieldNameWithTab",
+    "LuceneQueryInjectionSecurityTests::openSearchCompoundFieldNameWithNewline"
+   ],
+   "coupled_functional_tests": [
+    "LuceneQueryFunctionalTests::openSearchPunctuationInIdentifiersAndValuesKeepsWorking"
+   ],
+   "security_fail_patch": "sf_misses_s2.patch",
+   "realistic_because": "code a maintainer could have written: a compound key is split at the first dot and the namespace segment is treated as an application identifier rather than caller text"
+  },
+  {
+   "id": "T3",
+   "pattern": "B",
+   "lever": "injected sibling: a value supplied already quoted is passed through unescaped",
+   "shape": "a GemFire value wrapped in single or double quotes whose inner text carries a tab or newline",
+   "where": "vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java:127-138",
+   "reason_to_dismiss": "the caller quoted the value itself, so it looks like an intentional literal the converter should respect",
+   "security_tests": [
+    "LuceneQueryInjectionSecurityTests::gemfireQuotedValueWithTab",
+    "LuceneQueryInjectionSecurityTests::gemfireQuotedValueWithNewline"
+   ],
+   "coupled_functional_tests": [
+    "LuceneQueryFunctionalTests::gemfirePunctuationInIdentifiersAndValuesKeepsWorking"
+   ],
+   "security_fail_patch": "sf_misses_s3.patch",
+   "realistic_because": "code a maintainer could have written: the codebase already has outer-quote helpers used by other integrations to strip caller-supplied quotes"
+  },
+  {
+   "id": "T4",
+   "pattern": "B",
+   "lever": "injected sibling: the existence/absence query builds its field term directly",
+   "shape": "an Elasticsearch null/not-null filter whose field name carries a tab or newline",
+   "where": "vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java:67-78",
+   "reason_to_dismiss": "the existence query is a different query form with its own composition, so its field term looks separately derived",
+   "security_tests": [
+    "LuceneQueryInjectionSecurityTests::elasticsearchExistsFieldNameWithTab",
+    "LuceneQueryInjectionSecurityTests::elasticsearchExistsFieldNameWithNewline"
+   ],
+   "coupled_functional_tests": [
+    "LuceneQueryFunctionalTests::elasticsearchExistenceQueryKeepsItsShape"
+   ],
+   "security_fail_patch": "sf_misses_s4.patch",
+   "realistic_because": "code a maintainer could have written: a dedicated exists helper composes the prefix, field and wildcard for the null/not-null forms"
+  }
+ ],
+ "status": "built; gate static/nop/oracle/patches PASS on 2026-10-30. static green except the separately wired kind=blind patch (and FAIRNESS.md, written downstream); nop PASSED (22/22 security tests failing, 57/57 functional passing on the pinned+injected tree); oracle PASSED (3 identical runs, reward 1.0, 79/79); patches PASSED (9/9 as declared: 5 security_fail leaving 2-6 security tests failing with functional green, 2 functional_fail, hardening 1.0, alternative 1.0; blind patch pending downstream)."
+}

@@ -1,0 +1,322 @@
+{
+ "slug": "sakai-s4",
+ "candidate": {
+  "repo": "sakaiproject/sakai",
+  "advisory_ids": [
+   "GHSA-9284-FJC3-FMMJ",
+   "CVE-2026-54050"
+  ],
+  "vulnerable_commit": "2696b4b48cbef2e81512f52f84f7477adff78b27",
+  "fix_commit": "a092dbf3dc6bf343131f50007c207a9abd95e852",
+  "cwe": "CWE-639",
+  "source": "injected"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "HTTP profile change requests on the web API - PATCH /api/users/{userId}/profile (JSON Patch), POST /api/users/{userId}/profile/image, DELETE /api/users/{userId}/profile/image, DELETE /api/users/{userId}/profile/pronunciation, POST /api/users/{userId}/profile/lock (injected), POST /api/users/{userId}/profile/social (injected) - and the public profile service API that other modules call directly (lti UserPictureSetterImpl calls the official-image save).",
+  "sites": [
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:367-374 setProfileImage (ownership check already present at the pinned commit; kept and unified)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:448-458 saveOfficialImageUrl (no check at the pinned commit; published fix does not touch it)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:461-466 removeProfileImage (published fix site; landing point)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:873-910 saveUserProfile (published fix site; saves the identity carried by the request body)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:912-920 removePronunciationRecording (published fix site; had no protection before)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:setProfileLocked (INJECTED: persists a user's profile lock)",
+   "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:saveSocialNetworkingLinks (INJECTED: persists a user's social links directly)",
+   "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:117-140 patchProfile",
+   "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:193-239 image upload/details",
+   "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:241-253 removeProfileImage",
+   "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:262-267 removeNamePronunciation (no session check at the pinned commit)",
+   "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:setProfileLock and putSocialNetworking (INJECTED routes)",
+   "webapi/src/main/java/org/sakaiproject/webapi/exception/GlobalExceptionHandler.java:47-55 SecurityException -> 403 (published fix site)"
+  ],
+  "routes": [
+   "PATCH profile, including a JSON Patch document that replaces the identity field that is subsequently saved",
+   "DELETE profile image for any identifier",
+   "DELETE pronunciation recording for any identifier, with or without a session",
+   "POST profile lock for any identifier (injected sibling)",
+   "POST profile social links for any identifier (injected sibling)",
+   "direct profile service calls with a caller-supplied identifier: save profile, remove image, remove pronunciation recording, save official image url, set lock, save social links",
+   "legitimate owner and administrator use of every one of the above (must keep working)"
+  ],
+  "services": [],
+  "project_tests_run": "At the pinned commit inside the image build and locally: mvn -o -pl profile2/impl test (ProfileServiceTests, 7 tests) and mvn -o -pl webapi test (22 tests) pass; the same 7 project tests are re-run in the verifier's functional group."
+ },
+ "leak_terms": [
+  "ProfileService",
+  "ProfileServiceImpl",
+  "ProfileController",
+  "ProfileTransferBean",
+  "GlobalExceptionHandler",
+  "SakaiProxy",
+  "SakaiPerson",
+  "ProfileDao",
+  "SocialNetworkingInfo",
+  "saveUserProfile",
+  "removeProfileImage",
+  "removePronunciationRecording",
+  "saveOfficialImageUrl",
+  "setProfileImage",
+  "assertCanModifyProfile",
+  "checkCanModifyProfile",
+  "setProfileLocked",
+  "saveSocialNetworkingLinks",
+  "toggleProfileLocked",
+  "getCurrentUserId",
+  "isSuperUser",
+  "webapi",
+  "profile2",
+  "ProfileService.java",
+  "ProfileServiceImpl.java",
+  "ProfileController.java",
+  "GlobalExceptionHandler.java",
+  "SAK-52623",
+  "a092dbf3dc6bf343131f50007c207a9abd95e852",
+  "2696b4b48cbef2e81512f52f84f7477adff78b27"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_id_rewrite.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "unified ownership checks everywhere except the profile save; a patch document that rewrites the identity field is still accepted"
+  },
+  {
+   "patch": "sf_miss_pronunciation.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "every protection except pronunciation removal"
+  },
+  {
+   "patch": "sf_miss_image_delete.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "the reported landing point left open"
+  },
+  {
+   "patch": "sf_miss_official_image.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "institution-supplied picture save left open"
+  },
+  {
+   "patch": "sf_miss_lock.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "injected profile-lock writer left open"
+  },
+  {
+   "patch": "sf_miss_social_links.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "injected social-links writer left open"
+  },
+  {
+   "patch": "sf_reported_route_only.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "only the reported image removal is guarded; the other profile writers are open"
+  },
+  {
+   "patch": "sf_web_only.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "checks only in the web controller; direct service callers stay open"
+  },
+  {
+   "patch": "sf_crash_as_refusal.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "refusal becomes an HTTP 500 instead of a client error"
+  },
+  {
+   "patch": "sf_missing_authority.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "note": "a missing session fails open"
+  },
+  {
+   "patch": "sf_reads_only.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "note": "reads guarded but writes left open; also blocks a legitimate read"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "note": "refuses every profile change, including owner and administrator"
+  },
+  {
+   "patch": "ff_no_superuser.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "note": "owner-only, breaks administrative support"
+  },
+  {
+   "patch": "ff_adjacent_api.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "note": "shared rule applied to a read API, blocking legitimate profile viewing"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive blank/null handling of the identity and the profile bean"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "no new public API method; the controller rethrows the service refusal instead of calling an assertion"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash_as_refusal.patch",
+  "wrong_resource": "sf_miss_id_rewrite.patch",
+  "one_role_or_direction": "ff_no_superuser.patch",
+  "reads_only": "sf_reads_only.patch",
+  "check_after_adjustment": "sf_miss_id_rewrite.patch",
+  "unlisted_route": "sf_reported_route_only.patch",
+  "malformed_identity": "n/a: the protected identities are opaque strings compared exactly, with no parsing, normalisation or alternate spelling on their way to the writer",
+  "missing_authority": "sf_missing_authority.patch",
+  "adjacent_api": "ff_adjacent_api.patch"
+ },
+ "traps": [
+  {
+   "id": "t-patch-identity-rewrite",
+   "pattern": "A",
+   "shape": "shape: the identity that the save actually uses is produced by the request body, after the request path has been checked - a JSON Patch document can replace the identity field while the path still names the caller",
+   "where": "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:117-140; profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:873-910",
+   "how_type": true,
+   "reason_to_dismiss": "the path variable looks like the target; the profile bean was read for the caller's own identifier and the patch appears to edit fields only",
+   "security_tests": [
+    "HiddenProfileSecurityTest.patchCannotRewriteTheSavedIdentity",
+    "HiddenProfileServiceSecurityTest.saveUserProfileRefusesAnotherUser",
+    "HiddenProfileServiceSecurityTest.saveUserProfileRefusesWhenThereIsNoSession"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileFunctionalTest.ownerStillPatchesTheirOwnProfile",
+    "HiddenProfileFunctionalTest.ownerStillPatchesTheirOwnIdentityValue",
+    "HiddenProfileFunctionalTest.administratorStillPatchesAnotherProfile",
+    "HiddenProfileServiceFunctionalTest.ownerStillSavesTheirOwnProfile",
+    "HiddenProfileServiceFunctionalTest.administratorStillSavesAnotherProfile"
+   ],
+   "security_fail_patch": "sf_miss_id_rewrite.patch",
+   "realistic_because": "real upstream request handling: the patch is applied to the transfer object and the resulting object is saved without re-deriving the identity from the path"
+  },
+  {
+   "id": "t-pronunciation-delete",
+   "pattern": "A",
+   "shape": "route where the protection never existed: the pronunciation removal had no session test and no ownership test at all",
+   "where": "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:262-267; profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:912-920",
+   "how_type": true,
+   "reason_to_dismiss": "the report is about a picture; a recorded pronunciation is a neighbouring feature that the roster only reads, and the endpoint is small enough to look self-service",
+   "security_tests": [
+    "HiddenProfileSecurityTest.deletePronunciationCannotTargetAnotherProfile",
+    "HiddenProfileSecurityTest.deletePronunciationWithoutASessionIsRefused",
+    "HiddenProfileServiceSecurityTest.removePronunciationRecordingRefusesAnotherUser"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileFunctionalTest.ownerStillRemovesTheirOwnPronunciationRecording",
+    "HiddenProfileFunctionalTest.administratorStillRemovesAnotherPronunciationRecording",
+    "HiddenProfileFunctionalTest.anotherPersonsPronunciationRecordingStaysReadable",
+    "HiddenProfileServiceFunctionalTest.ownerStillRemovesTheirOwnPronunciationRecording",
+    "HiddenProfileServiceFunctionalTest.administratorStillRemovesAnotherPronunciationRecording"
+   ],
+   "security_fail_patch": "sf_miss_pronunciation.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t-official-image",
+   "pattern": "B",
+   "shape": "uncovered route with real upstream code: the institution-supplied picture store can be written for any identifier, and the published fix never touches it",
+   "where": "profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:448-458",
+   "how_type": true,
+   "reason_to_dismiss": "institution-supplied pictures are set from a directory feed, and the only in-tree caller passes the launching user's own identifier, so the write looks privileged rather than user-facing",
+   "security_tests": [
+    "HiddenProfileServiceSecurityTest.saveOfficialImageUrlRefusesAnotherUser"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileServiceFunctionalTest.aUserStillSetsTheirOwnOfficialImageUrl",
+    "HiddenProfileServiceFunctionalTest.administratorStillSetsAnotherOfficialImageUrl"
+   ],
+   "security_fail_patch": "sf_miss_official_image.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t-profile-lock",
+   "pattern": "A",
+   "shape": "uncovered route with an injected sibling: a web route persists a user's profile lock for any identifier",
+   "where": "INJECTED webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java setProfileLock; profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java setProfileLocked",
+   "how_type": false,
+   "reason_to_dismiss": "a lock is a visibility preference rather than profile content, and the route looks like self-service plumbing for a toggle the account screen already owns",
+   "security_tests": [
+    "HiddenProfileSecurityTest.lockCannotTargetAnotherProfile",
+    "HiddenProfileServiceSecurityTest.setProfileLockedRefusesAnotherUser"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileFunctionalTest.ownerStillSetsTheirOwnLock",
+    "HiddenProfileFunctionalTest.administratorStillSetsAnotherLock",
+    "HiddenProfileServiceFunctionalTest.ownerStillSetsTheirOwnLock",
+    "HiddenProfileServiceFunctionalTest.administratorStillSetsAnotherLock"
+   ],
+   "security_fail_patch": "sf_miss_lock.patch",
+   "realistic_because": "a maintainer exposing the account screen's existing profile-lock toggle over the web API would write exactly this self-service-shaped route"
+  },
+  {
+   "id": "t-social-links",
+   "pattern": "A",
+   "shape": "second writer: a dedicated route persists a user's social profile links directly, bypassing the profile save that carries the same fields",
+   "where": "INJECTED webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java putSocialNetworking; profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java saveSocialNetworkingLinks",
+   "how_type": false,
+   "reason_to_dismiss": "social links are public data that the profile save already writes, so the dedicated route reads as an alternative client path rather than a separate protected object",
+   "security_tests": [
+    "HiddenProfileSecurityTest.socialLinksCannotTargetAnotherProfile",
+    "HiddenProfileServiceSecurityTest.saveSocialNetworkingLinksRefusesAnotherUser"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileFunctionalTest.ownerStillSavesTheirOwnSocialLinks",
+    "HiddenProfileFunctionalTest.administratorStillSavesAnotherSocialLinks",
+    "HiddenProfileServiceFunctionalTest.ownerStillSavesTheirOwnSocialLinks",
+    "HiddenProfileServiceFunctionalTest.administratorStillSavesAnotherSocialLinks"
+   ],
+   "security_fail_patch": "sf_miss_social_links.patch",
+   "realistic_because": "splitting one set of profile fields out of the combined profile save into its own endpoint is an ordinary refactor adjacent to the image-details route"
+  },
+  {
+   "id": "t-image-delete-landing",
+   "pattern": "A",
+   "shape": "the reported landing point: image removal for a path identifier, where the only check was that a session exists",
+   "where": "webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java:241-253; profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java:461-466",
+   "how_type": false,
+   "reason_to_dismiss": "a null-session test in front of the call looks like the authorization check",
+   "security_tests": [
+    "HiddenProfileSecurityTest.deleteImageCannotTargetAnotherProfile",
+    "HiddenProfileServiceSecurityTest.removeProfileImageRefusesAnotherUser"
+   ],
+   "coupled_functional_tests": [
+    "HiddenProfileFunctionalTest.ownerStillRemovesTheirOwnImage",
+    "HiddenProfileFunctionalTest.administratorStillRemovesAnotherImage",
+    "HiddenProfileServiceFunctionalTest.ownerStillRemovesTheirOwnProfileImage",
+    "HiddenProfileServiceFunctionalTest.administratorStillRemovesAnotherProfileImage"
+   ],
+   "security_fail_patch": "sf_miss_image_delete.patch",
+   "realistic_because": "real, unmodified upstream code"
+  }
+ ],
+ "out_of_scope": [
+  "GET pronunciation and GET profile image for any identifier read other users' data; the advisory covers modification only and the roster deliberately plays other users' recordings, so reads were not pursued.",
+  "The institution-supplied picture url is fetched server-side, a possible SSRF-shaped concern unrelated to this object-level authorization defect; not pursued."
+ ],
+ "status": "built and gate-green 2026-10-30: static PASS; nop PASS (14/14 security tests fail on the pinned+injected tree, 31/31 functional pass, reward 0); oracle PASS 3x (reward 1.0 each, identical 14/14 security + 31/31 functional); patches PASS 16/16 as declared (10 security_fail, 4 functional_fail, hardening 1.0, alternative 1.0). blind.patch is declared and is written downstream by the pipeline. Six levers: the profile-patch identity rewrite (how-type shape), pronunciation removal (a route where the protection never existed), the real unchecked institution-supplied picture save (pattern B), the reported image-removal landing point, and two injected siblings (profile lock and a direct social-links writer)."
+}

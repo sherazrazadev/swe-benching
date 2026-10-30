@@ -1,0 +1,84 @@
+diff --git a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
+index 3073d88..b1e1e3a 100644
+--- a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
+@@ -52,13 +52,10 @@ public class ElasticsearchAiSearchFilterExpressionConverter extends AbstractFilt
+ 			context.append(")");
+ 		}
+ 		else if (expression.type() == Filter.ExpressionType.ISNULL) {
+-			context.append("-");
+-			this.convertOperand(expression.left(), context);
+-			context.append("*");
++			this.doExists(expression.left(), context, true);
+ 		}
+ 		else if (expression.type() == Filter.ExpressionType.ISNOTNULL) {
+-			this.convertOperand(expression.left(), context);
+-			context.append("*");
++			this.doExists(expression.left(), context, false);
+ 		}
+ 		else {
+ 			this.convertOperand(expression.left(), context);
+@@ -67,6 +64,20 @@ public class ElasticsearchAiSearchFilterExpressionConverter extends AbstractFilt
+ 		}
+ 	}
+ 
++	private void doExists(Filter.Operand operand, StringBuilder context, boolean negated) {
++		if (negated) {
++			context.append('-');
++		}
++		if (operand instanceof Key key) {
++			context.append("metadata.").append(key.key().trim());
++		}
++		else {
++			this.convertOperand(operand, context);
++		}
++		context.append(':');
++		context.append('*');
++	}
++
+ 	@Override
+ 	protected void doStartValueRange(Filter.Value listValue, StringBuilder context) {
+ 	}
+diff --git a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
+index efbf757..54d811c 100644
+--- a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
+@@ -127,7 +127,13 @@ public class GemFireAiSearchFilterExpressionConverter extends AbstractFilterExpr
+ 			context.append(this.dateFormat.format(date));
+ 		}
+ 		else if (value instanceof String text) {
+-			emitLuceneString(text, context);
++			// Values may be supplied already quoted by the filter DSL.
++			if (hasOuterQuotes(text)) {
++				context.append(removeOuterQuotes(text));
++			}
++			else {
++				emitLuceneString(text, context);
++			}
+ 		}
+ 		else {
+ 			context.append(value);
+diff --git a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
+index 5a02017..6f56e4a 100644
+--- a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
+@@ -86,8 +86,17 @@ public class OpenSearchAiSearchFilterExpressionConverter extends AbstractFilterE
+ 
+ 	@Override
+ 	public void doKey(Key key, StringBuilder context) {
+-		var fieldPath = withMetaPrefix(key.key().trim());
+-		emitLuceneString(fieldPath, context);
++		var identifier = key.key().trim();
++		// Compound keys address a metadata namespace followed by a field path.
++		int namespaceEnd = identifier.indexOf('.');
++		if (namespaceEnd > 0) {
++			context.append(withMetaPrefix(identifier.substring(0, namespaceEnd)));
++			context.append('.');
++			emitLuceneString(identifier.substring(namespaceEnd + 1), context);
++		}
++		else {
++			emitLuceneString(withMetaPrefix(identifier), context);
++		}
+ 		context.append(':');
+ 	}
+ 

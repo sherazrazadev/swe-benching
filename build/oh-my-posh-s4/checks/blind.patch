@@ -1,0 +1,304 @@
+diff -ruN pristine/src/segments/http.go app/src/segments/http.go
+--- a/src/segments/http.go
++++ b/src/segments/http.go
+@@ -32,11 +32,15 @@
+ 	method := h.options.String(METHOD, "GET")
+ 	timeout := h.options.Int(options.HTTPTimeout, 10000)
+ 
++	// The url option is theme text, so the first pass is trusted. Its result
++	// may contain values that came from outside the theme (for example an
++	// environment variable), so resolving it a second time is restricted:
++	// text the theme did not author must never reach the host helpers.
+ 	if resolved, err := template.Render(url, nil); err == nil {
+ 		url = resolved
+ 
+ 		// resolve any template expression the first pass produced
+-		if resolvedAgain, err := template.Render(url, nil); err == nil {
++		if resolvedAgain, err := template.RenderRestricted(url, nil); err == nil {
+ 			url = resolvedAgain
+ 		}
+ 	}
+diff -ruN pristine/src/segments/path.go app/src/segments/path.go
+--- a/src/segments/path.go
++++ b/src/segments/path.go
+@@ -281,8 +281,11 @@
+ 		pt.Path = fmt.Sprintf("Path style: %s is not available", style)
+ 	}
+ 
+-	// make sure we resolve all templates
+-	if txt, err := template.Render(pt.Path, pt); err == nil {
++	// Resolve any templates left in the composed path. pt.Path mixes raw
++	// filesystem folder names (data the product did not author) with text
++	// already produced by theme options, so it must use the restricted
++	// renderer: a folder name must never reach cmd/readFile/stat/glob.
++	if txt, err := template.RenderRestricted(pt.Path, pt); err == nil {
+ 		pt.Path = txt
+ 	}
+ }
+diff -ruN pristine/src/segments/scm.go app/src/segments/scm.go
+--- a/src/segments/scm.go
++++ b/src/segments/scm.go
+@@ -158,8 +158,10 @@
+ 		break
+ 	}
+ 
+-	// resolve template expressions in the composed branch name
+-	if txt, err := template.Render(branch, s); err == nil {
++	// Resolve template expressions in the composed branch name. The branch
++	// (and any mapped replacement) is repository data, not theme text, so it
++	// is rendered restricted; branch_template below stays trusted.
++	if txt, err := template.RenderRestricted(branch, s); err == nil {
+ 		branch = txt
+ 	}
+ 
+diff -ruN pristine/src/template/func_map.go app/src/template/func_map.go
+--- a/src/template/func_map.go
++++ b/src/template/func_map.go
+@@ -8,13 +8,28 @@
+ 	"github.com/Masterminds/sprig/v3"
+ )
+ 
+-// sharedFuncMap is built exactly once and reused across all template constructions.
+-var sharedFuncMap = sync.OnceValue(func() template.FuncMap {
++// hostFuncs reach outside the process: they execute programs, touch the
++// filesystem, read the environment or resolve a hostname. They are exposed
++// only to trusted, theme-authored templates.
++var hostFuncs = map[string]bool{
++	"cmd":           true,
++	"readFile":      true,
++	"stat":          true,
++	"glob":          true,
++	"env":           true,
++	"expandenv":     true,
++	"getHostByName": true,
++}
++
++// themeFuncMap builds the helpers that are safe for text the product did not
++// take verbatim from the user's theme. Everything in hostFuncs is omitted.
++// `.Env.xxx` still resolves, but through the Getenv field on the render
++// context rather than a template helper, so it is not reachable here.
++func themeFuncMap() map[string]any {
+ 	fm := map[string]any{
+ 		"secondsRound": secondsRound,
+ 		"url":          url,
+ 		"path":         filePath,
+-		"glob":         glob,
+ 		"matchP":       matchP,
+ 		"findP":        findP,
+ 		"replaceP":     replaceP,
+@@ -25,9 +40,6 @@
+ 		"hresult":      hresult,
+ 		"trunc":        trunc,
+ 		"truncE":       TruncE,
+-		"cmd":          cmd,
+-		"readFile":     readFile,
+-		"stat":         stat,
+ 		"dir":          filepath.Dir,
+ 		"base":         filepath.Base,
+ 		// Locale-aware date/time formatting using OS regional settings.
+@@ -42,15 +54,50 @@
+ 	}
+ 
+ 	for key, fun := range sprig.TxtFuncMap() {
++		if hostFuncs[key] {
++			continue
++		}
++
+ 		if _, ok := fm[key]; !ok {
+ 			fm[key] = fun
+ 		}
+ 	}
+ 
++	return fm
++}
++
++// themeFuncs is the restricted helper set, built once and reused.
++var themeFuncs = sync.OnceValue(func() template.FuncMap {
++	return template.FuncMap(themeFuncMap())
++})
++
++// fullFuncs is the complete helper set available to theme-authored templates:
++// the restricted set plus the host helpers. Built once and reused.
++var fullFuncs = sync.OnceValue(func() template.FuncMap {
++	fm := themeFuncMap()
++
++	fm["cmd"] = cmd
++	fm["readFile"] = readFile
++	fm["stat"] = stat
++	fm["glob"] = glob
++
++	sprigFuncs := sprig.TxtFuncMap()
++	for _, name := range []string{"env", "expandenv", "getHostByName"} {
++		if fn, ok := sprigFuncs[name]; ok {
++			fm[name] = fn
++		}
++	}
++
+ 	return template.FuncMap(fm)
+ })
+ 
+-// funcMap returns the shared merged FuncMap (built once, reused everywhere).
+-func funcMap() template.FuncMap {
+-	return sharedFuncMap()
++// funcMap returns the helper set for a render's trust level: theme-authored
++// text gets the full set, text assembled from runtime data gets the
++// restricted one.
++func funcMap(trusted bool) template.FuncMap {
++	if trusted {
++		return fullFuncs()
++	}
++
++	return themeFuncs()
+ }
+diff -ruN pristine/src/template/init.go app/src/template/init.go
+--- a/src/template/init.go
++++ b/src/template/init.go
+@@ -26,8 +26,10 @@
+ 	textPool    *generics.Pool[*Text]
+ 
+ 	// parsedTemplates caches fully-parsed *template.Template values keyed by
+-	// a string that encodes both the raw (unpatched) template text and the
+-	// context type, so cache hits can skip patchTemplate entirely.
++	// a parseCacheKey that encodes the raw (unpatched) template text, the
++	// trust level and the context identity, so cache hits can skip
++	// patchTemplate entirely. A trusted parse is never reused for a
++	// restricted render of the same text.
+ 	// Execute on a cached template is concurrency-safe; we never re-Parse it.
+ 	parsedTemplates sync.Map
+ )
+diff -ruN pristine/src/template/render.go app/src/template/render.go
+--- a/src/template/render.go
++++ b/src/template/render.go
+@@ -46,15 +46,23 @@
+ 	renderPool.Put(t)
+ }
+ 
+-// templateCacheKey returns the key used to look up a cached *template.Template.
+-// It encodes the raw (unpatched) template text and, when context is non-nil,
+-// the reflect.Type of the context so that two different struct types whose
+-// patchTemplate output would differ (via hasField) get separate cache entries.
+-// For map[string]any contexts the key also includes the sorted exported key
+-// names, since patchTemplate output depends on which keys are present.
+-func templateCacheKey(rawText string, ctx any) string {
++// parseCacheKey identifies a parsed *template.Template. Parsed templates are
++// bound to a function map at Parse time, so the trust level is part of the
++// identity: the same raw text parsed earlier as trusted theme text must never
++// be served to a later restricted render, and vice versa. contextKey encodes
++// the context type (and, for map[string]any, the exported keys) because
++// patchTemplate output depends on which fields the context exposes.
++type parseCacheKey struct {
++	text       string
++	contextKey string
++	trusted    bool
++}
++
++// contextKey returns the part of the cache identity that describes context,
++// or "" when context is nil.
++func contextKey(ctx any) string {
+ 	if ctx == nil {
+-		return rawText
++		return ""
+ 	}
+ 
+ 	t := reflect.TypeOf(ctx)
+@@ -67,22 +75,28 @@
+ 				}
+ 			}
+ 			sort.Strings(keys)
+-			return rawText + "\x00" + t.String() + "\x00" + strings.Join(keys, "\x01")
++			return t.String() + "\x00" + strings.Join(keys, "\x01")
+ 		}
+ 	}
+ 
+-	return rawText + "\x00" + t.String()
++	return t.String()
+ }
+ 
+-// parsedTemplate returns a fully-parsed *template.Template for text.
++// parsedTemplate returns a fully-parsed *template.Template for text at the
++// given trust level.
+ // The first call for a given key parses and stores it; subsequent calls
+ // return the cached value. Concurrent first-renders of the same template
+ // may both parse, but LoadOrStore ensures only one result is shared.
+-func parsedTemplate(text *Text) (*template.Template, error) {
+-	// Key on the raw, unpatched template text plus the context type so that
+-	// cache hits can skip patchTemplate entirely: patching is only needed
+-	// the first time a given (raw template, context type) pair is seen.
+-	key := templateCacheKey(text.template, text.context)
++func parsedTemplate(text *Text, trusted bool) (*template.Template, error) {
++	// Key on the raw, unpatched template text plus the trust level and context
++	// type so that cache hits can skip patchTemplate entirely: patching is only
++	// needed the first time a given (raw template, trust level, context type)
++	// combination is seen.
++	key := parseCacheKey{
++		text:       text.template,
++		contextKey: contextKey(text.context),
++		trusted:    trusted,
++	}
+ 
+ 	if cached, ok := parsedTemplates.Load(key); ok {
+ 		return cached.(*template.Template), nil
+@@ -91,8 +105,8 @@
+ 	// Cache miss: patch the raw template into its executable form.
+ 	text.patchTemplate()
+ 
+-	// Parse into a fresh template with the shared func map and settings.
+-	tmpl, err := template.New("cache").Funcs(funcMap()).Parse(text.template)
++	// Parse into a fresh template with the func map matching this render's trust level.
++	tmpl, err := template.New("cache").Funcs(funcMap(trusted)).Parse(text.template)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -102,8 +116,8 @@
+ 	return actual.(*template.Template), nil
+ }
+ 
+-func (t *renderer) execute(text *Text) (string, error) {
+-	tmpl, err := parsedTemplate(text)
++func (t *renderer) execute(text *Text, trusted bool) (string, error) {
++	tmpl, err := parsedTemplate(text, trusted)
+ 	if err != nil {
+ 		log.Error(err)
+ 		return "", errors.New(InvalidTemplate)
+diff -ruN pristine/src/template/text.go app/src/template/text.go
+--- a/src/template/text.go
++++ b/src/template/text.go
+@@ -29,7 +29,29 @@
+ 	return text
+ }
+ 
++// Render executes a template the caller knows was written by the user in
++// their own configuration (a theme, segment, palette or other config field).
++// The full helper set is available, including the helpers that run a program,
++// read a file or read the environment.
+ func Render(template string, context any) (string, error) {
++	return render(template, true, context)
++}
++
++// RenderRestricted executes text the product did not take verbatim from the
++// user's theme, for example a string composed from filesystem or repository
++// data. Helpers that run a program, read a file, read the environment or
++// resolve a hostname are unavailable; `.Env.` lookups and all pure helpers
++// still work. Text that cannot be parsed with that set is reported as an
++// error, so the caller keeps the original value: a refused value is never
++// executed and never aborts the prompt.
++func RenderRestricted(template string, context any) (string, error) {
++	return render(template, false, context)
++}
++
++// render is the shared implementation. The trust level is a parameter of the
++// call, never state on the pooled Text object, so one render's trust decision
++// cannot be inherited by a later render that reuses the same object.
++func render(template string, trusted bool, context any) (string, error) {
+ 	t := get(template, context)
+ 	defer t.release()
+ 
+@@ -40,7 +62,7 @@
+ 	renderer := renderPool.Get()
+ 	defer renderer.release()
+ 
+-	return renderer.execute(t)
++	return renderer.execute(t, trusted)
+ }
+ 
+ // Release resets the Text instance and returns it to the pool

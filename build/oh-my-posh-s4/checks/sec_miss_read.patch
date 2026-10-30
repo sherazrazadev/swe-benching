@@ -1,0 +1,491 @@
+--- a/src/color/colors.go
++++ b/src/color/colors.go
+@@ -160,7 +160,7 @@
+ 		return emptyColor
+ 	}
+ 
+-	text, err := template.Render(string(c), nil)
++	text, err := template.RenderTrusted(string(c), nil)
+ 	if err != nil {
+ 		return Transparent
+ 	}
+--- a/src/color/palette.go
++++ b/src/color/palette.go
+@@ -37,7 +37,7 @@
+ 	}
+ 
+ 	if strings.Contains(color.String(), "{{") {
+-		rendered, err := template.Render(color.String(), nil)
++		rendered, err := template.RenderTrusted(color.String(), nil)
+ 		if err != nil {
+ 			return "", err
+ 		}
+--- a/src/config/config.go
++++ b/src/config/config.go
+@@ -98,7 +98,7 @@
+ 		return cfg.Palette
+ 	}
+ 
+-	key, err := template.Render(cfg.Palettes.Template, nil)
++	key, err := template.RenderTrusted(cfg.Palettes.Template, nil)
+ 	if err != nil {
+ 		return cfg.Palette
+ 	}
+--- a/src/config/segment.go
++++ b/src/config/segment.go
+@@ -27,7 +27,7 @@
+ type SegmentStyle string
+ 
+ func (s *SegmentStyle) resolve(context any) SegmentStyle {
+-	value, err := template.Render(string(*s), context)
++	value, err := template.RenderTrusted(string(*s), context)
+ 
+ 	// default to Plain
+ 	if err != nil || value == "" {
+@@ -301,7 +301,7 @@
+ 		return false
+ 	}
+ 
+-	text, err := template.Render(segment.FallbackTemplate, segment.writer)
++	text, err := template.RenderTrusted(segment.FallbackTemplate, segment.writer)
+ 	if err != nil {
+ 		text = err.Error()
+ 	}
+@@ -580,7 +580,7 @@
+ 		segment.Template = segment.writer.Template()
+ 	}
+ 
+-	text, err := template.Render(segment.Template, segment.writer)
++	text, err := template.RenderTrusted(segment.Template, segment.writer)
+ 	if err != nil {
+ 		return err.Error()
+ 	}
+--- a/src/prompt/engine.go
++++ b/src/prompt/engine.go
+@@ -117,7 +117,7 @@
+ 	}
+ 
+ 	// Allow template logic to define when to enable the PWD (when supported)
+-	pwdType, err := template.Render(e.Config.PWD, nil)
++	pwdType, err := template.RenderTrusted(e.Config.PWD, nil)
+ 	if err != nil || pwdType == "" {
+ 		return
+ 	}
+@@ -181,7 +181,7 @@
+ 	}()
+ 
+ 	var err error
+-	if filler, err = template.Render(filler, e); err != nil {
++	if filler, err = template.RenderTrusted(filler, e); err != nil {
+ 		return "", false
+ 	}
+ 
+@@ -202,7 +202,7 @@
+ }
+ 
+ func (e *Engine) getTitleTemplateText() string {
+-	if txt, err := template.Render(e.Config.ConsoleTitleTemplate, nil); err == nil {
++	if txt, err := template.RenderTrusted(e.Config.ConsoleTitleTemplate, nil); err == nil {
+ 		return txt
+ 	}
+ 
+--- a/src/prompt/extra.go
++++ b/src/prompt/extra.go
+@@ -57,7 +57,7 @@
+ 		}
+ 	}
+ 
+-	promptText, err := template.Render(getTemplate(prompt.Template), nil)
++	promptText, err := template.RenderTrusted(getTemplate(prompt.Template), nil)
+ 	if err != nil {
+ 		promptText = err.Error()
+ 	}
+@@ -192,7 +192,7 @@
+ 		return "", 0
+ 	}
+ 
+-	text, err := template.Render(prompt.RightTemplate, nil)
++	text, err := template.RenderTrusted(prompt.RightTemplate, nil)
+ 	if err != nil {
+ 		text = err.Error()
+ 	}
+--- a/src/segments/http.go
++++ b/src/segments/http.go
+@@ -32,11 +32,11 @@
+ 	method := h.options.String(METHOD, "GET")
+ 	timeout := h.options.Int(options.HTTPTimeout, 10000)
+ 
+-	if resolved, err := template.Render(url, nil); err == nil {
++	if resolved, err := template.RenderTrusted(url, nil); err == nil {
+ 		url = resolved
+ 
+ 		// resolve any template expression the first pass produced
+-		if resolvedAgain, err := template.Render(url, nil); err == nil {
++		if resolvedAgain, err := template.RenderUntrusted(url, nil); err == nil {
+ 			url = resolvedAgain
+ 		}
+ 	}
+--- a/src/segments/language.go
++++ b/src/segments/language.go
+@@ -358,7 +358,7 @@
+ 		return
+ 	}
+ 
+-	url, err := template.Render(versionURLTemplate, l.Version)
++	url, err := template.RenderTrusted(versionURLTemplate, l.Version)
+ 	if err != nil {
+ 		return
+ 	}
+--- a/src/segments/options/map.go
++++ b/src/segments/options/map.go
+@@ -105,7 +105,7 @@
+ 		return value
+ 	}
+ 
+-	resolved, err := template.Render(value, context)
++	resolved, err := template.RenderTrusted(value, context)
+ 	if err != nil {
+ 		debugf("%s: template error, using raw value: %s", option, err)
+ 		return value
+--- a/src/segments/path.go
++++ b/src/segments/path.go
+@@ -282,7 +282,12 @@
+ 	}
+ 
+ 	// make sure we resolve all templates
+-	if txt, err := template.Render(pt.Path, pt); err == nil {
++	//
++	// pt.Path is composed from raw filesystem folder names (untrusted) plus
++	// already-rendered config templates, so it must never get the func map
++	// entries that touch the OS (cmd/readFile/stat/glob) — use the restricted
++	// renderer, not template.Render.
++	if txt, err := template.RenderUntrusted(pt.Path, pt); err == nil {
+ 		pt.Path = txt
+ 	}
+ }
+@@ -293,7 +298,7 @@
+ 		return 0
+ 	}
+ 
+-	txt, err := template.Render(width, pt)
++	txt, err := template.RenderTrusted(width, pt)
+ 	if err != nil {
+ 		log.Error(err)
+ 		return 0
+@@ -320,7 +325,7 @@
+ 		return separator
+ 	}
+ 
+-	txt, err := template.Render(separatorTemplate, pt)
++	txt, err := template.RenderTrusted(separatorTemplate, pt)
+ 	if err != nil {
+ 		log.Error(err)
+ 	}
+@@ -652,7 +657,7 @@
+ 			continue
+ 		}
+ 
+-		location, err := template.Render(key, pt)
++		location, err := template.RenderTrusted(key, pt)
+ 		if err != nil {
+ 			log.Error(err)
+ 		}
+--- a/src/segments/scm.go
++++ b/src/segments/scm.go
+@@ -159,7 +159,7 @@
+ 	}
+ 
+ 	// resolve template expressions in the composed branch name
+-	if txt, err := template.Render(branch, s); err == nil {
++	if txt, err := template.RenderUntrusted(branch, s); err == nil {
+ 		branch = txt
+ 	}
+ 
+@@ -168,7 +168,7 @@
+ 		return branch
+ 	}
+ 
+-	txt, err := template.Render(branchTemplate, struct{ Branch, Upstream string }{Branch: branch, Upstream: s.Upstream})
++	txt, err := template.RenderTrusted(branchTemplate, struct{ Branch, Upstream string }{Branch: branch, Upstream: s.Upstream})
+ 	if err != nil {
+ 		return branch
+ 	}
+--- a/src/segments/status.go
++++ b/src/segments/status.go
+@@ -48,7 +48,7 @@
+ 	}
+ 
+ 	if pipeStatus == "" {
+-		if txt, err := template.Render(statusTemplate, s); err == nil {
++		if txt, err := template.RenderTrusted(statusTemplate, s); err == nil {
+ 			return txt
+ 		}
+ 
+@@ -87,7 +87,7 @@
+ 
+ 		context.Code = code
+ 
+-		txt, err := template.Render(statusTemplate, context)
++		txt, err := template.RenderTrusted(statusTemplate, context)
+ 		if err != nil {
+ 			write(codeStr)
+ 			continue
+--- a/src/template/func_map.go
++++ b/src/template/func_map.go
+@@ -8,13 +8,25 @@
+ 	"github.com/Masterminds/sprig/v3"
+ )
+ 
+-// sharedFuncMap is built exactly once and reused across all template constructions.
+-var sharedFuncMap = sync.OnceValue(func() template.FuncMap {
++// dangerousFuncs execute host commands or touch the filesystem/environment
++// directly. They are only exposed to templates rendered via RenderTrusted
++// (see text.go) — never to RenderUntrusted, which may contain or be composed
++// from runtime data.
++var dangerousFuncs = map[string]bool{
++	"cmd":       true,
++	"readFile":  true,
++	"stat":      true,
++	"glob":      true,
++	"env":       true,
++	"expandenv": true,
++}
++
++// baseFuncMap returns the funcs available regardless of trust level.
++func baseFuncMap() map[string]any {
+ 	fm := map[string]any{
+ 		"secondsRound": secondsRound,
+ 		"url":          url,
+ 		"path":         filePath,
+-		"glob":         glob,
+ 		"matchP":       matchP,
+ 		"findP":        findP,
+ 		"replaceP":     replaceP,
+@@ -25,11 +37,10 @@
+ 		"hresult":      hresult,
+ 		"trunc":        trunc,
+ 		"truncE":       TruncE,
+-		"cmd":          cmd,
+-		"readFile":     readFile,
+-		"stat":         stat,
+ 		"dir":          filepath.Dir,
+ 		"base":         filepath.Base,
++		"readFile":     readFile,
++		"stat":         stat,
+ 		// Locale-aware date/time formatting using OS regional settings.
+ 		"localeShortDate": localeShortDate,
+ 		"localeShortTime": localeShortTime,
+@@ -42,15 +53,51 @@
+ 	}
+ 
+ 	for key, fun := range sprig.TxtFuncMap() {
++		if dangerousFuncs[key] {
++			continue
++		}
++
+ 		if _, ok := fm[key]; !ok {
+ 			fm[key] = fun
+ 		}
+ 	}
+ 
++	return fm
++}
++
++// sharedFuncMap is built exactly once and reused across all trusted template constructions.
++var sharedFuncMap = sync.OnceValue(func() template.FuncMap {
++	fm := baseFuncMap()
++
++	fm["cmd"] = cmd
++	fm["readFile"] = readFile
++	fm["stat"] = stat
++	fm["glob"] = glob
++
++	sprigFuncs := sprig.TxtFuncMap()
++	if fn, ok := sprigFuncs["env"]; ok {
++		fm["env"] = fn
++	}
++
++	if fn, ok := sprigFuncs["expandenv"]; ok {
++		fm["expandenv"] = fn
++	}
++
+ 	return template.FuncMap(fm)
+ })
+ 
+-// funcMap returns the shared merged FuncMap (built once, reused everywhere).
+-func funcMap() template.FuncMap {
+-	return sharedFuncMap()
++// restrictedFuncMap is built exactly once and reused across all restricted template
++// constructions (see RenderRestricted). It never contains dangerousFuncs.
++var restrictedFuncMap = sync.OnceValue(func() template.FuncMap {
++	return template.FuncMap(baseFuncMap())
++})
++
++// funcMap returns the merged FuncMap for the given trust level (built once per
++// level, reused everywhere).
++func funcMap(trusted bool) template.FuncMap {
++	if trusted {
++		return sharedFuncMap()
++	}
++
++	return restrictedFuncMap()
+ }
+--- a/src/template/list.go
++++ b/src/template/list.go
+@@ -42,7 +42,7 @@
+ 	buffer := text.NewBuilder()
+ 
+ 	for _, tmpl := range l {
+-		value, err := Render(tmpl, context)
++		value, err := RenderTrusted(tmpl, context)
+ 		if err != nil || len(strings.TrimSpace(value)) == 0 {
+ 			continue
+ 		}
+@@ -59,7 +59,7 @@
+ 	}
+ 
+ 	for _, tmpl := range l {
+-		value, err := Render(tmpl, context)
++		value, err := RenderTrusted(tmpl, context)
+ 		if err != nil || len(strings.TrimSpace(value)) == 0 {
+ 			continue
+ 		}
+--- a/src/template/render.go
++++ b/src/template/render.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"reflect"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"text/template"
+ 	"unicode"
+@@ -47,14 +48,19 @@
+ }
+ 
+ // templateCacheKey returns the key used to look up a cached *template.Template.
+-// It encodes the raw (unpatched) template text and, when context is non-nil,
+-// the reflect.Type of the context so that two different struct types whose
+-// patchTemplate output would differ (via hasField) get separate cache entries.
+-// For map[string]any contexts the key also includes the sorted exported key
+-// names, since patchTemplate output depends on which keys are present.
+-func templateCacheKey(rawText string, ctx any) string {
++// It encodes the raw (unpatched) template text, the trust level (parsed
++// templates are bound to a func map at Parse time, so a trusted and a
++// restricted render of identical text must never share a cache entry), and,
++// when context is non-nil, the reflect.Type of the context so that two
++// different struct types whose patchTemplate output would differ (via
++// hasField) get separate cache entries. For map[string]any contexts the key
++// also includes the sorted exported key names, since patchTemplate output
++// depends on which keys are present.
++func templateCacheKey(rawText string, trusted bool, ctx any) string {
++	key := rawText + "\x00" + strconv.FormatBool(trusted)
++
+ 	if ctx == nil {
+-		return rawText
++		return key
+ 	}
+ 
+ 	t := reflect.TypeOf(ctx)
+@@ -67,11 +73,11 @@
+ 				}
+ 			}
+ 			sort.Strings(keys)
+-			return rawText + "\x00" + t.String() + "\x00" + strings.Join(keys, "\x01")
++			return key + "\x00" + t.String() + "\x00" + strings.Join(keys, "\x01")
+ 		}
+ 	}
+ 
+-	return rawText + "\x00" + t.String()
++	return key + "\x00" + t.String()
+ }
+ 
+ // parsedTemplate returns a fully-parsed *template.Template for text.
+@@ -79,10 +85,11 @@
+ // return the cached value. Concurrent first-renders of the same template
+ // may both parse, but LoadOrStore ensures only one result is shared.
+ func parsedTemplate(text *Text) (*template.Template, error) {
+-	// Key on the raw, unpatched template text plus the context type so that
+-	// cache hits can skip patchTemplate entirely: patching is only needed
+-	// the first time a given (raw template, context type) pair is seen.
+-	key := templateCacheKey(text.template, text.context)
++	// Key on the raw, unpatched template text plus the trust level and context
++	// type so that cache hits can skip patchTemplate entirely: patching is only
++	// needed the first time a given (raw template, trust level, context type)
++	// combination is seen.
++	key := templateCacheKey(text.template, text.trusted, text.context)
+ 
+ 	if cached, ok := parsedTemplates.Load(key); ok {
+ 		return cached.(*template.Template), nil
+@@ -91,8 +98,8 @@
+ 	// Cache miss: patch the raw template into its executable form.
+ 	text.patchTemplate()
+ 
+-	// Parse into a fresh template with the shared func map and settings.
+-	tmpl, err := template.New("cache").Funcs(funcMap()).Parse(text.template)
++	// Parse into a fresh template with the func map matching this render's trust level.
++	tmpl, err := template.New("cache").Funcs(funcMap(text.trusted)).Parse(text.template)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- a/src/template/text.go
++++ b/src/template/text.go
+@@ -13,24 +13,46 @@
+ type Text struct {
+ 	context  Data
+ 	template string
++	trusted  bool
+ }
+ 
+ // New returns a Text instance from the pool with the given template and context
+-func get(template string, context any) *Text {
++func get(template string, trusted bool, context any) *Text {
+ 	if textPool == nil {
+ 		// Fallback if pool is not initialized yet
+-		return &Text{context: context, template: template}
++		return &Text{context: context, template: template, trusted: trusted}
+ 	}
+ 
+ 	text := textPool.Get()
+ 	text.template = template
++	text.trusted = trusted
+ 	text.context = context
+ 
+ 	return text
+ }
+ 
+-func Render(template string, context any) (string, error) {
+-	t := get(template, context)
++// RenderTrusted executes a template the caller has verified was authored by
++// the user in their own configuration (a segment/block/palette/etc. template
++// field), as opposed to text assembled at runtime from external data
++// (filesystem names, command output, API responses, ...). The full func map
++// is available, including cmd/readFile/stat/glob.
++//
++// Only call this with a string read verbatim from a config field — passing
++// runtime-composed text here defeats the whole point of the split with
++// RenderUntrusted.
++func RenderTrusted(template string, context any) (string, error) {
++	return render(template, true, context)
++}
++
++// RenderUntrusted executes a template that may contain, or be composed from,
++// runtime data rather than user-authored config text. cmd/readFile/stat/glob
++// and env/expandenv are not available.
++func RenderUntrusted(template string, context any) (string, error) {
++	return render(template, false, context)
++}
++
++func render(template string, trusted bool, context any) (string, error) {
++	t := get(template, trusted, context)
+ 	defer t.release()
+ 
+ 	if !strings.Contains(t.template, "{{") || !strings.Contains(t.template, "}}") {
+@@ -47,6 +69,7 @@
+ func (t *Text) release() {
+ 	t.context = nil
+ 	t.template = ""
++	t.trusted = false
+ 
+ 	if textPool != nil {
+ 		textPool.Put(t)

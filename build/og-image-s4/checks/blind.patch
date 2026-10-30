@@ -1,0 +1,494 @@
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts b/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
+@@ -6,13 +6,37 @@
+ import { fetchLocalAsset } from '../../../util/fetchLocalAsset'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { decodeDataFont, eventOrigin, isAuthorityBearing, isDataFontSource, sameOriginHref } from './font-source-guard'
+ 
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
+   const { app } = useRuntimeConfig()
+-  const fullPath = withBase(path, app.baseURL)
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+ 
++  // Inline font data is decoded locally; it is never a network target.
++  if (isDataFontSource(path)) {
++    const data = await decodeDataFont(path, timeout)
++    if (data)
++      return data
++    throw new Error('[Nuxt OG Image] Inline font data could not be decoded.')
++  }
++
++  if (typeof path !== 'string' || !path)
++    throw new Error('[Nuxt OG Image] Font source is not a usable path.')
++
++  // Never resolve an authority-bearing font source: only the request's own
++  // origin is a permitted target, whatever form the visitor wrote it in.
++  const cfRequestUrl = (event.context.cloudflare as { request?: { url?: string } } | undefined)?.request?.url
++  const origin = eventOrigin(event, cfRequestUrl)
++  const fullPath = withBase(path, app.baseURL)
++  if (origin) {
++    if (!sameOriginHref(fullPath, origin))
++      throw new Error('[Nuxt OG Image] Font source leaves the request origin; refusing to fetch it.')
++  }
++  else if (isAuthorityBearing(path)) {
++    throw new Error('[Nuxt OG Image] Font source carries its own authority; refusing to fetch it.')
++  }
++
+   const ab = await fetchLocalAsset(event, fullPath, { fetchTimeout: timeout })
+   if (ab)
+     return Buffer.from(ab)
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts b/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
+@@ -8,6 +8,7 @@
+ import { buildDir, rootDir } from '#og-image-virtual/build-dir.mjs'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { decodeDataFont, eventOrigin, fetchSameOriginAsset, isAuthorityBearing, isDataFontSource, sameOriginHref } from './font-source-guard'
+ 
+ let fontUrlMapping: Record<string, string> | undefined
+ 
+@@ -22,6 +23,7 @@
+ export async function resolve(event: H3Event, font: FontConfig): Promise<Buffer> {
+   const path = font.src || font.localPath
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
++  const { app } = useRuntimeConfig()
+ 
+   // Static bundled fonts — read directly from absolute path
+   if (font.absolutePath) {
+@@ -30,6 +32,40 @@
+       return data
+   }
+ 
++  // Inline font data is decoded locally; it is never a network target.
++  if (isDataFontSource(path)) {
++    const data = await decodeDataFont(path, timeout)
++    if (data)
++      return data
++    throw new Error('[Nuxt OG Image] Inline font data could not be decoded.')
++  }
++
++  if (typeof path !== 'string' || !path)
++    throw new Error('[Nuxt OG Image] Font source is not a usable path.')
++
++  // The request's own origin, used for every outbound font fetch below. A
++  // visitor-supplied path is only fetched from this origin, however it is
++  // written; relative-looking authority forms are canonicalized first.
++  const reqUrl = (() => {
++    try {
++      return getRequestURL(event)
++    }
++    catch {
++      return undefined
++    }
++  })()
++  const origin = eventOrigin(event, reqUrl ? `${reqUrl.protocol}//${reqUrl.host}` : undefined)
++  const fullPath = withBase(path, app.baseURL)
++  let target: string | null = null
++  if (origin) {
++    target = sameOriginHref(fullPath, origin)
++    if (!target)
++      throw new Error('[Nuxt OG Image] Font source leaves the request origin; refusing to fetch it.')
++  }
++  else if (isAuthorityBearing(path)) {
++    throw new Error('[Nuxt OG Image] Font source carries its own authority; refusing to fetch it.')
++  }
++
+   if (import.meta.prerender) {
+     // Static font downloads (separate from @nuxt/fonts to avoid conflicts)
+     if (path.startsWith('/_og-static-fonts/')) {
+@@ -97,17 +133,17 @@
+       return data
+   }
+ 
+-  const { app } = useRuntimeConfig()
+-  if (import.meta.dev) {
+-    const reqUrl = getRequestURL(event)
+-    const origin = `${reqUrl.protocol}//${reqUrl.host}`
+-    const url = new URL(withBase(path, app.baseURL), origin).href
+-    const res = await fetch(url, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-    if (res?.ok) {
+-      return Buffer.from(await res.arrayBuffer())
+-    }
++  if (import.meta.dev && target) {
++    // Same-origin dev fetch. The app's own (possibly loopback) host is fine,
++    // but each redirect hop is re-checked and a hop that leaves the origin is
++    // refused rather than followed (an open redirect must not reach an
++    // internal service through the visitor-supplied font path).
++    const outcome = await fetchSameOriginAsset(target, timeout)
++    if (outcome.status === 'ok')
++      return outcome.data
++    if (outcome.status === 'blocked')
++      throw new Error('[Nuxt OG Image] Font fetch was redirected off the request origin.')
+   }
+-  const fullPath = withBase(path, app.baseURL)
+   const fetchArrayBuffer = event.$fetch as unknown as (path: string, options: { responseType: 'arrayBuffer', timeout: number }) => Promise<ArrayBuffer>
+   const arrayBuffer = await fetchArrayBuffer(fullPath, {
+     responseType: 'arrayBuffer',
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/font-source-guard.ts b/src/runtime/server/og-image/bindings/font-assets/font-source-guard.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/font-source-guard.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/font-source-guard.ts
+@@ -0,0 +1,183 @@
++// Guard for visitor-supplied font sources (the `fonts` URL parameter).
++//
++// A font entry is decoded from the image URL, so every handler that resolves a
++// font must treat its path as hostile. The invariant enforced here is simple:
++// the only host the renderer may ever reach is the origin serving the image
++// request. That gives three permitted outcomes for a font source:
++//
++//   1. inline `data:` — decoded locally, never a network target;
++//   2. a path that canonicalizes to the request origin — fetched, but every
++//      redirect hop must stay on that origin;
++//   3. anything else — refused softly (the caller treats it as a missing font).
++//
++// Canonicalization is done with the WHATWG URL parser (the same parser
++// `fetch` uses), not with a string/scheme test. That is what closes the
++// authority-form family: `//host`, `\\host`, `/\host`, C0/space-prefixed
++// forms, embedded tab/CR/LF and `http:host` all resolve to their real origin
++// here, so none of them can masquerade as a relative path.
++
++import type { H3Event } from 'h3'
++import { getRequestURL } from 'h3'
++
++/** Reserved TLD (RFC 2606); used only as a neutral base for parsing. */
++const NEUTRAL_BASE = 'http://font-source.invalid/'
++const NEUTRAL_ORIGIN = 'http://font-source.invalid'
++
++const MAX_REDIRECT_HOPS = 5
++
++export type FontFetchOutcome
++  = | { status: 'ok', data: Buffer }
++    | { status: 'blocked' }
++    | { status: 'error' }
++
++/** True when the source is an inline `data:` URI (no network target). */
++export function isDataFontSource(source: unknown): source is string {
++  return typeof source === 'string' && source.trimStart().toLowerCase().startsWith('data:')
++}
++
++/**
++ * Pick the origin that serves this image request. `candidates` are tried in
++ * order (handlers pass their platform-native origin first), then the request
++ * URL. Returns undefined only when no valid origin can be derived.
++ */
++export function eventOrigin(event: H3Event, ...candidates: Array<string | undefined>): string | undefined {
++  for (const candidate of candidates) {
++    if (!candidate)
++      continue
++    try {
++      return new URL(candidate).origin
++    }
++    catch {
++      // not a usable origin; try the next source
++    }
++  }
++  try {
++    return getRequestURL(event).origin
++  }
++  catch {
++    return undefined
++  }
++}
++
++/**
++ * Canonicalize `fullPath` against `origin` and return the href only when it
++ * still points at that origin. Returns null for any authority-bearing source
++ * that resolves elsewhere, for non-http(s) schemes, and for unparseable input.
++ */
++export function sameOriginHref(fullPath: string, origin: string): string | null {
++  let requestOrigin: string
++  try {
++    requestOrigin = new URL(origin).origin
++  }
++  catch {
++    return null
++  }
++  try {
++    const target = new URL(fullPath, requestOrigin)
++    if (target.origin !== requestOrigin)
++      return null
++    if (target.protocol !== 'http:' && target.protocol !== 'https:')
++      return null
++    return target.href
++  }
++  catch {
++    return null
++  }
++}
++
++/**
++ * Parser-based check for a source that carries its own authority (or a
++ * non-http scheme). Used only as a fallback when no request origin could be
++ * derived: relative-looking sources are allowed through, anything that
++ * resolves cross-origin is refused.
++ */
++export function isAuthorityBearing(source: string): boolean {
++  try {
++    return new URL(source, NEUTRAL_BASE).origin !== NEUTRAL_ORIGIN
++  }
++  catch {
++    return true
++  }
++}
++
++/**
++ * Decode an inline `data:` font without touching the network. An invalid data
++ * URI yields null so the caller can treat the font as unavailable.
++ */
++export async function decodeDataFont(source: string, timeout: number): Promise<Buffer | null> {
++  try {
++    const res = await fetch(source.trimStart(), { signal: AbortSignal.timeout(timeout) })
++    if (!res.ok)
++      return null
++    return Buffer.from(await res.arrayBuffer())
++  }
++  catch {
++    return null
++  }
++}
++
++/**
++ * Fetch a same-origin asset, following redirects manually and refusing the
++ * moment a hop leaves the initial origin. This is the same-origin fetch path
++ * for the node/serverless/dev handlers: the app's own host may legitimately be
++ * loopback (development, proxy), so it is allowed, but an open redirect on the
++ * app cannot be used to bounce the request to another host.
++ *
++ * The outcome distinguishes a blocked redirect (`blocked`) from an ordinary
++ * failure (`error`) so callers do not fall through to another fetcher after a
++ * refused hop.
++ */
++export async function fetchSameOriginAsset(href: string, timeout: number): Promise<FontFetchOutcome> {
++  let allowedOrigin: string
++  try {
++    allowedOrigin = new URL(href).origin
++  }
++  catch {
++    return { status: 'blocked' }
++  }
++
++  const controller = new AbortController()
++  const timer = setTimeout(() => controller.abort(), timeout)
++  try {
++    let current = href
++    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
++      let url: URL
++      try {
++        url = new URL(current)
++      }
++      catch {
++        return { status: 'blocked' }
++      }
++      if (url.origin !== allowedOrigin)
++        return { status: 'blocked' }
++
++      const res = await fetch(url.href, { redirect: 'manual', signal: controller.signal })
++      if (res.status >= 300 && res.status < 400) {
++        const location = res.headers.get('location')
++        if (!location)
++          return { status: 'error' }
++        let next: URL
++        try {
++          next = new URL(location, url)
++        }
++        catch {
++          return { status: 'error' }
++        }
++        if (next.origin !== allowedOrigin)
++          return { status: 'blocked' }
++        current = next.href
++        continue
++      }
++      if (!res.ok)
++        return { status: 'error' }
++      return { status: 'ok', data: Buffer.from(await res.arrayBuffer()) }
++    }
++    return { status: 'blocked' }
++  }
++  catch {
++    return { status: 'error' }
++  }
++  finally {
++    clearTimeout(timer)
++  }
++}
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/netlify.ts b/src/runtime/server/og-image/bindings/font-assets/netlify.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/netlify.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/netlify.ts
+@@ -2,9 +2,11 @@
+ import type { FontConfig } from '../../../../types'
+ import { useRuntimeConfig } from 'nitropack/runtime'
+ import { withBase } from 'ufo'
++import { getNitroOrigin } from '#site-config/server/composables'
+ import { fetchLocalAsset } from '../../../util/fetchLocalAsset'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { decodeDataFont, eventOrigin, fetchSameOriginAsset, isAuthorityBearing, isDataFontSource, sameOriginHref } from './font-source-guard'
+ 
+ /**
+  * Font asset resolution for Netlify. Static assets are served from the
+@@ -14,10 +16,46 @@
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
+   const { app } = useRuntimeConfig()
+-  const fullPath = withBase(path, app.baseURL)
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+-  const ab = await fetchLocalAsset(event, fullPath, { fetchTimeout: timeout, includeExternalFallback: true })
++
++  // Inline font data is decoded locally; it is never a network target.
++  if (isDataFontSource(path)) {
++    const data = await decodeDataFont(path, timeout)
++    if (data)
++      return data
++    throw new Error('[Nuxt OG Image] Inline font data could not be decoded.')
++  }
++
++  if (typeof path !== 'string' || !path)
++    throw new Error('[Nuxt OG Image] Font source is not a usable path.')
++
++  // Only the request's own origin may be contacted, however the font source
++  // is written (absolute, network-path, backslash or whitespace-prefixed).
++  const origin = eventOrigin(event, getNitroOrigin(event))
++  const fullPath = withBase(path, app.baseURL)
++  let target: string | null = null
++  if (origin) {
++    target = sameOriginHref(fullPath, origin)
++    if (!target)
++      throw new Error('[Nuxt OG Image] Font source leaves the request origin; refusing to fetch it.')
++  }
++  else if (isAuthorityBearing(path)) {
++    throw new Error('[Nuxt OG Image] Font source carries its own authority; refusing to fetch it.')
++  }
++
++  // Internal lookup (ASSETS binding / Nitro local fetch) first.
++  const ab = await fetchLocalAsset(event, fullPath, { fetchTimeout: timeout })
+   if (ab)
+     return Buffer.from(ab)
++
++  // Edge routing fallback: fetch the deployment origin ourselves so redirects
++  // are re-validated and can never leave that origin.
++  if (target) {
++    const outcome = await fetchSameOriginAsset(target, timeout)
++    if (outcome.status === 'ok')
++      return outcome.data
++    if (outcome.status === 'blocked')
++      throw new Error('[Nuxt OG Image] Font fetch was redirected off the request origin.')
++  }
+   throw new Error(`[Nuxt OG Image] Cannot resolve font "${font.family}" (path: ${fullPath}).`)
+ }
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/node.ts b/src/runtime/server/og-image/bindings/font-assets/node.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/node.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/node.ts
+@@ -5,17 +5,48 @@
+ import { getNitroOrigin } from '#site-config/server/composables'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { decodeDataFont, eventOrigin, fetchSameOriginAsset, isAuthorityBearing, isDataFontSource, sameOriginHref } from './font-source-guard'
+ 
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
+   const { app } = useRuntimeConfig()
+-  const fullPath = withBase(path, app.baseURL)
+-  const origin = getNitroOrigin(event)
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+-  const res = await fetch(new URL(fullPath, origin).href, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-  if (res?.ok) {
+-    return Buffer.from(await res.arrayBuffer())
++
++  // Inline font data is decoded locally; it is never a network target.
++  if (isDataFontSource(path)) {
++    const data = await decodeDataFont(path, timeout)
++    if (data)
++      return data
++    throw new Error('[Nuxt OG Image] Inline font data could not be decoded.')
++  }
++
++  if (typeof path !== 'string' || !path)
++    throw new Error('[Nuxt OG Image] Font source is not a usable path.')
++
++  // The image request's own origin. A visitor-supplied path is only ever
++  // fetched from this origin, whatever authority form it is written in.
++  const origin = eventOrigin(event, getNitroOrigin(event))
++  const fullPath = withBase(path, app.baseURL)
++  let target: string | null = null
++  if (origin) {
++    target = sameOriginHref(fullPath, origin)
++    if (!target)
++      throw new Error('[Nuxt OG Image] Font source leaves the request origin; refusing to fetch it.')
++  }
++  else if (isAuthorityBearing(path)) {
++    throw new Error('[Nuxt OG Image] Font source carries its own authority; refusing to fetch it.')
+   }
++
++  if (target) {
++    const outcome = await fetchSameOriginAsset(target, timeout)
++    if (outcome.status === 'ok')
++      return outcome.data
++    // A redirect that left the origin must not be retried through another
++    // fetcher, or the open redirect would still be reachable.
++    if (outcome.status === 'blocked')
++      throw new Error('[Nuxt OG Image] Font fetch was redirected off the request origin.')
++  }
++
+   // Fallback to Nitro's internal handler when origin is unreachable
+   // (behind a proxy, serverless, or server not fully started)
+   const fetchArrayBuffer = event.$fetch as unknown as (path: string, options: { responseType: 'arrayBuffer', timeout: number }) => Promise<ArrayBuffer>
+diff -ruN a/src/runtime/server/og-image/bindings/font-assets/serverless.ts b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+--- a/src/runtime/server/og-image/bindings/font-assets/serverless.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+@@ -5,6 +5,7 @@
+ import { getNitroOrigin } from '#site-config/server/composables'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { decodeDataFont, eventOrigin, fetchSameOriginAsset, isAuthorityBearing, isDataFontSource, sameOriginHref } from './font-source-guard'
+ 
+ /**
+  * Font asset resolution for serverless Node platforms (Vercel, AWS Lambda).
+@@ -14,13 +15,39 @@
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
+   const { app } = useRuntimeConfig()
+-  const fullPath = withBase(path, app.baseURL)
+-  const origin = getNitroOrigin(event)
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+-  const res = await fetch(new URL(fullPath, origin).href, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-  if (res?.ok) {
+-    return Buffer.from(await res.arrayBuffer())
++
++  // Inline font data is decoded locally; it is never a network target.
++  if (isDataFontSource(path)) {
++    const data = await decodeDataFont(path, timeout)
++    if (data)
++      return data
++    throw new Error('[Nuxt OG Image] Inline font data could not be decoded.')
++  }
++
++  if (typeof path !== 'string' || !path)
++    throw new Error('[Nuxt OG Image] Font source is not a usable path.')
++
++  const origin = eventOrigin(event, getNitroOrigin(event))
++  const fullPath = withBase(path, app.baseURL)
++  let target: string | null = null
++  if (origin) {
++    target = sameOriginHref(fullPath, origin)
++    if (!target)
++      throw new Error('[Nuxt OG Image] Font source leaves the request origin; refusing to fetch it.')
++  }
++  else if (isAuthorityBearing(path)) {
++    throw new Error('[Nuxt OG Image] Font source carries its own authority; refusing to fetch it.')
+   }
++
++  if (target) {
++    const outcome = await fetchSameOriginAsset(target, timeout)
++    if (outcome.status === 'ok')
++      return outcome.data
++    if (outcome.status === 'blocked')
++      throw new Error('[Nuxt OG Image] Font fetch was redirected off the request origin.')
++  }
++
+   const fetchArrayBuffer = event.$fetch as unknown as (path: string, options: { responseType: 'arrayBuffer', timeout: number }) => Promise<ArrayBuffer>
+   const arrayBuffer = await fetchArrayBuffer(fullPath, {
+     responseType: 'arrayBuffer',

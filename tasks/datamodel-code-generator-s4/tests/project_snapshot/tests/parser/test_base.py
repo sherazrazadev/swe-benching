@@ -1,0 +1,977 @@
+"""Tests for base parser classes and utilities."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+import datamodel_code_generator._internal_utils as internal_utils
+from datamodel_code_generator.enums import CollapseRootModelsNameStrategy
+from datamodel_code_generator.imports import Imports
+from datamodel_code_generator.model import DataModel, DataModelFieldBase
+
+if TYPE_CHECKING:
+    from datamodel_code_generator.parser.schema_version import JsonSchemaFeatures
+
+from datamodel_code_generator.model.pydantic_v2 import BaseModel, DataModelField
+from datamodel_code_generator.model.pydantic_v2.root_model import RootModel
+from datamodel_code_generator.model.type_alias import TypeAlias, TypeAliasTypeBackport, TypeStatement
+from datamodel_code_generator.parser.base import (
+    Child,
+    HashableComparable,
+    Parser,
+    T,
+    _contains_model_reference,
+    _find_field,
+    _needs_validate_default,
+    _unwrap_type_alias,
+    add_model_path_to_list,
+    escape_characters,
+    exact_import,
+    get_module_directory,
+    get_most_of_parent,
+    relative,
+    sort_data_models,
+    to_hashable,
+)
+from datamodel_code_generator.reference import Reference, snake_to_upper_camel
+from datamodel_code_generator.types import DataType
+
+
+class A(DataModel):
+    """Test data model class A."""
+
+
+class B(DataModel):
+    """Test data model class B."""
+
+
+class C(Parser):
+    """Test parser class C."""
+
+    @property
+    def schema_features(self) -> JsonSchemaFeatures:
+        """Return mock schema features."""
+        from datamodel_code_generator.enums import JsonSchemaVersion
+        from datamodel_code_generator.parser.schema_version import JsonSchemaFeatures
+
+        return JsonSchemaFeatures.from_version(JsonSchemaVersion.Draft202012)
+
+    def parse_raw(self, name: str, raw: dict[str, Any]) -> None:
+        """Parse raw data into models."""
+
+
+def test_parser() -> None:
+    """Test parser initialization."""
+    c = C(
+        data_model_type=D,
+        data_model_root_type=B,
+        data_model_field_type=DataModelFieldBase,
+        base_class="Base",
+        source="",
+    )
+    assert c.data_model_type == D
+    assert c.data_model_root_type == B
+    assert c.data_model_field_type == DataModelFieldBase
+    assert c.base_class == "Base"
+    # Test schema_features property of test stub
+    assert c.schema_features.prefix_items is True
+
+
+def test_add_model_path_to_list() -> None:
+    """Test method which adds model paths to "update" list."""
+    reference_1 = Reference(path="Base1", original_name="A", name="A")
+    reference_2 = Reference(path="Alias2", original_name="B", name="B")
+    reference_3 = Reference(path="Alias3", original_name="B", name="B")
+    reference_4 = Reference(path="Alias4", original_name="B", name="B")
+    reference_5 = Reference(path="Alias5", original_name="B", name="B")
+    model1 = BaseModel(fields=[], reference=reference_1)
+    model2 = TypeAlias(fields=[], reference=reference_2)
+    model3 = TypeAlias(fields=[], reference=reference_3)
+    model4 = TypeAliasTypeBackport(fields=[], reference=reference_4)
+    model5 = TypeStatement(fields=[], reference=reference_5)
+
+    paths = add_model_path_to_list(None, model1)
+    assert "Base1" in paths
+    assert len(paths) == 1
+
+    paths = list[str]()
+    add_model_path_to_list(paths, model1)
+    assert "Base1" in paths
+    assert len(paths) == 1
+
+    add_model_path_to_list(paths, model1)
+    assert len(paths) != 2
+    assert len(paths) == 1
+
+    add_model_path_to_list(paths, model2)
+    assert "Alias2" not in paths
+
+    add_model_path_to_list(paths, model3)
+    assert "Alias3" not in paths
+
+    add_model_path_to_list(paths, model4)
+    assert "Alias4" not in paths
+
+    add_model_path_to_list(paths, model5)
+    assert "Alias5" not in paths
+
+
+def test_sort_data_models() -> None:
+    """Test sorting data models by dependencies."""
+    reference_a = Reference(path="A", original_name="A", name="A")
+    reference_b = Reference(path="B", original_name="B", name="B")
+    reference_c = Reference(path="C", original_name="C", name="C")
+    data_type_a = DataType(reference=reference_a)
+    data_type_b = DataType(reference=reference_b)
+    data_type_c = DataType(reference=reference_c)
+    reference = [
+        BaseModel(
+            fields=[
+                DataModelField(data_type=data_type_a),
+                DataModelFieldBase(data_type=data_type_c),
+            ],
+            reference=reference_a,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_b,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_c,
+        ),
+    ]
+
+    unresolved, resolved, require_update_action_models = sort_data_models(reference)
+    expected = OrderedDict()
+    expected["B"] = reference[1]
+    expected["C"] = reference[2]
+    expected["A"] = reference[0]
+
+    assert resolved == expected
+    assert unresolved == []
+    assert require_update_action_models == ["B", "A"]
+
+    _, _, seeded_require_update_action_models = sort_data_models(reference, require_update_action_models=["B"])
+    assert seeded_require_update_action_models == ["B", "A"]
+
+
+def test_sort_data_models_unresolved() -> None:
+    """Test sorting data models with unresolved references."""
+    reference_a = Reference(path="A", original_name="A", name="A")
+    reference_b = Reference(path="B", original_name="B", name="B")
+    reference_c = Reference(path="C", original_name="C", name="C")
+    reference_d = Reference(path="D", original_name="D", name="D")
+    reference_v = Reference(path="V", original_name="V", name="V")
+    reference_z = Reference(path="Z", original_name="Z", name="Z")
+    data_type_a = DataType(reference=reference_a)
+    data_type_b = DataType(reference=reference_b)
+    data_type_c = DataType(reference=reference_c)
+    data_type_v = DataType(reference=reference_v)
+    data_type_z = DataType(reference=reference_z)
+    reference = [
+        BaseModel(
+            fields=[
+                DataModelField(data_type=data_type_a),
+                DataModelFieldBase(data_type=data_type_c),
+            ],
+            reference=reference_a,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_b,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_c,
+        ),
+        BaseModel(
+            fields=[
+                DataModelField(data_type=data_type_a),
+                DataModelField(data_type=data_type_c),
+                DataModelField(data_type=data_type_z),
+            ],
+            reference=reference_d,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_v)],
+            reference=reference_z,
+        ),
+    ]
+
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        sort_data_models(reference)
+
+
+def test_sort_data_models_unresolved_raise_recursion_error() -> None:
+    """Test sorting data models raises error on recursion limit."""
+    reference_a = Reference(path="A", original_name="A", name="A")
+    reference_b = Reference(path="B", original_name="B", name="B")
+    reference_c = Reference(path="C", original_name="C", name="C")
+    reference_d = Reference(path="D", original_name="D", name="D")
+    reference_v = Reference(path="V", original_name="V", name="V")
+    reference_z = Reference(path="Z", original_name="Z", name="Z")
+    data_type_a = DataType(reference=reference_a)
+    data_type_b = DataType(reference=reference_b)
+    data_type_c = DataType(reference=reference_c)
+    data_type_v = DataType(reference=reference_v)
+    data_type_z = DataType(reference=reference_z)
+    reference = [
+        BaseModel(
+            fields=[
+                DataModelField(data_type=data_type_a),
+                DataModelFieldBase(data_type=data_type_c),
+            ],
+            reference=reference_a,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_b,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_b)],
+            reference=reference_c,
+        ),
+        BaseModel(
+            fields=[
+                DataModelField(data_type=data_type_a),
+                DataModelField(data_type=data_type_c),
+                DataModelField(data_type=data_type_z),
+            ],
+            reference=reference_d,
+        ),
+        BaseModel(
+            fields=[DataModelField(data_type=data_type_v)],
+            reference=reference_z,
+        ),
+    ]
+
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        sort_data_models(reference, recursion_count=100000)
+
+
+@pytest.mark.parametrize(
+    ("current_module", "reference", "val"),
+    [
+        ("", "Foo", ("", "")),
+        ("a", "a.Foo", ("", "")),
+        ("a", "a.b.Foo", (".", "b")),
+        ("a.b", "a.Foo", (".", "Foo")),
+        ("a.b.c", "a.Foo", ("..", "Foo")),
+        ("a.b.c", "Foo", ("...", "Foo")),
+    ],
+)
+def test_relative(current_module: str, reference: str, val: tuple[str, str]) -> None:
+    """Test relative import calculation."""
+    assert relative(current_module, reference) == val
+
+
+@pytest.mark.parametrize(
+    ("from_", "import_", "name", "val"),
+    [
+        (".", "mod", "Foo", (".mod", "Foo")),
+        ("..", "mod", "Foo", ("..mod", "Foo")),
+        (".a", "mod", "Foo", (".a.mod", "Foo")),
+        ("..a", "mod", "Foo", ("..a.mod", "Foo")),
+        ("..a.b", "mod", "Foo", ("..a.b.mod", "Foo")),
+    ],
+)
+def test_exact_import(from_: str, import_: str, name: str, val: tuple[str, str]) -> None:
+    """Test exact import formatting."""
+    assert exact_import(from_, import_, name) == val
+
+
+@pytest.mark.parametrize(
+    ("word", "expected"),
+    [
+        (
+            "_hello",
+            "_Hello",
+        ),  # In case a name starts with a underline, we should keep it.
+        ("hello_again", "HelloAgain"),  # regular snake case
+        ("hello__again", "HelloAgain"),  # handles double underscores
+        (
+            "hello___again_again",
+            "HelloAgainAgain",
+        ),  # handles double and single underscores
+        ("hello_again_", "HelloAgain"),  # handles trailing underscores
+        ("hello", "Hello"),  # no underscores
+        ("____", "_"),  # degenerate case, but this is the current expected behavior
+    ],
+)
+def test_snake_to_upper_camel(word: str, expected: str) -> None:
+    """Tests the snake to upper camel function."""
+    actual = snake_to_upper_camel(word)
+    assert actual == expected
+
+
+class D(DataModel):
+    """Test data model class D."""
+
+
+@pytest.fixture
+def parser_fixture() -> C:
+    """Create a test parser instance for unit tests."""
+    return C(
+        data_model_type=D,
+        data_model_root_type=B,
+        data_model_field_type=DataModelFieldBase,
+        base_class="Base",
+        source="",
+    )
+
+
+def _reference(path: str) -> Reference:
+    return Reference(path=path, original_name=path, name=path)
+
+
+def _create_override_required_models(
+    original_data_type: DataType,
+    *,
+    original_default: object | None = None,
+    original_has_default: bool = False,
+) -> tuple[BaseModel, BaseModel, DataModelField]:
+    base_reference = _reference("BaseModel")
+    base_field = DataModelField(
+        name="value",
+        original_name="value",
+        data_type=original_data_type,
+        required=False,
+        default=original_default,
+        has_default=original_has_default,
+    )
+    base_model = BaseModel(fields=[base_field], reference=base_reference)
+    child_field = DataModelField(
+        name="value",
+        original_name="value",
+        data_type=DataType(),
+        required=False,
+    )
+    child_model = BaseModel(
+        fields=[child_field],
+        base_classes=[base_reference],
+        reference=_reference("ChildModel"),
+    )
+    return base_model, child_model, child_field
+
+
+def _override_required_fields(parser: C, models: list[BaseModel]) -> None:
+    Parser._Parser__override_required_field(parser, models)
+
+
+def test_find_field_skips_non_matching_fields() -> None:
+    """Field lookup checks later fields after a non-matching field."""
+    first_field = DataModelField(
+        name="first",
+        original_name="first",
+        data_type=DataType(type="str"),
+    )
+    second_field = DataModelField(
+        name="second",
+        original_name="second",
+        data_type=DataType(type="int"),
+    )
+    model = BaseModel(fields=[first_field, second_field], reference=_reference("SearchModel"))
+
+    assert _find_field("second", [model]) is second_field
+
+
+def test_override_required_field_copies_reference_type(parser_fixture: C) -> None:
+    """Required inherited placeholders are replaced with reference-backed fields."""
+    target_reference = _reference("TargetModel")
+    BaseModel(fields=[], reference=target_reference)
+    base_model, child_model, child_field = _create_override_required_models(
+        DataType(reference=target_reference),
+    )
+    parser_fixture.generation_store.register_model(base_model)
+    parser_fixture.generation_store.register_model(child_model)
+
+    _override_required_fields(parser_fixture, [base_model, child_model])
+
+    replacement = child_model.fields[0]
+    assert replacement is not child_field
+    assert replacement.original_name == "value"
+    assert replacement.required is True
+    assert replacement.parent is child_model
+    assert replacement.data_type.reference is target_reference
+    assert replacement.data_type.parent is replacement
+
+
+def test_override_required_field_copies_nested_types(parser_fixture: C) -> None:
+    """Nested inherited data types are recursively copied with current parent-link behavior pinned."""
+    target_reference = _reference("NestedTarget")
+    BaseModel(fields=[], reference=target_reference)
+    original_data_type = DataType(
+        data_types=[
+            DataType(reference=target_reference),
+            DataType(data_types=[DataType(type="str")]),
+            DataType(type="int"),
+        ],
+    )
+    base_model, child_model, child_field = _create_override_required_models(original_data_type)
+    parser_fixture.generation_store.register_model(base_model)
+    parser_fixture.generation_store.register_model(child_model)
+
+    _override_required_fields(parser_fixture, [base_model, child_model])
+
+    replacement = child_model.fields[0]
+    copied_data_type = replacement.data_type
+    assert replacement is not child_field
+    assert copied_data_type is not original_data_type
+    assert copied_data_type.parent is replacement
+    assert copied_data_type.data_types[0].reference is target_reference
+    assert copied_data_type.data_types[0] is not original_data_type.data_types[0]
+    assert copied_data_type.data_types[0].parent is copied_data_type
+    assert copied_data_type.data_types[1] is not original_data_type.data_types[1]
+    assert copied_data_type.data_types[1].data_types[0].type == "str"
+    assert copied_data_type.data_types[1].parent is copied_data_type
+    assert copied_data_type.data_types[1].data_types[0].parent is None
+    assert copied_data_type.data_types[2].type == "int"
+    assert copied_data_type.data_types[2] is not original_data_type.data_types[2]
+    assert copied_data_type.data_types[2].parent is copied_data_type
+
+
+def test_override_required_field_copies_plain_type_with_required_default() -> None:
+    """Required inherited fields can keep defaults when that option is enabled."""
+    parser = C(source="", apply_default_values_for_required_fields=True)
+    original_data_type = DataType(type="str")
+    base_model, child_model, child_field = _create_override_required_models(
+        original_data_type,
+        original_default="'fallback'",
+        original_has_default=True,
+    )
+    parser.generation_store.register_model(base_model)
+    parser.generation_store.register_model(child_model)
+
+    _override_required_fields(parser, [base_model, child_model])
+
+    replacement = child_model.fields[0]
+    assert replacement is not child_field
+    assert replacement.data_type is not original_data_type
+    assert replacement.data_type.type == "str"
+    assert replacement.data_type.parent is replacement
+    assert replacement.required is True
+    assert replacement.has_default is True
+    assert replacement.default == "'fallback'"
+    assert replacement.use_default_with_required is True
+
+
+def test_override_required_field_removes_placeholder_without_inherited_field(parser_fixture: C) -> None:
+    """Placeholders without a matching inherited field are removed."""
+    base_reference = _reference("EmptyBase")
+    base_model = BaseModel(fields=[], reference=base_reference)
+    child_field = DataModelField(
+        name="missing",
+        original_name="missing",
+        data_type=DataType(),
+    )
+    child_model = BaseModel(
+        fields=[child_field],
+        base_classes=[base_reference],
+        reference=_reference("MissingChild"),
+    )
+    parser_fixture.generation_store.register_model(base_model)
+    parser_fixture.generation_store.register_model(child_model)
+
+    _override_required_fields(parser_fixture, [base_model, child_model])
+
+    assert child_model.fields == []
+
+
+def test_additional_imports() -> None:
+    """Test that additional imports are inside imports container."""
+    new_parser = C(
+        source="",
+        additional_imports=["collections.deque"],
+    )
+    assert len(new_parser.imports) == 1
+    assert new_parser.imports["collections"] == {"deque"}
+
+
+def test_no_additional_imports() -> None:
+    """Test that not additional imports are not affecting imports container."""
+    new_parser = C(
+        source="",
+    )
+    assert len(new_parser.imports) == 0
+
+
+@pytest.mark.parametrize(
+    ("input_data", "expected"),
+    [
+        (
+            {
+                ("folder1", "module1.py"): "content1",
+                ("folder1", "module2.py"): "content2",
+                ("folder1", "__init__.py"): "init_content",
+            },
+            {
+                ("folder1", "module1.py"): "content1",
+                ("folder1", "module2.py"): "content2",
+                ("folder1", "__init__.py"): "init_content",
+            },
+        ),
+        (
+            {
+                ("folder1.module", "file.py"): "content1",
+                ("folder1.module", "__init__.py"): "init_content",
+            },
+            {
+                ("folder1", "module", "file.py"): "content1",
+                ("folder1", "__init__.py"): "init_content",
+                ("folder1", "module", "__init__.py"): "init_content",
+            },
+        ),
+    ],
+)
+def test_postprocess_result_modules(input_data: Any, expected: Any) -> None:
+    """Test postprocessing of result modules."""
+    result = Parser._Parser__postprocess_result_modules(input_data)
+    assert result == expected
+
+
+def test_find_member_with_integer_enum() -> None:
+    """Test find_member method with integer enum values."""
+    from datamodel_code_generator.model.enum import Enum
+    from datamodel_code_generator.model.pydantic_v2.base_model import DataModelField
+    from datamodel_code_generator.reference import Reference
+    from datamodel_code_generator.types import DataType
+
+    # Create test Enum with integer values
+    enum = Enum(
+        reference=Reference(path="test_path", original_name="TestEnum", name="TestEnum"),
+        fields=[
+            DataModelField(
+                name="VALUE_1000",
+                default="1000",
+                data_type=DataType(type="int"),
+                required=True,
+            ),
+            DataModelField(
+                name="VALUE_100",
+                default="100",
+                data_type=DataType(type="int"),
+                required=True,
+            ),
+            DataModelField(
+                name="VALUE_0",
+                default="0",
+                data_type=DataType(type="int"),
+                required=True,
+            ),
+        ],
+    )
+
+    # Test finding members with integer values
+    assert enum.find_member(1000).field.name == "VALUE_1000"
+    assert enum.find_member(100).field.name == "VALUE_100"
+    assert enum.find_member(0).field.name == "VALUE_0"
+
+    # String values only match integer members for discriminator mapping keys
+    assert enum.find_member("1000") is None
+    assert enum.find_member("1000", coerce_strings=True).field.name == "VALUE_1000"
+    assert enum.find_member("100", coerce_strings=True).field.name == "VALUE_100"
+    assert enum.find_member("0", coerce_strings=True).field.name == "VALUE_0"
+
+    # Test with non-existent values
+    assert enum.find_member(999) is None
+    assert enum.find_member("999", coerce_strings=True) is None
+
+
+def test_find_member_with_string_enum() -> None:
+    """Test find_member method with string enum values."""
+    from datamodel_code_generator.model.enum import Enum
+    from datamodel_code_generator.model.pydantic_v2.base_model import DataModelField
+    from datamodel_code_generator.reference import Reference
+    from datamodel_code_generator.types import DataType
+
+    enum = Enum(
+        reference=Reference(path="test_path", original_name="TestEnum", name="TestEnum"),
+        fields=[
+            DataModelField(
+                name="NO_DEFAULT",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+            DataModelField(
+                name="VALUE_A",
+                default="'value_a'",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+            DataModelField(
+                name="VALUE_B",
+                default="'value_b'",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+            DataModelField(
+                name="BARE",
+                default="bare value",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+        ],
+    )
+
+    member = enum.find_member("bare value")
+    assert member is not None
+    assert member.field.name == "BARE"
+
+    member = enum.find_member("value_a")
+    assert member is not None
+    assert member.field.name == "VALUE_A"
+
+    member = enum.find_member("value_b")
+    assert member is not None
+    assert member.field.name == "VALUE_B"
+
+    # A value that is only the quoted form of a member is a different value
+    assert enum.find_member("'value_a'") is None
+
+
+def test_find_member_with_mixed_enum() -> None:
+    """Test find_member method with mixed type enum values."""
+    from datamodel_code_generator.model.enum import Enum
+    from datamodel_code_generator.model.pydantic_v2.base_model import DataModelField
+    from datamodel_code_generator.reference import Reference
+    from datamodel_code_generator.types import DataType
+
+    enum = Enum(
+        reference=Reference(path="test_path", original_name="TestEnum", name="TestEnum"),
+        fields=[
+            DataModelField(
+                name="INT_VALUE",
+                default="100",
+                data_type=DataType(type="int"),
+                required=True,
+            ),
+            DataModelField(
+                name="STR_VALUE",
+                default="'value_a'",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+        ],
+    )
+
+    member = enum.find_member(100)
+    assert member is not None
+    assert member.field.name == "INT_VALUE"
+
+    assert enum.find_member("100") is None
+    member = enum.find_member("100", coerce_strings=True)
+    assert member is not None
+    assert member.field.name == "INT_VALUE"
+
+    member = enum.find_member("value_a")
+    assert member is not None
+    assert member.field.name == "STR_VALUE"
+
+    assert enum.find_member("'value_a'") is None
+
+
+@pytest.mark.parametrize(
+    ("input_str", "expected"),
+    [
+        ("\u0000", r"\x00"),  # Test null byte
+        ("'", r"\'"),  # Test single quote
+        ("\b", r"\b"),  # Test backspace
+        ("\f", r"\f"),  # Test form feed
+        ("\n", r"\n"),  # Test newline
+        ("\r", r"\r"),  # Test carriage return
+        ("\t", r"\t"),  # Test tab
+        ("\\", r"\\"),  # Test backslash
+    ],
+)
+def test_character_escaping(input_str: str, expected: str) -> None:
+    """Test character escaping in strings."""
+    assert input_str.translate(escape_characters) == expected
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_use_non_positive_negative_number_constrained_types(flag: bool) -> None:
+    """Test configuration of non-positive negative number constrained types."""
+    instance = C(source="", use_non_positive_negative_number_constrained_types=flag)
+
+    assert instance.data_type_manager.use_non_positive_negative_number_constrained_types == flag
+
+
+def test_to_hashable_simple_values() -> None:
+    """Test to_hashable with simple values."""
+    assert to_hashable("string") == "string"
+    assert to_hashable(123) == 123
+    assert to_hashable(None) is None
+    assert to_hashable(None) != to_hashable("")
+
+
+def test_parser_base_reexports_internal_utils() -> None:
+    """Test parser.base preserves public helper imports from the leaf module."""
+    assert to_hashable is internal_utils.to_hashable
+    assert get_most_of_parent is internal_utils.get_most_of_parent
+    assert Child is internal_utils.Child
+    assert HashableComparable is internal_utils.HashableComparable
+    assert T is internal_utils.T
+
+
+def test_get_most_of_parent_honors_type_filter() -> None:
+    """Test parent traversal returns None when the requested type is absent."""
+    child = SimpleNamespace(parent="root")
+
+    assert get_most_of_parent(child, str) == "root"
+    assert get_most_of_parent(child, int) is None
+
+
+def test_to_hashable_list_and_tuple() -> None:
+    """Test to_hashable with list and tuple."""
+    result = to_hashable([3, 1, 2])
+    assert isinstance(result, tuple)
+    assert result == (1, 2, 3)  # sorted
+
+    result = to_hashable((3, 1, 2))
+    assert isinstance(result, tuple)
+    assert result == (1, 2, 3)  # sorted
+
+
+def test_to_hashable_dict() -> None:
+    """Test to_hashable with dict."""
+    result = to_hashable({"b": 2, "a": 1})
+    assert isinstance(result, tuple)
+    # sorted by key
+    assert result == (("a", 1), ("b", 2))
+
+
+def test_to_hashable_mixed_types_fallback() -> None:
+    """Test to_hashable with mixed types that cannot be compared."""
+    mixed_list = [complex(1, 2), complex(3, 4)]
+    result = to_hashable(mixed_list)
+    assert isinstance(result, tuple)
+    # Should preserve order since sorting fails
+    assert result == (complex(1, 2), complex(3, 4))
+
+
+def test_to_hashable_nested_structures() -> None:
+    """Test to_hashable with nested structures."""
+    nested = {"outer": [{"inner": 1}]}
+    result = to_hashable(nested)
+    assert isinstance(result, tuple)
+
+
+def test_postprocess_result_modules_single_element_tuple() -> None:
+    """Test postprocessing with single element tuple (len < 2)."""
+    input_data = {
+        ("__init__.py",): "init_content",
+    }
+    result = Parser._Parser__postprocess_result_modules(input_data)
+    # Single element tuple should remain unchanged
+    assert ("__init__.py",) in result
+
+
+def test_postprocess_result_modules_single_file_no_dot() -> None:
+    """Test postprocessing with single file without dot in name."""
+    input_data = {
+        ("module.py",): "content",
+        ("__init__.py",): "init_content",
+    }
+    result = Parser._Parser__postprocess_result_modules(input_data)
+    assert ("module.py",) in result
+
+
+def test_postprocess_result_modules_single_element_no_dot() -> None:
+    """Test postprocessing with single element without dot (len(r) < 2 branch)."""
+    input_data = {
+        ("__init__.py",): "init_content",
+        ("file",): "content",  # Single element without dot, so len(r) = 1
+    }
+    result = Parser._Parser__postprocess_result_modules(input_data)
+    assert ("file",) in result
+
+
+@pytest.mark.parametrize(
+    ("module", "expected"),
+    [
+        ((), ()),  # empty
+        (("pkg",), ("pkg",)),  # single
+        (("pkg", "issuing"), ("pkg",)),  # submodule
+        (("foo", "bar", "baz"), ("foo", "bar")),  # deeply nested
+    ],
+    ids=["empty", "single", "submodule", "deeply_nested"],
+)
+def test_get_module_directory(module: tuple[str, ...], expected: tuple[str, ...]) -> None:
+    """Test get_module_directory with various inputs."""
+    assert get_module_directory(module) == expected
+
+
+@pytest.mark.parametrize(
+    ("scc_modules", "existing_modules", "expected"),
+    [
+        # name conflict: _internal already exists
+        ({(), ("sub",)}, {("_internal",)}, ("_internal_1",)),
+        # multiple conflicts: _internal and _internal_1 exist
+        ({(), ("sub",)}, {("_internal",), ("_internal_1",)}, ("_internal_2",)),
+        # different prefix break: LCP computation hits break
+        ({("common", "a"), ("common", "b"), ("other", "x")}, set(), ("_internal",)),
+    ],
+    ids=["name_conflict", "multiple_conflicts", "different_prefix_break"],
+)
+def test_compute_internal_module_path(
+    parser_fixture: C,
+    scc_modules: set[tuple[str, ...]],
+    existing_modules: set[tuple[str, ...]],
+    expected: tuple[str, ...],
+) -> None:
+    """Test __compute_internal_module_path with various conflict scenarios."""
+    result = parser_fixture._Parser__compute_internal_module_path(scc_modules, existing_modules)
+    assert result == expected
+
+
+def test_build_module_dependency_graph_with_missing_ref(parser_fixture: C) -> None:
+    """Test __build_module_dependency_graph when reference path is not in path_to_module."""
+    missing_reference = Reference(path="nonexistent.Model", original_name="Missing", name="Missing")
+    model1 = BaseModel(
+        fields=[DataModelField(data_type=DataType(reference=missing_reference))],
+        reference=Reference(path="pkg.Model1", original_name="Model1", name="Model1"),
+    )
+    parser_fixture.generation_store.register_model(model1)
+
+    module_models_list = [
+        (("pkg",), [model1]),
+    ]
+
+    graph = parser_fixture._Parser__build_module_dependency_graph(module_models_list)
+
+    assert graph == {("pkg",): set()}
+
+
+def test_collapse_root_models_preserves_root_model_used_by_other_modules() -> None:
+    """Root collapse should not mark a root model unused while another model still references it."""
+    parser = C(
+        data_model_type=BaseModel,
+        data_model_root_type=RootModel,
+        data_model_field_type=DataModelField,
+        base_class="Base",
+        source="",
+    )
+    parser.collapse_root_models = True
+    parser.collapse_root_models_name_strategy = CollapseRootModelsNameStrategy.Child
+    root_reference = Reference(path="Root", original_name="Root", name="Root")
+    inner_reference = Reference(path="Inner", original_name="Inner", name="Inner")
+    root_model = RootModel(
+        fields=[DataModelField(data_type=DataType(reference=inner_reference))],
+        reference=root_reference,
+    )
+    local_type = DataType(reference=root_reference)
+    local_model = BaseModel(
+        fields=[DataModelField(data_type=local_type)],
+        reference=Reference(path="pkg.Local", original_name="Local", name="Local"),
+    )
+    external_type = DataType(reference=root_reference)
+    external_model = BaseModel(
+        fields=[DataModelField(data_type=external_type)],
+        reference=Reference(path="other.External", original_name="External", name="External"),
+    )
+    for model in (root_model, local_model, external_model):
+        parser.generation_store.register_model(model)
+    unused_models: list[DataModel] = []
+
+    parser._Parser__collapse_root_models([local_model], unused_models, Imports(), parser.model_resolver)
+
+    assert local_type.reference is inner_reference
+    assert external_type.reference is root_reference
+    assert unused_models == []
+
+
+def test_unwrap_type_alias_stops_on_recursive_alias() -> None:
+    """Test _unwrap_type_alias stops when a type alias resolves back to itself."""
+    alias_reference = Reference(path="Alias", original_name="Alias", name="Alias")
+    alias_data_type = DataType(reference=alias_reference)
+    alias_model = TypeStatement(fields=[DataModelField(data_type=alias_data_type)], reference=alias_reference)
+
+    assert alias_reference.source is alias_model
+    assert _unwrap_type_alias(alias_data_type) is alias_data_type
+
+
+def test_contains_model_reference_traverses_nested_data_types() -> None:
+    """Test _contains_model_reference walks nested container data types."""
+    model_reference = Reference(path="Item", original_name="Item", name="Item")
+    BaseModel(fields=[], reference=model_reference)
+
+    list_of_models = DataType(
+        is_list=True,
+        data_types=[DataType(reference=model_reference)],
+        use_union_operator=True,
+    )
+
+    assert _contains_model_reference(list_of_models) is True
+
+
+def test_contains_model_reference_traverses_dict_key() -> None:
+    """Test _contains_model_reference walks dict_key data types."""
+    model_reference = Reference(path="KeyModel", original_name="KeyModel", name="KeyModel")
+    BaseModel(fields=[], reference=model_reference)
+
+    dict_with_model_key = DataType(
+        is_dict=True,
+        dict_key=DataType(reference=model_reference),
+        use_union_operator=True,
+    )
+
+    assert _contains_model_reference(dict_with_model_key) is True
+
+
+def test_needs_validate_default_for_union_type_alias() -> None:
+    """Test _needs_validate_default resolves type aliases before checking union branches."""
+    a_reference = Reference(path="A", original_name="A", name="A")
+    b_reference = Reference(path="B", original_name="B", name="B")
+    BaseModel(fields=[], reference=a_reference)
+    BaseModel(fields=[], reference=b_reference)
+
+    union_data_type = DataType(
+        data_types=[DataType(reference=a_reference), DataType(reference=b_reference)],
+        use_union_operator=True,
+    )
+    alias_reference = Reference(path="Alias", original_name="Alias", name="Alias")
+    TypeStatement(fields=[DataModelField(data_type=union_data_type)], reference=alias_reference)
+
+    assert _needs_validate_default(DataType(reference=alias_reference)) is True
+
+
+def test_needs_validate_default_for_optional_single_model_union() -> None:
+    """Test _needs_validate_default returns True for A | None union."""
+    model_reference = Reference(path="A", original_name="A", name="A")
+    BaseModel(fields=[], reference=model_reference)
+
+    optional_model_union = DataType(
+        data_types=[DataType(reference=model_reference), DataType(type="None")],
+        use_union_operator=True,
+    )
+
+    assert _needs_validate_default(optional_model_union) is True
+
+
+def test_get_enum_discriminator_literal_with_escaped_value() -> None:
+    """Test discriminator literals use the runtime enum value, not its escaped source."""
+    from datamodel_code_generator.model.enum import Enum
+    from datamodel_code_generator.model.pydantic_v2.base_model import DataModelField
+    from datamodel_code_generator.parser.base import Parser
+    from datamodel_code_generator.reference import Reference
+    from datamodel_code_generator.types import DataType
+
+    enum = Enum(
+        reference=Reference(path="test_path", original_name="TestEnum", name="TestEnum"),
+        fields=[
+            DataModelField(
+                name="DON_T",
+                default="'don\\'t'",
+                data_type=DataType(type="str"),
+                required=True,
+            ),
+        ],
+    )
+
+    assert Parser._get_enum_discriminator_literal(enum, "don't") == "don't"
+    assert Parser._get_enum_discriminator_literal(enum, "missing") == "missing"

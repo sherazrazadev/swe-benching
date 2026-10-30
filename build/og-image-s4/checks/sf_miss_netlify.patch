@@ -1,0 +1,388 @@
+diff --git a/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts b/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
+index e46cc3dc..4efcb0d2 100644
+--- a/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/cloudflare.ts
+@@ -2,16 +2,27 @@ import type { H3Event } from 'h3'
+ import type { FontConfig } from '../../../../types'
+ import { useRuntimeConfig } from 'nitropack/runtime'
+ import { withBase } from 'ufo'
++import { getSiteConfig } from '#site-config/server/composables'
+ import { getCloudflareAssets } from '../../../util/cloudflareAssets'
+ import { fetchLocalAsset } from '../../../util/fetchLocalAsset'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { fetchSpecialFontUrl, isDataFontUrl, isExternalFontUrl } from './external-url'
+ 
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
++  const runtimeConfig = useOgImageRuntimeConfig()
++  const timeout = getFetchTimeout(runtimeConfig)
+   const { app } = useRuntimeConfig()
+   const fullPath = withBase(path, app.baseURL)
+-  const timeout = getFetchTimeout(useOgImageRuntimeConfig())
++
++  // `data:` and external font URLs are attacker-reachable via the `fonts` URL
++  // param (GHSA-q8hw-4fvp-9rwv). fetchLocalAsset would otherwise fall back to an
++  // unvalidated $fetch against the absolute URL. `data:` is decoded inline;
++  // external URLs are unsupported (use @nuxt/fonts) except the site's own origin,
++  // fetched through the SSRF guard.
++  if (path && (isDataFontUrl(path) || isExternalFontUrl(path)))
++    return fetchSpecialFontUrl(path, getSiteConfig(event).url, timeout)
+ 
+   const ab = await fetchLocalAsset(event, fullPath, { fetchTimeout: timeout })
+   if (ab)
+diff --git a/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts b/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
+index 2183c4df..4faaafae 100644
+--- a/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts
+@@ -6,8 +6,11 @@ import { useRuntimeConfig } from 'nitropack/runtime'
+ import { join } from 'pathe'
+ import { withBase } from 'ufo'
+ import { buildDir, rootDir } from '#og-image-virtual/build-dir.mjs'
++import { getSiteConfig } from '#site-config/server/composables'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
++import { fetchWithRedirectValidation } from '../../../util/ssrf'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { fetchSpecialFontUrl, isDataFontUrl, isExternalFontUrl } from './external-url'
+ 
+ let fontUrlMapping: Record<string, string> | undefined
+ 
+@@ -21,7 +24,8 @@ async function loadFontUrlMapping(): Promise<Record<string, string>> {
+ 
+ export async function resolve(event: H3Event, font: FontConfig): Promise<Buffer> {
+   const path = font.src || font.localPath
+-  const timeout = getFetchTimeout(useOgImageRuntimeConfig())
++  const runtimeConfig = useOgImageRuntimeConfig()
++  const timeout = getFetchTimeout(runtimeConfig)
+ 
+   // Static bundled fonts — read directly from absolute path
+   if (font.absolutePath) {
+@@ -30,6 +34,14 @@ export async function resolve(event: H3Event, font: FontConfig): Promise<Buffer>
+       return data
+   }
+ 
++  // `data:` and external font URLs are attacker-reachable via the `fonts` URL
++  // param (GHSA-q8hw-4fvp-9rwv). None of the relative-path branches below match
++  // them, so without this gate they fall through to an unvalidated fetch/$fetch.
++  // `data:` is decoded inline; external URLs are unsupported (use @nuxt/fonts)
++  // except the site's own origin, fetched through the SSRF guard.
++  if (path && (isDataFontUrl(path) || isExternalFontUrl(path)))
++    return fetchSpecialFontUrl(path, getSiteConfig(event).url, timeout)
++
+   if (import.meta.prerender) {
+     // Static font downloads (separate from @nuxt/fonts to avoid conflicts)
+     if (path.startsWith('/_og-static-fonts/')) {
+@@ -101,10 +113,13 @@ export async function resolve(event: H3Event, font: FontConfig): Promise<Buffer>
+   if (import.meta.dev) {
+     const reqUrl = getRequestURL(event)
+     const origin = `${reqUrl.protocol}//${reqUrl.host}`
+-    const url = new URL(withBase(path, app.baseURL), origin).href
+-    const res = await fetch(url, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-    if (res?.ok) {
+-      return Buffer.from(await res.arrayBuffer())
++    const target = new URL(withBase(path, app.baseURL), origin)
++    // Same-origin dev fetch: trust our own (loopback) host but re-validate any
++    // redirect that leaves it, so an open redirect can't reach an internal
++    // target via the font path (GHSA-q8hw-4fvp-9rwv).
++    const ab = await fetchWithRedirectValidation(target.href, { timeout, trustedHost: target.host }).catch(() => null)
++    if (ab) {
++      return Buffer.from(ab)
+     }
+   }
+   const fullPath = withBase(path, app.baseURL)
+diff --git a/src/runtime/server/og-image/bindings/font-assets/external-url.ts b/src/runtime/server/og-image/bindings/font-assets/external-url.ts
+new file mode 100644
+index 00000000..bd6ec87d
+--- /dev/null
++++ b/src/runtime/server/og-image/bindings/font-assets/external-url.ts
+@@ -0,0 +1,95 @@
++import { fetchWithRedirectValidation } from '../../../util/ssrf'
++
++// Sentinel origin used purely to canonicalize + classify a font path with the
++// same WHATWG parser `fetch` uses. `.invalid` is reserved (RFC 2606) and never
++// resolves, so it can't be a useful SSRF target even in the (unreachable)
++// case where a path's own authority happens to equal it.
++const SENTINEL_ORIGIN = 'http://font-asset.invalid/'
++const SENTINEL_HOST = 'font-asset.invalid'
++
++/** True for an inline `data:` font URI (no network — safe to decode directly). */
++export function isDataFontUrl(path: string): boolean {
++  return path.trimStart().toLowerCase().startsWith('data:')
++}
++
++/**
++ * True when a font path carries its own authority (`//host`, `http://host`,
++ * `\\host`) or a non-http scheme — i.e. it would not resolve same-origin.
++ *
++ * Classification resolves the path against a sentinel origin through the WHATWG
++ * URL parser, so it sees exactly what `fetch` will: leading C0 controls/spaces,
++ * embedded tab/CR/LF, and backslash folding are all normalized first. This
++ * closes the bypass class where " //127.0.0.1" or " //169.254.169.254" looks
++ * relative to a naive scheme check yet resolves cross-origin (GHSA-q8hw-4fvp-9rwv).
++ * Check `isDataFontUrl` first — `data:` is non-http and would report true here.
++ */
++export function isExternalFontUrl(path: string): boolean {
++  let resolved: URL
++  try {
++    resolved = new URL(path, SENTINEL_ORIGIN)
++  }
++  catch {
++    // Unparseable even with a base: not a usable relative asset path. Force it
++    // through the guard (which rejects it) rather than a raw same-origin fetch.
++    return true
++  }
++  return resolved.protocol !== 'http:' || resolved.host !== SENTINEL_HOST
++}
++
++/**
++ * Resolve an authority-bearing font URL to the href to fetch, but only when it
++ * is same-origin with the configured site URL. Returns null otherwise.
++ *
++ * Runtime external font URLs are unsupported — `@nuxt/fonts` is the only
++ * supported way to load custom fonts, and it serves them same-origin. The single
++ * allowed exception is the site's own origin, gated on an explicitly configured
++ * site URL. Resolving against that origin also collapses canonicalization
++ * bypasses (a crafted " //127.0.0.1" resolves cross-origin → rejected).
++ */
++export function resolveSameOriginFontUrl(path: string, siteUrl: string | undefined): string | null {
++  if (!siteUrl)
++    return null
++  let siteOrigin: string
++  try {
++    siteOrigin = new URL(siteUrl).origin
++  }
++  catch {
++    return null
++  }
++  let target: URL
++  try {
++    target = new URL(path, siteOrigin)
++  }
++  catch {
++    return null
++  }
++  return target.origin === siteOrigin ? target.href : null
++}
++
++/**
++ * Fetch a `data:` or authority-bearing font URL. `data:` is decoded directly
++ * (no network). An external URL is fetched only when same-origin with the site
++ * URL, and always through the SSRF guard (scheme allowlist, private-network
++ * block, per-hop redirect re-validation) so the site's own host can't be used
++ * to relay into its internal network via an open redirect.
++ *
++ * Throws on an unsupported/blocked/unreachable URL so the caller falls back to a
++ * bundled font; blocked targets stay indistinguishable from missing fonts.
++ */
++export async function fetchSpecialFontUrl(path: string, siteUrl: string | undefined, timeout: number): Promise<Buffer> {
++  if (isDataFontUrl(path)) {
++    const res = await fetch(path.trimStart(), { signal: AbortSignal.timeout(timeout) }).catch(() => null)
++    if (res?.ok)
++      return Buffer.from(await res.arrayBuffer())
++    throw new Error('[Nuxt OG Image] Invalid data: font URL.')
++  }
++
++  const href = resolveSameOriginFontUrl(path, siteUrl)
++  if (!href)
++    throw new Error('[Nuxt OG Image] External font URLs are not supported. Load custom fonts via @nuxt/fonts.')
++
++  const ab = await fetchWithRedirectValidation(href, { timeout })
++  if (!ab)
++    throw new Error('[Nuxt OG Image] Font URL blocked or unreachable.')
++  return Buffer.from(ab)
++}
+diff --git a/src/runtime/server/og-image/bindings/font-assets/node.ts b/src/runtime/server/og-image/bindings/font-assets/node.ts
+index 63c19f2c..fa6abf93 100644
+--- a/src/runtime/server/og-image/bindings/font-assets/node.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/node.ts
+@@ -2,19 +2,36 @@ import type { H3Event } from 'h3'
+ import type { FontConfig } from '../../../../types'
+ import { useRuntimeConfig } from 'nitropack/runtime'
+ import { withBase } from 'ufo'
+-import { getNitroOrigin } from '#site-config/server/composables'
++import { getNitroOrigin, getSiteConfig } from '#site-config/server/composables'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
++import { fetchWithRedirectValidation } from '../../../util/ssrf'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { fetchSpecialFontUrl, isDataFontUrl, isExternalFontUrl } from './external-url'
+ 
+ export async function resolve(event: H3Event, font: FontConfig) {
+   const path = font.src || font.localPath
++  const runtimeConfig = useOgImageRuntimeConfig()
++  const timeout = getFetchTimeout(runtimeConfig)
+   const { app } = useRuntimeConfig()
+-  const fullPath = withBase(path, app.baseURL)
+   const origin = getNitroOrigin(event)
+-  const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+-  const res = await fetch(new URL(fullPath, origin).href, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-  if (res?.ok) {
+-    return Buffer.from(await res.arrayBuffer())
++  const fullPath = withBase(path, app.baseURL)
++
++  // `data:` and external font URLs are attacker-reachable via the `fonts` URL
++  // param (GHSA-q8hw-4fvp-9rwv). `data:` is decoded inline; external URLs are
++  // unsupported (use @nuxt/fonts) except the site's own origin, fetched through
++  // the SSRF guard. Classification is canonicalized so crafted paths like
++  // " //127.0.0.1" can't slip past as relative into the raw fetch below.
++  if (path && (isDataFontUrl(path) || isExternalFontUrl(path)))
++    return fetchSpecialFontUrl(path, getSiteConfig(event).url, timeout)
++
++  // Same-origin asset fetch. `trustedHost` exempts our own origin from the
++  // block classifier (it may be loopback behind a proxy) while still
++  // re-validating any redirect that leaves the origin — so an open redirect on
++  // the app can't bounce the font fetch to an internal target (GHSA-q8hw-4fvp-9rwv).
++  const target = new URL(fullPath, origin)
++  const ab = await fetchWithRedirectValidation(target.href, { timeout, trustedHost: target.host }).catch(() => null)
++  if (ab) {
++    return Buffer.from(ab)
+   }
+   // Fallback to Nitro's internal handler when origin is unreachable
+   // (behind a proxy, serverless, or server not fully started)
+diff --git a/src/runtime/server/og-image/bindings/font-assets/serverless.ts b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+index 76f7bc59..7f48f54e 100644
+--- a/src/runtime/server/og-image/bindings/font-assets/serverless.ts
++++ b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+@@ -2,9 +2,11 @@ import type { H3Event } from 'h3'
+ import type { FontConfig } from '../../../../types'
+ import { useRuntimeConfig } from 'nitropack/runtime'
+ import { withBase } from 'ufo'
+-import { getNitroOrigin } from '#site-config/server/composables'
++import { getNitroOrigin, getSiteConfig } from '#site-config/server/composables'
+ import { getFetchTimeout } from '../../../util/fetchTimeout'
++import { fetchWithRedirectValidation } from '../../../util/ssrf'
+ import { useOgImageRuntimeConfig } from '../../../utils'
++import { fetchSpecialFontUrl, isDataFontUrl, isExternalFontUrl } from './external-url'
+ 
+ /**
+  * Font asset resolution for serverless Node platforms (Vercel, AWS Lambda).
+@@ -17,9 +19,19 @@ export async function resolve(event: H3Event, font: FontConfig) {
+   const fullPath = withBase(path, app.baseURL)
+   const origin = getNitroOrigin(event)
+   const timeout = getFetchTimeout(useOgImageRuntimeConfig())
+-  const res = await fetch(new URL(fullPath, origin).href, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
+-  if (res?.ok) {
+-    return Buffer.from(await res.arrayBuffer())
++
++  // `data:` and external font URLs are attacker-reachable via the `fonts` URL
++  // param. `data:` is decoded inline; external URLs are unsupported (use
++  // @nuxt/fonts) except the site's own origin, fetched through the SSRF guard.
++  if (path && (isDataFontUrl(path) || isExternalFontUrl(path)))
++    return fetchSpecialFontUrl(path, getSiteConfig(event).url, timeout)
++
++  // Same-origin asset fetch. `trustedHost` exempts our own origin from the block classifier
++  // (it may be loopback behind a proxy) while still re-validating any redirect that leaves it.
++  const target = new URL(fullPath, origin)
++  const ab = await fetchWithRedirectValidation(target.href, { timeout, trustedHost: target.host }).catch(() => null)
++  if (ab) {
++    return Buffer.from(ab)
+   }
+   const fetchArrayBuffer = event.$fetch as unknown as (path: string, options: { responseType: 'arrayBuffer', timeout: number }) => Promise<ArrayBuffer>
+   const arrayBuffer = await fetchArrayBuffer(fullPath, {
+diff --git a/src/runtime/server/og-image/fonts.ts b/src/runtime/server/og-image/fonts.ts
+index ea7f0916..2bbfc57d 100644
+--- a/src/runtime/server/og-image/fonts.ts
++++ b/src/runtime/server/og-image/fonts.ts
+@@ -248,20 +248,51 @@ export async function loadAllFonts(event: H3Event, options: LoadFontsOptions): P
+   return loaded
+ }
+ 
++// Defence-in-depth bounds for attacker-controlled `defineOgImage({ fonts })`
++// (the `fonts` param is decoded from the URL). Cap the count so a single request
++// can't trigger an unbounded fan-out of font fetches, and cap the path length so
++// an oversized URL can't be smuggled in. `data:` URIs carry the font inline so
++// they're legitimately long; they're exempt from the path cap and bounded by the
++// HTTP request-size limit instead (no network fetch happens for them).
++const MAX_DEFINED_FONTS = 10
++const MAX_FONT_PATH_LENGTH = 2048
++
++function isDataUri(path: string): boolean {
++  return path.trimStart().toLowerCase().startsWith('data:')
++}
++
++/** Coerce an attacker-supplied weight to a sane numeric CSS weight. */
++function normalizeFontWeight(weight: unknown): number {
++  const n = typeof weight === 'number' ? weight : typeof weight === 'string' ? Number(weight) : Number.NaN
++  if (!Number.isFinite(n))
++    return 400
++  return Math.min(Math.max(Math.round(n), 1), 1000)
++}
++
+ /**
+  * Load additional fonts specified via defineOgImage({ fonts: [...] }).
+  * Only object format ({ name, weight, path }) with a path is supported.
++ *
++ * Field values arrive from the attacker-controlled `fonts` URL param, so each is
++ * parsed at this boundary (require string name/path, coerce weight) and the
++ * array is bounded before any font is fetched.
+  */
+ export async function loadDefinedFonts(event: OgImageRenderEventContext, fontDefs: any[]): Promise<RuntimeFontConfig[]> {
+   const results: RuntimeFontConfig[] = []
+-  for (const def of fontDefs) {
+-    if (!def || typeof def !== 'object' || !def.path)
++  const defs = Array.isArray(fontDefs) ? fontDefs : []
++  if (import.meta.dev && defs.length > MAX_DEFINED_FONTS)
++    logger.warn(`defineOgImage fonts capped at ${MAX_DEFINED_FONTS}; ${defs.length - MAX_DEFINED_FONTS} ignored.`)
++  for (const def of defs.slice(0, MAX_DEFINED_FONTS)) {
++    if (!def || typeof def !== 'object')
++      continue
++
++    const name = typeof def.name === 'string' ? def.name.trim() : ''
++    const path = typeof def.path === 'string' ? def.path : ''
++    if (!name || !path || (path.length > MAX_FONT_PATH_LENGTH && !isDataUri(path)))
+       continue
+ 
+-    const name: string = def.name
+-    const weight: number = def.weight || 400
++    const weight = normalizeFontWeight(def.weight)
+     const style: 'normal' | 'italic' = def.style === 'italic' ? 'italic' : 'normal'
+-    const path: string = def.path
+ 
+     const fontConfig = { family: name, weight, style, src: path, localPath: path } satisfies FontConfig
+     const data = await resolve(event.e, fontConfig).catch(() => null)
+diff --git a/src/runtime/server/util/ssrf.ts b/src/runtime/server/util/ssrf.ts
+index 3ef69a87..8de5c648 100644
+--- a/src/runtime/server/util/ssrf.ts
++++ b/src/runtime/server/util/ssrf.ts
+@@ -227,12 +227,22 @@ export interface SafeFetchOptions {
+   timeout: number
+   headers?: Record<string, string>
+   signal?: AbortSignal
++  /**
++   * A host (hostname + optional port) that is exempt from `isBlockedUrl`. Used
++   * for same-origin asset fetches whose own origin may legitimately be loopback
++   * (dev) or otherwise "private" — the initial host is trusted, but any redirect
++   * that leaves it is still re-validated, closing the open-redirect SSRF where
++   * the app's own origin 30x's to an internal target.
++   */
++  trustedHost?: string
+ }
+ 
+ /**
+  * Fetch a URL with manual redirect handling. Each hop (including the initial
+  * URL) is run through `isBlockedUrl` before the request is dispatched, so an
+  * allowed origin returning a 30x to an internal IP cannot complete the SSRF.
++ * A hop whose host matches `opts.trustedHost` skips the block check (see
++ * SafeFetchOptions.trustedHost).
+  *
+  * Returns `null` on any failure (block, network error, non-2xx, redirect
+  * limit). The caller treats null as a soft failure and falls back to the
+@@ -255,7 +265,18 @@ export async function fetchWithRedirectValidation(
+   try {
+     let url = initialUrl
+     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+-      if (isBlockedUrl(url))
++      // The trusted (same-origin) host is exempt; every other host — including
++      // any cross-origin redirect target — must clear the block classifier.
++      let isTrusted = false
++      if (opts.trustedHost) {
++        try {
++          isTrusted = new URL(url).host === opts.trustedHost
++        }
++        catch {
++          return null
++        }
++      }
++      if (!isTrusted && isBlockedUrl(url))
+         return null
+       const res = await fetch(url, {
+         redirect: 'manual',

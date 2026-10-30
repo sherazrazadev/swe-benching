@@ -1,0 +1,180 @@
+diff -ruN a/src/datamodel_code_generator/parser/base.py b/src/datamodel_code_generator/parser/base.py
+--- a/src/datamodel_code_generator/parser/base.py	2026-10-30 00:24:39.000000000 +0000
++++ b/src/datamodel_code_generator/parser/base.py	2026-10-30 00:45:52.236984417 +0000
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import builtins
++import keyword
+ import operator
+ import os.path
+ import re
+@@ -415,6 +416,30 @@
+     return [*path, SPECIAL_PATH_FORMAT.format(keyword)]
+ 
+ 
++def is_dotted_python_identifier_path(value: str) -> bool:
++    """Return whether ``value`` is a dotted path of non-keyword identifiers.
++
++    Only values that satisfy this predicate may be rendered into generated
++    source as a Python name, because anything else could break out of the
++    import statement or the annotation it is placed in.
++    """
++    return bool(value) and all(
++        part.isidentifier() and not keyword.iskeyword(part) for part in value.split(".")
++    )
++
++
++def ensure_dotted_python_identifier_path(value: object, *, origin: str) -> str:
++    """Return ``value`` if it is a safe dotted name, else refuse the schema.
++
++    Raises:
++        Error: when ``value`` is not a dotted Python identifier path.
++    """
++    if not isinstance(value, str) or not is_dotted_python_identifier_path(value):
++        msg = f"{origin} must be a dotted Python identifier path: {value!r}"
++        raise Error(msg)
++    return value
++
++
+ escape_characters = str.maketrans({
+     "\u0000": r"\x00",  # Null byte
+     "\\": r"\\",
+@@ -1517,6 +1542,11 @@
+         if self.base_class_map and class_name in self.base_class_map:
+             return normalize(self.base_class_map[class_name])
+         if custom_base_path:
++            # Schema-supplied base classes become import targets, so every
++            # element of the documented string-or-list form must be a safe
++            # dotted name before it is normalized or used.
++            for base_path in custom_base_path if isinstance(custom_base_path, list) else [custom_base_path]:
++                ensure_dotted_python_identifier_path(base_path, origin="customBasePath")
+             return normalize(custom_base_path)
+         return self.base_class or None
+ 
+diff -ruN a/src/datamodel_code_generator/parser/jsonschema.py b/src/datamodel_code_generator/parser/jsonschema.py
+--- a/src/datamodel_code_generator/parser/jsonschema.py	2026-10-30 00:24:43.000000000 +0000
++++ b/src/datamodel_code_generator/parser/jsonschema.py	2026-10-30 00:46:10.878028786 +0000
+@@ -60,6 +60,7 @@
+     SPECIAL_PATH_FORMAT,
+     Parser,
+     Source,
++    ensure_dotted_python_identifier_path,
+     escape_characters,
+     get_special_path,
+     title_to_class_name,
+@@ -1818,16 +1819,29 @@
+         self.imports.append(import_)
+         return self.data_type.from_import(import_)
+ 
+-    def _inline_python_import_type(self, obj: JsonSchemaObject) -> DataType | None:  # noqa: PLR6301
+-        """Return the type named by an x-python-import declared directly on a field."""
+-        x_python_import = obj.extras.get("x-python-import")
+-        if not isinstance(x_python_import, dict):
++    @staticmethod
++    def _schema_import_path(declaration: Any) -> str | None:
++        """Turn an ``x-python-import`` declaration into a safe dotted import path.
++
++        Returns ``None`` when the declaration is absent or incomplete, matching
++        the historic behaviour of the import helpers.  A complete declaration is
++        schema-supplied text that ends up inside an ``import`` statement, so it
++        is refused unless it is a dotted Python identifier path.
++        """
++        if not isinstance(declaration, dict):
+             return None
+-        module = x_python_import.get("module")
+-        type_name = x_python_import.get("name")
++        module = declaration.get("module")
++        type_name = declaration.get("name")
+         if not module or not type_name:
+             return None
+-        import_ = Import.from_full_path(f"{module}.{type_name}")
++        return ensure_dotted_python_identifier_path(f"{module}.{type_name}", origin="x-python-import")
++
++    def _inline_python_import_type(self, obj: JsonSchemaObject) -> DataType | None:  # noqa: PLR6301
++        """Return the type named by an x-python-import declared directly on a field."""
++        import_path = self._schema_import_path(obj.extras.get("x-python-import"))
++        if import_path is None:
++            return None
++        import_ = Import.from_full_path(import_path)
+         self.imports.append(import_)
+         return self.data_type.from_import(import_)
+ 
+@@ -1852,14 +1866,10 @@
+             )
+             self._ref_data_type_facts[resolved_ref] = facts
+         x_python_import, is_optional = facts
+-        if isinstance(x_python_import, dict):
+-            module = x_python_import.get("module")
+-            type_name = x_python_import.get("name")
+-            if module and type_name:  # pragma: no branch
+-                full_path = f"{module}.{type_name}"
+-                import_ = Import.from_full_path(full_path)
+-                self.imports.append(import_)
+-                return self.data_type.from_import(import_)
++        if (import_path := self._schema_import_path(x_python_import)) is not None:
++            import_ = Import.from_full_path(import_path)
++            self.imports.append(import_)
++            return self.data_type.from_import(import_)
+         reference = self.model_resolver.add_ref(ref)
+         return self.data_type(reference=reference, is_optional=is_optional)
+ 
+@@ -1946,7 +1956,11 @@
+         if isinstance(additional_imports, list):
+             for import_path in additional_imports:
+                 if isinstance(import_path, str) and import_path:
+-                    self.imports.append(Import.from_full_path(import_path))
++                    self.imports.append(
++                        Import.from_full_path(
++                            ensure_dotted_python_identifier_path(import_path, origin="x-additional-imports")
++                        )
++                    )
+ 
+         # Process model-level metadata and model_extra_keys for json_schema_extra in ConfigDict
+         model_extras: dict[str, Any] = {k: v for k, v in obj.extras.items() if k in DEFAULT_MODEL_EXTRA_KEYS}
+@@ -2072,15 +2086,15 @@
+         """Resolve import for a type name from $defs with x-python-import."""
+         try:
+             ref_schema = self._load_ref_schema_object(f"#/$defs/{type_name}")
+-            x_python_import = ref_schema.extras.get("x-python-import")
+-            if isinstance(x_python_import, dict):
+-                module = x_python_import.get("module")
+-                name = x_python_import.get("name")
+-                if module and name:  # pragma: no branch
+-                    return Import.from_full_path(f"{module}.{name}")
+         except Exception:  # noqa: BLE001, S110
+-            pass
+-        return None
++            return None
++        # Refusal for an unsafe declaration must escape this method: the caller
++        # is on the generation path, so only the load above is allowed to fail
++        # silently when the type name simply is not a $defs entry.
++        import_path = self._schema_import_path(ref_schema.extras.get("x-python-import"))
++        if import_path is None:
++            return None
++        return Import.from_full_path(import_path)
+ 
+     def _get_python_type_override(self, obj: JsonSchemaObject) -> DataType | None:
+         """Get DataType from x-python-type if it's incompatible with schema type."""
+@@ -4115,7 +4129,10 @@
+         if item.ref:
+             return self.get_ref_data_type(item.ref)
+         if item.custom_type_path:  # pragma: no cover
+-            return self.data_type_manager.get_data_type_from_full_path(item.custom_type_path, is_custom_type=True)
++            return self.data_type_manager.get_data_type_from_full_path(
++                ensure_dotted_python_identifier_path(item.custom_type_path, origin="customTypePath"),
++                is_custom_type=True,
++            )
+         if item.is_array:
+             return self.parse_array_fields(name, item, get_special_path("array", path)).data_type
+         if item.discriminator and parent and parent.is_array and (item.oneOf or item.anyOf):
+@@ -4357,7 +4374,8 @@
+             data_type: DataType = self.get_ref_data_type(obj.ref)
+         elif obj.custom_type_path:
+             data_type = self.data_type_manager.get_data_type_from_full_path(
+-                obj.custom_type_path, is_custom_type=True
++                ensure_dotted_python_identifier_path(obj.custom_type_path, origin="customTypePath"),
++                is_custom_type=True,
+             )  # pragma: no cover
+         elif obj.is_array:
+             data_type = self.parse_array_fields(

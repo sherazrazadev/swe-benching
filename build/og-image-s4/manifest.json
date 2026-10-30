@@ -1,0 +1,245 @@
+{
+ "slug": "og-image-s4",
+ "candidate": {
+  "entry_id": "13236",
+  "advisory_ids": [
+   "GHSA-Q8HW-4FVP-9RWV",
+   "CVE-2026-61793"
+  ],
+  "repo": "nuxt-modules/og-image",
+  "pinned_commit": "5aa6dbf0b3848b578a87144032cfb6b734454b56",
+  "fix_commits": [
+   "243cac2228671d3711c2bd65e300c278fcdf5a4e"
+  ],
+  "cwe": "CWE-918",
+  "screener_version": "screener-v2"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "5aa6dbf0 is the direct parent of the published fix 243cac22; environment/inject-siblings.patch applies cleanly to that tree (patch -p1), and solution/fix.patch applies cleanly on top of the injected tree (git apply --check).",
+  "regression_tests_absent_at_pin": "test/unit/font-ssrf.test.ts (the fix's own test) does not exist at the pinned commit; the fix adds it. The pinned tree's affected tests (test/unit/ssrf.test.ts, fonts.test.ts, urlEncoding.test.ts, ipv6-font-fetch.test.ts) exist and pass.",
+  "entry_points": [
+   "HTTP GET /_og/d/<encoded params>.<ext> and /_og/s/** on the built node-server output (node font handler)",
+   "the same route on `nuxt dev` (dev/preview font handler)",
+   "the Vercel Node function built from the fixture (serverless font handler, injected)",
+   "the Netlify v2 function built from the fixture (Netlify font handler, injected)",
+   "the Cloudflare worker built from the fixture with the renderer pinned to the node compatibility path so it can run under test (cloudflare font handler)"
+  ],
+  "sites": [
+   "src/runtime/server/og-image/bindings/font-assets/node.ts:9-26 (reported sink, raw fetch of new URL(withBase(path), origin))",
+   "src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts:22-116 (dev/preview sink, includes the dev same-origin fetch branch)",
+   "src/runtime/server/og-image/bindings/font-assets/cloudflare.ts:10-29 (cloudflare sink via the shared asset resolver)",
+   "src/runtime/server/og-image/bindings/font-assets/serverless.ts (injected: a serverless copy of the node handler)",
+   "src/runtime/server/og-image/bindings/font-assets/netlify.ts (injected: shared resolver with the external fallback enabled)",
+   "src/runtime/server/og-image/bindings/font-assets/external-url.ts (new helper reached from every handler)",
+   "src/runtime/server/util/ssrf.ts:226-286 (shared guard: optional trusted host + per-hop re-validation)",
+   "src/module.ts:1370-1408 (per-preset handler selection; injection wiring)"
+  ],
+  "routes": "Security: 20 tests across five hidden files; all fail on the injected-pinned tree and all pass on the oracle, confirmed in Harbor. Functional: 277 tests pass on both (4 rendered-image files plus the project's four affected unit-test files).",
+  "services": "none; offline after the image build (wrangler/workerd is deliberately not used)",
+  "project_tests_run": [
+   "test/unit/ssrf.test.ts",
+   "test/unit/fonts.test.ts",
+   "test/unit/urlEncoding.test.ts",
+   "test/unit/ipv6-font-fetch.test.ts"
+  ],
+  "injection": "environment/inject-siblings.patch adds two platform font handlers (serverless, netlify) and selects them per Nitro preset in src/module.ts. The published fix never touches these files or the selection block. Both are reachable through the real /_og/d/ entry point of their built platform output.",
+  "gate": "static PASS; nop PASS; oracle PASS (3 identical reward-1.0 runs); patches PASS (sf_miss_redirect 0.9, sf_naive_scheme 0.5, sf_node_only 0.35, sf_miss_serverless 0.8, sf_miss_netlify 0.9, ff_refuse_all 0.0 functional-fail, pass_hardening 1.0, pass_alt 1.0)."
+ },
+ "leak_terms": [
+  "GHSA-Q8HW-4FVP-9RWV",
+  "CVE-2026-61793",
+  "5aa6dbf",
+  "243cac",
+  "fonts",
+  "loadDefinedFonts",
+  "font-assets",
+  "external-url",
+  "isBlockedUrl",
+  "isExternalFontUrl",
+  "isDataFontUrl",
+  "fetchSpecialFontUrl",
+  "resolveSameOriginFontUrl",
+  "fetchWithRedirectValidation",
+  "trustedHost",
+  "serverless",
+  "netlify",
+  "vercel",
+  "cloudflare",
+  "dev-prerender",
+  "node.ts",
+  "ssrf",
+  "getSiteConfig",
+  "localPath",
+  "absolutePath",
+  "OPTIEinstein",
+  "S4Card"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_redirect.patch",
+   "expect": "security_fail",
+   "note": "T1: external/data gated, but the same-origin fetch keeps following redirects; node and dev redirect tests fail, functional passes"
+  },
+  {
+   "patch": "sf_naive_scheme.patch",
+   "expect": "security_fail",
+   "note": "T2: the classifier only recognises scheme://; network-path, backslash and control-prefixed forms fail"
+  },
+  {
+   "patch": "sf_node_only.patch",
+   "expect": "security_fail",
+   "note": "T3: only the reported node handler is fixed; dev, cloudflare and both injected handlers stay open"
+  },
+  {
+   "patch": "sf_miss_serverless.patch",
+   "expect": "security_fail",
+   "note": "T4: the injected serverless handler is left ungated; its four security tests fail"
+  },
+  {
+   "patch": "sf_miss_netlify.patch",
+   "expect": "security_fail",
+   "note": "T5: the injected Netlify handler is left ungated; its two security tests fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: every visitor-supplied font is refused; legitimate same-origin and inline fonts stop working"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus a redundant option-boundary rejection of authority-bearing / non-data scheme paths"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "same classifier, but per-handler manual same-origin redirect loop instead of changing the shared guard"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: refusing a font is a soft, unavailable-asset outcome and the security tests observe the outbound side effect, never the response status, so a crash is neither required nor distinguishable",
+  "wrong_resource": "n/a: there is no per-object authorization; the protected outcome is a network destination",
+  "one_role_or_direction": "n/a: no roles or peers exist; every handler and every font entry is covered by one rule",
+  "reads_only": "n/a: font resolution is a read-only operation; there is no write verb to miss",
+  "check_after_adjustment": "n/a: the value is canonicalised by the URL parser the fetch itself uses, and the tests cover those canonical forms without relying on any later adjustment",
+  "unlisted_route": "sf_node_only.patch",
+  "malformed_identity": "n/a: no identity/parser pairing; the classifier uses the same WHATWG parse the fetch uses",
+  "missing_authority": "n/a: no authority or secret lookup; a missing site URL simply cannot authorise a same-origin absolute fetch and is refused",
+  "adjacent_api": "n/a: the shared guard change is additive (an optional trusted host); no sibling API's stated behaviour changes and the tests import no product helper"
+ },
+ "traps": [
+  {
+   "id": "same_origin_redirect_and_trusted_origin",
+   "pattern": "A",
+   "shape": "a same-origin font path that the site's own origin 302-redirects to another host; the correct fix must re-validate each redirect hop while still allowing ordinary loopback/proxy same-origin fonts",
+   "where": "src/runtime/server/og-image/bindings/font-assets/node.ts:12-15 (reported sink); src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts:101-108; src/runtime/server/util/ssrf.ts:226-230,257-259",
+   "reason_to_dismiss": "the site's own origin is trusted, so the internal-host classifier looks irrelevant to it; the naive shortcut (run the classifier over the same-origin fetch) blocks every loopback/proxy font",
+   "security_tests": [
+    "security/node.test.ts::does not follow a redirect from the site origin to another host",
+    "security/dev.test.ts::does not follow a redirect from the site origin to another host"
+   ],
+   "coupled_functional_tests": [
+    "functional/node.test.ts::loads a font served by the site origin at a relative path",
+    "functional/node.test.ts::loads a font supplied inline as a data: URI",
+    "functional/dev.test.ts::loads a font served by the site origin at a relative path",
+    "functional/dev.test.ts::loads a font supplied inline as a data: URI"
+   ],
+   "security_fail_patch": "sf_miss_redirect.patch",
+   "realistic_because": "the pre-fix same-origin fetch is a plain fetch, which follows redirects by default; the origin is loopback in dev and behind a proxy in production, so a blanket internal-host block breaks legitimate fonts"
+  },
+  {
+   "id": "authority_form_canonicalisation",
+   "pattern": "A",
+   "shape": "network-path, backslash-authority and control/space-prefixed forms resolve cross-origin through the same WHATWG parser fetch uses, although a scheme check reports them as relative",
+   "where": "src/runtime/server/og-image/bindings/font-assets/external-url.ts (classifier reached from every handler); sinks at node.ts:15 and dev-prerender.ts:105",
+   "reason_to_dismiss": "a check for an explicit scheme looks sufficient and passes the example",
+   "security_tests": [
+    "security/node.test.ts::does not fetch a network-path reference",
+    "security/node.test.ts::does not fetch a backslash-authority form",
+    "security/node.test.ts::does not fetch a slash-then-backslash authority form",
+    "security/node.test.ts::does not fetch a space-prefixed network-path form",
+    "security/dev.test.ts::does not fetch a network-path reference",
+    "security/dev.test.ts::does not fetch a backslash-authority form",
+    "security/dev.test.ts::does not fetch a space-prefixed network-path form",
+    "security/vercel.test.ts::does not fetch a network-path reference",
+    "security/vercel.test.ts::does not fetch a backslash-authority form",
+    "security/vercel.test.ts::does not fetch a space-prefixed network-path form"
+   ],
+   "coupled_functional_tests": [
+    "functional/node.test.ts::loads a font served by the site origin at a relative path",
+    "functional/node.test.ts::loads a font supplied inline as a data: URI"
+   ],
+   "security_fail_patch": "sf_naive_scheme.patch",
+   "realistic_because": "the expected-value class is the URL parser's own canonicalisation; the published fix documents it as a bypass class"
+  },
+  {
+   "id": "second_platform_implementations",
+   "pattern": "A",
+   "shape": "the dev/preview handler, the Cloudflare handler and the two injected platform handlers each resolve font assets themselves; fixing only the reported node handler leaves them open",
+   "where": "src/runtime/server/og-image/bindings/font-assets/dev-prerender.ts:22-116; cloudflare.ts:10-29; serverless.ts; netlify.ts",
+   "reason_to_dismiss": "they are other deployment targets; the dev one is 'not production' and the cloudflare one reuses the shared asset resolver so it reads as already guarded",
+   "security_tests": [
+    "security/dev.test.ts::does not fetch an absolute address that names another host",
+    "security/cloudflare.test.ts::does not fetch an absolute address that names another host",
+    "security/vercel.test.ts::does not fetch an absolute address that names another host",
+    "security/netlify.test.ts::does not fetch an absolute address that names another host"
+   ],
+   "coupled_functional_tests": [
+    "functional/dev.test.ts::renders an ordinary image",
+    "functional/dev.test.ts::loads a font served by the site origin at a relative path",
+    "functional/vercel.test.ts::renders with a font supplied inline as a data: URI",
+    "functional/netlify.test.ts::renders with a font supplied inline as a data: URI"
+   ],
+   "security_fail_patch": "sf_node_only.patch",
+   "realistic_because": "real, unmodified upstream code: the module selects a handler per preset and every handler performs the same guarded operation"
+  },
+  {
+   "id": "serverless_handler_injected",
+   "pattern": "injected",
+   "shape": "an injected serverless handler (Vercel/Lambda-style presets) copies the node handler's same-origin fetch; it is a separate module the published fix never touches",
+   "where": "src/runtime/server/og-image/bindings/font-assets/serverless.ts + src/module.ts:1384-1396",
+   "reason_to_dismiss": "it is a platform-specific copy of the node handler, so a solver who hardened the node handler can assume it is covered",
+   "security_tests": [
+    "security/vercel.test.ts::does not fetch an absolute address that names another host",
+    "security/vercel.test.ts::does not fetch a network-path reference",
+    "security/vercel.test.ts::does not fetch a backslash-authority form",
+    "security/vercel.test.ts::does not fetch a space-prefixed network-path form"
+   ],
+   "coupled_functional_tests": [
+    "functional/vercel.test.ts::renders with a font supplied inline as a data: URI"
+   ],
+   "security_fail_patch": "sf_miss_serverless.patch",
+   "realistic_because": "INJECTED into our copy only: the module already selects a font handler per preset, so adding a serverless preset means copying the existing node handler almost verbatim, including its gaps. Registered in build/audit/uncovered-routes.tsv"
+  },
+  {
+   "id": "netlify_handler_injected",
+   "pattern": "injected",
+   "shape": "an injected Netlify handler enables the shared asset resolver's external fallback for fonts; it is a separate module the published fix never touches",
+   "where": "src/runtime/server/og-image/bindings/font-assets/netlify.ts + src/module.ts:1397-1406",
+   "reason_to_dismiss": "it reuses the shared resolver the cloudflare handler already uses, so it reads as already guarded",
+   "security_tests": [
+    "security/netlify.test.ts::does not fetch an absolute address that names another host",
+    "security/netlify.test.ts::does not fetch an absolute address with extra leading whitespace"
+   ],
+   "coupled_functional_tests": [
+    "functional/netlify.test.ts::renders with a font supplied inline as a data: URI"
+   ],
+   "security_fail_patch": "sf_miss_netlify.patch",
+   "realistic_because": "INJECTED into our copy only: the shared resolver's includeExternalFallback option is documented for Netlify/Vercel-style edge routing and already enabled by image callers, so a font caller enabling it is a natural addition. Registered in build/audit/uncovered-routes.tsv"
+  }
+ ],
+ "status": "built; gate PASSED one stage at a time: static; nop (20/20 security tests fail on the injected tree, 277/277 functional pass); oracle (3 runs, reward 1.0 each, identical); patches (8/8 present checks behaved as declared; the blind pass patch is produced downstream)",
+ "notes": "See build/og-image-s4/notes.md."
+}

@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/microsandbox-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/microsandbox-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 111,
+ "duration_ms": 1044696,
+ "total_cost_usd": 3.5143575999999994,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "c00cca7a-459a-4bee-b940-0cdb390a2ea2",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 116902,
+   "outputTokens": 62941,
+   "cacheReadInputTokens": 8939648,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 3.5143575999999994,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "All work is complete and verified. Final state:\n\n- `blind.patch` \u2014 736 lines, 5 source files, `a/`\u2026`b/` paths, applies cleanly with `patch -p1 --dry-run` to a fresh copy of `pristine`\n- Final gate-equivalent run: **security 5/5 passed, functional 6/6 passed**\n- In-repo `runtime::spawn::tests`: 37/37 passed\n- Probe (`fd:96` channel carries the config; argv carries only identity labels) passed\n\n## Patch path\n\n```\n/home/runner/.tb-graders/cwe/blind/microsandbox-s4/blind.patch\n```\n\n## 5-line summary\n\n1. Added `microsandbox_runtime::handoff::LaunchHandoff` (env entries, typed `NetworkConfig`, startup workload) and fixed fd `HANDOFF_FD = 96`.\n2. `spawn.rs` no longer renders `--env`, `--network-config`, or `--startup-*`; it JSON-serializes the hand-off into an unlinked `tempfile::tempfile()` and `dup2`s it onto fd 96 in `pre_exec`.\n3. The detached replay of guest env and the init hand-off env (inline pairs and encoded payload) are folded into the same fd payload instead of `cmd.arg(\"--env\")`.\n4. `crates/cli/lib/sandbox_cmd.rs` gained `--handoff-fd`, reads the payload into `VmConfig.env` / `network` / `startup_command`, and keeps the old argv path as a manual-invocation fallback.\n5. argv retains only name, sandbox id, vcpus, memory, log verbosity, paths/mounts, metrics and fd numbers; all configured values and every tested secret still reach the child.\n\n## Mechanisms list\n\n- **BASE** (`spawn.rs:1322`, secret env on argv) \u2014 every `--env KEY=VALUE` moved into `LaunchHandoff.env` over fd 96; CLI restores `VmConfig.env`.\n- **NET-CONFIG** (`spawn.rs:1309`, secret nested in network JSON) \u2014 typed `NetworkConfig` carried in `LaunchHandoff.network`; `--network-config` argv pair removed.\n- **STARTUP-ENV** (`spawn.rs:1393`, duplicate secret under `--startup-env`) \u2014 startup workload moved to `LaunchHandoff.startup`; all `--startup-*` tokens removed.\n- **S-DETACHED** (`spawn.rs:225`, detached env replay as `--env`) \u2014 replay copy appended to the fd payload, not the command line.\n- **S-INIT** (`spawn.rs:237`, inline init env beside the base64 payload) \u2014 inline pairs and `MSB_HANDOFF_INIT_ENV` payload both moved into the fd payload.\n\nEvidence: `probe/probe_dump.rs` + `probe/README.md` (probe temporarily copied into the package to run, then removed so it is not in the patch). One caveat: the CLI crate cannot be compile-checked in this offline environment (workspace cache lacks its `anyhow`/`aead` sources), but it is not in the gate's `-p microsandbox` build graph; the SDK/runtime changes it consumes compile and all gate tests pass.",
+ "status": "ok"
+}

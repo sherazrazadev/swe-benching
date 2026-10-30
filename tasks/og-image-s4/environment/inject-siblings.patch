@@ -1,0 +1,97 @@
+diff --git a/src/module.ts b/src/module.ts
+index eb112017..5cceef72 100644
+--- a/src/module.ts
++++ b/src/module.ts
+@@ -1379,6 +1379,27 @@ export default defineNuxtModule<ModuleOptions>({
+ import { resolve as devResolve } from '${devBinding}'
+ import { resolve as cfResolve } from '${cfBinding}'
+ export const resolve = (import.meta.dev || import.meta.prerender) ? devResolve : cfResolve
++`
++      }
++      // Serverless Node platforms serve static assets from their edge router, so
++      // same-origin font requests go through the deployment origin.
++      const isServerlessNode = ['vercel', 'aws-lambda', 'aws-amplify', 'azure', 'azure-functions'].includes(normalizedPreset)
++      if (isServerlessNode) {
++        const devBinding = resolver.resolve('./runtime/server/og-image/bindings/font-assets/dev-prerender')
++        const serverlessBinding = resolver.resolve('./runtime/server/og-image/bindings/font-assets/serverless')
++        return `
++import { resolve as devResolve } from '${devBinding}'
++import { resolve as serverlessResolve } from '${serverlessBinding}'
++export const resolve = (import.meta.dev || import.meta.prerender) ? devResolve : serverlessResolve
++`
++      }
++      if (normalizedPreset === 'netlify') {
++        const devBinding = resolver.resolve('./runtime/server/og-image/bindings/font-assets/dev-prerender')
++        const netlifyBinding = resolver.resolve('./runtime/server/og-image/bindings/font-assets/netlify')
++        return `
++import { resolve as devResolve } from '${devBinding}'
++import { resolve as netlifyResolve } from '${netlifyBinding}'
++export const resolve = (import.meta.dev || import.meta.prerender) ? devResolve : netlifyResolve
+ `
+       }
+       // For non-cloudflare (node), use dev-prerender for dev/prerender, node binding for runtime
+diff --git a/src/runtime/server/og-image/bindings/font-assets/netlify.ts b/src/runtime/server/og-image/bindings/font-assets/netlify.ts
+new file mode 100644
+index 00000000..0355a22d
+--- /dev/null
++++ b/src/runtime/server/og-image/bindings/font-assets/netlify.ts
+@@ -0,0 +1,23 @@
++import type { H3Event } from 'h3'
++import type { FontConfig } from '../../../../types'
++import { useRuntimeConfig } from 'nitropack/runtime'
++import { withBase } from 'ufo'
++import { fetchLocalAsset } from '../../../util/fetchLocalAsset'
++import { getFetchTimeout } from '../../../util/fetchTimeout'
++import { useOgImageRuntimeConfig } from '../../../utils'
++
++/**
++ * Font asset resolution for Netlify. Static assets are served from the
++ * platform's edge router, so the shared asset resolver falls back to a
++ * request against the deployment origin when the internal lookup misses.
++ */
++export async function resolve(event: H3Event, font: FontConfig) {
++  const path = font.src || font.localPath
++  const { app } = useRuntimeConfig()
++  const fullPath = withBase(path, app.baseURL)
++  const timeout = getFetchTimeout(useOgImageRuntimeConfig())
++  const ab = await fetchLocalAsset(event, fullPath, { fetchTimeout: timeout, includeExternalFallback: true })
++  if (ab)
++    return Buffer.from(ab)
++  throw new Error(`[Nuxt OG Image] Cannot resolve font "${font.family}" (path: ${fullPath}).`)
++}
+diff --git a/src/runtime/server/og-image/bindings/font-assets/serverless.ts b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+new file mode 100644
+index 00000000..76f7bc59
+--- /dev/null
++++ b/src/runtime/server/og-image/bindings/font-assets/serverless.ts
+@@ -0,0 +1,30 @@
++import type { H3Event } from 'h3'
++import type { FontConfig } from '../../../../types'
++import { useRuntimeConfig } from 'nitropack/runtime'
++import { withBase } from 'ufo'
++import { getNitroOrigin } from '#site-config/server/composables'
++import { getFetchTimeout } from '../../../util/fetchTimeout'
++import { useOgImageRuntimeConfig } from '../../../utils'
++
++/**
++ * Font asset resolution for serverless Node platforms (Vercel, AWS Lambda).
++ * Static assets are served by the platform's edge router, so same-origin
++ * requests are made against the deployment origin.
++ */
++export async function resolve(event: H3Event, font: FontConfig) {
++  const path = font.src || font.localPath
++  const { app } = useRuntimeConfig()
++  const fullPath = withBase(path, app.baseURL)
++  const origin = getNitroOrigin(event)
++  const timeout = getFetchTimeout(useOgImageRuntimeConfig())
++  const res = await fetch(new URL(fullPath, origin).href, { signal: AbortSignal.timeout(timeout) }).catch(() => null)
++  if (res?.ok) {
++    return Buffer.from(await res.arrayBuffer())
++  }
++  const fetchArrayBuffer = event.$fetch as unknown as (path: string, options: { responseType: 'arrayBuffer', timeout: number }) => Promise<ArrayBuffer>
++  const arrayBuffer = await fetchArrayBuffer(fullPath, {
++    responseType: 'arrayBuffer',
++    timeout,
++  })
++  return Buffer.from(arrayBuffer)
++}

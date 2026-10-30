@@ -1,0 +1,32 @@
+diff --git a/sdk/rust/lib/runtime/spawn.rs b/sdk/rust/lib/runtime/spawn.rs
+index 04ae7110..e90eb826 100644
+--- a/sdk/rust/lib/runtime/spawn.rs
++++ b/sdk/rust/lib/runtime/spawn.rs
+@@ -221,6 +221,27 @@ pub async fn spawn_sandbox(
+     // mode, which corrupts the parent's terminal output (\n without \r).
+     cmd.stdin(Stdio::null());
+ 
++    // Detached sandboxes outlive the launcher, and the supervisor replays the
++    // recorded command line when it restarts one. Keep the guest environment
++    // on that command line so a restarted sandbox boots with the values it was
++    // created with.
++    if matches!(mode, SpawnMode::Detached) {
++        for var in &config.spec.env {
++            cmd.arg("--env");
++            cmd.arg(format!("{}={}", var.key, var.value));
++        }
++    }
++
++    // Hand-off init processes can predate the encoded hand-off environment and
++    // read their values from the sandbox environment instead, so forward them
++    // inline as well.
++    if let Some(init) = &config.spec.init {
++        for (key, value) in &init.env {
++            cmd.arg("--env");
++            cmd.arg(format!("{key}={value}"));
++        }
++    }
++
+     if parent_watchdog.is_some() || startup_pipe.is_some() {
+         let parent_watch_fd = parent_watchdog
+             .as_ref()

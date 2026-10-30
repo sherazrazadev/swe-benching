@@ -1,0 +1,40 @@
+diff --git a/src/datamodel_code_generator/imports.py b/src/datamodel_code_generator/imports.py
+index e491cb662..6ceae1028 100644
+--- a/src/datamodel_code_generator/imports.py
++++ b/src/datamodel_code_generator/imports.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ from collections import defaultdict
+ from dataclasses import dataclass
++import keyword
+ from functools import lru_cache
+ from itertools import starmap
+ from typing import TYPE_CHECKING
+@@ -61,8 +62,27 @@ class Imports(defaultdict[str | None, set[str]]):
+             for i in sorted(imports)
+         ]
+ 
++    @staticmethod
++    def _is_dotted_identifier_path(name: str, *, allow_relative: bool) -> bool:
++        if allow_relative:
++            name = name.lstrip(".")
++        if not name:
++            return True
++        return all(part.isidentifier() and not keyword.iskeyword(part) for part in name.split("."))
++
++    def _check_name(self, name: str, *, allow_relative: bool) -> None:
++        if not self._is_dotted_identifier_path(name, allow_relative=allow_relative):
++            from datamodel_code_generator import Error  # noqa: PLC0415
++
++            msg = f"invalid Python import name: {name!r}"
++            raise Error(msg)
++
+     def create_line(self, from_: str | None, imports: set[str]) -> str:
+         """Create a single import line from module and names."""
++        if from_:
++            self._check_name(from_, allow_relative=True)
++        for import_ in imports:
++            self._check_name(import_.split(" as ")[0], allow_relative=False)
+         if from_:
+             return f"from {from_} import {', '.join(self._set_alias(from_, imports))}"
+         return "\n".join(f"import {i}" for i in self._set_alias(from_, imports))

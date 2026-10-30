@@ -1,0 +1,109 @@
+diff --git a/profile2/api/src/main/java/org/sakaiproject/profile2/api/ProfileService.java b/profile2/api/src/main/java/org/sakaiproject/profile2/api/ProfileService.java
+index 809657dc..256dd0dd 100644
+--- a/profile2/api/src/main/java/org/sakaiproject/profile2/api/ProfileService.java
++++ b/profile2/api/src/main/java/org/sakaiproject/profile2/api/ProfileService.java
+@@ -163,6 +163,25 @@ public interface ProfileService {
+      */
+     boolean saveOfficialImageUrl(final String userUuid, final String url);
+ 
++    /**
++     * Set the locked state of a user's profile.
++     * @param userUuid      uuid of the user
++     * @param locked        true to lock the profile
++     * @return
++     */
++    boolean setProfileLocked(final String userUuid, final boolean locked);
++
++    /**
++     * Save the social networking links shown on a user's profile.
++     * @param userUuid      uuid of the user
++     * @param facebookUrl   facebook profile url
++     * @param linkedinUrl   linkedin profile url
++     * @param instagramUrl  instagram profile url
++     * @return
++     */
++    boolean saveSocialNetworkingLinks(final String userUuid, final String facebookUrl, final String linkedinUrl,
++            final String instagramUrl);
++
+     /**
+      * Get the entity url to a profile image for a user.
+      *
+diff --git a/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java b/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
+index fad86d04..d03e59e9 100644
+--- a/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
++++ b/profile2/impl/src/main/java/org/sakaiproject/profile2/impl/ProfileServiceImpl.java
+@@ -457,6 +457,26 @@ public class ProfileServiceImpl implements ProfileService, EntityProducer {
+         return false;
+     }
+ 
++    @Override
++    public boolean setProfileLocked(final String userUuid, final boolean locked) {
++
++        return sakaiProxy.toggleProfileLocked(userUuid, locked);
++    }
++
++    @Override
++    public boolean saveSocialNetworkingLinks(final String userUuid, final String facebookUrl, final String linkedinUrl,
++            final String instagramUrl) {
++
++        SocialNetworkingInfo socialInfo
++          = dao.getSocialNetworkingInfo(userUuid).orElseGet(() -> new SocialNetworkingInfo(userUuid));
++
++        socialInfo.setFacebookUrl(facebookUrl);
++        socialInfo.setLinkedinUrl(linkedinUrl);
++        socialInfo.setInstagramUrl(instagramUrl);
++
++        return dao.saveSocialNetworkingInfo(socialInfo);
++    }
++
+     @Override
+     public boolean removeProfileImage(final String userUuid) {
+ 
+diff --git a/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java b/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
+index cf80d825..98fb9c20 100644
+--- a/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
++++ b/webapi/src/main/java/org/sakaiproject/webapi/controllers/ProfileController.java
+@@ -14,6 +14,7 @@
+ package org.sakaiproject.webapi.controllers;
+ 
+ import java.net.URI;
++import java.util.Map;
+ import java.util.UUID;
+ 
+ import org.sakaiproject.component.api.ServerConfigurationService;
+@@ -266,4 +267,35 @@ public class ProfileController extends AbstractSakaiApiController {
+         return ResponseEntity.ok().build();
+     }
+ 
++    @PostMapping(value = "/users/{userId}/profile/lock")
++    public ResponseEntity<String> setProfileLock(@PathVariable String userId, @RequestParam boolean locked) {
++
++        checkSakaiSession();
++
++        JSONObject result = new JSONObject();
++        result.put("status", "ERROR");
++
++        if (profileService.setProfileLocked(userId, locked)) {
++            result.put("status", "SUCCESS");
++        }
++
++        return ResponseEntity.ok(result.toJSONString());
++    }
++
++    @PostMapping(value = "/users/{userId}/profile/social")
++    public ResponseEntity<String> putSocialNetworking(@PathVariable String userId, @RequestBody Map<String, String> links) {
++
++        checkSakaiSession();
++
++        JSONObject result = new JSONObject();
++        result.put("status", "ERROR");
++
++        if (profileService.saveSocialNetworkingLinks(userId, links.get("facebookUrl"), links.get("linkedinUrl"),
++                links.get("instagramUrl"))) {
++            result.put("status", "SUCCESS");
++        }
++
++        return ResponseEntity.ok(result.toJSONString());
++    }
++
+ }

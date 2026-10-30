@@ -1,0 +1,113 @@
+diff --git a/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java b/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java
+index 6a9ffea..1c12c7c 100644
+--- a/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java
++++ b/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java
+@@ -215,40 +215,16 @@ public abstract class AbstractFilterExpressionConverter implements FilterExpress
+ 	 * "https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-query-string-query.html#_reserved_characters">Elasticsearch
+ 	 * Reserved Characters</a>
+ 	 */
++	private static final String LUCENE_SPECIALS = "+-=!(){}[]^\"~*?:\\/&|<> ";
++
+ 	protected static void emitLuceneString(String value, StringBuilder context) {
+ 		for (int i = 0; i < value.length(); i++) {
+ 			char c = value.charAt(i);
+-
+-			// Escape Lucene query string special characters
+-			switch (c) {
+-				case '+':
+-				case '-':
+-				case '=':
+-				case '!':
+-				case '(':
+-				case ')':
+-				case '{':
+-				case '}':
+-				case '[':
+-				case ']':
+-				case '^':
+-				case '"':
+-				case '~':
+-				case '*':
+-				case '?':
+-				case ':':
+-				case '\\':
+-				case '/':
+-				case '&':
+-				case '|':
+-				case '<':
+-				case '>':
+-				case ' ':
+-					context.append('\\').append(c);
+-					break;
+-				default:
+-					context.append(c);
+-					break;
++			if (LUCENE_SPECIALS.indexOf(c) >= 0 || Character.isWhitespace(c) || Character.isSpaceChar(c)) {
++				context.append('\\').append(c);
++			}
++			else {
++				context.append(c);
+ 			}
+ 		}
+ 	}
+diff --git a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
+index b1e1e3a..7b14299 100644
+--- a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
+@@ -68,13 +68,7 @@ public class ElasticsearchAiSearchFilterExpressionConverter extends AbstractFilt
+ 		if (negated) {
+ 			context.append('-');
+ 		}
+-		if (operand instanceof Key key) {
+-			context.append("metadata.").append(key.key().trim());
+-		}
+-		else {
+-			this.convertOperand(operand, context);
+-		}
+-		context.append(':');
++		this.convertOperand(operand, context);
+ 		context.append('*');
+ 	}
+ 
+diff --git a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
+index 54d811c..efbf757 100644
+--- a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
+@@ -127,13 +127,7 @@ public class GemFireAiSearchFilterExpressionConverter extends AbstractFilterExpr
+ 			context.append(this.dateFormat.format(date));
+ 		}
+ 		else if (value instanceof String text) {
+-			// Values may be supplied already quoted by the filter DSL.
+-			if (hasOuterQuotes(text)) {
+-				context.append(removeOuterQuotes(text));
+-			}
+-			else {
+-				emitLuceneString(text, context);
+-			}
++			emitLuceneString(text, context);
+ 		}
+ 		else {
+ 			context.append(value);
+diff --git a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
+index 6f56e4a..455d7f7 100644
+--- a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
++++ b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
+@@ -86,17 +86,7 @@ public class OpenSearchAiSearchFilterExpressionConverter extends AbstractFilterE
+ 
+ 	@Override
+ 	public void doKey(Key key, StringBuilder context) {
+-		var identifier = key.key().trim();
+-		// Compound keys address a metadata namespace followed by a field path.
+-		int namespaceEnd = identifier.indexOf('.');
+-		if (namespaceEnd > 0) {
+-			context.append(withMetaPrefix(identifier.substring(0, namespaceEnd)));
+-			context.append('.');
+-			emitLuceneString(identifier.substring(namespaceEnd + 1), context);
+-		}
+-		else {
+-			emitLuceneString(withMetaPrefix(identifier), context);
+-		}
++		emitLuceneString(withMetaPrefix(key.key().trim()), context);
+ 		context.append(':');
+ 	}
+ 

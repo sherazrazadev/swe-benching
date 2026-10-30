@@ -1,0 +1,736 @@
+diff -ruN -x target pristine/crates/cli/lib/sandbox_cmd.rs app/crates/cli/lib/sandbox_cmd.rs
+--- a/crates/cli/lib/sandbox_cmd.rs	2026-10-30 00:57:57.000000000 +0000
++++ b/crates/cli/lib/sandbox_cmd.rs	2026-10-30 01:40:22.283441335 +0000
+@@ -4,12 +4,15 @@
+ //! [`microsandbox_runtime::vm::enter()`]. This command **never returns**
+ //! — the VMM calls `_exit()` on guest shutdown.
+ 
++use std::fs::File;
++use std::io::Read;
+ use std::mem::MaybeUninit;
+ use std::path::PathBuf;
+ use std::{os::fd::FromRawFd, os::fd::OwnedFd};
+ 
+ use clap::Args;
+ use microsandbox_runtime::{
++    handoff::LaunchHandoff,
+     logging::LogLevel,
+     vm::{Config, DiskMountSpec, MetricsSlotHandoff, StartupCommand, VmConfig},
+ };
+@@ -69,6 +72,14 @@
+     #[arg(long = "startup-fd", hide = true)]
+     pub startup_fd: Option<i32>,
+ 
++    /// Inherited fd carrying the JSON [`LaunchHandoff`] (set by the SDK).
++    ///
++    /// This is where the SDK delivers the environment entries, network
++    /// configuration, and startup workload, so they never appear on the
++    /// sandbox process's command line.
++    #[arg(long = "handoff-fd", hide = true)]
++    pub handoff_fd: Option<i32>,
++
+     /// Startup workload command to execute after agentd is ready.
+     #[arg(long = "startup-cmd", hide = true)]
+     pub startup_cmd: Option<String>,
+@@ -213,6 +224,16 @@
+ 
+ /// Run the sandbox process. This function **never returns**.
+ pub fn run(args: SandboxArgs) -> ! {
++    // The SDK delivers the secret-bearing configuration (env, network,
++    // startup workload) over an inherited fd instead of argv. Read it up
++    // front; `None` means a manual invocation that still uses the argv flags.
++    let handoff = match args.handoff_fd.map(read_handoff).transpose() {
++        Ok(handoff) => handoff,
++        Err(err) => {
++            eprintln!("{err}");
++            std::process::exit(2);
++        }
++    };
+     let parent_watchdog = match args
+         .parent_watch_fd
+         .map(parent_watchdog_from_fd)
+@@ -262,19 +283,25 @@
+         disks,
+         backends: vec![],
+         init_path: args.init_path,
+-        env: args.env,
++        env: match &handoff {
++            Some(handoff) => handoff.env.clone(),
++            None => args.env,
++        },
+         workdir: args.workdir,
+         exec_path: args.exec_path,
+         exec_args: args.exec_args,
+         #[cfg(feature = "net")]
+-        network: args
+-            .network_config
+-            .as_deref()
+-            .map(|json| {
+-                serde_json::from_str::<microsandbox_network::config::NetworkConfig>(json)
+-                    .expect("invalid network config JSON")
+-            })
+-            .unwrap_or_default(),
++        network: match &handoff {
++            Some(handoff) => handoff.network.clone().unwrap_or_default(),
++            None => args
++                .network_config
++                .as_deref()
++                .map(|json| {
++                    serde_json::from_str::<microsandbox_network::config::NetworkConfig>(json)
++                        .expect("invalid network config JSON")
++                })
++                .unwrap_or_default(),
++        },
+         #[cfg(feature = "net")]
+         sandbox_slot: args.sandbox_slot,
+     };
+@@ -289,13 +316,22 @@
+         runtime_dir: args.runtime_dir,
+         sandboxes_dir: args.sandboxes_dir,
+         agent_sock_path: args.agent_sock,
+-        startup_command: args.startup_cmd.map(|cmd| StartupCommand {
+-            cmd,
+-            args: args.startup_args,
+-            env: args.startup_env,
+-            cwd: args.startup_cwd,
+-            user: args.startup_user,
+-        }),
++        startup_command: match &handoff {
++            Some(handoff) => handoff.startup.as_ref().map(|startup| StartupCommand {
++                cmd: startup.cmd.clone(),
++                args: startup.args.clone(),
++                env: startup.env.clone(),
++                cwd: startup.cwd.clone(),
++                user: startup.user.clone(),
++            }),
++            None => args.startup_cmd.map(|cmd| StartupCommand {
++                cmd,
++                args: args.startup_args,
++                env: args.startup_env,
++                cwd: args.startup_cwd,
++                user: args.startup_user,
++            }),
++        },
+         startup_fd,
+         parent_watchdog,
+         forward_output: args.forward_output,
+@@ -324,6 +360,28 @@
+     microsandbox_runtime::vm::enter(config)
+ }
+ 
++/// Read and parse the JSON [`LaunchHandoff`] delivered over the inherited
++/// hand-off fd. The fd is taken over so it is closed once consumed.
++fn read_handoff(fd: i32) -> Result<LaunchHandoff, String> {
++    if fd < 0 {
++        return Err(format!(
++            "invalid --handoff-fd: fd must be non-negative, got {fd}"
++        ));
++    }
++    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
++        return Err(format!(
++            "invalid --handoff-fd {fd}: {}",
++            std::io::Error::last_os_error()
++        ));
++    }
++
++    let mut file = unsafe { File::from_raw_fd(fd) };
++    let mut bytes = Vec::new();
++    file.read_to_end(&mut bytes)
++        .map_err(|e| format!("failed to read --handoff-fd {fd}: {e}"))?;
++    serde_json::from_slice(&bytes).map_err(|e| format!("invalid launch hand-off: {e}"))
++}
++
+ fn parent_watchdog_from_fd(fd: i32) -> Result<OwnedFd, String> {
+     validate_pipe_fd(
+         fd,
+diff -ruN -x target pristine/crates/runtime/lib/handoff.rs app/crates/runtime/lib/handoff.rs
+--- a/crates/runtime/lib/handoff.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/runtime/lib/handoff.rs	2026-10-30 01:38:52.122072384 +0000
+@@ -0,0 +1,61 @@
++//! Private launch hand-off between the SDK and the `msb sandbox` process.
++//!
++//! The SDK serializes a [`LaunchHandoff`] as JSON and hands it to the sandbox
++//! process over an inherited file descriptor
++//! ([`crate::vm::HANDOFF_FD`]). Keeping this data off the process argv means
++//! environment entries, network secrets, and the startup workload are not
++//! exposed through `ps` or `/proc/<pid>/cmdline` to every local user.
++//!
++//! The argv keeps only operator-readable identity labels (sandbox name and
++//! id, CPU/memory sizing, log verbosity) and the real inherited fds.
++
++use serde::{Deserialize, Serialize};
++
++#[cfg(feature = "net")]
++use microsandbox_network::config::NetworkConfig;
++
++//--------------------------------------------------------------------------------------------------
++// Types
++//--------------------------------------------------------------------------------------------------
++
++/// The secret-bearing part of a sandbox's launch configuration.
++///
++/// Everything in here used to be rendered as `--env`, `--network-config`, or
++/// `--startup-*` tokens on the helper process's command line.
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct LaunchHandoff {
++    /// Guest environment entries as `KEY=VALUE`, including the internal
++    /// `MSB_*` specifications the runtime consumes (`MSB_TMPFS`,
++    /// `MSB_DIR_MOUNTS`, `MSB_HANDOFF_INIT*`, rlimits, user, hostname, ...).
++    ///
++    /// These may carry user secrets, so they travel over the fd rather than
++    /// argv.
++    pub env: Vec<String>,
++
++    /// Startup workload to run after the agent is ready, when requested.
++    pub startup: Option<StartupSpec>,
++
++    /// Structured network configuration. The proxy/TLS secret material is
++    /// nested inside it rather than in a plain `KEY=VALUE` pair.
++    #[cfg(feature = "net")]
++    pub network: Option<NetworkConfig>,
++}
++
++/// A startup workload requested through the sandbox configuration.
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct StartupSpec {
++    /// Path or command name to execute inside the guest.
++    pub cmd: String,
++
++    /// Arguments to pass to the command.
++    pub args: Vec<String>,
++
++    /// Environment entries for the workload as `KEY=VALUE`.
++    pub env: Vec<String>,
++
++    /// Working directory for the workload.
++    pub cwd: Option<String>,
++
++    /// Guest user override for the workload.
++    pub user: Option<String>,
++}
+diff -ruN -x target pristine/crates/runtime/lib/lib.rs app/crates/runtime/lib/lib.rs
+--- a/crates/runtime/lib/lib.rs	2026-10-30 00:57:57.000000000 +0000
++++ b/crates/runtime/lib/lib.rs	2026-10-30 01:38:52.432073559 +0000
+@@ -14,6 +14,7 @@
+ pub mod boot_error;
+ pub mod console;
+ pub mod exec_log;
++pub mod handoff;
+ pub mod heartbeat;
+ pub mod logging;
+ pub mod maintenance;
+diff -ruN -x target pristine/crates/runtime/lib/vm.rs app/crates/runtime/lib/vm.rs
+--- a/crates/runtime/lib/vm.rs	2026-10-30 00:57:57.000000000 +0000
++++ b/crates/runtime/lib/vm.rs	2026-10-30 01:38:53.276076759 +0000
+@@ -57,6 +57,13 @@
+ /// Short best-effort send budget once agentd is already considered unresponsive.
+ const AGENT_UNRESPONSIVE_SHUTDOWN_PUSH_TIMEOUT: Duration = Duration::from_secs(1);
+ 
++/// Fixed fd carrying the JSON [`crate::handoff::LaunchHandoff`] into
++/// `msb sandbox`.
++///
++/// The bulk of the configuration (env entries, network config, startup
++/// workload) arrives here so it never appears on the process argv.
++pub const HANDOFF_FD: i32 = 96;
++
+ /// Fixed fd used to pass the attached-parent watchdog pipe into `msb sandbox`.
+ pub const PARENT_WATCH_FD: i32 = 97;
+ 
+diff -ruN -x target pristine/sdk/rust/lib/runtime/spawn.rs app/sdk/rust/lib/runtime/spawn.rs
+--- a/sdk/rust/lib/runtime/spawn.rs	2026-10-30 00:57:59.000000000 +0000
++++ b/sdk/rust/lib/runtime/spawn.rs	2026-10-30 01:40:44.120546295 +0000
+@@ -15,6 +15,7 @@
+     collections::HashMap,
+     ffi::OsString,
+     fmt::Write,
++    io::{Seek, SeekFrom, Write as IoWrite},
+     os::fd::{FromRawFd, OwnedFd},
+     path::{Path, PathBuf},
+     process::Stdio,
+@@ -38,6 +39,7 @@
+     ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_CWD, ENV_HANDOFF_INIT_ENV, ENV_HOSTNAME,
+     ENV_SECURITY_PROFILE, ENV_TMPFS, ENV_USER,
+ };
++use microsandbox_runtime::handoff::{LaunchHandoff, StartupSpec};
+ use microsandbox_types::SandboxLogLevel;
+ use microsandbox_utils::{DB_FILENAME, DB_SUBDIR};
+ 
+@@ -194,9 +196,11 @@
+         },
+     };
+ 
+-    // Build the command.
+-    let mut cmd = Command::new(&msb_path);
+-    cmd.args(sandbox_cli_args(
++    // Split the configuration: argv keeps only operator-readable identity
++    // labels (name, id, sizing, log verbosity) plus the real inherited fds;
++    // the secret-bearing bulk — env entries, network config, startup workload
++    // — travels over the private hand-off fd.
++    let (mut visible, mut handoff) = sandbox_cli_args(
+         local,
+         config,
+         sandbox_id,
+@@ -214,35 +218,49 @@
+         startup_pipe
+             .as_ref()
+             .map(|_| microsandbox_runtime::vm::STARTUP_FD),
+-    ));
+-
+-    // Prevent the sandbox process from inheriting the parent's terminal on
+-    // stdin — the VMM's implicit console auto-detects terminals and sets raw
+-    // mode, which corrupts the parent's terminal output (\n without \r).
+-    cmd.stdin(Stdio::null());
++    );
+ 
+-    // Detached sandboxes outlive the launcher, and the supervisor replays the
+-    // recorded command line when it restarts one. Keep the guest environment
+-    // on that command line so a restarted sandbox boots with the values it was
+-    // created with.
++    // Detached sandboxes outlive the launcher and are restarted from a
++    // recorded launch, and hand-off init processes can predate the encoded
++    // hand-off environment and read their values from the sandbox
++    // environment. Both extra copies of the environment belong in the
++    // hand-off payload rather than on the command line.
+     if matches!(mode, SpawnMode::Detached) {
+         for var in &config.spec.env {
+-            cmd.arg("--env");
+-            cmd.arg(format!("{}={}", var.key, var.value));
++            handoff.env.push(format!("{}={}", var.key, var.value));
+         }
+     }
+-
+-    // Hand-off init processes can predate the encoded hand-off environment and
+-    // read their values from the sandbox environment instead, so forward them
+-    // inline as well.
+     if let Some(init) = &config.spec.init {
+         for (key, value) in &init.env {
+-            cmd.arg("--env");
+-            cmd.arg(format!("{key}={value}"));
++            handoff.env.push(format!("{key}={value}"));
+         }
+     }
+ 
+-    if parent_watchdog.is_some() || startup_pipe.is_some() {
++    // Serialize the hand-off into an anonymous (already unlinked) temp file.
++    // The child only ever sees the fd number on its argv.
++    let handoff_file = match write_handoff(&handoff) {
++        Ok(file) => file,
++        Err(err) => {
++            release_metrics_reservation(config, metrics_reservation.as_ref());
++            return Err(err);
++        }
++    };
++    let handoff_raw_fd = handoff_file.as_raw_fd();
++    visible.push(OsString::from("--handoff-fd"));
++    visible.push(OsString::from(
++        microsandbox_runtime::vm::HANDOFF_FD.to_string(),
++    ));
++
++    // Build the command.
++    let mut cmd = Command::new(&msb_path);
++    cmd.args(visible);
++
++    // Prevent the sandbox process from inheriting the parent's terminal on
++    // stdin — the VMM's implicit console auto-detects terminals and sets raw
++    // mode, which corrupts the parent's terminal output (\n without \r).
++    cmd.stdin(Stdio::null());
++
++    {
+         let parent_watch_fd = parent_watchdog
+             .as_ref()
+             .map(|pipe| pipe.read_fd.as_raw_fd());
+@@ -252,6 +270,7 @@
+                 if startup_write_fd.is_some() {
+                     detach_from_launcher_session()?;
+                 }
++                dup_inherited_fd(handoff_raw_fd, microsandbox_runtime::vm::HANDOFF_FD)?;
+                 if let Some(fd) = parent_watch_fd {
+                     dup_inherited_fd(fd, microsandbox_runtime::vm::PARENT_WATCH_FD)?;
+                 }
+@@ -440,6 +459,19 @@
+     Ok(Pipe { read_fd, write_fd })
+ }
+ 
++/// Serialize the [`LaunchHandoff`] into an anonymous temp file, rewound to the
++/// start. The file is unlinked as soon as it is created, so there is no path
++/// for another process to open, and the child receives only the fd number.
++fn write_handoff(handoff: &LaunchHandoff) -> MicrosandboxResult<std::fs::File> {
++    let mut file = tempfile::tempfile()?;
++    let json = serde_json::to_vec(handoff)
++        .map_err(|e| crate::MicrosandboxError::Runtime(format!("serialize launch handoff: {e}")))?;
++    file.write_all(&json)?;
++    file.flush()?;
++    file.seek(SeekFrom::Start(0))?;
++    Ok(file)
++}
++
+ fn dup_inherited_fd(src: i32, dst: i32) -> std::io::Result<()> {
+     if unsafe { libc::dup2(src, dst) } < 0 {
+         return Err(std::io::Error::last_os_error());
+@@ -1076,8 +1108,11 @@
+     metrics_reservation: Option<&MetricsReservation>,
+     parent_watch_fd: Option<i32>,
+     startup_fd: Option<i32>,
+-) -> Vec<OsString> {
++) -> (Vec<OsString>, LaunchHandoff) {
++    // `args` is the operator-visible argv. `handoff` carries everything that
++    // may contain a secret and is delivered over the private hand-off fd.
+     let mut args = vec![OsString::from("sandbox")];
++    let mut handoff = LaunchHandoff::default();
+ 
+     if let Some(log_level) = config.spec.runtime.log_level {
+         args.push(OsString::from(sandbox_log_level_cli_flag(log_level)));
+@@ -1107,7 +1142,7 @@
+         args.push(OsString::from("--startup-fd"));
+         args.push(OsString::from(fd.to_string()));
+     }
+-    push_startup_command_args(&mut args, config);
++    handoff.startup = startup_spec(config);
+ 
+     let sp = &config.spec.lifecycle;
+     if let Some(max_dur) = sp.max_duration_secs {
+@@ -1169,8 +1204,9 @@
+ 
+                 // MSB_BLOCK_ROOT: always 2 devices.
+                 let block_root = "kind=oci-erofs,lower=/dev/vda,upper=/dev/vdb,upper_fstype=ext4";
+-                args.push(OsString::from("--env"));
+-                args.push(OsString::from(format!("{}={block_root}", ENV_BLOCK_ROOT)));
++                handoff
++                    .env
++                    .push(format!("{}={block_root}", ENV_BLOCK_ROOT));
+             }
+         }
+         RootfsSource::DiskImage {
+@@ -1188,11 +1224,9 @@
+             if let Some(ft) = fstype {
+                 block_root_val.push_str(&format!(",fstype={ft}"));
+             }
+-            args.push(OsString::from("--env"));
+-            args.push(OsString::from(format!(
+-                "{}={block_root_val}",
+-                ENV_BLOCK_ROOT
+-            )));
++            handoff
++                .env
++                .push(format!("{}={block_root_val}", ENV_BLOCK_ROOT));
+         }
+     }
+ 
+@@ -1290,75 +1324,66 @@
+     }
+ 
+     if !tmpfs_val.is_empty() {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!("{}={tmpfs_val}", ENV_TMPFS)));
++        handoff.env.push(format!("{}={tmpfs_val}", ENV_TMPFS));
+     }
+ 
+     if !dir_mounts_val.is_empty() {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!(
+-            "{}={dir_mounts_val}",
+-            ENV_DIR_MOUNTS
+-        )));
++        handoff
++            .env
++            .push(format!("{}={dir_mounts_val}", ENV_DIR_MOUNTS));
+     }
+ 
+     if !file_mounts_val.is_empty() {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!(
+-            "{}={file_mounts_val}",
+-            ENV_FILE_MOUNTS
+-        )));
++        handoff
++            .env
++            .push(format!("{}={file_mounts_val}", ENV_FILE_MOUNTS));
+     }
+ 
+     if !disk_mounts_val.is_empty() {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!(
+-            "{}={disk_mounts_val}",
+-            ENV_DISK_MOUNTS
+-        )));
++        handoff
++            .env
++            .push(format!("{}={disk_mounts_val}", ENV_DISK_MOUNTS));
+     }
+ 
+     if !config.spec.rlimits.is_empty() {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!(
++        handoff.env.push(format!(
+             "{}={}",
+             microsandbox_protocol::ENV_RLIMITS,
+             encode_rlimits(&config.spec.rlimits)
+-        )));
++        ));
+     }
+ 
+-    // Network configuration.
++    // Network configuration travels as a typed value in the hand-off. The
++    // slot stays on argv because it is just a numeric label.
+     #[cfg(feature = "net")]
+     {
+-        let network = config
+-            .local_network_config()
+-            .expect("sandbox network spec should decode to local network config");
+-        let net_json = serde_json::to_string(&network).expect("failed to serialize network config");
+-        args.push(OsString::from("--network-config"));
+-        args.push(OsString::from(net_json));
++        handoff.network = Some(
++            config
++                .local_network_config()
++                .expect("sandbox network spec should decode to local network config"),
++        );
+         args.push(OsString::from("--sandbox-slot"));
+         args.push(OsString::from(sandbox_id.to_string()));
+     }
+ 
+     for var in &config.spec.env {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!("{}={}", var.key, var.value)));
++        handoff
++            .env
++            .push(format!("{}={}", var.key, var.value));
+     }
+ 
+     if let Some(ref user) = config.spec.runtime.user {
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!("{}={user}", ENV_USER)));
++        handoff.env.push(format!("{}={user}", ENV_USER));
+     }
+ 
+-    args.push(OsString::from("--env"));
+-    args.push(OsString::from(format!(
++    handoff.env.push(format!(
+         "{}={}",
+         ENV_SECURITY_PROFILE,
+         match config.spec.security_profile {
+             crate::sandbox::SecurityProfile::Default => "default",
+             crate::sandbox::SecurityProfile::Restricted => "restricted",
+         }
+-    )));
++    ));
+ 
+     // Hostname: explicit value or fall back to a sandbox-name-derived form
+     // that fits within the Linux UTS limit.
+@@ -1367,8 +1392,7 @@
+             Some(h) => h.to_string(),
+             None => crate::sandbox::hostname_from_sandbox_name(&config.spec.name),
+         };
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!("{}={hostname}", ENV_HOSTNAME)));
++        handoff.env.push(format!("{}={hostname}", ENV_HOSTNAME));
+     }
+ 
+     // Handoff-init: PID 1 hand-off to a user-supplied init binary.
+@@ -1380,26 +1404,26 @@
+             .cmd
+             .to_str()
+             .expect("validate() rejects non-UTF-8 cmd paths");
+-        args.push(OsString::from("--env"));
+-        args.push(OsString::from(format!("{ENV_HANDOFF_INIT}={cmd}")));
++        handoff.env.push(format!("{ENV_HANDOFF_INIT}={cmd}"));
+ 
+         if !init.args.is_empty() {
+             let argv_val = encode_handoff_json(&init.args);
+-            args.push(OsString::from("--env"));
+-            args.push(OsString::from(format!(
+-                "{ENV_HANDOFF_INIT_ARGS}={argv_val}"
+-            )));
++            handoff
++                .env
++                .push(format!("{ENV_HANDOFF_INIT_ARGS}={argv_val}"));
+         }
+ 
+         if let Some(ref workdir) = config.spec.runtime.workdir {
+-            args.push(OsString::from("--env"));
+-            args.push(OsString::from(format!("{ENV_HANDOFF_INIT_CWD}={workdir}")));
++            handoff
++                .env
++                .push(format!("{ENV_HANDOFF_INIT_CWD}={workdir}"));
+         }
+ 
+         if !init.env.is_empty() {
+             let env_val = encode_handoff_json(&init.env);
+-            args.push(OsString::from("--env"));
+-            args.push(OsString::from(format!("{ENV_HANDOFF_INIT_ENV}={env_val}")));
++            handoff
++                .env
++                .push(format!("{ENV_HANDOFF_INIT_ENV}={env_val}"));
+         }
+     }
+ 
+@@ -1408,30 +1432,24 @@
+         args.push(OsString::from(workdir));
+     }
+ 
+-    args
++    (args, handoff)
+ }
+ 
+-fn push_startup_command_args(args: &mut Vec<OsString>, config: &SandboxConfig) {
+-    let Some((cmd, cmd_args)) = resolve_startup_command(config) else {
+-        return;
+-    };
++fn startup_spec(config: &SandboxConfig) -> Option<StartupSpec> {
++    let (cmd, cmd_args) = resolve_startup_command(config)?;
+ 
+-    args.push(OsString::from(format!("--startup-cmd={cmd}")));
+-    for arg in cmd_args {
+-        args.push(OsString::from(format!("--startup-arg={arg}")));
+-    }
+-    for var in &config.spec.env {
+-        args.push(OsString::from(format!(
+-            "--startup-env={}={}",
+-            var.key, var.value
+-        )));
+-    }
+-    if let Some(workdir) = &config.spec.runtime.workdir {
+-        args.push(OsString::from(format!("--startup-cwd={workdir}")));
+-    }
+-    if let Some(user) = &config.spec.runtime.user {
+-        args.push(OsString::from(format!("--startup-user={user}")));
+-    }
++    Some(StartupSpec {
++        cmd,
++        args: cmd_args,
++        env: config
++            .spec
++            .env
++            .iter()
++            .map(|var| format!("{}={}", var.key, var.value))
++            .collect(),
++        cwd: config.spec.runtime.workdir.clone(),
++        user: config.spec.runtime.user.clone(),
++    })
+ }
+ 
+ fn resolve_startup_command(config: &SandboxConfig) -> Option<(String, Vec<String>)> {
+@@ -1504,9 +1522,49 @@
+         LocalBackend::lazy()
+     }
+ 
++    /// Re-expand the hand-off payload into the historical `--flag value`
++    /// token stream so the token-based assertions in this module keep
++    /// working after the split between argv and the private fd.
++    fn flatten_invocation(
++        visible: Vec<OsString>,
++        handoff: microsandbox_runtime::handoff::LaunchHandoff,
++    ) -> Vec<String> {
++        let mut out: Vec<String> = visible
++            .into_iter()
++            .map(|arg| arg.to_string_lossy().into_owned())
++            .collect();
++        for value in handoff.env {
++            out.push("--env".to_string());
++            out.push(value);
++        }
++        if let Some(startup) = handoff.startup {
++            out.push(format!("--startup-cmd={}", startup.cmd));
++            for arg in startup.args {
++                out.push(format!("--startup-arg={arg}"));
++            }
++            for value in startup.env {
++                out.push(format!("--startup-env={value}"));
++            }
++            if let Some(cwd) = startup.cwd {
++                out.push(format!("--startup-cwd={cwd}"));
++            }
++            if let Some(user) = startup.user {
++                out.push(format!("--startup-user={user}"));
++            }
++        }
++        #[cfg(feature = "net")]
++        {
++            if let Some(network) = handoff.network {
++                out.push("--network-config".to_string());
++                out.push(serde_json::to_string(&network).unwrap());
++            }
++        }
++        out
++    }
++
+     fn render_args(config: &SandboxConfig) -> Vec<String> {
+         let local = test_local_backend();
+-        sandbox_cli_args(
++        let (visible, handoff) = sandbox_cli_args(
+             &local,
+             config,
+             42,
+@@ -1520,10 +1578,8 @@
+             None,
+             None,
+             None,
+-        )
+-        .iter()
+-        .map(|arg| arg.to_string_lossy().into_owned())
+-        .collect()
++        );
++        flatten_invocation(visible, handoff)
+     }
+ 
+     fn decode_handoff_json<T: DeserializeOwned>(value: &str) -> T {
+@@ -1536,7 +1592,7 @@
+         staged_file_mounts: &HashMap<String, (PathBuf, String, String)>,
+     ) -> Vec<String> {
+         let local = test_local_backend();
+-        sandbox_cli_args(
++        let (visible, handoff) = sandbox_cli_args(
+             &local,
+             config,
+             42,
+@@ -1550,10 +1606,8 @@
+             None,
+             None,
+             None,
+-        )
+-        .iter()
+-        .map(|arg| arg.to_string_lossy().into_owned())
+-        .collect()
++        );
++        flatten_invocation(visible, handoff)
+     }
+ 
+     #[tokio::test]
+@@ -1614,7 +1668,7 @@
+             .unwrap();
+ 
+         let local = test_local_backend();
+-        let args = sandbox_cli_args(
++        let (args, _handoff) = sandbox_cli_args(
+             &local,
+             &config,
+             42,
+@@ -1735,27 +1789,7 @@
+             .await
+             .unwrap();
+ 
+-        let local = test_local_backend();
+-        let args = sandbox_cli_args(
+-            &local,
+-            &config,
+-            42,
+-            Path::new("/tmp/msb.db"),
+-            30,
+-            Path::new("/tmp/logs"),
+-            Path::new("/tmp/runtime"),
+-            Path::new("/tmp/agent.sock"),
+-            Path::new("/tmp/libkrunfw.dylib"),
+-            &HashMap::new(),
+-            None,
+-            None,
+-            None,
+-        );
+-
+-        let rendered = args
+-            .iter()
+-            .map(|arg| arg.to_string_lossy().into_owned())
+-            .collect::<Vec<_>>();
++        let rendered = render_args(&config);
+ 
+         assert!(rendered.windows(2).any(|pair| {
+             pair[0] == "--env"

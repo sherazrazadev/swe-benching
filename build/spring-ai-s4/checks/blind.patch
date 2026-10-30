@@ -1,0 +1,126 @@
+diff -ruN a/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java b/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java
+--- a/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java	2026-10-30 00:26:03.000000000 +0000
++++ b/spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/converter/AbstractFilterExpressionConverter.java	2026-10-30 00:57:58.810327014 +0000
+@@ -66,6 +66,17 @@
+ 		.withZone(ZoneOffset.UTC);
+ 
+ 	/**
++	 * Characters with a syntactic meaning of their own in a Lucene query string.
++	 */
++	private static final String LUCENE_RESERVED = "+-=!(){}[]^\"~*?:\\/&|<>";
++
++	/**
++	 * The complete whitespace set of the Lucene classic query parser; any of these ends a
++	 * term when it appears unescaped.
++	 */
++	private static final String LUCENE_WHITESPACE = " \t\n\r\u3000";
++
++	/**
+ 	 * Create a new AbstractFilterExpressionConverter.
+ 	 */
+ 	public AbstractFilterExpressionConverter() {
+@@ -208,7 +219,10 @@
+ 	 * VectorDB query string filters.
+ 	 * <p>
+ 	 * Lucene/Elasticsearch query strings require backslash-escaping of special
+-	 * characters: {@code + - = ! ( ) { } [ ] ^ " ~ * ? : \ / & | < > } as well as spaces.
++	 * characters: {@code + - = ! ( ) { } [ ] ^ " ~ * ? : \ / & | < > } as well as every
++	 * character the classic query parser treats as whitespace (space, tab, line feed,
++	 * carriage return and the ideographic space). A whitespace character ends the current
++	 * term, so leaving one unescaped would let caller data introduce query structure.
+ 	 * @param value the string value to format
+ 	 * @param context the context to append the escaped string to
+ 	 * @see <a href=
+@@ -218,37 +232,11 @@
+ 	protected static void emitLuceneString(String value, StringBuilder context) {
+ 		for (int i = 0; i < value.length(); i++) {
+ 			char c = value.charAt(i);
+-
+-			// Escape Lucene query string special characters
+-			switch (c) {
+-				case '+':
+-				case '-':
+-				case '=':
+-				case '!':
+-				case '(':
+-				case ')':
+-				case '{':
+-				case '}':
+-				case '[':
+-				case ']':
+-				case '^':
+-				case '"':
+-				case '~':
+-				case '*':
+-				case '?':
+-				case ':':
+-				case '\\':
+-				case '/':
+-				case '&':
+-				case '|':
+-				case '<':
+-				case '>':
+-				case ' ':
+-					context.append('\\').append(c);
+-					break;
+-				default:
+-					context.append(c);
+-					break;
++			if (LUCENE_RESERVED.indexOf(c) >= 0 || LUCENE_WHITESPACE.indexOf(c) >= 0) {
++				context.append('\\').append(c);
++			}
++			else {
++				context.append(c);
+ 			}
+ 		}
+ 	}
+diff -ruN a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java
+--- a/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java	2026-10-30 00:26:03.000000000 +0000
++++ b/vector-stores/spring-ai-elasticsearch-store/src/main/java/org/springframework/ai/vectorstore/elasticsearch/ElasticsearchAiSearchFilterExpressionConverter.java	2026-10-30 00:54:44.965964134 +0000
+@@ -69,7 +69,9 @@
+ 			context.append('-');
+ 		}
+ 		if (operand instanceof Key key) {
+-			context.append("metadata.").append(key.key().trim());
++			// Compose the existence field term through the same literal escaper as any
++			// other key: the field name is caller data, not query structure.
++			emitLuceneString("metadata." + key.key().trim(), context);
+ 		}
+ 		else {
+ 			this.convertOperand(operand, context);
+diff -ruN a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java
+--- a/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java	2026-10-30 00:26:03.000000000 +0000
++++ b/vector-stores/spring-ai-gemfire-store/src/main/java/org/springframework/ai/vectorstore/gemfire/GemFireAiSearchFilterExpressionConverter.java	2026-10-30 00:54:46.741984205 +0000
+@@ -127,13 +127,10 @@
+ 			context.append(this.dateFormat.format(date));
+ 		}
+ 		else if (value instanceof String text) {
+-			// Values may be supplied already quoted by the filter DSL.
+-			if (hasOuterQuotes(text)) {
+-				context.append(removeOuterQuotes(text));
+-			}
+-			else {
+-				emitLuceneString(text, context);
+-			}
++			// A value is always literal text, including one the caller wrapped in
++			// quotes: quoting is caller data too, so it must not be stripped and its
++			// contents must be escaped like any other value.
++			emitLuceneString(text, context);
+ 		}
+ 		else {
+ 			context.append(value);
+diff -ruN a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java
+--- a/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java	2026-10-30 00:26:03.000000000 +0000
++++ b/vector-stores/spring-ai-opensearch-store/src/main/java/org/springframework/ai/vectorstore/opensearch/OpenSearchAiSearchFilterExpressionConverter.java	2026-10-30 00:54:45.835974153 +0000
+@@ -90,7 +90,10 @@
+ 		// Compound keys address a metadata namespace followed by a field path.
+ 		int namespaceEnd = identifier.indexOf('.');
+ 		if (namespaceEnd > 0) {
+-			context.append(withMetaPrefix(identifier.substring(0, namespaceEnd)));
++			// Both sides of the namespace separator are caller-supplied text: the
++			// namespace segment must be escaped exactly like the field path after it.
++			context.append("metadata.");
++			emitLuceneString(identifier.substring(0, namespaceEnd), context);
+ 			context.append('.');
+ 			emitLuceneString(identifier.substring(namespaceEnd + 1), context);
+ 		}

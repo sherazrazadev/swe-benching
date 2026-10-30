@@ -1,0 +1,195 @@
+{
+ "slug": "microsandbox-s4",
+ "candidate": "GHSA-M8F5-RH7H-VGG3 / CVE-2026-61670 (superradcompany/microsandbox), entry_id 21243",
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "entry_point": "Public SDK spawn path: microsandbox::runtime::spawn_sandbox (the only function that constructs and launches the `msb sandbox` child process; reached by Sandbox::create/start and by every language binding). Reproduced at the pinned+injected commit and at the published-fix tree with a stand-in `msb` binary on MSB_PATH: the launched child's own /proc/self/cmdline, environment and inherited descriptors are recorded, so the assertion is made on what the child actually received.",
+  "sites": [
+   "sdk/rust/lib/runtime/spawn.rs sandbox_cli_args environment loop (pinned 1322-1325) - reported site",
+   "sdk/rust/lib/runtime/spawn.rs sandbox_cli_args network-config serialization (pinned 1309-1320) - serialized NetworkConfig carries SecretEntry.value",
+   "sdk/rust/lib/runtime/spawn.rs push_startup_command_args startup-env copy (pinned 1393-1414) - startup workload environment",
+   "sdk/rust/lib/runtime/spawn.rs spawn_sandbox detached branch - injected sibling S-DETACHED",
+   "sdk/rust/lib/runtime/spawn.rs spawn_sandbox hand-off init branch - injected sibling S-INIT",
+   "crates/cli/lib/sandbox_cmd.rs SandboxArgs - the runtime side of the same handoff (rewritten by the reference fix so the launched process still receives the configuration)"
+  ],
+  "routes_investigated_not_built": [
+   "The hidden `msb sandbox` command itself (crates/cli/lib/sandbox_cmd.rs): its own --env/--network-config/--startup-env flags are a manual/debugging surface; the SDK no longer emits them after the fix and the verifier does not run the CLI (booting a VM needs /dev/kvm and libkrunfw). Included in the reference fix, not separately tested.",
+   "Snapshot/restore and `Sandbox::start` resume paths: both re-enter the same spawn entry point with the persisted SandboxConfig, so they are covered by the same property through the shared spawn path; no separate route exists at the pinned commit.",
+   "The sdk/rust/bin shim forwards argv unchanged and never adds configuration, so it is not an independent site."
+  ],
+  "injected_siblings": [
+   "S-DETACHED: sdk/rust/lib/runtime/spawn.rs spawn_sandbox - detached spawns repeat the guest environment as --env pairs on the launched command line (a maintainer's replay/diagnostics branch).",
+   "S-INIT: sdk/rust/lib/runtime/spawn.rs spawn_sandbox - hand-off init processes get their environment forwarded inline as --env pairs in addition to the encoded hand-off payload."
+  ],
+  "services": [],
+  "project_tests_run": "In the agent image at the pinned+injected commit `cargo test -p microsandbox --lib runtime::spawn::tests` passes offline (37 tests, pure argv-rendering; no DB/VM/network). At the reference fix tree the same unit tests pass (38, one added by the published fix). The verifier suites do not run the project's unit tests; they drive the public spawn path with a stand-in runtime binary and need no /dev/kvm, libkrunfw or network."
+ },
+ "leak_terms": [
+  "spawn_sandbox",
+  "sandbox_cli_args",
+  "LaunchConfig",
+  "CONFIG_FD",
+  "config_fd",
+  "config-file",
+  "write_launch_config_fd",
+  "push_startup_command_args",
+  "SandboxConfig",
+  "SecretEntry",
+  "local_network_config",
+  "startup_command_requested",
+  "HandoffInit",
+  "MSB_HANDOFF_INIT",
+  "ENV_HANDOFF_INIT_ENV",
+  "--env",
+  "--network-config",
+  "--startup-env",
+  "detached"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_env.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the reported environment loop still writes KEY=VALUE pairs on the command line; the environment, startup-workload and detached security tests fail, all functional tests pass"
+  },
+  {
+   "patch": "miss_network.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the serialized network configuration (which carries the real proxy secret value) is still passed on the command line; the network-secret security test fails"
+  },
+  {
+   "patch": "miss_startup.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the startup-workload copy of the environment is still emitted inline; the startup-workload security test fails"
+  },
+  {
+   "patch": "miss_detached.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the injected detached-spawn branch still repeats the guest environment on the command line; the detached security test fails"
+  },
+  {
+   "patch": "miss_init.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the injected hand-off init branch still forwards the init environment inline; the init-handoff security test fails"
+  },
+  {
+   "patch": "overbroad.patch",
+   "expect": "functional_fail",
+   "note": "over-broad fix: the launch payload is stripped of environment, secrets and workload settings, so no secret is on the command line but the configuration no longer reaches the runtime; five functional tests fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a defensive guard in the argv builder that asserts no configured environment pair ever reaches the visible command line; scores 1.0"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: the launch configuration is handed to the runtime through the child's environment instead of an inherited descriptor; secrets stay off the command line, the configuration still arrives, labels stay visible; scores 1.0"
+  },
+  {
+   "patch": "blind_r1.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written later by the blind-fix run (instruction + repository only); not present at build time"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: the property is about what the launch command line exposes, not an authorization decision; there is nothing to refuse and a refusal would not hide a secret",
+  "crash_as_refusal": "n/a: the sandbox launch has no refusal path; a crash during launch is caught by the functional tests (the sandbox must still start)",
+  "wrong_resource": "n/a: the launch decision acts on the sandbox being launched; there is no proxy or neighbouring resource to authorise",
+  "one_role_or_direction": "miss_detached.patch",
+  "reads_only": "n/a: there is no read/write split; the protected surface is a single launch handoff",
+  "check_after_adjustment": "n/a: the launch arguments are built from the stored sandbox configuration with no normalising or adjusting step on the values",
+  "unlisted_route": "miss_startup.patch",
+  "malformed_identity": "n/a: no identity or credential is parsed on this path",
+  "missing_authority": "n/a: the decision does not consult an external authority that could be absent",
+  "adjacent_api": "overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "BASE",
+   "pattern": "A (reported site)",
+   "shape": "secret environment values written to the launched process command line",
+   "where": "sdk/rust/lib/runtime/spawn.rs:1322 (pinned)",
+   "reason_to_dismiss": "none - this is the site the report points at",
+   "security_tests": [
+    "security/msb_security.rs::environment_secret_is_not_readable_from_the_launch_command_line"
+   ],
+   "coupled_functional_tests": [
+    "functional/msb_functional.rs::a_normal_sandbox_starts_and_stays_identifiable",
+    "functional/msb_functional.rs::the_complete_configuration_reaches_the_launched_process"
+   ],
+   "security_fail_patch": "miss_env.patch"
+  },
+  {
+   "id": "NET-CONFIG",
+   "pattern": "A (published fix, far shape)",
+   "shape": "the real secret value nested inside the serialized network configuration rather than in a KEY=VALUE pair",
+   "where": "sdk/rust/lib/runtime/spawn.rs:1309 (pinned)",
+   "reason_to_dismiss": "the network configuration is structured configuration, not the environment loop the report names; a fix that removes the --env emission leaves the serialized blob on the command line",
+   "security_tests": [
+    "security/msb_security.rs::network_secret_is_not_readable_from_the_launch_command_line"
+   ],
+   "coupled_functional_tests": [
+    "functional/msb_functional.rs::a_network_secret_still_takes_effect"
+   ],
+   "security_fail_patch": "miss_network.patch"
+  },
+  {
+   "id": "STARTUP-ENV",
+   "pattern": "A (published fix, far site)",
+   "shape": "a second copy of the same secret values emitted for the startup workload under a different flag, only when a startup command is requested",
+   "where": "sdk/rust/lib/runtime/spawn.rs:1393 (pinned)",
+   "reason_to_dismiss": "the startup workload is a separate feature that runs after boot, so its environment reads as a different concern from the sandbox environment in the report",
+   "security_tests": [
+    "security/msb_security.rs::startup_workload_secret_is_not_readable_from_the_launch_command_line"
+   ],
+   "coupled_functional_tests": [
+    "functional/msb_functional.rs::a_startup_workload_still_takes_effect"
+   ],
+   "security_fail_patch": "miss_startup.patch"
+  },
+  {
+   "id": "S-DETACHED",
+   "pattern": "injected sibling",
+   "shape": "the detached-spawn branch repeats the guest environment as command-line pairs (a recorded-command-line replay for restarted sandboxes)",
+   "where": "sdk/rust/lib/runtime/spawn.rs:225 (vulnerable tree)",
+   "reason_to_dismiss": "detached creation is a different launch path from the foreground run the report describes; the duplicate reads as part of the detached supervisor's replay",
+   "realistic_because": "detached sandboxes outlive the launcher and are re-created from their recorded launch state, so a maintainer repeating the environment in that branch is an ordinary copy-and-adapt change",
+   "security_tests": [
+    "security/msb_security.rs::detached_secret_is_not_readable_from_the_launch_command_line"
+   ],
+   "coupled_functional_tests": [
+    "functional/msb_functional.rs::detached_sandboxes_still_start_and_receive_their_configuration"
+   ],
+   "security_fail_patch": "miss_detached.patch"
+  },
+  {
+   "id": "S-INIT",
+   "pattern": "injected sibling",
+   "shape": "hand-off init environment forwarded inline as command-line pairs alongside the encoded hand-off payload",
+   "where": "sdk/rust/lib/runtime/spawn.rs:237 (vulnerable tree)",
+   "reason_to_dismiss": "the hand-off init runs before the agent relay and is a pre-boot concern, so forwarding its environment inline reads as a compatibility detail rather than part of the sandbox environment",
+   "realistic_because": "the hand-off already carries an encoded environment payload for the init process; adding a plain-environment fallback for older init binaries next to it is a natural compatibility addition",
+   "security_tests": [
+    "security/msb_security.rs::init_handoff_secret_is_not_readable_from_the_launch_command_line"
+   ],
+   "coupled_functional_tests": [
+    "functional/msb_functional.rs::an_init_handoff_still_takes_effect"
+   ],
+   "security_fail_patch": "miss_init.patch"
+  }
+ ],
+ "status": "built and gate passed on the final artifacts: static PASS; nop PASS (0/5 security, 6/6 functional); oracle PASS 3/3 (reward 1.0, identical); patches PASS (5 security_fail each leaving only its lever open, 1 functional_fail with 5 functional failures, hardening 1.0, alt_fix 1.0). Blind patch and FAIRNESS.md are written after the build, per the pipeline."
+}

@@ -1,0 +1,325 @@
+package config
+
+import (
+	"testing"
+
+	"github.com/jandedobbeleer/oh-my-posh/src/cache"
+	"github.com/jandedobbeleer/oh-my-posh/src/cli/upgrade"
+	"github.com/jandedobbeleer/oh-my-posh/src/color"
+	"github.com/jandedobbeleer/oh-my-posh/src/runtime/mock"
+	"github.com/jandedobbeleer/oh-my-posh/src/shell"
+	"github.com/jandedobbeleer/oh-my-posh/src/template"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestGetPalette(t *testing.T) {
+	palette := color.Palette{
+		"red":  "#ff0000",
+		"blue": "#0000ff",
+	}
+
+	cases := []struct {
+		Palettes        *color.Palettes
+		Palette         color.Palette
+		ExpectedPalette color.Palette
+		Case            string
+	}{
+		{
+			Case: "match",
+			Palettes: &color.Palettes{
+				Template: "{{ .Shell }}",
+				List: map[string]color.Palette{
+					"bash": palette,
+					"zsh": {
+						"red":  "#ff0001",
+						"blue": "#0000fb",
+					},
+				},
+			},
+			ExpectedPalette: palette,
+		},
+		{
+			Case: "no match, no fallback",
+			Palettes: &color.Palettes{
+				Template: "{{ .Shell }}",
+				List: map[string]color.Palette{
+					"fish": palette,
+					"zsh": {
+						"red":  "#ff0001",
+						"blue": "#0000fb",
+					},
+				},
+			},
+			ExpectedPalette: nil,
+		},
+		{
+			Case: "no match, default",
+			Palettes: &color.Palettes{
+				Template: "{{ .Shell }}",
+				List: map[string]color.Palette{
+					"zsh": {
+						"red":  "#ff0001",
+						"blue": "#0000fb",
+					},
+				},
+			},
+			Palette:         palette,
+			ExpectedPalette: palette,
+		},
+		{
+			Case:            "no palettes",
+			ExpectedPalette: nil,
+		},
+		{
+			Case: "match, with override",
+			Palettes: &color.Palettes{
+				Template: "{{ .Shell }}",
+				List: map[string]color.Palette{
+					"bash": {
+						"red":    "#ff0001",
+						"yellow": "#ffff00",
+					},
+				},
+			},
+			Palette: palette,
+			ExpectedPalette: color.Palette{
+				"red":    "#ff0001",
+				"blue":   "#0000ff",
+				"yellow": "#ffff00",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		env := &mock.Environment{}
+		env.On("Shell").Return("bash")
+
+		template.Cache = &cache.Template{
+			SimpleTemplate: cache.SimpleTemplate{
+				Shell: "bash",
+			},
+		}
+		template.Init(env, nil, nil)
+
+		cfg := &Config{
+			Palette:  tc.Palette,
+			Palettes: tc.Palettes,
+		}
+
+		got := cfg.getPalette()
+		assert.Equal(t, tc.ExpectedPalette, got, tc.Case)
+	}
+}
+func TestFeaturesShellIntegration(t *testing.T) {
+	cases := []struct {
+		Case             string
+		Shell            string
+		ShellIntegration bool
+		ExpectedFeats    shell.Features
+	}{
+		{
+			Case:             "pwsh with shell integration enables FTCSMarks and KeyHandlers",
+			Shell:            shell.PWSH,
+			ShellIntegration: true,
+			ExpectedFeats:    shell.FTCSMarks | shell.KeyHandlers,
+		},
+		{
+			Case:             "bash with shell integration enables FTCSMarks only",
+			Shell:            shell.BASH,
+			ShellIntegration: true,
+			ExpectedFeats:    shell.FTCSMarks,
+		},
+		{
+			Case:             "zsh with shell integration enables FTCSMarks only",
+			Shell:            shell.ZSH,
+			ShellIntegration: true,
+			ExpectedFeats:    shell.FTCSMarks,
+		},
+		{
+			Case:             "pwsh without shell integration enables nothing",
+			Shell:            shell.PWSH,
+			ShellIntegration: false,
+			ExpectedFeats:    0,
+		},
+	}
+
+	for _, tc := range cases {
+		env := &mock.Environment{}
+		env.On("Shell").Return(tc.Shell)
+
+		template.Cache = &cache.Template{
+			SimpleTemplate: cache.SimpleTemplate{
+				Shell: tc.Shell,
+			},
+		}
+		template.Init(env, nil, nil)
+
+		cfg := &Config{
+			ShellIntegration: tc.ShellIntegration,
+			Upgrade:          &upgrade.Config{},
+		}
+
+		got := cfg.Features(env)
+		assert.Equal(t, tc.ExpectedFeats, got, tc.Case)
+	}
+}
+
+func TestFeaturesTransientRightPrompt(t *testing.T) {
+	cases := []struct {
+		Case          string
+		RightTemplate string
+		ExpectedFeats shell.Features
+	}{
+		{
+			Case:          "transient prompt without right template",
+			ExpectedFeats: shell.Transient | shell.KeyHandlers,
+		},
+		{
+			Case:          "transient prompt with right template",
+			RightTemplate: "R>",
+			ExpectedFeats: shell.Transient | shell.TransientRPrompt | shell.KeyHandlers,
+		},
+	}
+
+	for _, tc := range cases {
+		env := &mock.Environment{}
+		env.On("Shell").Return(shell.FISH)
+
+		cfg := &Config{
+			TransientPrompt: &Segment{RightTemplate: tc.RightTemplate},
+			Upgrade:         &upgrade.Config{},
+		}
+
+		got := cfg.Features(env)
+		assert.Equal(t, tc.ExpectedFeats, got, tc.Case)
+	}
+}
+
+func TestFeaturesVIMode(t *testing.T) {
+	cases := []struct {
+		Case          string
+		Shell         string
+		ExpectedFeats shell.Features
+	}{
+		{
+			Case:          "zsh enables vi mode tracking",
+			Shell:         shell.ZSH,
+			ExpectedFeats: shell.VIMode,
+		},
+		{
+			Case:          "pwsh enables vi mode tracking",
+			Shell:         shell.PWSH,
+			ExpectedFeats: shell.VIMode,
+		},
+		{
+			Case:          "fish enables vi mode tracking",
+			Shell:         shell.FISH,
+			ExpectedFeats: shell.VIMode,
+		},
+		{
+			Case:          "bash does not enable vi mode tracking",
+			Shell:         shell.BASH,
+			ExpectedFeats: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		env := &mock.Environment{}
+		env.On("Shell").Return(tc.Shell)
+
+		template.Cache = &cache.Template{
+			SimpleTemplate: cache.SimpleTemplate{
+				Shell: tc.Shell,
+			},
+		}
+		template.Init(env, nil, nil)
+
+		cfg := &Config{
+			Upgrade: &upgrade.Config{},
+			Blocks: []*Block{
+				{
+					Segments: []*Segment{
+						{Type: VIMODE},
+					},
+				},
+			},
+		}
+
+		got := cfg.Features(env)
+		assert.Equal(t, tc.ExpectedFeats, got, tc.Case)
+	}
+}
+
+func TestUpgradeFeatures(t *testing.T) {
+	cases := []struct {
+		Case                  string
+		ExpectedFeats         shell.Features
+		UpgradeCacheKeyExists bool
+		AutoUpgrade           bool
+		Force                 bool
+		DisplayNotice         bool
+		AutoUpgradeKey        bool
+		NoticeKey             bool
+	}{
+		{
+			Case:                  "cache exists, no force",
+			UpgradeCacheKeyExists: true,
+			ExpectedFeats:         0,
+		},
+		{
+			Case:          "auto upgrade enabled",
+			AutoUpgrade:   true,
+			ExpectedFeats: shell.Upgrade,
+		},
+		{
+			Case:           "auto upgrade via cache",
+			AutoUpgradeKey: true,
+			ExpectedFeats:  shell.Upgrade,
+		},
+		{
+			Case:          "notice enabled, no auto upgrade",
+			DisplayNotice: true,
+			ExpectedFeats: shell.Notice,
+		},
+		{
+			Case:          "notice via cache, no auto upgrade",
+			NoticeKey:     true,
+			ExpectedFeats: shell.Notice,
+		},
+		{
+			Case:                  "force upgrade ignores cache",
+			UpgradeCacheKeyExists: true,
+			Force:                 true,
+			AutoUpgrade:           true,
+			ExpectedFeats:         shell.Upgrade,
+		},
+	}
+
+	for _, tc := range cases {
+		if tc.UpgradeCacheKeyExists {
+			cache.Set(cache.Device, upgrade.CACHEKEY, "", cache.INFINITE)
+		}
+
+		if tc.AutoUpgradeKey {
+			cache.Set(cache.Device, AUTOUPGRADE, true, cache.INFINITE)
+		}
+
+		if tc.NoticeKey {
+			cache.Set(cache.Device, UPGRADENOTICE, true, cache.INFINITE)
+		}
+
+		cfg := &Config{
+			Upgrade: &upgrade.Config{
+				Auto:          tc.AutoUpgrade,
+				Force:         tc.Force,
+				DisplayNotice: tc.DisplayNotice,
+			},
+		}
+
+		got := cfg.upgradeFeatures()
+		assert.Equal(t, tc.ExpectedFeats, got, tc.Case)
+
+		cache.DeleteAll(cache.Device)
+	}
+}
