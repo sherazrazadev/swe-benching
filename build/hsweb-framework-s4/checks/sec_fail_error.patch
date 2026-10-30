@@ -1,0 +1,300 @@
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java
+index bed446d..b3d44af 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java
+@@ -4,10 +4,12 @@ import lombok.Getter;
+ import lombok.Setter;
+ import org.hswebframework.web.oauth2.ErrorType;
+ import org.hswebframework.web.oauth2.OAuth2Exception;
+-import org.springframework.util.ObjectUtils;
+ import org.springframework.util.StringUtils;
+ 
+ import jakarta.validation.constraints.NotBlank;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.Objects;
+ 
+ @Getter
+ @Setter
+@@ -31,13 +33,126 @@ public class OAuth2Client {
+     private String userId;
+ 
+     public void validateRedirectUri(String redirectUri) {
+-        if (ObjectUtils.isEmpty(redirectUri) || (!redirectUri.startsWith(this.redirectUrl))) {
++        validateRedirectUri(redirectUri, OAuth2Properties.RedirectUriValidationMode.COMPATIBLE);
++    }
++
++    public void validateRedirectUri(String redirectUri, OAuth2Properties.RedirectUriValidationMode validationMode) {
++        if (!isValidRedirectUri(redirectUri, validationMode)) {
+             throw new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI);
+         }
+     }
+ 
++    public boolean isSameRedirectUri(String redirectUri, String anotherRedirectUri) {
++        URI left = parseUri(redirectUri);
++        URI right = parseUri(anotherRedirectUri);
++        return left != null
++                && right != null
++                && !hasFragment(left)
++                && !hasFragment(right)
++                && isExactMatch(left, right);
++    }
++
++    private boolean isValidRedirectUri(String redirectUri, OAuth2Properties.RedirectUriValidationMode validationMode) {
++        if (!StringUtils.hasText(redirectUri) || !StringUtils.hasText(this.redirectUrl)) {
++            return false;
++        }
++        URI registered = parseUri(this.redirectUrl);
++        URI actual = parseUri(redirectUri);
++        if (registered == null || actual == null) {
++            return false;
++        }
++        if (hasFragment(registered) || hasFragment(actual)) {
++            return false;
++        }
++        registered = registered.normalize();
++        actual = actual.normalize();
++        if (registered.isOpaque() || actual.isOpaque()) {
++            return isExactMatch(registered, actual);
++        }
++        if (!hasSameEndpoint(registered, actual)) {
++            return false;
++        }
++        if (validationMode == OAuth2Properties.RedirectUriValidationMode.EXACT) {
++            return isExactPathAndQuery(registered, actual);
++        }
++        return matchCompatiblePath(registered.getPath(), actual.getPath())
++                && matchCompatibleQuery(registered.getRawQuery(), actual.getRawQuery());
++    }
++
++    private boolean hasSameEndpoint(URI registered, URI actual) {
++        return equalsIgnoreCase(registered.getScheme(), actual.getScheme())
++                && Objects.equals(registered.getUserInfo(), actual.getUserInfo())
++                && equalsIgnoreCase(registered.getHost(), actual.getHost())
++                && registered.getPort() == actual.getPort();
++    }
++
++    private boolean isExactMatch(URI left, URI right) {
++        if (!equalsIgnoreCase(left.getScheme(), right.getScheme())) {
++            return false;
++        }
++        if (left.isOpaque() || right.isOpaque()) {
++            return Objects.equals(left.getRawSchemeSpecificPart(), right.getRawSchemeSpecificPart());
++        }
++        return Objects.equals(left.getUserInfo(), right.getUserInfo())
++                && equalsIgnoreCase(left.getHost(), right.getHost())
++                && left.getPort() == right.getPort()
++                && isExactPathAndQuery(left, right)
++                && Objects.equals(left.getRawFragment(), right.getRawFragment());
++    }
++
++    private boolean isExactPathAndQuery(URI registered, URI actual) {
++        return Objects.equals(pathOrEmpty(registered), pathOrEmpty(actual))
++                && Objects.equals(registered.getRawQuery(), actual.getRawQuery());
++    }
++
++    private URI parseUri(String value) {
++        try {
++            return new URI(value.trim());
++        } catch (URISyntaxException e) {
++            return null;
++        }
++    }
++
++    private boolean hasFragment(URI uri) {
++        return StringUtils.hasLength(uri.getRawFragment());
++    }
++
++    private String pathOrEmpty(URI uri) {
++        return uri.getPath() == null ? "" : uri.getPath();
++    }
++
++    private boolean matchCompatiblePath(String registeredPath, String actualPath) {
++        String registered = registeredPath == null ? "" : registeredPath;
++        String actual = actualPath == null ? "" : actualPath;
++        if (registered.isEmpty()) {
++            return actual.isEmpty() || actual.startsWith("/");
++        }
++        if (actual.equals(registered)) {
++            return true;
++        }
++        if (registered.endsWith("/")) {
++            return actual.startsWith(registered);
++        }
++        return actual.startsWith(registered + "/");
++    }
++
++    private boolean matchCompatibleQuery(String registeredQuery, String actualQuery) {
++        if (!StringUtils.hasLength(registeredQuery)) {
++            return true;
++        }
++        if (!StringUtils.hasLength(actualQuery)) {
++            return false;
++        }
++        return actualQuery.equals(registeredQuery)
++                || actualQuery.startsWith(registeredQuery + "&");
++    }
++
++    private boolean equalsIgnoreCase(String left, String right) {
++        return left == null ? right == null : left.equalsIgnoreCase(right);
++    }
++
+     public void validateSecret(String secret) {
+-        if (ObjectUtils.isEmpty(secret) || (!secret.equals(this.clientSecret))) {
++        if (!StringUtils.hasLength(secret) || (!secret.equals(this.clientSecret))) {
+             throw new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_SECRET);
+         }
+     }
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Properties.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Properties.java
+index 8956781..b039f1c 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Properties.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Properties.java
+@@ -17,4 +17,12 @@ public class OAuth2Properties {
+     //refreshToken有效期
+     private Duration refreshTokenIn = Duration.ofDays(30);
+ 
++    //redirect_uri 校验模式
++    private RedirectUriValidationMode redirectUriValidationMode = RedirectUriValidationMode.COMPATIBLE;
++
++    public enum RedirectUriValidationMode {
++        COMPATIBLE,
++        EXACT
++    }
++
+ }
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2ServerAutoConfiguration.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2ServerAutoConfiguration.java
+index 4fdfa28..6cdef2e 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2ServerAutoConfiguration.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2ServerAutoConfiguration.java
+@@ -99,8 +99,9 @@ public class OAuth2ServerAutoConfiguration {
+         @ConditionalOnMissingBean
+         @ConditionalOnBean(OAuth2ClientManager.class)
+         public OAuth2AuthorizeController oAuth2AuthorizeController(OAuth2GrantService grantService,
+-                                                                   OAuth2ClientManager clientManager) {
+-            return new OAuth2AuthorizeController(grantService, clientManager);
++                                                                   OAuth2ClientManager clientManager,
++                                                                   OAuth2Properties properties) {
++            return new OAuth2AuthorizeController(grantService, clientManager, properties);
+         }
+ 
+     }
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java
+index 0c7a3c4..9f464c3 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java
+@@ -23,4 +23,6 @@ public class AuthorizationCodeCache implements Serializable {
+ 
+     private String scope;
+ 
+-}
+\ No newline at end of file
++    private String redirectUri;
++
++}
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeTokenRequest.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeTokenRequest.java
+index 896981b..513e88f 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeTokenRequest.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeTokenRequest.java
+@@ -28,4 +28,8 @@ public class AuthorizationCodeTokenRequest extends OAuth2Request {
+     public Optional<String> scope() {
+         return getParameter(OAuth2Constants.scope).map(String::valueOf);
+     }
++
++    public Optional<String> redirectUri() {
++        return getParameter(OAuth2Constants.redirect_uri).map(String::valueOf);
++    }
+ }
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java
+index d63b568..f8aef89 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java
+@@ -55,6 +55,10 @@ public class DefaultAuthorizationCodeGranter implements AuthorizationCodeGranter
+         request.getParameter(OAuth2Constants.scope).map(String::valueOf).ifPresent(codeCache::setScope);
+         codeCache.setCode(code);
+         codeCache.setClientId(client.getClientId());
++        codeCache.setRedirectUri(request
++                                         .getParameter(OAuth2Constants.redirect_uri)
++                                         .map(String::valueOf)
++                                         .orElse(client.getRedirectUrl()));
+ 
+         ScopePredicate permissionPredicate = OAuth2ScopeUtils.createScopePredicate(codeCache.getScope());
+ 
+@@ -92,6 +96,12 @@ public class DefaultAuthorizationCodeGranter implements AuthorizationCodeGranter
+                     if (!request.getClient().getClientId().equals(cache.getClientId())) {
+                         return Mono.error(new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_ID));
+                     }
++                    String redirectUri = request
++                            .redirectUri()
++                            .orElse(request.getClient().getRedirectUrl());
++                    if (!request.getClient().isSameRedirectUri(redirectUri, cache.getRedirectUri())) {
++                        return Mono.error(new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI));
++                    }
+                     return accessTokenManager
+                             .createAccessToken(cache.getClientId(), cache.getAuthentication(), false)
+                             .flatMap(token -> new OAuth2GrantedEvent(request.getClient(),
+diff --git a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java
+index 20d68f0..54705bc 100644
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java
+@@ -16,6 +16,7 @@ import org.hswebframework.web.oauth2.server.AccessToken;
+ import org.hswebframework.web.oauth2.server.OAuth2Client;
+ import org.hswebframework.web.oauth2.server.OAuth2ClientManager;
+ import org.hswebframework.web.oauth2.server.OAuth2GrantService;
++import org.hswebframework.web.oauth2.server.OAuth2Properties;
+ import org.hswebframework.web.oauth2.server.code.AuthorizationCodeRequest;
+ import org.hswebframework.web.oauth2.server.code.AuthorizationCodeTokenRequest;
+ import org.hswebframework.web.oauth2.server.credential.ClientCredentialRequest;
+@@ -49,6 +50,8 @@ public class OAuth2AuthorizeController {
+ 
+     private final OAuth2ClientManager clientManager;
+ 
++    private final OAuth2Properties properties;
++
+     @GetMapping(value = "/authorize", params = "response_type=code")
+     @Operation(summary = "申请授权码,并获取重定向地址", parameters = {
+             @Parameter(name = "client_id", required = true),
+@@ -66,7 +69,12 @@ public class OAuth2AuthorizeController {
+                         .getOAuth2Client(param.get("client_id"))
+                         .flatMap(client -> {
+                             String redirectUri = param.getOrDefault("redirect_uri", client.getRedirectUrl());
+-                            client.validateRedirectUri(redirectUri);
++                            if (redirectUri != null) {
++                                redirectUri = redirectUri.trim();
++                            }
++                            client.validateRedirectUri(redirectUri, properties.getRedirectUriValidationMode());
++                            final String validatedRedirectUri = redirectUri;
++                            param.put("redirect_uri", validatedRedirectUri);
+                             return oAuth2GrantService
+                                     .authorizationCode()
+                                     .requestCode(new AuthorizationCodeRequest(client, auth, param))
+@@ -75,7 +83,7 @@ public class OAuth2AuthorizeController {
+                                                 .ofNullable(param.get("state"))
+                                                 .ifPresent(state -> response.with("state", state));
+                                     })
+-                                    .map(response -> buildRedirect(redirectUri, response.getParameters()));
++                                    .map(response -> buildRedirect(validatedRedirectUri, response.getParameters()));
+                         }))
+                 .onErrorResume(error -> {
+                     String redirectUri = param.get("redirect_uri");
+@@ -105,6 +113,12 @@ public class OAuth2AuthorizeController {
+                         .getOAuth2Client(param.get("client_id"))
+                         .flatMap(client -> {
+                             String redirectUri = param.getOrDefault("redirect_uri", client.getRedirectUrl());
++                            if (redirectUri != null) {
++                                redirectUri = redirectUri.trim();
++                            }
++                            client.validateRedirectUri(redirectUri, properties.getRedirectUriValidationMode());
++                            final String validatedRedirectUri = redirectUri;
++                            param.put("redirect_uri", validatedRedirectUri);
+                             return oAuth2GrantService
+                                     .authorizationCode()
+                                     .requestCode(new AuthorizationCodeRequest(client, auth, param))
+@@ -113,7 +127,7 @@ public class OAuth2AuthorizeController {
+                                                 .ofNullable(param.get("state"))
+                                                 .ifPresent(state -> response.with("state", state));
+                                     })
+-                                    .map(response -> buildRedirect(redirectUri, response.getParameters()));
++                                    .map(response -> buildRedirect(validatedRedirectUri, response.getParameters()));
+                         }));
+     }
+ 

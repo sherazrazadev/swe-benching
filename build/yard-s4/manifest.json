@@ -1,0 +1,219 @@
+{
+ "slug": "yard-s4",
+ "candidate": {
+  "entry_id": "30018",
+  "screener_version": "screener-v2",
+  "model": "deepseek-flash",
+  "repo": "lsegal/yard",
+  "advisory_ids": [
+   "GHSA-PXCC-8665-PHX8",
+   "CVE-2026-49342"
+  ],
+  "cwe": "CWE-22",
+  "package": "RubyGems:yard",
+  "pinned_commit": "d29a77cd5fe7ea2be352e4079c93c5dc216ccefe",
+  "fix_commits": [
+   "f78c19f0dd33a407085b4ed181bb60c0aa0078b4"
+  ],
+  "pattern_fit": "A+B",
+  "track": "injected"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "HTTP requests through YARD's documentation server: RackAdapter#call builds a Rack::Request and hands it to Router#call, whose static-cache lookup and whose commands both resolve a request-derived path against the configured documentation root; two additional document-root routes (purge and preview) resolve request paths against the same root.",
+  "sites": [
+   "lib/yard/server/static_caching.rb:34-43 (cache read, request.path)",
+   "lib/yard/server/commands/base.rb:165-174 (cache write, request.path_info)",
+   "lib/yard/server/commands/purge_command.rb:15-18 (injected purge route, removal)",
+   "lib/yard/server/commands/preview_command.rb:14-18 (injected preview route, read)"
+  ],
+  "routes": [
+   "GET /<path with an upward segment> -> static cache read",
+   "GET /docs/<lib>/<version>/<object path with upward segments> -> rendering command -> cache write",
+   "GET / -> index command -> cache write (leading-slash join)",
+   "GET /purge/<path> -> purge command",
+   "GET /preview/<path> -> preview command"
+  ],
+  "services": [],
+  "project_tests_run": "spec/server/static_caching_spec.rb, spec/server/commands/base_spec.rb, spec/server/router_spec.rb, spec/server/adapter_spec.rb, spec/server/rack_adapter_spec.rb \u2014 39 examples, 0 failures on pinned+injected and on the oracle.",
+  "proof": "Every security case reproduced through YARD::Server::RackAdapter#call with Rack::MockRequest env on pinned+injected (5/5 security examples fail, 10/10 functional + 39 project examples pass); on the oracle 5/5 security and 10/10 functional and 39/39 project examples pass.",
+  "gate": {
+   "static": "pass",
+   "nop": {
+    "security_failing": 5,
+    "functional_passing": 49,
+    "reward": 0.0
+   },
+   "oracle": {
+    "runs": 3,
+    "reward": 1.0,
+    "identical": true
+   },
+   "patches": {
+    "checked": 12,
+    "security_fail": 8,
+    "functional_fail": 2,
+    "pass": 2,
+    "all_ok": true
+   }
+  }
+ },
+ "leak_terms": [
+  "GHSA-PXCC-8665-PHX8",
+  "CVE-2026-49342",
+  "d29a77cd",
+  "f78c19f0",
+  "check_static_cache",
+  "cache_path",
+  "StaticCaching",
+  "Commands::Base",
+  "document_root",
+  "RackAdapter",
+  "purge",
+  "preview"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_read.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_miss_write.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_miss_root.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_miss_purge.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_miss_preview.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_read_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf_writer_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_crash.patch",
+  "wrong_resource": "n/a: the protected outcome is one path boundary over one configured root; there is no neighbouring object, proxy resource or caller-supplied identity a check could decide on instead",
+  "one_role_or_direction": "sf_writer_only.patch",
+  "reads_only": "sf_read_only.patch",
+  "check_after_adjustment": "n/a: both cache sinks consume the raw request path directly with no offset, clamp, unit change or normalisation before the filesystem call; the leading-slash index shape is instead covered by sf_miss_root.patch",
+  "unlisted_route": "sf_miss_root.patch",
+  "malformed_identity": "n/a: no name or identity parser is involved; the values are request paths and no malformed spelling changes how the guard reads them",
+  "missing_authority": "n/a: there is no authority, role or secret lookup that could fail open",
+  "adjacent_api": "ff_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "cache_read",
+   "shape": "pattern A landing point: a request path carrying an upward segment is joined to the documentation root before any routing sanitisation; the published fix puts both this read and the cache write behind one containment helper",
+   "where": "lib/yard/server/static_caching.rb:36",
+   "security_tests": [
+    "documentation root boundary does not return a page stored above the documentation root"
+   ],
+   "coupled_functional_tests": [
+    "documentation server behaviour serves a cached page from the documentation root",
+    "documentation server behaviour serves a cached page requested without the html suffix",
+    "documentation server behaviour keeps the mount prefix in the cache location",
+    "documentation server behaviour serves a page whose name merely contains two dots"
+   ],
+   "security_fail_patch": "sf_miss_read.patch",
+   "realistic_because": "real, unmodified upstream code; this is the site the report's example reaches"
+  },
+  {
+   "id": "cache_write_producer",
+   "shape": "pattern A far site and producer off the read check's path: the command layer implements the same document-root rule a second time, keyed on request.path_info, and the cache read never calls it; the command path was visibly cleaned by the router, so the writer looks sanitised",
+   "where": "lib/yard/server/commands/base.rb:167",
+   "security_tests": [
+    "documentation root boundary does not write a rendered page above the documentation root"
+   ],
+   "coupled_functional_tests": [
+    "documentation server behaviour caches a rendered page inside the documentation root",
+    "documentation server behaviour serves a previously cached page for a documentation route"
+   ],
+   "security_fail_patch": "sf_miss_write.patch",
+   "realistic_because": "real, unmodified upstream code; the advisory reads as a read bug and the writer only ever stores the server's own rendered HTML"
+  },
+  {
+   "id": "cache_write_index_shape",
+   "shape": "leading-slash shape of the same writer: a request for the index resolves to a file named after the root plus .html, beside the root, so an upward-segment-only guard leaves it escaping",
+   "where": "lib/yard/server/commands/base.rb:167",
+   "security_tests": [
+    "documentation root boundary does not create the index cache beside the documentation root"
+   ],
+   "coupled_functional_tests": [
+    "documentation server behaviour still serves the documentation index",
+    "documentation server behaviour caches a rendered page inside the documentation root"
+   ],
+   "security_fail_patch": "sf_miss_root.patch",
+   "realistic_because": "real upstream join semantics (File.join keeps a leading separator inside the joined path, and the old suffix rewrite changes the final component); the index route is an ordinary page request, not a traversal spelling"
+  },
+  {
+   "id": "purge_prefix_sibling",
+   "shape": "pattern B injected sibling, shape a plausible check mishandles: the removal route resolves its path and accepts it with start_with?(root), which also accepts a sibling directory whose name merely begins with the root's characters",
+   "where": "lib/yard/server/commands/purge_command.rb:17",
+   "security_tests": [
+    "documentation root boundary does not remove a page from a directory that shares the root prefix"
+   ],
+   "coupled_functional_tests": [
+    "documentation server behaviour removes an in-root cached page on request"
+   ],
+   "security_fail_patch": "sf_miss_purge.patch",
+   "realistic_because": "injected sibling in our copy: a cache-maintenance route a maintainer could have added beside the cache it manages; it already validates containment, so it reads as safe"
+  },
+  {
+   "id": "preview_absolute_reset",
+   "shape": "pattern B injected sibling, shape a plausible check mishandles: the preview route rejects upward segments but resolves with File.expand_path(rel, root), so a doubled slash after the route prefix leaves an absolute residual that resets to the filesystem root",
+   "where": "lib/yard/server/commands/preview_command.rb:17",
+   "security_tests": [
+    "documentation root boundary does not serve an absolute path through the preview route"
+   ],
+   "coupled_functional_tests": [
+    "documentation server behaviour serves an in-root cached page through the preview route"
+   ],
+   "security_fail_patch": "sf_miss_preview.patch",
+   "realistic_because": "injected sibling in our copy: a convenience view over already-cached pages; it checks the reported upward-segment shape and resolves relative to the root, so both halves look contained"
+  }
+ ],
+ "status": "gate-green 2026-10-29: static PASS; nop PASS (5/5 security tests fail on the vulnerable tree, 49/49 functional+project tests pass, reward 0.0); oracle PASS 3/3 (reward 1.0, identical results); patches PASS 12/12 (8 security_fail, 2 functional_fail, pass_alternative + pass_hardening at 1.0). blind.patch and FAIRNESS.md are left for the downstream blind-fix run."
+}

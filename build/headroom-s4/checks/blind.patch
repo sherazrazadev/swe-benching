@@ -1,0 +1,306 @@
+diff -ruN a/headroom/proxy/handlers/openai.py b/headroom/proxy/handlers/openai.py
+--- a/headroom/proxy/handlers/openai.py	2026-10-29 13:10:57.000000000 +0000
++++ b/headroom/proxy/handlers/openai.py	2026-10-29 13:36:39.388032514 +0000
+@@ -29,6 +29,7 @@
+     extract_tags,
+     jitter_delay_ms,
+ )
++from headroom.proxy.origin_policy import current_policy, header_value
+ from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+ from headroom.proxy.ws_session_registry import (
+     TerminationCause,
+@@ -3533,6 +3534,43 @@
+                 },
+             )
+ 
++    async def _reject_untrusted_browser_origin(
++        self,
++        websocket: WebSocket,
++        request_id: str = "-",
++    ) -> bool:
++        """Refuse an upgrade whose browser ``Origin`` the proxy does not trust.
++
++        Returns True when the upgrade was refused. The check runs before the
++        client is accepted and before any provider dial, so a refused request
++        gets a clean close and opens no upstream session.
++
++        Native clients (Codex CLI, SDKs) send no ``Origin`` and pass; a
++        browser origin must be on the operator's allowlist or on the local
++        machine (see :mod:`headroom.proxy.origin_policy`). The policy object is
++        the one built with the app, so the WebSocket gate applies exactly the
++        same configuration as the CORS middleware.
++        """
++        headers = dict(websocket.headers)
++        origin = header_value(headers, "origin")
++        policy = getattr(self, "browser_origin_policy", None)
++        if policy is None:
++            # Handlers constructed outside ``create_app`` (unit tests) still
++            # use the same loader the app builder uses.
++            policy = current_policy()
++        if policy.allows(origin):
++            return False
++        url = getattr(websocket, "url", None)
++        path = getattr(url, "path", "") if url is not None else ""
++        logger.warning(
++            "event=websocket_origin_refused request_id=%s path=%s origin=%r",
++            request_id,
++            path or "unknown",
++            origin,
++        )
++        await websocket.close(code=1008, reason="origin not allowed")
++        return True
++
+     async def handle_openai_responses_ws(self, websocket: WebSocket) -> None:
+         """WebSocket proxy for /v1/responses (Codex gpt-5.4+).
+ 
+@@ -3544,7 +3582,12 @@
+         4. Compresses eligible `response.create` text through the Python
+            ContentRouter path, then sends the request upstream
+         5. Relays all subsequent messages bidirectionally
++
++        Every upgrade route for the Responses relay dispatches here, so the
++        browser-origin gate below covers all of them.
+         """
++        if await self._reject_untrusted_browser_origin(websocket):
++            return
+         try:
+             import websockets
+         except ImportError:
+@@ -5749,6 +5792,12 @@
+         """Open the provider session and pump frames in both directions."""
+         import websockets
+ 
++        # Same browser-origin gate as the shared Responses handler, applied
++        # before accept() and before the provider dial so the thin relays
++        # (legacy handshake, dashboard relay) cannot be used as a bypass.
++        if await self._reject_untrusted_browser_origin(websocket, request_id):
++            return
++
+         ws_headers = dict(websocket.headers)
+         _hop_headers = {
+             "host",
+diff -ruN a/headroom/proxy/origin_policy.py b/headroom/proxy/origin_policy.py
+--- a/headroom/proxy/origin_policy.py	1970-01-01 00:00:00.000000000 +0000
++++ b/headroom/proxy/origin_policy.py	2026-10-29 13:37:06.775434409 +0000
+@@ -0,0 +1,174 @@
++"""The proxy's browser-origin policy, shared by every browser-facing surface.
++
++The proxy exposes two browser reachable interfaces: the HTTP API (guarded by
++the CORS middleware) and the Responses WebSocket relays (upgrades). Both must
++answer the same question — *may this browser origin talk to the proxy?* — from
++the same operator configuration. This module is that single answer, so the
++HTTP gate and the WebSocket gate cannot drift apart.
++
++Operator configuration
++----------------------
++``HEADROOM_CORS_ORIGINS`` is the browser-access configuration: a
++comma-separated list of origins. A single ``*`` in the list allows every
++browser origin. When it is unset (or blank) the browser-access default is the
++local machine: an origin whose host is a loopback name or address, on any
++port. An explicit list replaces that local default.
++
++Requests that carry no ``Origin`` at all are not browser requests (native
++CLIs and SDKs omit it) and are always allowed; that decision belongs to the
++callers, not to this policy.
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping
++from urllib.parse import urlsplit
++
++from headroom.proxy.loopback_guard import is_loopback_host
++
++__all__ = [
++    "CORS_ORIGINS_ENV",
++    "DEFAULT_LOOPBACK_ORIGIN_REGEX",
++    "BrowserOriginPolicy",
++    "current_policy",
++    "header_value",
++]
++
++#: Environment variable holding the comma-separated browser-access allowlist.
++CORS_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
++
++#: CORS equivalent of the default local-machine policy (the HTTP middleware
++#: needs a regex; the WebSocket gate parses the origin instead).
++DEFAULT_LOOPBACK_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
++
++# Default ports, so ``https://host`` and ``https://host:443`` compare equal.
++_WEB_SCHEME_PORTS: dict[str, int] = {
++    "http": 80,
++    "https": 443,
++    "ws": 80,
++    "wss": 443,
++}
++
++
++def header_value(headers: Mapping[str, str], name: str) -> str | None:
++    """Case-insensitive lookup over a plain dict or Starlette ``Headers``.
++
++    ``dict(websocket.headers)`` is normalised to lower case by Starlette, but
++    hand-built header maps in unit tests are not, so match on the name's case
++    explicitly rather than relying on the mapping implementation.
++    """
++    try:
++        value = headers.get(name)
++    except AttributeError:  # pragma: no cover - defensive for odd mappings
++        value = None
++    if value is not None:
++        return value
++    lowered = name.lower()
++    try:
++        items = headers.items()
++    except AttributeError:  # pragma: no cover - defensive for odd mappings
++        return None
++    for key, candidate in items:
++        if key.lower() == lowered:
++            return candidate
++    return None
++
++
++def _canonical_origin(value: str | None) -> tuple[str, str, int] | None:
++    """Return ``(scheme, host, port)`` for a browser ``Origin`` value.
++
++    ``None`` means "not a usable web origin": the opaque ``null`` origin, a
++    value with no host (``http://``), a non-web scheme, a malformed value the
++    URL parser rejects, or one carrying userinfo, a path, a query or a
++    fragment. Hosts are compared exactly — ``localhost.evil.example`` is a
++    different host from ``localhost`` and must never be treated as loopback.
++    """
++    if value is None:
++        return None
++    candidate = value.strip()
++    if not candidate:
++        return None
++    try:
++        parts = urlsplit(candidate)
++        scheme = parts.scheme.lower()
++        host = parts.hostname
++        port = parts.port
++    except ValueError:
++        # e.g. an unterminated IPv6 literal or a non-numeric port.
++        return None
++    if scheme not in _WEB_SCHEME_PORTS or not host:
++        return None
++    if parts.username is not None or parts.password is not None:
++        return None
++    if parts.path not in ("", "/") or parts.query or parts.fragment:
++        return None
++    if port is None:
++        port = _WEB_SCHEME_PORTS[scheme]
++    # A trailing dot is the DNS root label, not a different host.
++    return (scheme, host.lower().rstrip("."), port)
++
++
++class BrowserOriginPolicy:
++    """Decides whether a browser origin may use the proxy's browser surfaces.
++
++    ``configured`` is the operator's allowlist, or ``None`` when the local
++    machine default applies. The policy is immutable once built.
++    """
++
++    __slots__ = ("_allowed", "_configured")
++
++    def __init__(self, configured: tuple[str, ...] | None) -> None:
++        self._configured = configured
++        self._allowed = frozenset(
++            parsed
++            for parsed in (_canonical_origin(entry) for entry in (configured or ()))
++            if parsed is not None
++        )
++
++    @property
++    def configured(self) -> tuple[str, ...] | None:
++        """The explicit allowlist, or ``None`` for the local-machine default."""
++        return self._configured
++
++    @property
++    def allows_any_origin(self) -> bool:
++        """True when the operator opted into the ``*`` wildcard."""
++        return self._configured is not None and "*" in self._configured
++
++    def allows(self, origin_header: str | None) -> bool:
++        """True when a request carrying this ``Origin`` may proceed.
++
++        An absent or blank ``Origin`` identifies no origin — that is a native
++        client, not a browser — and is allowed. Any other value must parse as
++        a web origin the policy trusts.
++        """
++        if origin_header is None or not origin_header.strip():
++            return True
++        if self.allows_any_origin:
++            return True
++        parsed = _canonical_origin(origin_header)
++        if parsed is None:
++            return False
++        if self._configured is None:
++            return is_loopback_host(parsed[1])
++        return parsed in self._allowed
++
++    # -- CORS middleware view -------------------------------------------------
++
++    def cors_origins(self) -> list[str]:
++        """``allow_origins`` for :class:`CORSMiddleware`."""
++        return list(self._configured) if self._configured is not None else []
++
++    def cors_origin_regex(self) -> str | None:
++        """``allow_origin_regex`` for :class:`CORSMiddleware`."""
++        return None if self._configured is not None else DEFAULT_LOOPBACK_ORIGIN_REGEX
++
++
++def current_policy(environ: Mapping[str, str] | None = None) -> BrowserOriginPolicy:
++    """Build the policy from the current browser-access configuration."""
++    source = os.environ if environ is None else environ
++    raw = (source.get(CORS_ORIGINS_ENV) or "").strip()
++    if not raw:
++        return BrowserOriginPolicy(None)
++    return BrowserOriginPolicy(tuple(part.strip() for part in raw.split(",") if part.strip()))
+diff -ruN a/headroom/proxy/server.py b/headroom/proxy/server.py
+--- a/headroom/proxy/server.py	2026-10-29 13:10:53.000000000 +0000
++++ b/headroom/proxy/server.py	2026-10-29 13:36:18.530846984 +0000
+@@ -144,6 +144,7 @@
+     is_token_mode,
+     normalize_proxy_mode,
+ )
++from headroom.proxy.origin_policy import current_policy
+ from headroom.proxy.probe_recorder import probe_recorder_from_env
+ from headroom.proxy.project_context import (
+     classify_project,
+@@ -562,6 +563,11 @@
+     def __init__(self, config: ProxyConfig):
+         self.config = config
+         self.config.mode = normalize_proxy_mode(self.config.mode)
++        # Browser-origin policy, loaded once from the browser-access
++        # configuration (HEADROOM_CORS_ORIGINS / the local-machine default).
++        # The CORS middleware and the WebSocket origin gate both consume this
++        # same object, so an operator's allowlist governs every surface.
++        self.browser_origin_policy = current_policy()
+         pipeline_extensions = list(config.pipeline_extensions or [])
+         probe_recorder = probe_recorder_from_env()
+         if probe_recorder is not None:
+@@ -2302,18 +2308,13 @@
+     # layer, not in ProxyConfig). Set HEADROOM_CORS_ORIGINS (comma-separated)
+     # to pin an explicit allowlist for Docker or remote-dashboard deployments;
+     # "*" restores the old wildcard behaviour if the operator accepts the risk.
+-    _default_loopback_origin_regex = r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
+-    _cors_origins_env = os.environ.get("HEADROOM_CORS_ORIGINS", "").strip()
+-    if _cors_origins_env:
+-        _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+-        _cors_allow_origin_regex: str | None = None
+-    else:
+-        _cors_allow_origins = []
+-        _cors_allow_origin_regex = _default_loopback_origin_regex
++    # The same policy object gates the Responses WebSocket upgrades, so the
++    # HTTP and WebSocket browser surfaces share one configuration.
++    _browser_origin_policy = proxy.browser_origin_policy
+     app.add_middleware(
+         CORSMiddleware,
+-        allow_origins=_cors_allow_origins,
+-        allow_origin_regex=_cors_allow_origin_regex,
++        allow_origins=_browser_origin_policy.cors_origins(),
++        allow_origin_regex=_browser_origin_policy.cors_origin_regex(),
+         allow_credentials=False,
+         allow_methods=["GET", "POST"],
+         allow_headers=["Content-Type", "Authorization"],

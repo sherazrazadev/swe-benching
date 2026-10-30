@@ -1,0 +1,111 @@
+diff --git a/lib/yard/autoload.rb b/lib/yard/autoload.rb
+index ebe8eea0..76d7ded1 100644
+--- a/lib/yard/autoload.rb
++++ b/lib/yard/autoload.rb
+@@ -240,6 +240,8 @@ module YARD
+       autoload :ListCommand,          __p('server/commands/list_command')
+       autoload :LibraryCommand,       __p('server/commands/library_command')
+       autoload :LibraryIndexCommand,  __p('server/commands/library_index_command')
++      autoload :PreviewCommand,       __p('server/commands/preview_command')
++      autoload :PurgeCommand,         __p('server/commands/purge_command')
+       autoload :RootRequestCommand,   __p('server/commands/root_request_command')
+       autoload :SearchCommand,        __p('server/commands/search_command')
+       autoload :StaticFileCommand,    __p('server/commands/static_file_command')
+diff --git a/lib/yard/server/commands/preview_command.rb b/lib/yard/server/commands/preview_command.rb
+new file mode 100644
+index 00000000..96f8a546
+--- /dev/null
++++ b/lib/yard/server/commands/preview_command.rb
+@@ -0,0 +1,27 @@
++# frozen_string_literal: true
++
++module YARD
++  module Server
++    module Commands
++      # Serves a cached documentation page as a downloadable file.
++      class PreviewCommand < Base
++        def run
++          return not_found unless adapter.document_root
++
++          url = request.path_info.sub(%r{\A/preview/}, '')
++          return not_found if url.empty?
++
++          # Requests may not walk up out of the cached documentation tree.
++          return not_found if url.split(%r{[/\\]}).include?('..')
++
++          path = File.expand_path(url, adapter.document_root)
++          return not_found unless File.file?(path)
++
++          headers['Content-Type'] = 'text/html'
++          headers['Content-Disposition'] = 'attachment'
++          self.body = File.read(path)
++        end
++      end
++    end
++  end
++end
+diff --git a/lib/yard/server/commands/purge_command.rb b/lib/yard/server/commands/purge_command.rb
+new file mode 100644
+index 00000000..759697c9
+--- /dev/null
++++ b/lib/yard/server/commands/purge_command.rb
+@@ -0,0 +1,27 @@
++# frozen_string_literal: true
++
++module YARD
++  module Server
++    module Commands
++      # Removes a page from the static documentation cache so that the next
++      # request for it is rendered again from the current sources.
++      class PurgeCommand < Base
++        def run
++          return not_found unless adapter.document_root
++
++          url = request.path_info.sub(%r{\A/purge/?}, '')
++          return not_found if url.empty?
++
++          path = File.expand_path(url, adapter.document_root)
++          # Only cached documentation may be removed.
++          return not_found unless path.start_with?(adapter.document_root)
++          return not_found unless File.file?(path)
++
++          File.delete(path)
++          headers['Content-Type'] = 'text/plain'
++          self.body = "Purged #{url}"
++        end
++      end
++    end
++  end
++end
+diff --git a/lib/yard/server/router.rb b/lib/yard/server/router.rb
+index c12753ce..1b0f5925 100644
+--- a/lib/yard/server/router.rb
++++ b/lib/yard/server/router.rb
+@@ -105,6 +105,8 @@ module YARD
+       def route(path = request.path_info)
+         path = path.gsub(%r{//+}, '/').gsub(%r{^/|/$}, '')
+         return route_index if path.empty? || path == docs_prefix
++        return route_purge if path =~ %r{\Apurge(/|$)}
++        return route_preview if path =~ %r{\Apreview(/|$)}
+         case path
+         when %r{^(#{docs_prefix}|#{list_prefix}|#{search_prefix}|#{static_prefix})(/.*|$)}
+           prefix = $1
+@@ -151,6 +153,18 @@ module YARD
+         end
+       end
+ 
++      # Routes cache maintenance requests to {Commands::PurgeCommand}
++      # @return (see #route)
++      def route_purge
++        Commands::PurgeCommand.new(adapter.options).call(request)
++      end
++
++      # Routes cached-page preview requests to {Commands::PreviewCommand}
++      # @return (see #route)
++      def route_preview
++        Commands::PreviewCommand.new(adapter.options).call(request)
++      end
++
+       # Routes requests from {#list_prefix} and calls the appropriate command
+       # @param (see #route_docs)
+       # @return (see #route_docs)

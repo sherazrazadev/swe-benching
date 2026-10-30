@@ -1,0 +1,282 @@
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java
+@@ -31,11 +31,19 @@
+     private String userId;
+ 
+     public void validateRedirectUri(String redirectUri) {
+-        if (ObjectUtils.isEmpty(redirectUri) || (!redirectUri.startsWith(this.redirectUrl))) {
++        if (!RedirectUriMatcher.isRegisteredTarget(this.redirectUrl, redirectUri)) {
+             throw new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI);
+         }
+     }
+ 
++    /**
++     * Whether the two targets name the very same callback. Used to bind an authorization code to
++     * the callback it was issued for.
++     */
++    public boolean isSameRedirectUri(String redirectUri, String anotherRedirectUri) {
++        return RedirectUriMatcher.isSameTarget(redirectUri, anotherRedirectUri);
++    }
++
+     public void validateSecret(String secret) {
+         if (ObjectUtils.isEmpty(secret) || (!secret.equals(this.clientSecret))) {
+             throw new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_SECRET);
+--- /dev/null
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/RedirectUriMatcher.java
+@@ -0,0 +1,145 @@
++package org.hswebframework.web.oauth2.server;
++
++import org.springframework.util.StringUtils;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.Objects;
++
++/**
++ * Compares a redirect target supplied by a caller with the callback registered for a client.
++ *
++ * <p>The comparison is made on the endpoint components (scheme, user-info, host and port) and then
++ * on the path and query. Targets that cannot be parsed, and targets carrying a fragment, are never
++ * acceptable. Two modes are offered: {@link #isRegisteredTarget(String, String)} keeps the
++ * permissive path/query behaviour the server has always accepted (a deeper path below the
++ * registered one, additional query parameters, a sub-path of a registered bare origin), while
++ * {@link #isSameTarget(String, String)} demands that both values describe the same target, which is
++ * what binding an authorization code to the callback it was issued for requires.
++ */
++public final class RedirectUriMatcher {
++
++    private RedirectUriMatcher() {
++    }
++
++    /**
++     * @param registeredUrl the callback registered for the client
++     * @param requestedUrl  the target supplied by the caller
++     * @return whether the requested target may receive the authorization result
++     */
++    public static boolean isRegisteredTarget(String registeredUrl, String requestedUrl) {
++        if (!StringUtils.hasText(registeredUrl) || !StringUtils.hasText(requestedUrl)) {
++            return false;
++        }
++        URI registered = parse(registeredUrl);
++        URI requested = parse(requestedUrl);
++        if (registered == null || requested == null) {
++            return false;
++        }
++        if (hasFragment(registered) || hasFragment(requested)) {
++            return false;
++        }
++        registered = registered.normalize();
++        requested = requested.normalize();
++
++        if (registered.isOpaque() || requested.isOpaque()) {
++            return isSameTarget(registered, requested);
++        }
++        if (!sameEndpoint(registered, requested)) {
++            return false;
++        }
++        return pathCovered(registered.getPath(), requested.getPath())
++                && queryCovered(registered.getRawQuery(), requested.getRawQuery());
++    }
++
++    /**
++     * @param recordedUrl  the target recorded when the authorization code was issued
++     * @param presentedUrl the target presented when redeeming the code
++     * @return whether the presented target is exactly the one the code was issued for
++     */
++    public static boolean isSameTarget(String recordedUrl, String presentedUrl) {
++        if (!StringUtils.hasText(recordedUrl) || !StringUtils.hasText(presentedUrl)) {
++            return false;
++        }
++        URI recorded = parse(recordedUrl);
++        URI presented = parse(presentedUrl);
++        if (recorded == null || presented == null) {
++            return false;
++        }
++        if (hasFragment(recorded) || hasFragment(presented)) {
++            return false;
++        }
++        return isSameTarget(recorded.normalize(), presented.normalize());
++    }
++
++    private static boolean isSameTarget(URI recorded, URI presented) {
++        if (recorded.isOpaque() || presented.isOpaque()) {
++            return recorded.isOpaque()
++                    && presented.isOpaque()
++                    && equalsIgnoreCase(recorded.getScheme(), presented.getScheme())
++                    && Objects.equals(recorded.getRawSchemeSpecificPart(),
++                                      presented.getRawSchemeSpecificPart());
++        }
++        return sameEndpoint(recorded, presented)
++                && Objects.equals(pathOrEmpty(recorded), pathOrEmpty(presented))
++                && Objects.equals(recorded.getRawQuery(), presented.getRawQuery());
++    }
++
++    private static boolean sameEndpoint(URI left, URI right) {
++        if (!equalsIgnoreCase(left.getScheme(), right.getScheme())) {
++            return false;
++        }
++        if (left.getHost() == null || right.getHost() == null) {
++            // Without a parsed host the authority is only comparable as a whole; this also stops
++            // an authority the URI parser refuses from silently matching another such authority.
++            return Objects.equals(left.getRawAuthority(), right.getRawAuthority());
++        }
++        return equalsIgnoreCase(left.getHost(), right.getHost())
++                && Objects.equals(left.getUserInfo(), right.getUserInfo())
++                && left.getPort() == right.getPort();
++    }
++
++    private static boolean pathCovered(String registeredPath, String requestedPath) {
++        String registered = registeredPath == null ? "" : registeredPath;
++        String requested = requestedPath == null ? "" : requestedPath;
++        if (registered.isEmpty()) {
++            return requested.isEmpty() || requested.startsWith("/");
++        }
++        if (requested.equals(registered)) {
++            return true;
++        }
++        if (registered.endsWith("/")) {
++            return requested.startsWith(registered);
++        }
++        return requested.startsWith(registered + "/");
++    }
++
++    private static boolean queryCovered(String registeredQuery, String requestedQuery) {
++        if (!StringUtils.hasLength(registeredQuery)) {
++            return true;
++        }
++        return StringUtils.hasLength(requestedQuery)
++                && (requestedQuery.equals(registeredQuery)
++                || requestedQuery.startsWith(registeredQuery + "&"));
++    }
++
++    private static URI parse(String value) {
++        try {
++            return new URI(value.trim());
++        } catch (URISyntaxException e) {
++            return null;
++        }
++    }
++
++    private static boolean hasFragment(URI uri) {
++        return StringUtils.hasLength(uri.getRawFragment());
++    }
++
++    private static String pathOrEmpty(URI uri) {
++        return uri.getPath() == null ? "" : uri.getPath();
++    }
++
++    private static boolean equalsIgnoreCase(String left, String right) {
++        return left == null ? right == null : left.equalsIgnoreCase(right);
++    }
++}
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java
+@@ -23,4 +23,7 @@
+ 
+     private String scope;
+ 
++    //授权码签发时使用的重定向地址,兑换token时必须提供相同的地址
++    private String redirectUri;
++
+ }
+\ No newline at end of file
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java
+@@ -55,6 +55,11 @@
+         request.getParameter(OAuth2Constants.scope).map(String::valueOf).ifPresent(codeCache::setScope);
+         codeCache.setCode(code);
+         codeCache.setClientId(client.getClientId());
++        codeCache.setRedirectUri(request
++                                         .getParameter(OAuth2Constants.redirect_uri)
++                                         .map(String::valueOf)
++                                         .map(String::trim)
++                                         .orElseGet(client::getRedirectUrl));
+ 
+         ScopePredicate permissionPredicate = OAuth2ScopeUtils.createScopePredicate(codeCache.getScope());
+ 
+@@ -92,6 +97,19 @@
+                     if (!request.getClient().getClientId().equals(cache.getClientId())) {
+                         return Mono.error(new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_ID));
+                     }
++                    //兑换token时提供的重定向地址必须与签发授权码时使用的地址一致
++                    OAuth2Client client = request.getClient();
++                    String recordedRedirectUri = cache.getRedirectUri() == null
++                            ? client.getRedirectUrl()
++                            : cache.getRedirectUri();
++                    String presentedRedirectUri = request
++                            .getParameter(OAuth2Constants.redirect_uri)
++                            .map(String::valueOf)
++                            .map(String::trim)
++                            .orElseGet(client::getRedirectUrl);
++                    if (!client.isSameRedirectUri(presentedRedirectUri, recordedRedirectUri)) {
++                        return Mono.error(new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI));
++                    }
+                     return accessTokenManager
+                             .createAccessToken(cache.getClientId(), cache.getAuthentication(), false)
+                             .flatMap(token -> new OAuth2GrantedEvent(request.getClient(),
+--- a/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java
++++ b/hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java
+@@ -11,6 +11,7 @@
+ import org.hswebframework.web.authorization.annotation.Authorize;
+ import org.hswebframework.web.authorization.exception.UnAuthorizedException;
+ import org.hswebframework.web.oauth2.ErrorType;
++import org.hswebframework.web.oauth2.OAuth2Constants;
+ import org.hswebframework.web.oauth2.OAuth2Exception;
+ import org.hswebframework.web.oauth2.server.AccessToken;
+ import org.hswebframework.web.oauth2.server.OAuth2Client;
+@@ -65,8 +66,9 @@
+                 .flatMap(auth -> this
+                         .getOAuth2Client(param.get("client_id"))
+                         .flatMap(client -> {
+-                            String redirectUri = param.getOrDefault("redirect_uri", client.getRedirectUrl());
++                            String redirectUri = resolveRedirectUri(client, param);
+                             client.validateRedirectUri(redirectUri);
++                            param.put(OAuth2Constants.redirect_uri, redirectUri);
+                             return oAuth2GrantService
+                                     .authorizationCode()
+                                     .requestCode(new AuthorizationCodeRequest(client, auth, param))
+@@ -76,15 +78,7 @@
+                                                 .ifPresent(state -> response.with("state", state));
+                                     })
+                                     .map(response -> buildRedirect(redirectUri, response.getParameters()));
+-                        }))
+-                .onErrorResume(error -> {
+-                    String redirectUri = param.get("redirect_uri");
+-                    if (redirectUri == null) {
+-                        return Mono.error(error);
+-                    }
+-                    return Mono.just(buildRedirect(redirectUri,
+-                                                   Map.<String, Object>of("error", "access_denied")));
+-                });
++                        }));
+     }
+ 
+     @Deprecated
+@@ -104,7 +98,9 @@
+                 .flatMap(auth -> this
+                         .getOAuth2Client(param.get("client_id"))
+                         .flatMap(client -> {
+-                            String redirectUri = param.getOrDefault("redirect_uri", client.getRedirectUrl());
++                            String redirectUri = resolveRedirectUri(client, param);
++                            client.validateRedirectUri(redirectUri);
++                            param.put(OAuth2Constants.redirect_uri, redirectUri);
+                             return oAuth2GrantService
+                                     .authorizationCode()
+                                     .requestCode(new AuthorizationCodeRequest(client, auth, param))
+@@ -117,6 +113,16 @@
+                         }));
+     }
+ 
++    /**
++     * The target to return to: the one the caller asked for, or the client's registered callback
++     * when none was supplied. The value is trimmed before it is validated and stored so that the
++     * same address is used to build the redirect and to bind the authorization code to it.
++     */
++    private static String resolveRedirectUri(OAuth2Client client, Map<String, String> param) {
++        String redirectUri = param.getOrDefault(OAuth2Constants.redirect_uri, client.getRedirectUrl());
++        return redirectUri == null ? null : redirectUri.trim();
++    }
++
+     @GetMapping(value = "/token")
+     @Operation(summary = "(GET)申请token", parameters = {
+             @Parameter(name = "client_id"),

@@ -1,0 +1,474 @@
+diff --git a/internal/extclient/authed_client.go b/internal/extclient/authed_client.go
+index b0bcb41e..7d89ffd0 100644
+--- a/internal/extclient/authed_client.go
++++ b/internal/extclient/authed_client.go
+@@ -43,6 +43,12 @@ func NewAuthedAPIClient(host, token string) *AuthedAPIClient {
+ 	}
+ }
+ 
++// Host returns the trusted host that the authed API client sends
++// authenticated requests to.
++func (a *AuthedAPIClient) Host() string {
++	return a.host
++}
++
+ // SetHost sets the host for base host for the authed API client.
+ func (a *AuthedAPIClient) SetHost(host string) {
+ 	a.host = host
+diff --git a/internal/hcl/modules/credentials_source.go b/internal/hcl/modules/credentials_source.go
+index 80aa5a2c..bc4fca70 100644
+--- a/internal/hcl/modules/credentials_source.go
++++ b/internal/hcl/modules/credentials_source.go
+@@ -78,15 +78,7 @@ func (s *CredentialsSource) ForHost(host svchost.Hostname) (auth.HostCredentials
+ 		return HostCredentials{token: s.BaseCredentialSet.Token}, nil
+ 	}
+ 
+-	token := s.FetchToken(display)
+-	if token == "" {
+-		// Fall back to the configured Terraform Cloud/Enterprise token so module
+-		// sources served by the same account work without a separate credential
+-		// entry.
+-		token = s.BaseCredentialSet.Token
+-	}
+-
+-	return HostCredentials{token: token}, nil
++	return HostCredentials{token: s.FetchToken(display)}, nil
+ }
+ 
+ // StoreForHost is unimplemented but is required for the auth.CredentialsSource interface.
+diff --git a/internal/hcl/modules/registry.go b/internal/hcl/modules/registry.go
+index 47a81599..fc456d72 100644
+--- a/internal/hcl/modules/registry.go
++++ b/internal/hcl/modules/registry.go
+@@ -27,6 +27,14 @@ import (
+ 
+ var defaultRegistryHost = "registry.terraform.io"
+ 
++// sameCredentialHost reports whether a request target is the registry host the
++// credentials were issued for, ignoring case and any trailing dot. Credentials
++// are never attached to another host, even when a registry's service discovery
++// document points elsewhere.
++func sameCredentialHost(requestHost string, registryHost string) bool {
++	return strings.EqualFold(strings.TrimSuffix(requestHost, "."), strings.TrimSuffix(registryHost, "."))
++}
++
+ // validRegistryName is a regexp that matches valid registry identifier for namespaces, module names and targets
+ var validRegistryName = regexp.MustCompile("^[0-9A-Za-z-_]+$")
+ 
+@@ -159,7 +167,12 @@ func (d *Disco) DownloadLocation(moduleURL RegistryURL, version string) (string,
+ 	d.logger.Debug().Msgf("Looking up download URL for module %s from registry URL %s", moduleURL.RawSource, downloadURL.String())
+ 
+ 	req, _ := http.NewRequest("GET", downloadURL.String(), nil)
+-	moduleURL.Credentials.PrepareRequest(req)
++	// The download URL comes from the registry's service discovery document, so
++	// only attach the credentials when it points back at the registry host the
++	// credentials were issued for.
++	if sameCredentialHost(downloadURL.Host, moduleURL.Host) {
++		moduleURL.Credentials.PrepareRequest(req)
++	}
+ 	retryReq, _ := retryablehttp.FromRequest(req)
+ 
+ 	var client *retryablehttp.Client
+@@ -276,7 +289,12 @@ func (r *RegistryLoader) lookupModule(moduleAddr string, versionConstraints stri
+ // fetchModuleVersions fetches the list of versions from the registry endpoint for the given module URL
+ func (r *RegistryLoader) fetchModuleVersions(moduleURL RegistryURL) ([]string, error) {
+ 	req, _ := http.NewRequest("GET", moduleURL.Location+"/versions", nil)
+-	moduleURL.Credentials.PrepareRequest(req)
++	// The versions URL is built from the registry's service discovery document,
++	// so only attach the credentials when it points back at the registry host
++	// the credentials were issued for.
++	if sameCredentialHost(req.URL.Host, moduleURL.Host) {
++		moduleURL.Credentials.PrepareRequest(req)
++	}
+ 	retryReq, _ := retryablehttp.FromRequest(req)
+ 
+ 	var client *retryablehttp.Client
+diff --git a/internal/hcl/parser.go b/internal/hcl/parser.go
+index c0740aea..5656623a 100644
+--- a/internal/hcl/parser.go
++++ b/internal/hcl/parser.go
+@@ -217,15 +217,18 @@ func OptionWithRawCtyInput(input cty.Value) (op Option) {
+ }
+ 
+ // OptionWithTFCRemoteVarLoader accepts Terraform Cloud/Enterprise host and token
+-// values to load remote execution variables.
+-func OptionWithTFCRemoteVarLoader(host, token, localWorkspace string, loaderOpts ...TFCRemoteVariablesLoaderOption) Option {
++// values to load remote execution variables. hostConfigured indicates whether
++// the host was explicitly set by the user (rather than defaulted to
++// app.terraform.io), which controls how the loader handles a mismatching host
++// in the scanned Terraform.
++func OptionWithTFCRemoteVarLoader(host, token, localWorkspace string, hostConfigured bool, loaderOpts ...TFCRemoteVariablesLoaderOption) Option {
+ 	return func(p *Parser) {
+ 		if host == "" || token == "" {
+ 			return
+ 		}
+ 
+ 		client := extclient.NewAuthedAPIClient(host, token)
+-		p.remoteVariableLoaders = append(p.remoteVariableLoaders, NewTFCRemoteVariablesLoader(client, localWorkspace, p.logger, loaderOpts...))
++		p.remoteVariableLoaders = append(p.remoteVariableLoaders, NewTFCRemoteVariablesLoader(client, localWorkspace, hostConfigured, p.logger, loaderOpts...))
+ 	}
+ }
+ 
+diff --git a/internal/hcl/remote_variables_loader.go b/internal/hcl/remote_variables_loader.go
+index 5680c6b4..3d97567a 100644
+--- a/internal/hcl/remote_variables_loader.go
++++ b/internal/hcl/remote_variables_loader.go
+@@ -35,6 +35,12 @@ type TFCRemoteVariablesLoader struct {
+ 	client         *extclient.AuthedAPIClient
+ 	localWorkspace string
+ 	remoteConfig   *TFCRemoteConfig
++	// hostConfigured is true when the user has explicitly set the Terraform
++	// Cloud host (via the TERRAFORM_CLOUD_HOST env var or terraform_cloud_host
++	// config option) rather than falling back to the app.terraform.io default.
++	// It controls how we react when the scanned Terraform requests a different
++	// host to the trusted one: see Load.
++	hostConfigured bool
+ 	logger         zerolog.Logger
+ }
+ 
+@@ -102,7 +108,7 @@ func RemoteVariablesLoaderWithRemoteConfig(config TFCRemoteConfig) TFCRemoteVari
+ }
+ 
+ // NewTFCRemoteVariablesLoader constructs a new loader for fetching remote variables.
+-func NewTFCRemoteVariablesLoader(client *extclient.AuthedAPIClient, localWorkspace string, logger zerolog.Logger, opts ...TFCRemoteVariablesLoaderOption) *TFCRemoteVariablesLoader {
++func NewTFCRemoteVariablesLoader(client *extclient.AuthedAPIClient, localWorkspace string, hostConfigured bool, logger zerolog.Logger, opts ...TFCRemoteVariablesLoaderOption) *TFCRemoteVariablesLoader {
+ 	if localWorkspace == "" {
+ 		localWorkspace = os.Getenv("TF_WORKSPACE")
+ 	}
+@@ -110,6 +116,7 @@ func NewTFCRemoteVariablesLoader(client *extclient.AuthedAPIClient, localWorkspa
+ 	r := &TFCRemoteVariablesLoader{
+ 		client:         client,
+ 		localWorkspace: localWorkspace,
++		hostConfigured: hostConfigured,
+ 		logger:         logger,
+ 	}
+ 
+@@ -153,7 +160,28 @@ func (r *TFCRemoteVariablesLoader) Load(options RemoteVarLoaderOptions) (map[str
+ 		}
+ 	}
+ 
++	// config.Host may have come from the scanned Terraform (the cloud/backend
++	// "hostname" attribute), which is untrusted input. We must never send the
++	// configured Terraform Cloud token to a host other than the trusted one,
++	// otherwise a malicious .tf could exfiltrate the token to an attacker host.
++	trustedHost := r.client.Host()
++	if config.Host != "" && !hostsEqual(config.Host, trustedHost) {
++		if r.hostConfigured {
++			// The user pinned a trusted host but the scanned Terraform asks for a
++			// different one. Don't send the token to the unverified host, just
++			// skip loading remote variables.
++			r.logger.Warn().Msgf("Terraform config sets hostname %q which does not match the configured Terraform Cloud host %q, not sending token to the unverified host and skipping remote variable loading", config.Host, trustedHost)
++			return vars, nil
++		}
++
++		// The user has a Terraform Cloud token set but has not pinned a trusted
++		// host, and the scanned Terraform is trying to point us at its own host.
++		// Refuse to run rather than risk sending the token to an untrusted host.
++		return vars, errors.Errorf("the Terraform being scanned sets a Terraform Cloud/Enterprise hostname (%q), but no trusted host is configured. Infracost will not send your Terraform Cloud token to an unverified host. If %q is trusted, set the TERRAFORM_CLOUD_HOST environment variable (or terraform_cloud_host config option) to it.", config.Host, config.Host)
++	}
++
+ 	if config.Host != "" {
++		// config.Host has been verified to match the trusted host.
+ 		r.client.SetHost(config.Host)
+ 	}
+ 
+@@ -361,6 +389,12 @@ func (r *TFCRemoteVariablesLoader) getVarValue(variable tfcVar) cty.Value {
+ 	return cty.StringVal(variable.Value)
+ }
+ 
++// hostsEqual reports whether two Terraform Cloud/Enterprise hostnames refer to
++// the same host, ignoring case and any trailing dot.
++func hostsEqual(a, b string) bool {
++	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
++}
++
+ func getAttribute(block *Block, name string) string {
+ 	if block == nil {
+ 		return ""
+diff --git a/internal/providers/terraform/cloud.go b/internal/providers/terraform/cloud.go
+index 81c42547..c5a12c81 100644
+--- a/internal/providers/terraform/cloud.go
++++ b/internal/providers/terraform/cloud.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"strings"
+ 
+ 	"github.com/pkg/errors"
+ 
+@@ -11,6 +12,12 @@ import (
+ 	"github.com/infracost/infracost/internal/logging"
+ )
+ 
++// hostsEqual reports whether two Terraform Cloud/Enterprise hostnames refer to
++// the same host, ignoring case and any trailing dot.
++func hostsEqual(a, b string) bool {
++	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
++}
++
+ func cloudAPI(host string, path string, token string) ([]byte, error) {
+ 	client := &http.Client{}
+ 
+diff --git a/internal/providers/terraform/hcl_provider.go b/internal/providers/terraform/hcl_provider.go
+index d7534689..aaa2283e 100644
+--- a/internal/providers/terraform/hcl_provider.go
++++ b/internal/providers/terraform/hcl_provider.go
+@@ -143,6 +143,7 @@ func NewHCLProvider(ctx *config.ProjectContext, rootPath hcl.RootPath, config *H
+ 			credsSource.BaseCredentialSet.Host,
+ 			credsSource.BaseCredentialSet.Token,
+ 			localWorkspace,
++			ctx.ProjectConfig.TerraformCloudHost != "",
+ 			loaderOpts...),
+ 		)
+ 	}
+diff --git a/internal/providers/terraform/terragrunt_hcl_provider.go b/internal/providers/terraform/terragrunt_hcl_provider.go
+index 2bf77e93..d177dd22 100644
+--- a/internal/providers/terraform/terragrunt_hcl_provider.go
++++ b/internal/providers/terraform/terragrunt_hcl_provider.go
+@@ -133,10 +133,20 @@ func NewTerragruntHCLProvider(rootPath hcl.RootPath, ctx *config.ProjectContext)
+ 		}
+ 	}
+ 
++	// Use Infracost's own registry getter (rather than tgterraform.RegistryGetter)
++	// so we can scope the TG_TF_REGISTRY_TOKEN to trusted hosts. TrustedHosts is
++	// seeded with the configured Terraform Cloud host (terraform_cloud_host config
++	// value / TERRAFORM_CLOUD_HOST env var) so tokens are also sent to a private
++	// Terraform Enterprise registry when the user has pinned one.
++	var trustedRegistryHosts []string
++	if h := ctx.ProjectConfig.TerraformCloudHost; h != "" {
++		trustedRegistryHosts = append(trustedRegistryHosts, h)
++	}
+ 	fetcher := modules.NewPackageFetcher(remoteCache, logger, modules.WithGetters(map[string]getter.Getter{
+-		"tfr": &tgterraform.RegistryGetter{
++		"tfr": &TerraformRegistryGetter{
+ 			ProxyForDomains: []string{".terraform.io"},
+ 			ProxyURL:        os.Getenv("INFRACOST_REGISTRY_PROXY"),
++			TrustedHosts:    trustedRegistryHosts,
+ 		},
+ 		"file": &tgcliterraform.FileCopyGetter{},
+ 	}), modules.WithPublicModuleChecker(modules.NewHttpPublicModuleChecker()))
+diff --git a/internal/providers/terraform/terragrunt_registry_service.go b/internal/providers/terraform/terragrunt_registry_service.go
+index c9e494ed..58b9d2bb 100644
+--- a/internal/providers/terraform/terragrunt_registry_service.go
++++ b/internal/providers/terraform/terragrunt_registry_service.go
+@@ -1,6 +1,15 @@
+ package terraform
+ 
+-// Contents of this file were copied from github.com/gruntwork-io/terragrunt
++// Contents of this file were copied from github.com/gruntwork-io/terragrunt (the
++// tfr:// registry getter) and adapted so that Infracost controls the getter that
++// is actually wired up. On top of the upstream getter we add:
++//   - a trusted-host allowlist so the configured registry token (TG_TF_REGISTRY_TOKEN)
++//     is only ever sent to a trusted host, never to a host derived from an
++//     untrusted module source (see isTrustedRegistryHost / httpGETAndGetResponse);
++//   - support for the TG_TF_DEFAULT_REGISTRY_HOST env var, both as the default
++//     registry domain and as a trusted host;
++//   - the INFRACOST_REGISTRY_PROXY support (ProxyForDomains/ProxyURL) carried
++//     over from Infracost's terragrunt fork.
+ import (
+ 	"context"
+ 	"fmt"
+@@ -29,6 +38,10 @@ const (
+ 	serviceDiscoveryPath  = "/.well-known/terraform.json"
+ 	versionQueryKey       = "version"
+ 	authTokenEnvVarName   = "TG_TF_REGISTRY_TOKEN" //nolint
++	// defaultRegistryHostEnvVarName lets users point Terragrunt at a private
++	// default registry (used when a module source omits the registry host). When
++	// set we both resolve unqualified sources to it and trust it as a token host.
++	defaultRegistryHostEnvVarName = "TG_TF_DEFAULT_REGISTRY_HOST"
+ )
+ 
+ // TerraformRegistryServicePath is a struct for extracting the modules service path in the Registry.
+@@ -51,7 +64,8 @@ type TerraformRegistryServicePath struct {
+ //
+ // Authentication to private module registries is handled via environment variables. The authorization API token is
+ // expected to be provided to Terragrunt via the TG_TF_REGISTRY_TOKEN environment variable. This token can be any
+-// registry API token generated on Terraform Cloud / Enterprise.
++// registry API token generated on Terraform Cloud / Enterprise. The token is only ever attached to requests to a
++// trusted host (see isTrustedRegistryHost); it is never sent to a host derived from an untrusted module source.
+ //
+ // MAINTAINER'S NOTE: Ideally we implement the full credential system that terraform uses as part of `terraform login`,
+ // but all the relevant packages are internal to the terraform repository, thus making it difficult to use as a
+@@ -65,6 +79,15 @@ type TerraformRegistryServicePath struct {
+ // GH issue: https://github.com/gruntwork-io/terragrunt/issues/1772
+ type TerraformRegistryGetter struct {
+ 	client *getter.Client
++	// ProxyForDomains / ProxyURL route requests to matching hosts through the
++	// INFRACOST_REGISTRY_PROXY (carried over from Infracost's terragrunt fork).
++	ProxyForDomains []string
++	ProxyURL        string
++	// TrustedHosts are additional hosts the registry token may be sent to, on top
++	// of the well-known public registries and the TG_TF_DEFAULT_REGISTRY_HOST env
++	// var. This is populated from the resolved terraform_cloud_host config value
++	// (which also covers the TERRAFORM_CLOUD_HOST env var).
++	TrustedHosts []string
+ }
+ 
+ // SetClient allows the getter to know what getter client (different from the underlying HTTP client) to use for
+@@ -86,7 +109,7 @@ func (tfrGetter *TerraformRegistryGetter) ClientMode(ctx context.Context, u *url
+ func (tfrGetter *TerraformRegistryGetter) Get(ctx context.Context, dstPath string, srcURL *url.URL) error {
+ 	registryDomain := srcURL.Host
+ 	if registryDomain == "" {
+-		registryDomain = defaultRegistryDomain
++		registryDomain = defaultRegistryHost()
+ 	}
+ 	queryValues := srcURL.Query()
+ 	modulePath, moduleSubDir := getter.SourceDirSubdir(srcURL.Path)
+@@ -100,7 +123,7 @@ func (tfrGetter *TerraformRegistryGetter) Get(ctx context.Context, dstPath strin
+ 	}
+ 	version := versionList[0]
+ 
+-	moduleRegistryBasePath, err := getModuleRegistryURLBasePath(ctx, registryDomain)
++	moduleRegistryBasePath, err := tfrGetter.getModuleRegistryURLBasePath(ctx, registryDomain)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -110,7 +133,7 @@ func (tfrGetter *TerraformRegistryGetter) Get(ctx context.Context, dstPath strin
+ 		return err
+ 	}
+ 
+-	terraformGet, err := getTerraformGetHeader(ctx, *moduleURL)
++	terraformGet, err := tfrGetter.getTerraformGetHeader(ctx, *moduleURL)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -138,7 +161,7 @@ func (tfrGetter *TerraformRegistryGetter) Get(ctx context.Context, dstPath strin
+ 
+ // GetFile is not implemented for the Terraform module registry Getter since the terraform module registry doesn't serve
+ // a single file.
+-func (tfrGetter *TerraformRegistryGetter) GetFile(dst string, src *url.URL) error {
++func (tfrGetter *TerraformRegistryGetter) GetFile(ctx context.Context, dst string, src *url.URL) error {
+ 	return errors.WithStackTrace(fmt.Errorf("GetFile is not implemented for the Terraform Registry Getter"))
+ }
+ 
+@@ -194,13 +217,13 @@ func (tfrGetter *TerraformRegistryGetter) getSubdir(ctx context.Context, dstPath
+ // (https://www.terraform.io/docs/internals/remote-service-discovery.html)
+ // to figure out where the modules are stored. This will return the base
+ // path where the modules can be accessed
+-func getModuleRegistryURLBasePath(ctx context.Context, domain string) (string, error) {
++func (tfrGetter *TerraformRegistryGetter) getModuleRegistryURLBasePath(ctx context.Context, domain string) (string, error) {
+ 	sdURL := url.URL{
+ 		Scheme: "https",
+ 		Host:   domain,
+ 		Path:   serviceDiscoveryPath,
+ 	}
+-	bodyData, _, err := httpGETAndGetResponse(ctx, sdURL)
++	bodyData, _, err := tfrGetter.httpGETAndGetResponse(ctx, sdURL)
+ 	if err != nil {
+ 		return "", err
+ 	}
+@@ -215,8 +238,8 @@ func getModuleRegistryURLBasePath(ctx context.Context, domain string) (string, e
+ 
+ // getTerraformGetHeader makes an http GET call to the given registry URL and return the contents of the header
+ // X-Terraform-Get. This function will return an error if the response does not contain the header.
+-func getTerraformGetHeader(ctx context.Context, url url.URL) (string, error) {
+-	_, header, err := httpGETAndGetResponse(ctx, url)
++func (tfrGetter *TerraformRegistryGetter) getTerraformGetHeader(ctx context.Context, url url.URL) (string, error) {
++	_, header, err := tfrGetter.httpGETAndGetResponse(ctx, url)
+ 	if err != nil {
+ 		details := "error receiving HTTP data"
+ 		return "", errors.WithStackTrace(ModuleDownloadErr{sourceURL: url.String(), details: details})
+@@ -250,20 +273,42 @@ func getDownloadURLFromHeader(moduleURL url.URL, terraformGet string) (string, e
+ 
+ // httpGETAndGetResponse is a helper function to make a GET request to the given URL using the http client. This
+ // function will then read the response and return the contents + the response header.
+-func httpGETAndGetResponse(ctx context.Context, getURL url.URL) ([]byte, *http.Header, error) {
++func (tfrGetter *TerraformRegistryGetter) httpGETAndGetResponse(ctx context.Context, getURL url.URL) ([]byte, *http.Header, error) {
+ 	req, err := http.NewRequestWithContext(ctx, "GET", getURL.String(), nil)
+ 	if err != nil {
+ 		return nil, nil, errors.WithStackTrace(err)
+ 	}
+ 
+ 	// Handle authentication via env var. Authentication is done by providing the registry token as a bearer token in
+-	// the request header.
++	// the request header. The request host is derived from the (untrusted) module source, so we only attach the token
++	// when the host is a trusted registry - otherwise a malicious module source could exfiltrate the token to an
++	// attacker-controlled host.
+ 	authToken := os.Getenv(authTokenEnvVarName)
+-	if authToken != "" {
++	if authToken != "" && tfrGetter.isTrustedRegistryHost(getURL.Host) {
+ 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", authToken))
+ 	}
+ 
+-	resp, err := httpClient.Do(req)
++	client := httpClient
++	if tfrGetter.ProxyURL != "" {
++		var shouldProxy bool
++		for _, suffix := range tfrGetter.ProxyForDomains {
++			if strings.HasSuffix(getURL.Host, suffix) {
++				shouldProxy = true
++				break
++			}
++		}
++		if shouldProxy {
++			if parsed, err := url.Parse(tfrGetter.ProxyURL); err == nil {
++				client = &http.Client{
++					Transport: &http.Transport{
++						Proxy: http.ProxyURL(parsed),
++					},
++				}
++			}
++		}
++	}
++
++	resp, err := client.Do(req)
+ 	if err != nil {
+ 		return nil, nil, errors.WithStackTrace(err)
+ 	}
+@@ -277,6 +322,55 @@ func httpGETAndGetResponse(ctx context.Context, getURL url.URL) ([]byte, *http.H
+ 	return bodyData, &resp.Header, errors.WithStackTrace(err)
+ }
+ 
++// defaultRegistryHost returns the registry host to use when a module source omits
++// it. Users can point at a private default registry via TG_TF_DEFAULT_REGISTRY_HOST,
++// otherwise we fall back to the public Terraform registry.
++func defaultRegistryHost() string {
++	if h := os.Getenv(defaultRegistryHostEnvVarName); h != "" {
++		return h
++	}
++	return defaultRegistryDomain
++}
++
++// isTrustedRegistryHost reports whether the TG_TF_REGISTRY_TOKEN may be sent to
++// the given host. The token is a Terraform Cloud/Enterprise registry token, so
++// we only attach it to the well-known public registries, to the configured
++// Terraform Cloud/Enterprise host (terraform_cloud_host config / TERRAFORM_CLOUD_HOST
++// env var, passed in via TrustedHosts) and to a configured default registry
++// (TG_TF_DEFAULT_REGISTRY_HOST) - never to a host derived from an untrusted
++// module source.
++func (tfrGetter *TerraformRegistryGetter) isTrustedRegistryHost(host string) bool {
++	trusted := []string{
++		"registry.terraform.io", // public Terraform registry
++		"registry.opentofu.org", // public OpenTofu registry
++		"app.terraform.io",      // Terraform Cloud (incl. private module registry)
++	}
++	// The resolved terraform_cloud_host config value lets Terraform Enterprise
++	// users point at their own host, so trust it too when it is explicitly
++	// configured.
++	trusted = append(trusted, tfrGetter.TrustedHosts...)
++	// Also read TERRAFORM_CLOUD_HOST directly so the token is scoped correctly
++	// even when the getter is constructed without a resolved config (the config
++	// value above already covers this env var, but reading it here keeps the
++	// getter self-contained).
++	if h := os.Getenv("TERRAFORM_CLOUD_HOST"); h != "" {
++		trusted = append(trusted, h)
++	}
++	// TG_TF_DEFAULT_REGISTRY_HOST points unqualified module sources at a private
++	// registry, so trust that host as well when it is configured.
++	if h := os.Getenv(defaultRegistryHostEnvVarName); h != "" {
++		trusted = append(trusted, h)
++	}
++
++	for _, t := range trusted {
++		if t != "" && hostsEqual(host, t) {
++			return true
++		}
++	}
++
++	return false
++}
++
+ // buildRequestUrl - create url to download module using moduleRegistryBasePath
+ func buildRequestUrl(registryDomain string, moduleRegistryBasePath string, modulePath string, version string) (*url.URL, error) {
+ 	moduleRegistryBasePath = strings.TrimSuffix(moduleRegistryBasePath, "/")

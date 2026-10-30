@@ -1,0 +1,162 @@
+diff --git a/src/addressparser/index.ts b/src/addressparser/index.ts
+index f7b5afa..98a9f9b 100644
+--- a/src/addressparser/index.ts
++++ b/src/addressparser/index.ts
+@@ -387,6 +387,21 @@ function _handleAddress(tokens: Token[], depth: number): Address[] {
+                     break;
+             }
+         } else if (token.value) {
++            // An empty quoted string is dropped by the tokenizer, leaving no text token of its
++            // own for textWasQuoted to be recorded on, so the pair of quote operators right in
++            // front of this token is all that is left of it and the run it opens carries the
++            // quoting instead. Without this '""@example.com' reads as the bare '@example.com',
++            // the quotes never go back on, and the value is no longer an addr-spec a trailing
++            // comment can be peeled off of. It only ever opens a run: a run that already holds
++            // material collected outside the quotes is not a quoted string, whatever follows it
++            const prevPrevToken = i > 1 ? tokens[i - 2] : null;
++            const opensAfterEmptyQuotedString =
++                prevToken?.type === 'operator' &&
++                prevToken.value === '"' &&
++                !!prevToken.noBreak &&
++                prevPrevToken?.type === 'operator' &&
++                prevPrevToken.value === '"';
++
+             if (state === 'address') {
+                 // Handle unquoted name that includes a "<".
+                 // Apple Mail truncates everything between an unexpected < and an address.
+@@ -416,7 +431,7 @@ function _handleAddress(tokens: Token[], depth: number): Address[] {
+                 data[state].push(token.value);
+                 lastChars[state] = token.value.charAt(token.value.length - 1);
+                 if (state === 'text') {
+-                    data.textWasQuoted.push(insideQuotes);
++                    data.textWasQuoted.push(insideQuotes || opensAfterEmptyQuotedString);
+                 }
+             }
+         }
+@@ -511,6 +526,19 @@ function _handleAddress(tokens: Token[], depth: number): Address[] {
+         data.text = data.text.join(' ');
+         data.address = data.address.join(' ');
+ 
++        if (addressFromQuotedText && data.text) {
++            // The mailbox is still sitting in the text, so it moves over here and is quoted
++            // before the recovery below rather than after it. Anything else the text holds
++            // came along with it: a comment ends the domain but leaves the atoms behind it in
++            // the same text, and '"user"@example.com(x)evil.com' was handed on as the address
++            // 'user@example.com evil.com', a second domain riding into the envelope recipient
++            // on a value that is no addr-spec at all (GHSA-g57g-f23g-4646). Putting the quotes
++            // back first is what lets the recovery tell the whitespace an addr-spec may carry
++            // from the wreckage trailing one, as only a quoted local part may hold whitespace
++            data.address = _quoteLocalPart(data.text);
++            data.text = '';
++        }
++
+         _recoverAddrSpec(data);
+ 
+         const address: MailboxAddress = {
+@@ -526,10 +554,6 @@ function _handleAddress(tokens: Token[], depth: number): Address[] {
+             }
+         }
+ 
+-        if (addressFromQuotedText && address.address) {
+-            address.address = _quoteLocalPart(address.address);
+-        }
+-
+         addresses.push(address);
+     }
+ 
+@@ -594,22 +618,12 @@ class Tokenizer {
+             this.checkChar(chr, nextChr);
+         }
+ 
+-        // An empty quoted string leaves two quote operators with nothing between them. It
+-        // carries no text of its own, and keeping the pair would split the run around it
+-        // into separate tokens, so the pair is skipped as a whole.
+-        for (let i = 0; i < this.list.length; i++) {
+-            const node = this.list[i];
++        this.list.forEach(node => {
+             node.value = (node.value || '').toString().trim();
+-            if (!node.value) {
+-                continue;
+-            }
+-            const nextNode = this.list[i + 1];
+-            if (node.type === 'operator' && node.value === '"' && nextNode && nextNode.type === 'operator' && nextNode.value === '"') {
+-                i++;
+-                continue;
++            if (node.value) {
++                list.push(node);
+             }
+-            list.push(node);
+-        }
++        });
+ 
+         return list;
+     }
+diff --git a/src/mime-node/index.ts b/src/mime-node/index.ts
+index 8c79ae4..6580ccb 100644
+--- a/src/mime-node/index.ts
++++ b/src/mime-node/index.ts
+@@ -1408,8 +1408,9 @@ class MimeNode {
+             }
+ 
+             if (address && address.address) {
+-                const normalized = this._normalizeAddress(address.address);
+-                if (normalized === address.address && typeof address.name === 'string') {
++                const supplied = address.address.toString();
++                const normalized = this._normalizeAddress(this._recoverSplitAddress(supplied));
++                if (normalized === supplied && typeof address.name === 'string') {
+                     // there is nothing to rewrite, so there is nothing to keep off the original
+                     flattened.push(address);
+                     continue;
+@@ -1692,6 +1693,52 @@ class MimeNode {
+         return values.join(', ');
+     }
+ 
++    /**
++     * Reads an address value that was supplied already split into a name and an address.
++     *
++     * The address half is normally an addr-spec, but a value built from a header line can
++     * carry the text that followed the mailbox with it. The header parser applies the same
++     * recovery to that shape, so an object and the header it was built from agree on the
++     * mailbox the value denotes.
++     *
++     * @param value Supplied address value
++     * @return The mailbox the value denotes
++     * @internal
++     */
++    _recoverSplitAddress(value: string): string {
++        let quoted = false;
++        let hasTail = false;
++
++        for (let i = 0; i < value.length; i++) {
++            const chr = value.charAt(i);
++            if (quoted && chr === '\\') {
++                i++;
++                continue;
++            }
++            if (chr === '"') {
++                quoted = !quoted;
++                continue;
++            }
++            if (!quoted && (chr === '(' || chr === ' ' || chr === '\t' || chr === '\r' || chr === '\n')) {
++                hasTail = true;
++                break;
++            }
++        }
++
++        if (!hasTail) {
++            return value;
++        }
++
++        const parsed = addressparser(value);
++        for (let i = 0; i < parsed.length; i++) {
++            if (parsed[i].address) {
++                return parsed[i].address as string;
++            }
++        }
++
++        return value;
++    }
++
+     /**
+      * Normalizes an email address
+      *

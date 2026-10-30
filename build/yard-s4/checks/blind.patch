@@ -1,0 +1,177 @@
+diff -ruN a/lib/yard/autoload.rb b/lib/yard/autoload.rb
+--- a/lib/yard/autoload.rb	2026-10-29 13:10:16.000000000 +0000
++++ b/lib/yard/autoload.rb	2026-10-29 13:21:42.737687874 +0000
+@@ -250,6 +250,7 @@
+ 
+     autoload :Adapter,                __p('server/adapter')
+     autoload :DocServerSerializer,    __p('server/doc_server_serializer')
++    autoload :DocumentRoot,           __p('server/document_root')
+     autoload :DocServerHelper,        __p('server/doc_server_helper')
+     autoload :FinishRequest,          __p('server/adapter')
+     autoload :LibraryVersion,         __p('server/library_version')
+diff -ruN a/lib/yard/server/commands/base.rb b/lib/yard/server/commands/base.rb
+--- a/lib/yard/server/commands/base.rb	2026-10-29 13:10:14.000000000 +0000
++++ b/lib/yard/server/commands/base.rb	2026-10-29 13:21:49.215739356 +0000
+@@ -164,11 +164,14 @@
+         # @see StaticCaching
+         def cache(data)
+           if caching && adapter.document_root
+-            path = File.join(adapter.document_root, request.path_info.sub(/\.html$/, '') + '.html')
+-            path = path.sub(%r{/\.html$}, '.html')
+-            FileUtils.mkdir_p(File.dirname(path))
+-            log.debug "Caching data to #{path}"
+-            File.open(path, 'wb') {|f| f.write(data) }
++            path = DocumentRoot.cache_path(adapter.document_root, request.path_info)
++            if path
++              FileUtils.mkdir_p(File.dirname(path))
++              log.debug "Caching data to #{path}"
++              File.open(path, 'wb') {|f| f.write(data) }
++            else
++              log.debug "Not caching #{request.path_info}: outside the document root"
++            end
+           end
+           self.body = data
+         end
+diff -ruN a/lib/yard/server/commands/preview_command.rb b/lib/yard/server/commands/preview_command.rb
+--- a/lib/yard/server/commands/preview_command.rb	2026-10-29 13:10:16.000000000 +0000
++++ b/lib/yard/server/commands/preview_command.rb	2026-10-29 13:21:53.035769705 +0000
+@@ -15,6 +15,11 @@
+           return not_found if url.split(%r{[/\\]}).include?('..')
+ 
+           path = File.expand_path(url, adapter.document_root)
++          # ".." segments are not the only way out: an absolute residual
++          # (for example after a doubled slash) resets expand_path to the
++          # filesystem root. Whatever the shape, the page must live inside the
++          # documentation root.
++          return not_found unless DocumentRoot.inside?(adapter.document_root, path)
+           return not_found unless File.file?(path)
+ 
+           headers['Content-Type'] = 'text/html'
+diff -ruN a/lib/yard/server/commands/purge_command.rb b/lib/yard/server/commands/purge_command.rb
+--- a/lib/yard/server/commands/purge_command.rb	2026-10-29 13:10:16.000000000 +0000
++++ b/lib/yard/server/commands/purge_command.rb	2026-10-29 13:21:50.908752821 +0000
+@@ -13,8 +13,9 @@
+           return not_found if url.empty?
+ 
+           path = File.expand_path(url, adapter.document_root)
+-          # Only cached documentation may be removed.
+-          return not_found unless path.start_with?(adapter.document_root)
++          # Only cached documentation may be removed, and only from inside the
++          # documentation root itself.
++          return not_found unless DocumentRoot.inside?(adapter.document_root, path)
+           return not_found unless File.file?(path)
+ 
+           File.delete(path)
+diff -ruN a/lib/yard/server/document_root.rb b/lib/yard/server/document_root.rb
+--- a/lib/yard/server/document_root.rb	1970-01-01 00:00:00.000000000 +0000
++++ b/lib/yard/server/document_root.rb	2026-10-29 13:21:40.820300503 +0000
+@@ -0,0 +1,84 @@
++# frozen_string_literal: true
++module YARD
++  module Server
++    # Resolves request-derived locations against the documentation root.
++    #
++    # The documentation root is a hard boundary: a request may only name the
++    # root itself or genuine descendants of it. Request paths are URLs, not
++    # filesystem paths, so a leading separator is meaningful to routing but
++    # must never turn a lookup under the root into an absolute filesystem
++    # path. Every server operation that maps a request path onto the root
++    # ({StaticCaching#check_static_cache}, {Commands::Base#cache}) or onto a
++    # previously cached page ({Commands::PurgeCommand},
++    # {Commands::PreviewCommand}) goes through this module.
++    #
++    # @since 0.9.44
++    module DocumentRoot
++      module_function
++
++      # Maps a URL-relative cache path onto the documentation root.
++      #
++      # The path is normalised the way the server has always normalised page
++      # names: a page requested with or without its <tt>.html</tt> suffix names
++      # the same file, and a directory-style request (<tt>dir/</tt>) names
++      # <tt>dir.html</tt>. The result is always a path inside +root+, or +nil+
++      # when the request would leave it.
++      #
++      # @param [String] root the documentation root
++      # @param [String] request_path the request path (with any mount prefix)
++      # @return [String] the absolute cache file path
++      # @return [nil] if the request path would resolve outside +root+
++      def cache_path(root, request_path)
++        return nil if root.nil? || request_path.nil?
++        return nil if upward?(request_path)
++
++        # A trailing ".html" is optional in a request; "dir/" denotes dir.html.
++        relative = request_path.sub(/\.html$/, '') + '.html'
++        relative = relative.sub(%r{/\.html\z}, '.html')
++
++        # A URL path is rooted at the documentation root, never at "/" or at a
++        # Windows drive: drop the leading separators before joining.
++        relative = relative.sub(%r{\A/+}, '')
++        return nil if relative.empty?
++        return nil if File::ALT_SEPARATOR && relative =~ /\A[A-Za-z]:/
++
++        relative = File.cleanpath(relative)
++        return nil if upward?(relative) || relative.empty?
++
++        path = File.join(root, relative)
++        inside?(root, path) ? path : nil
++      end
++
++      # Whether +path+ is the documentation root or genuinely below it.
++      #
++      # A plain prefix test is not enough: a sibling directory whose name
++      # merely begins with the root's characters (for example
++      # <tt>/srv/docs-archive</tt> for a root of <tt>/srv/docs</tt>) is outside
++      # the boundary.
++      #
++      # @param [String] root the documentation root
++      # @param [String] path the resolved filesystem path to test
++      # @return [Boolean]
++      def inside?(root, path)
++        return false if root.nil? || path.nil?
++
++        root = File.expand_path(root)
++        path = File.expand_path(path)
++        return true if path == root
++
++        prefix = root.end_with?(File::SEPARATOR) ? root : root + File::SEPARATOR
++        path.start_with?(prefix)
++      end
++
++      # Whether +path+ carries an upward directory segment. Both separator
++      # styles are checked so a Windows-style request cannot slip a ".."
++      # past a POSIX-only split.
++      #
++      # @param [String] path the path to inspect
++      # @return [Boolean]
++      def upward?(path)
++        path.split(%r{[/\\]}).include?('..')
++      end
++    end
++  end
++end
+diff -ruN a/lib/yard/server/static_caching.rb b/lib/yard/server/static_caching.rb
+--- a/lib/yard/server/static_caching.rb	2026-10-29 13:10:14.000000000 +0000
++++ b/lib/yard/server/static_caching.rb	2026-10-29 13:21:46.871720713 +0000
+@@ -14,6 +14,10 @@
+       # the existence of cached data. To actually cache a response, see
+       # {Commands::Base#cache}.
+       #
++      # A request path that resolves outside the documentation root names no
++      # cached page and is reported as a miss, so routing continues and the
++      # normal request handling decides the response.
++      #
+       # @example Implementing In-Memory Cache Checking
+       #   module MemoryCaching
+       #     def check_static_cache
+@@ -33,8 +37,8 @@
+       # @see Commands::Base#cache
+       def check_static_cache
+         return nil unless adapter.document_root
+-        cache_path = File.join(adapter.document_root, request.path.sub(/\.html$/, '') + '.html')
+-        cache_path = cache_path.sub(%r{/\.html$}, '.html')
++        cache_path = DocumentRoot.cache_path(adapter.document_root, request.path)
++        return nil unless cache_path
+         if File.file?(cache_path)
+           log.debug "Loading cache from disk: #{cache_path}"
+           return [200, {'Content-Type' => 'text/html'}, [File.read_binary(cache_path)]]

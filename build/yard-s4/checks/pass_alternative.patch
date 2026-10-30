@@ -1,0 +1,131 @@
+diff --git a/lib/yard/server/commands/base.rb b/lib/yard/server/commands/base.rb
+index c7d207cb..9739b4c9 100644
+--- a/lib/yard/server/commands/base.rb
++++ b/lib/yard/server/commands/base.rb
+@@ -1,6 +1,4 @@
+ # frozen_string_literal: true
+-require 'fileutils'
+-
+ module YARD
+   module Server
+     module Commands
+@@ -32,6 +30,8 @@ module YARD
+       # @abstract
+       # @see #run
+       class Base
++        include StaticCaching
++
+         # @group Basic Command and Adapter Options
+ 
+         # @return [Hash] the options passed to the command's constructor
+@@ -163,13 +163,7 @@ module YARD
+         # @return [String] the same cached data (for chaining)
+         # @see StaticCaching
+         def cache(data)
+-          if caching && adapter.document_root
+-            path = File.join(adapter.document_root, request.path_info.sub(/\.html$/, '') + '.html')
+-            path = path.sub(%r{/\.html$}, '.html')
+-            FileUtils.mkdir_p(File.dirname(path))
+-            log.debug "Caching data to #{path}"
+-            File.open(path, 'wb') {|f| f.write(data) }
+-          end
++          super if caching
+           self.body = data
+         end
+ 
+diff --git a/lib/yard/server/commands/preview_command.rb b/lib/yard/server/commands/preview_command.rb
+index 96f8a546..4b369a60 100644
+--- a/lib/yard/server/commands/preview_command.rb
++++ b/lib/yard/server/commands/preview_command.rb
+@@ -15,6 +15,8 @@ module YARD
+           return not_found if url.split(%r{[/\\]}).include?('..')
+ 
+           path = File.expand_path(url, adapter.document_root)
++          root = File.expand_path(adapter.document_root)
++          return not_found unless path == root || path.start_with?(root + File::SEPARATOR)
+           return not_found unless File.file?(path)
+ 
+           headers['Content-Type'] = 'text/html'
+diff --git a/lib/yard/server/commands/purge_command.rb b/lib/yard/server/commands/purge_command.rb
+index 759697c9..ee0fadca 100644
+--- a/lib/yard/server/commands/purge_command.rb
++++ b/lib/yard/server/commands/purge_command.rb
+@@ -14,7 +14,8 @@ module YARD
+ 
+           path = File.expand_path(url, adapter.document_root)
+           # Only cached documentation may be removed.
+-          return not_found unless path.start_with?(adapter.document_root)
++          root = File.expand_path(adapter.document_root)
++          return not_found unless path == root || path.start_with?(root + File::SEPARATOR)
+           return not_found unless File.file?(path)
+ 
+           File.delete(path)
+diff --git a/lib/yard/server/static_caching.rb b/lib/yard/server/static_caching.rb
+index ca43b15a..a962fae0 100644
+--- a/lib/yard/server/static_caching.rb
++++ b/lib/yard/server/static_caching.rb
+@@ -1,4 +1,6 @@
+ # frozen_string_literal: true
++require 'fileutils'
++
+ module YARD
+   module Server
+     # Implements static caching for requests.
+@@ -10,9 +12,8 @@ module YARD
+       # implement your own +#check_static_cache+ method and mix the module into
+       # the Router class.
+       #
+-      # Note that caching does not occur here. This method simply checks for
+-      # the existence of cached data. To actually cache a response, see
+-      # {Commands::Base#cache}.
++      # This method checks for the existence of cached data. To actually cache
++      # a response, see {#cache}.
+       #
+       # @example Implementing In-Memory Cache Checking
+       #   module MemoryCaching
+@@ -33,14 +34,43 @@ module YARD
+       # @see Commands::Base#cache
+       def check_static_cache
+         return nil unless adapter.document_root
+-        cache_path = File.join(adapter.document_root, request.path.sub(/\.html$/, '') + '.html')
+-        cache_path = cache_path.sub(%r{/\.html$}, '.html')
++        cache_path = contained_cache_path(request.path)
++        return nil unless cache_path
++
+         if File.file?(cache_path)
+           log.debug "Loading cache from disk: #{cache_path}"
+           return [200, {'Content-Type' => 'text/html'}, [File.read_binary(cache_path)]]
+         end
+         nil
+       end
++
++      # Caches rendered HTML response data to disk.
++      #
++      # @param [String] data the data to cache
++      # @return [void]
++      # @since 0.9.44
++      def cache(data)
++        return unless adapter.document_root
++
++        path = adapter.document_root ? contained_cache_path(request.path_info) : nil
++        return unless path
++
++        FileUtils.mkdir_p(File.dirname(path))
++        log.debug "Caching data to #{path}"
++        File.open(path, 'wb') {|f| f.write(data) }
++      end
++
++      private
++
++      def contained_cache_path(request_path)
++        root = File.expand_path(adapter.document_root)
++        path = request_path.sub(/\.html$/, '') + '.html'
++        path = path.sub(%r{\A/+}, '')
++        full = File.expand_path(path, root)
++        return nil unless full == root || full.start_with?(root + File::SEPARATOR)
++
++        full
++      end
+     end
+   end
+ end

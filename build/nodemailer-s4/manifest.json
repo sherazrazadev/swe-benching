@@ -1,0 +1,175 @@
+{
+ "slug": "nodemailer-s4",
+ "candidate": {
+  "repo": "nodemailer/nodemailer",
+  "advisory_ids": [
+   "GHSA-G57G-F23G-4646",
+   "CVE-2026-100699"
+  ],
+  "vulnerable_commit": "1465c3f5ff74a7c4fbbe9853bd01448bb92bf5b7",
+  "fix_commit": "2f36eb1aa1dd33e312411dc9b888548e14db54ee",
+  "cwe": "CWE-20",
+  "source": "mined+injected"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "library API: addressparser() (default export, nodemailer/lib/addressparser) and MimeNode setHeader/getEnvelope/setEnvelope (nodemailer/lib/mime-node); the SMTP client SMTPConnection.send (nodemailer/lib/smtp-connection) is the delivery sink.",
+  "sites": [
+   "src/addressparser/index.ts:390-405, 526-544, 554-558 (published fix: quoted-text assignment moved before the addr-spec recovery; empty quoted-string marker recorded)",
+   "src/addressparser/index.ts:594-604 (INJECTED: tokenizer drops the operator pair of an empty quoted string before the parser can record it)",
+   "src/mime-node/index.ts:1410-1427 (ready address value bypasses the parser; real, unmodified upstream code)",
+   "src/smtp-connection/index.ts:1653-1657 (INJECTED: envelope delivery strips quotes from a whitespace-free quoted local part)"
+  ],
+  "routes": [
+   "addressparser(value) on a quoted local part followed by a comment/whitespace tail",
+   "MimeNode.setHeader('To'|'Cc'|'Bcc', value) -> getEnvelope()",
+   "MimeNode.setEnvelope({to,cc,bcc}) with string values",
+   "addressparser/MimeNode with an empty quoted local part followed by a comment tail",
+   "MimeNode.setHeader/setEnvelope with a ready {name,address} value",
+   "SMTPConnection.send -> RCPT TO command"
+  ],
+  "services": [],
+  "project_tests_run": "At the pinned commit with injection applied: node --import tsx --test test/addressparser/addressparser-test.ts (128 pass), test/mime-node/mime-node-test.ts (185 pass), test/smtp-connection/smtp-connection-test.ts (68 pass); npm run build succeeds. On the reference fix all three still pass. The functional group also runs the project's own addressparser suite from a pristine copy."
+ },
+ "leak_terms": [
+  "addressparser",
+  "MimeNode",
+  "setHeader",
+  "getEnvelope",
+  "setEnvelope",
+  "_normalizeAddress",
+  "_recoverSplitAddress",
+  "_quoteLocalPart",
+  "_handleAddress",
+  "Tokenizer",
+  "tokenizer",
+  "smtp-connection",
+  "SMTPConnection",
+  "isSingleMailbox",
+  "index.ts"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_fail_main.patch",
+   "expect": "security_fail",
+   "note": "fixes the producer, the ready-address route and the delivery command but not the reported quoted-text recovery"
+  },
+  {
+   "patch": "sec_fail_tokenizer.patch",
+   "expect": "security_fail",
+   "note": "fixes the reported recovery, the ready-address route and the delivery command but keeps the tokenizer rule that hides an empty quoted local part"
+  },
+  {
+   "patch": "sec_fail_split.patch",
+   "expect": "security_fail",
+   "note": "fixes the parser and the delivery command but not a ready address value"
+  },
+  {
+   "patch": "sec_fail_delivery.patch",
+   "expect": "security_fail",
+   "note": "fixes the parser and the ready-address route but keeps the SMTP client's quote-stripping rule"
+  },
+  {
+   "patch": "func_fail_overbroad.patch",
+   "expect": "functional_fail",
+   "note": "refuses every value carrying whitespace or a comment, which throws away ordinary display names"
+  },
+  {
+   "patch": "func_fail_crash.patch",
+   "expect": "functional_fail",
+   "note": "throws on a comment tail instead of reading the mailbox, breaking values the product reads today"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus a delivery-time check that a recipient command carries one unambiguous mailbox"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "note": "reference behaviour with the quoted-text step placed inside the recovery function, and the SMTP rule narrowed to leave a quoted '@' alone"
+  },
+  {
+   "patch": "pass_blind.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_fail_overbroad.patch",
+  "crash_as_refusal": "func_fail_crash.patch",
+  "wrong_resource": "n/a: the decision is made about the recipient value itself; there is no neighbouring or proxy resource",
+  "one_role_or_direction": "n/a: To, Cc, Bcc and explicit envelope recipients share one parser and one delivery path, so there is no role or direction to fix separately",
+  "reads_only": "n/a: the library does not read or write a stored resource here; the protected outcome is the address handed to the mail server",
+  "check_after_adjustment": "sec_fail_delivery.patch",
+  "unlisted_route": "sec_fail_split.patch",
+  "malformed_identity": "sec_fail_tokenizer.patch",
+  "missing_authority": "n/a: no authority, secret or role lookup can fail open; the decision is made from the supplied value itself",
+  "adjacent_api": "func_fail_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-quoted-text-recovery",
+   "shape": "the reported site: the text a quoted local part leaves behind is turned into the address before its quotes are restored, so the recovery that peels trailing wreckage never sees a quoted local part and the tail rides into the address",
+   "where": "src/addressparser/index.ts:526-544 (pinned: 506-558)",
+   "security_tests": [
+    "tests/security/addressparser_values.test.ts",
+    "tests/security/message_recipients.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legitimate.test.ts"
+   ],
+   "security_fail_patch": "sec_fail_main.patch",
+   "realistic_because": "published fix site"
+  },
+  {
+   "id": "T2-empty-quoted-producer",
+   "shape": "producer off the check's path: the tokenizer drops the two quote operators of an empty quoted string before the parser walks the tokens, so the run that carries the mailbox is never recorded as quoted and the trailing text becomes the address",
+   "where": "src/addressparser/index.ts:594-604 (INJECTED, tokenizer; the published fix never touches it)",
+   "security_tests": [
+    "tests/security/addressparser_values.test.ts (empty quoted local part cases)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legitimate.test.ts"
+   ],
+   "security_fail_patch": "sec_fail_tokenizer.patch",
+   "realistic_because": "plausible maintainer cleanup of empty operator pairs in the tokenizer; the published fix never touches these lines"
+  },
+  {
+   "id": "T3-ready-address-route",
+   "shape": "route where the protection never existed: a ready {name,address} recipient skips the parser and is only normalised, so the comment tail stays in the delivery address",
+   "where": "src/mime-node/index.ts:1410-1427 (real, unmodified upstream code also present in the latest upstream tree)",
+   "security_tests": [
+    "tests/security/split_address.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legitimate.test.ts (ready address values)"
+   ],
+   "security_fail_patch": "sec_fail_split.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4-delivery-command-quotes",
+   "shape": "second local-part rule after the check: the SMTP client simplifies a whitespace-free quoted local part, so a quoted '@' becomes a second unquoted '@' in the delivery command",
+   "where": "src/smtp-connection/index.ts:1653-1657 (INJECTED, transport layer; the published fix never touches it)",
+   "security_tests": [
+    "tests/security/delivery_command.test.ts"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legitimate.test.ts"
+   ],
+   "security_fail_patch": "sec_fail_delivery.patch",
+   "realistic_because": "plausible maintainer compatibility rule in the SMTP client; the published fix never touches these lines"
+  }
+ ],
+ "status": "built"
+}

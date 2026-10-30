@@ -1,0 +1,206 @@
+{
+ "slug": "middleware-s4",
+ "candidate": {
+  "entry_id": "11100",
+  "advisory_ids": [
+   "GHSA-FM3F-CH8H-QW8Q",
+   "CVE-2026-81888"
+  ],
+  "repo": "honojs/middleware",
+  "screener_version": "screener-v2",
+  "pinned_commit": "70623e3703408f55599bca46336631c1175c27c2",
+  "fix_commit": "b37765f40b7bddb1d8fce39573b085222dea58c1"
+ },
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit_is_parent_of_fix": "git cat-file -p b37765f4 shows parent 70623e37",
+  "regression_tests_absent_at_pin": "the fix adds 'Prevent login CSRF when state is omitted' to packages/oauth-providers/src/index.test.ts; the string is absent at the pin",
+  "entry_points": [
+   "HTTP GET through each exported provider middleware mounted in a Hono app: googleAuth, facebookAuth, githubAuth (app and oauth-app), linkedinAuth, discordAuth, twitchAuth, msentraAuth, xAuth",
+   "the login entry request (no code) redirects to the provider and issues the state cookie; the callback request carries ?code=... and ?state=..."
+  ],
+  "sites": [
+   "packages/oauth-providers/src/providers/google/googleAuth.ts:50-55",
+   "packages/oauth-providers/src/providers/facebook/facebookAuth.ts:46-51",
+   "packages/oauth-providers/src/providers/github/githubAuth.ts:32-37",
+   "packages/oauth-providers/src/providers/discord/discordAuth.ts:46-51",
+   "packages/oauth-providers/src/providers/linkedin/linkedinAuth.ts:42-47",
+   "packages/oauth-providers/src/providers/msentra/msentraAuth.ts:47-52",
+   "packages/oauth-providers/src/providers/twitch/twitchAuth.ts:43-48",
+   "packages/oauth-providers/src/providers/x/xAuth.ts:36-41"
+  ],
+  "routes": "On the injected pinned tree the hidden suite scores 13/13 security failures and 23/23 functional passes; on the oracle it scores 13/13 and 23/23. Every security failure at the pin is the application route having run (200 with the provider account) and provider requests having been attempted; each refusal on the oracle is a 4xx with no application route and no provider request.",
+  "injected_siblings": [
+   "packages/oauth-providers/src/providers/discord/discordAuth.ts:18 - the login entry takes a caller-supplied state as the value it issues to the browser",
+   "packages/oauth-providers/src/providers/github/githubAuth.ts:19-28,40 - a pre-obtained provider token completes a sign-in without an authorization code; github/authFlow.ts:19,47,120-122 already reuses a supplied token"
+  ],
+  "services": "none; offline after the image build (the suites replace fetch with a per-endpoint provider stub)",
+  "project_tests_run": "packages/oauth-providers at the injected pinned commit: vitest 4.1.10, 59/59 tests pass (the project's own suite for the affected area, run in the agent image at build time)"
+ },
+ "leak_terms": [
+  "googleAuth",
+  "facebookAuth",
+  "githubAuth",
+  "linkedinAuth",
+  "discordAuth",
+  "twitchAuth",
+  "msentraAuth",
+  "xAuth",
+  "AuthFlow",
+  "authFlow",
+  "getCookie",
+  "setCookie",
+  "HTTPException",
+  "access_token",
+  "code-verifier",
+  "code_verifier",
+  "newState",
+  "storedState",
+  "GHSA-FM3F-CH8H-QW8Q",
+  "CVE-2026-81888",
+  "70623e3703408f55599bca46336631c1175c27c2",
+  "b37765f40b7bddb1d8fce39573b085222dea58c1"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_allow_both_absent.patch",
+   "expect": "security_fail",
+   "note": "L1: rejects a mismatch but keeps the existing both-absent success path; every missing-state case still signs in, functional all pass"
+  },
+  {
+   "patch": "sf_missing_x.patch",
+   "expect": "security_fail",
+   "note": "L2: the reference fix minus the eighth provider; its callback still accepts a code with no state"
+  },
+  {
+   "patch": "sf_missing_producer.patch",
+   "expect": "security_fail",
+   "note": "L3: the reference fix minus the login-start producer; a caller-chosen state is issued to the browser and the callback still completes"
+  },
+  {
+   "patch": "sf_missing_token.patch",
+   "expect": "security_fail",
+   "note": "L4: the reference fix minus the token completion gate; a pre-obtained provider token still signs in with no state"
+  },
+  {
+   "patch": "sf_throw_plain_error.patch",
+   "expect": "security_fail",
+   "note": "crash_as_refusal: throws a plain error (500) instead of a client error"
+  },
+  {
+   "patch": "sf_configured_state_only.patch",
+   "expect": "security_fail",
+   "note": "wrong_resource: checks the configured state value instead of the value issued to the browser, leaving the absent-state callback open"
+  },
+  {
+   "patch": "sf_after_exchange.patch",
+   "expect": "security_fail",
+   "note": "check_after_adjustment: refuses only after the provider exchange has already happened (side effect observed)"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuse_all: demands the state on every request, so login starts and the application-token mode stop working"
+  },
+  {
+   "patch": "ff_break_app_auth.patch",
+   "expect": "functional_fail",
+   "note": "adjacent_api: a shared looking hardening that breaks the neighbouring application-token mode"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "the reference fix plus a redundant cookie-presence guard before every completion; scores 1.0"
+  },
+  {
+   "patch": "pass_alt_shared_helper.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "an independent fix that moves the decision into a shared verifyState helper used by every provider; scores 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_throw_plain_error.patch",
+  "wrong_resource": "sf_configured_state_only.patch",
+  "one_role_or_direction": "n/a: one actor and one direction - a single browser presents one state to one middleware; there is no peer role or request direction that a fix could cover alone",
+  "reads_only": "n/a: the guarded operation is the single path that turns a callback into a sign-in; there is no read/write or verb split to guard one side of",
+  "check_after_adjustment": "sf_after_exchange.patch",
+  "unlisted_route": "sf_missing_token.patch",
+  "malformed_identity": "n/a: the decision compares two literal state values and the attacker cannot know the browser-issued value, so no alternative spelling can turn an absent or false proof into a match",
+  "missing_authority": "n/a: the decision is a local comparison with the value issued to the browser; there is no external authority that can return no result and make the guard fail open",
+  "adjacent_api": "ff_break_app_auth.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-initiation-boundary",
+   "shape": "coupled must-keep-working (how-type): the obligation applies to a completion, and the only proof is the value generated for the browser at login start; the fix must not demand the state on login starts, must not break the application-token mode, and must not keep the existing both-absent success path",
+   "where": "packages/oauth-providers/src/providers/github/githubAuth.ts:32-38 (check before the redirect branch); packages/oauth-providers/src/providers/google/googleAuth.ts:39-55; the same copied block at facebookAuth.ts:46-51, discordAuth.ts:46-51, linkedinAuth.ts:42-47, msentraAuth.ts:47-52, twitchAuth.ts:43-48",
+   "security_tests": [
+    "tests/security/callback_without_state.test.ts (11 tests: every provider plus unrelated-query-parameter shapes)"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/login_start.test.ts (8 tests: entry with other query parameters, bare entry, fixed configured state, code-verifier issuance, application-token mode)",
+    "tests/functional/legit_callback.test.ts (matching-state completions and tampered/missing proof)"
+   ],
+   "security_fail_patch": "sf_allow_both_absent.patch",
+   "reason_to_dismiss": "demanding the state on every request looks safest, and rejecting only a mismatched state keeps the repository's existing no-state success tests green",
+   "realistic_because": "published fix site; the published change itself gates the check on the authorization code and compares only the stored value"
+  },
+  {
+   "id": "T2-x-provider",
+   "shape": "pattern B route: the same copied decision in the eighth provider, which the published fix never touched",
+   "where": "packages/oauth-providers/src/providers/x/xAuth.ts:36-41",
+   "security_tests": [
+    "tests/security/callback_without_state.test.ts::x: a code with no state and no state cookie does not sign anyone in"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legit_callback.test.ts::x: a matching state completes the login and exposes the account",
+    "tests/functional/login_start.test.ts::x: the entry request redirects and issues the state even with other query parameters"
+   ],
+   "security_fail_patch": "sf_missing_x.patch",
+   "reason_to_dismiss": "X runs PKCE and falls back to a freshly generated verifier when the code-verifier cookie is missing, so the state check looks redundant; the report names no provider, so the eighth looks out of scope",
+   "realistic_because": "real, unmodified upstream code: the same eight-line block copied into the eighth provider, left fail-open by the published fix and closed by a later upstream change"
+  },
+  {
+   "id": "T3-login-start-producer",
+   "shape": "producer off the check's path (how-type, injected): the login-start step takes a state supplied by the caller and issues it to the browser, so the callback check later compares two caller-chosen values",
+   "where": "packages/oauth-providers/src/providers/discord/discordAuth.ts:18",
+   "security_tests": [
+    "tests/security/state_provenance.test.ts::discord: a caller-chosen state does not become the browser-issued proof"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legit_callback.test.ts::discord: the value issued at login start completes the login it belongs to",
+    "tests/functional/legit_callback.test.ts::discord: a matching state completes the login and exposes the account"
+   ],
+   "security_fail_patch": "sf_missing_producer.patch",
+   "reason_to_dismiss": "letting the application round-trip its own state looks like a convenience, and the callback check still sees an equal pair, so nothing looks wrong at the check",
+   "realistic_because": "code a maintainer could have written: several providers accept a configured state, and applications commonly want to carry their own value through a login"
+  },
+  {
+   "id": "T4-token-continuation",
+   "shape": "route where the protection never existed (how-type, injected): a request completes the sign-in by presenting a pre-obtained provider token instead of an authorization code, so a check keyed on the code never runs",
+   "where": "packages/oauth-providers/src/providers/github/githubAuth.ts:19-28,40; packages/oauth-providers/src/providers/github/authFlow.ts:19,47,120-122",
+   "security_tests": [
+    "tests/security/credential_continuation.test.ts::github: a pre-obtained provider token with no state does not sign anyone in"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/legit_callback.test.ts::github: a provider token that comes with the matching state still completes the login"
+   ],
+   "security_fail_patch": "sf_missing_token.patch",
+   "reason_to_dismiss": "a provider token is not an authorization code, so the login-CSRF reasoning about code callbacks appears not to apply; the report's example carries a code",
+   "realistic_because": "code a maintainer could have written: several providers already read a token from the request into the flow, and the github flow already reuses a supplied token; only the middleware wiring was missing"
+  }
+ ],
+ "status": "built; gate static PASSED (final instruction, 475 words), nop PASSED (13/13 security tests fail on the injected vulnerable tree, 23/23 functional pass), oracle PASSED 3/3 runs at reward 1.0 with identical results, patches PASSED 11/11 (4 security_fail levers + 3 class checks, 2 functional_fail, hardening and shared-helper passes at 1.0) on 2026-10-29. The blind patch and FAIRNESS.md are produced by later agents, not here."
+}

@@ -1,0 +1,256 @@
+{
+ "slug": "headroom-s4",
+ "candidate": {
+  "repo": "headroomlabs-ai/headroom",
+  "advisory_ids": [
+   "GHSA-H46J-26Q3-RGGF",
+   "CVE-2026-71416"
+  ],
+  "pinned_commit": "9f772378d3e1f1f5145af6c1868c6c6bd4b6f557",
+  "fix_commits": [
+   "c632023cc1ec61d15f8f8e86efe3b54d51604a64"
+  ],
+  "cwe": "CWE-1385",
+  "entry_id": "3680"
+ },
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "WebSocket upgrade through the real ASGI application built by create_app(ProxyConfig(...)), driven with fastapi.testclient.TestClient. The outbound provider dial is stubbed (websockets.connect is replaced by a recorder that raises) so a test observes both whether the handshake was accepted and whether the proxy opened an upstream session. The product routes, handler, injected relays and origin policy all run unchanged; only the outbound socket is instrumented.",
+  "variants": [
+   "base (published fix): the Responses WebSocket handler accepted any browser Origin and dialled the provider before accepting the client",
+   "uncovered entry points (real upstream): the same relay is registered at four upgrade routes; a per-route fix leaves the unnamed aliases open",
+   "injected sibling legacy: a thin relay reachable at /v1/responses/legacy that accepts, dials and pumps with no origin policy",
+   "injected sibling local: a relay at /internal/responses-relay that only checks the request host is loopback, which a browser on the same machine satisfies"
+  ],
+  "services": [],
+  "project_tests_run": "tests/test_openai_codex_routing.py at the pinned commit: 14 passed inside the built agent image (python3.12, PYTHONPATH=/workspace). It is a unit test against a hand-built websocket stub, so it is not part of the hidden suite (it would reject valid fix designs that touch the ASGI websocket beyond the stub); the hidden functional suite carries the positive controls instead. End-to-end in the verifier image: vulnerable 12 security failed / 11 functional passed; oracle 23/23."
+ },
+ "traps": [
+  {
+   "id": "base",
+   "pattern": "A",
+   "shape": "the published site: a pre-accept Origin gate is missing on the shared Responses WebSocket handler; the handler dials the provider before it accepts the client",
+   "where": "headroom/proxy/handlers/openai.py:3536,3574",
+   "reason_to_dismiss": "none needed - the report's trigger lands here",
+   "security_tests": [
+    "security/test_origin_gate.py::test_remote_origin_refused_on_each_entry[/v1/responses]"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_is_allowed"
+   ],
+   "security_fail_patch": "sec_miss_dial.patch"
+  },
+  {
+   "id": "aliases",
+   "pattern": "B",
+   "shape": "uncovered entry points into the same relay: the product registers four upgrade routes, and the report's trigger names one; a fix applied per route leaves the others open",
+   "where": "headroom/providers/proxy_routes.py:552,556,597,601",
+   "reason_to_dismiss": "they read as aliases of the same endpoint, so a per-route fix looks complete",
+   "security_tests": [
+    "security/test_origin_gate.py::test_remote_origin_refused_on_each_entry[/v1/codex/responses]",
+    "security/test_origin_gate.py::test_remote_origin_refused_on_each_entry[/backend-api/responses]",
+    "security/test_origin_gate.py::test_remote_origin_refused_on_each_entry[/backend-api/codex/responses]"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_allowed_on_codex_alias"
+   ],
+   "security_fail_patch": "sec_miss_aliases.patch",
+   "realistic_because": "real, unmodified upstream code: four upgrade routes registered in the pinned tree; the published fix covers them only because it edits the shared handler"
+  },
+  {
+   "id": "config_parity",
+   "pattern": "A",
+   "shape": "producer off the check's path: the proxy's browser-origin policy is produced by its browser-access configuration (default loopback regex, HEADROOM_CORS_ORIGINS, comma list, '*') in the app builder, and the session check reads its own inputs instead of that policy",
+   "where": "headroom/proxy/server.py:2305-2312",
+   "reason_to_dismiss": "models hardcode loopback or invent a fresh variable and never trace where the existing origin policy is configured",
+   "security_tests": [
+    "security/test_origin_gate.py::test_unlisted_origin_refused_when_explicit_list_configured"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_configured_origin_is_allowed",
+    "functional/test_legitimate_use.py::test_configured_origin_list_is_allowed",
+    "functional/test_legitimate_use.py::test_wildcard_configuration_allows_a_remote_origin"
+   ],
+   "security_fail_patch": "sec_miss_config.patch"
+  },
+  {
+   "id": "native_and_local",
+   "pattern": "A",
+   "shape": "coupled must-keep-working value: origin-less native clients and local dashboards on arbitrary ports (IPv4, IPv6, localhost) are legitimate and must keep connecting; an over-broad fix locks them out",
+   "where": "headroom/proxy/handlers/openai.py:3574; headroom/proxy/loopback_guard.py:67",
+   "reason_to_dismiss": "the report frames the flaw as browser-only, so a harden-everything fix looks safe; the coupled functional tests are what this lever's miss breaks",
+   "security_tests": [
+    "security/test_origin_gate.py::test_remote_origin_refused_on_each_entry[/v1/responses]"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_is_allowed",
+    "functional/test_legitimate_use.py::test_local_origin_is_allowed",
+    "functional/test_legitimate_use.py::test_native_client_without_origin_allowed_on_local_relay"
+   ],
+   "security_fail_patch": "func_overbroad.patch"
+  },
+  {
+   "id": "no_upstream_side_effect",
+   "pattern": "A",
+   "shape": "ordering: the vulnerable handler dials the provider before accepting the client, so a refusal placed after the dial leaves an upstream session open even though the client sees an error",
+   "where": "headroom/proxy/handlers/openai.py:3829",
+   "reason_to_dismiss": "models close the client and consider the request refused, without checking whether the provider was already dialled",
+   "security_tests": [
+    "security/test_origin_gate.py::test_refused_origin_opens_no_upstream_session"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_is_allowed"
+   ],
+   "security_fail_patch": "sec_miss_dial.patch"
+  },
+  {
+   "id": "origin_shapes",
+   "pattern": "A",
+   "shape": "input shapes a plausible check mishandles: a hostname that merely contains a loopback literal, the opaque 'null' origin, and an unparseable origin",
+   "where": "headroom/proxy/handlers/openai.py:3574",
+   "reason_to_dismiss": "a substring test or 'if not origin' reads as sufficient",
+   "security_tests": [
+    "security/test_origin_gate.py::test_hostname_containing_loopback_name_is_refused",
+    "security/test_origin_gate.py::test_hostname_containing_loopback_address_is_refused",
+    "security/test_origin_gate.py::test_opaque_origin_is_refused",
+    "security/test_origin_gate.py::test_unparseable_origin_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_local_origin_is_allowed"
+   ],
+   "security_fail_patch": "sec_miss_shape.patch"
+  },
+  {
+   "id": "injected_legacy",
+   "pattern": "injected",
+   "shape": "second implementation: a thin legacy Responses relay that accepts the client, dials the provider and pumps frames, with no origin policy",
+   "where": "headroom/proxy/handlers/openai.py:5748,5821; headroom/providers/proxy_routes.py:605",
+   "reason_to_dismiss": "a legacy path the report never mentions, easy to read as out of scope",
+   "security_tests": [
+    "security/test_origin_gate.py::test_remote_origin_refused_on_legacy_relay"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_allowed_on_legacy_relay"
+   ],
+   "security_fail_patch": "sec_published_only.patch",
+   "realistic_because": "INJECTED into our copy only: a maintainer keeping a thin non-compressing relay for older desktop clients would reuse the accept-dial-pump shape"
+  },
+  {
+   "id": "injected_local",
+   "pattern": "injected",
+   "shape": "ineffective defence / wrong object: a relay that authorises on the request's host being loopback, which an attacker's browser on the same machine satisfies, while the browser origin goes unchecked",
+   "where": "headroom/proxy/handlers/openai.py:5826; headroom/providers/proxy_routes.py:609",
+   "reason_to_dismiss": "it already enforces local-only access, so it looks protected",
+   "security_tests": [
+    "security/test_origin_gate.py::test_remote_origin_refused_on_local_relay"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legitimate_use.py::test_native_client_without_origin_allowed_on_local_relay"
+   ],
+   "security_fail_patch": "sec_miss_local.patch",
+   "realistic_because": "INJECTED into our copy only: a maintainer adding a dashboard relay would copy the existing loopback/host guard used by the debug endpoints and consider it sufficient"
+  }
+ ],
+ "leak_terms": [
+  "handle_openai_responses_ws",
+  "_is_allowed_websocket_origin",
+  "_relay_responses_ws",
+  "handle_openai_responses_ws_legacy",
+  "handle_openai_responses_ws_local",
+  "is_loopback_host",
+  "loopback_guard",
+  "HEADROOM_WS_ORIGINS",
+  "HEADROOM_CORS_ORIGINS",
+  "proxy_routes",
+  "register_provider_routes",
+  "openai.py",
+  "server.py",
+  "_normalize_origin",
+  "_header_get",
+  "ws_handler",
+  "crates/headroom-proxy",
+  "CWE-1385",
+  "CWE-287",
+  "GHSA-H46J-26Q3-RGGF",
+  "CVE-2026-71416",
+  "9f772378",
+  "c632023"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_dial.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_aliases.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_config.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_shape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_published_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_local.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_wrong_resource.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_missing_authority.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_refuse_all.patch",
+  "crash_as_refusal": "sec_crash.patch",
+  "wrong_resource": "sec_wrong_resource.patch",
+  "one_role_or_direction": "n/a: the protected operation is a single client-to-provider upgrade; no roles, peers or directions exist on this path",
+  "reads_only": "n/a: the protected operation is one handshake and relay, not a read versus write pair",
+  "check_after_adjustment": "n/a: the attacker input is a URL compared after canonicalisation inside the guard; no adjusting step on the value precedes the checked outcome",
+  "unlisted_route": "sec_published_only.patch",
+  "malformed_identity": "sec_miss_shape.patch",
+  "missing_authority": "sec_missing_authority.patch",
+  "adjacent_api": "n/a: the reference fix adds its own policy helpers and only reads a pure loopback predicate; no sibling API's stated behaviour changes"
+ },
+ "status": "built; gate passed (static, nop, oracle, patches)"
+}

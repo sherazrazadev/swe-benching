@@ -1,0 +1,47 @@
+diff --git a/src/addressparser/index.ts b/src/addressparser/index.ts
+index 0b2a902..f7b5afa 100644
+--- a/src/addressparser/index.ts
++++ b/src/addressparser/index.ts
+@@ -594,12 +594,22 @@ class Tokenizer {
+             this.checkChar(chr, nextChr);
+         }
+ 
+-        this.list.forEach(node => {
++        // An empty quoted string leaves two quote operators with nothing between them. It
++        // carries no text of its own, and keeping the pair would split the run around it
++        // into separate tokens, so the pair is skipped as a whole.
++        for (let i = 0; i < this.list.length; i++) {
++            const node = this.list[i];
+             node.value = (node.value || '').toString().trim();
+-            if (node.value) {
+-                list.push(node);
++            if (!node.value) {
++                continue;
+             }
+-        });
++            const nextNode = this.list[i + 1];
++            if (node.type === 'operator' && node.value === '"' && nextNode && nextNode.type === 'operator' && nextNode.value === '"') {
++                i++;
++                continue;
++            }
++            list.push(node);
++        }
+ 
+         return list;
+     }
+diff --git a/src/smtp-connection/index.ts b/src/smtp-connection/index.ts
+index 92966db..a14e8ee 100644
+--- a/src/smtp-connection/index.ts
++++ b/src/smtp-connection/index.ts
+@@ -1650,6 +1650,11 @@ class SMTPConnection extends EventEmitter {
+             }
+         }
+ 
++        // A quoted local part that carries no whitespace does not need the quotes, and an
++        // envelope command is easier for older receivers to read without them, so the bare
++        // form is used for delivery.
++        this._envelope.to = this._envelope.to.map(recipient => recipient.replace(/^"([^"\s\\]*)"@/, '$1@'));
++
+         // clone the recipients array for latter manipulation
+         this._envelope.rcptQueue = ([] as string[]).concat(this._envelope.to || []);
+         this._envelope.rejected = [];

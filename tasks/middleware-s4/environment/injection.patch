@@ -1,0 +1,68 @@
+diff -ruN -x node_modules a/packages/oauth-providers/src/providers/discord/discordAuth.ts b/packages/oauth-providers/src/providers/discord/discordAuth.ts
+--- a/packages/oauth-providers/src/providers/discord/discordAuth.ts	2026-10-29 12:57:19.884854820 +0000
++++ b/packages/oauth-providers/src/providers/discord/discordAuth.ts	2026-10-29 13:06:29.239228674 +0000
+@@ -15,7 +15,7 @@
+ }): MiddlewareHandler {
+   return async (c, next) => {
+     // Generate encoded "keys"
+-    const newState = getRandomState()
++    const newState = c.req.query('state') || getRandomState()
+ 
+     // Create new Auth instance
+     const auth = new AuthFlow({
+diff -ruN -x node_modules a/packages/oauth-providers/src/providers/github/authFlow.ts b/packages/oauth-providers/src/providers/github/authFlow.ts
+--- a/packages/oauth-providers/src/providers/github/authFlow.ts	2026-10-29 12:54:59.633169448 +0000
++++ b/packages/oauth-providers/src/providers/github/authFlow.ts	2026-10-29 13:06:29.238894221 +0000
+@@ -16,6 +16,7 @@
+   state: string
+   oauthApp: boolean
+   code: string | undefined
++  token?: Token
+ }
+ type Token = {
+   token: string
+@@ -36,14 +37,14 @@
+   user: Partial<GitHubUser> | undefined
+   granted_scopes: string[] | undefined
+ 
+-  constructor({ client_id, client_secret, scope, state, oauthApp, code }: GithubAuthFlow) {
++  constructor({ client_id, client_secret, scope, state, oauthApp, code, token }: GithubAuthFlow) {
+     this.client_id = client_id
+     this.client_secret = client_secret
+     this.scope = scope
+     this.state = state
+     this.oauthApp = oauthApp
+     this.code = code
+-    this.token = undefined
++    this.token = token
+     this.refresh_token = undefined
+     this.user = undefined
+     this.granted_scopes = undefined
+diff -ruN -x node_modules a/packages/oauth-providers/src/providers/github/githubAuth.ts b/packages/oauth-providers/src/providers/github/githubAuth.ts
+--- a/packages/oauth-providers/src/providers/github/githubAuth.ts	2026-10-29 12:57:19.884854820 +0000
++++ b/packages/oauth-providers/src/providers/github/githubAuth.ts	2026-10-29 13:06:29.239094344 +0000
+@@ -16,6 +16,7 @@
+ }): MiddlewareHandler {
+   return async (c, next) => {
+     const newState = getRandomState()
++    const accessToken = c.req.query('access_token')
+     // Create new Auth instance
+     const auth = new AuthFlow({
+       client_id: options.client_id || (env(c).GITHUB_ID as string),
+@@ -24,6 +25,7 @@
+       state: newState,
+       oauthApp: options.oauthApp || false,
+       code: c.req.query('code'),
++      token: accessToken ? { token: accessToken } : undefined,
+     })
+ 
+     // Avoid CSRF attack by checking state
+@@ -35,7 +37,7 @@
+     }
+ 
+     // Redirect to login dialog
+-    if (!auth.code) {
++    if (!auth.code && !auth.token?.token) {
+       setCookie(c, 'state', newState, {
+         maxAge: 60 * 10,
+         httpOnly: true,

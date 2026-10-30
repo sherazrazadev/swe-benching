@@ -1,0 +1,128 @@
+diff --git a/headroom/providers/proxy_routes.py b/headroom/providers/proxy_routes.py
+index 40a4faea..5aa5c204 100644
+--- a/headroom/providers/proxy_routes.py
++++ b/headroom/providers/proxy_routes.py
+@@ -602,6 +602,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
+     async def openai_codex_nested_responses_ws(websocket: WebSocket):
+         await proxy.handle_openai_responses_ws(websocket)
+ 
++    @app.websocket("/v1/responses/legacy")
++    async def openai_responses_ws_legacy(websocket: WebSocket):
++        await proxy.handle_openai_responses_ws_legacy(websocket)
++
++    @app.websocket("/internal/responses-relay")
++    async def openai_responses_ws_local(websocket: WebSocket):
++        await proxy.handle_openai_responses_ws_local(websocket)
++
+     @app.api_route("/backend-api/responses/{sub_path:path}", methods=["GET", "POST", "DELETE"])
+     async def openai_codex_responses_sub(request: Request, sub_path: str):
+         return await openai_responses_sub(request, sub_path)
+diff --git a/headroom/proxy/handlers/openai.py b/headroom/proxy/handlers/openai.py
+index d61ced6e..164cad3b 100644
+--- a/headroom/proxy/handlers/openai.py
++++ b/headroom/proxy/handlers/openai.py
+@@ -5745,6 +5745,104 @@ class OpenAIHandlerMixin:
+                 metrics=getattr(self, "metrics", None),
+             )
+ 
++    async def _relay_responses_ws(self, websocket: WebSocket, request_id: str) -> None:
++        """Open the provider session and pump frames in both directions."""
++        import websockets
++
++        ws_headers = dict(websocket.headers)
++        _hop_headers = {
++            "host",
++            "connection",
++            "upgrade",
++            "sec-websocket-key",
++            "sec-websocket-version",
++            "sec-websocket-extensions",
++            "sec-websocket-accept",
++            "sec-websocket-protocol",
++            "content-length",
++            "transfer-encoding",
++        }
++        upstream_headers = {k: v for k, v in ws_headers.items() if k.lower() not in _hop_headers}
++        upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
++        if is_chatgpt_auth:
++            upstream_url = "wss://chatgpt.com/backend-api/codex/responses"
++        else:
++            ws_base = self.OPENAI_API_URL.replace("https://", "wss://").replace(
++                "http://", "ws://"
++            )
++            upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
++
++        await websocket.accept()
++        try:
++            upstream = await websockets.connect(
++                upstream_url, additional_headers=upstream_headers, max_size=None
++            )
++        except Exception as exc:
++            logger.warning("[%s] responses relay upstream connect failed: %s", request_id, exc)
++            await websocket.close(code=1011, reason="upstream unavailable")
++            return
++
++        async def client_to_upstream() -> None:
++            try:
++                while True:
++                    message = await websocket.receive_text()
++                    await upstream.send(message)
++            except Exception:
++                return
++
++        async def upstream_to_client() -> None:
++            try:
++                async for message in upstream:
++                    text = (
++                        message
++                        if isinstance(message, str)
++                        else message.decode("utf-8", "replace")
++                    )
++                    await websocket.send_text(text)
++            except Exception:
++                return
++
++        relay_tasks = [
++            asyncio.create_task(client_to_upstream()),
++            asyncio.create_task(upstream_to_client()),
++        ]
++        try:
++            await asyncio.wait(relay_tasks, return_when=asyncio.FIRST_COMPLETED)
++        finally:
++            for task in relay_tasks:
++                task.cancel()
++            with contextlib.suppress(Exception):
++                await asyncio.gather(*relay_tasks, return_exceptions=True)
++            with contextlib.suppress(Exception):
++                await upstream.close()
++            with contextlib.suppress(Exception):
++                await websocket.close(code=1000)
++
++    async def handle_openai_responses_ws_legacy(self, websocket: WebSocket) -> None:
++        """Relay used by desktop builds that still negotiate the legacy handshake."""
++        request_id = await self._next_request_id()
++        await self._relay_responses_ws(websocket, request_id)
++
++    async def handle_openai_responses_ws_local(self, websocket: WebSocket) -> None:
++        """Relay for the dashboard; restricted to requests addressed to this machine."""
++        from headroom.proxy.loopback_guard import is_loopback_host
++
++        ws_headers = dict(websocket.headers)
++        host_header = ws_headers.get("host", "")
++        if host_header.startswith("["):
++            closing = host_header.find("]")
++            hostname = host_header[1:closing] if closing != -1 else host_header
++        elif host_header.count(":") == 1:
++            hostname = host_header.rsplit(":", 1)[0]
++        else:
++            hostname = host_header
++        if not is_loopback_host(hostname):
++            logger.warning("event=responses_relay_rejected host=%r", host_header)
++            await websocket.close(code=1008, reason="local access only")
++            return
++        request_id = await self._next_request_id()
++        await self._relay_responses_ws(websocket, request_id)
++
+     async def _ws_http_fallback(
+         self,
+         websocket: WebSocket,

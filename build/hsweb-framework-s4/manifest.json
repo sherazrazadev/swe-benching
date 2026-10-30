@@ -1,0 +1,224 @@
+{
+ "slug": "hsweb-framework-s4",
+ "candidate": {
+  "repo": "hs-web/hsweb-framework",
+  "advisory_ids": [
+   "GHSA-FXR3-GVM4-M8VC",
+   "CVE-2026-11477"
+  ],
+  "vulnerable_commit": "3843e1bbb4799f34c372e07fc35117199f6c6376",
+  "fix_commit": "c2882679a9125cea52678151af5ae213cbd52579",
+  "cwe": "CWE-601",
+  "source": "injected"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "HTTP GET /oauth2/authorize?response_type=code (current behavior) and GET/POST /oauth2/token with grant_type=authorization_code, driven through the product's own WebFlux controllers with a per-client callback registry, a token manager and a serialized authorization-code store.",
+  "sites": [
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java:33-37 (string-prefix redirect target comparison)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java:59-89 (authorization handler and its refusal path)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java:90-125 (INJECTED older authorization mapping)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java:50-74 (code issuance, where the target must be recorded)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java:82-109 (code redemption, where the recorded target must be compared)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeCache.java:15-25 (serialized code model)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/AuthorizationCodeTokenRequest.java:24-30 (redemption parameter accessor)",
+   "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Properties.java:9-20 and OAuth2ServerAutoConfiguration.java:98-104 (configuration and wiring)"
+  ],
+  "routes": [
+   "authorization request on the documented mapping",
+   "authorization request on the older mapping kept for old clients (INJECTED)",
+   "authorization request that is refused, whose refusal must not return the supplied target (INJECTED refusal path)",
+   "code redemption over GET",
+   "code redemption over POST form data",
+   "code issued with no target supplied (client default in effect)"
+  ],
+  "services": [],
+  "project_tests_run": "mvn -o -pl hsweb-authorization/hsweb-authorization-oauth2 test at the pinned+injected commit inside the environment image build: 7 tests, 0 failures, 2 skipped (the two @Ignore'd tests need a local Redis)."
+ },
+ "leak_terms": [
+  "OAuth2Client",
+  "OAuth2ClientManager",
+  "OAuth2ClientEntity",
+  "OAuth2ClientService",
+  "OAuth2Properties",
+  "OAuth2ServerAutoConfiguration",
+  "OAuth2AuthorizeController",
+  "OAuth2GrantService",
+  "DefaultAuthorizationCodeGranter",
+  "AuthorizationCodeCache",
+  "AuthorizationCodeTokenRequest",
+  "AuthorizationCodeGranter",
+  "InDBOAuth2ClientManager",
+  "validateRedirectUri",
+  "isSameRedirectUri",
+  "isValidRedirectUri",
+  "matchCompatiblePath",
+  "matchCompatibleQuery",
+  "hasSameEndpoint",
+  "parseUri",
+  "buildRedirect",
+  "requestCode",
+  "requestToken",
+  "authorizeByCode",
+  "authorizeByCodeLegacy",
+  "toOAuth2Client",
+  "RedirectUriValidationMode",
+  "COMPATIBLE",
+  "EXACT",
+  "callback_uri",
+  "redirectUrl",
+  "redirectUri",
+  "callbackUri",
+  "serialized code store",
+  "code cache"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_fail_shape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_binding.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_legacy.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_error.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_malformed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_fail_crash.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_fail_exact.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "func_fail_refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_blind.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_fail_refuse_all.patch",
+  "crash_as_refusal": "sec_fail_crash.patch",
+  "wrong_resource": "n/a: the decision is over the redirect target itself; there is no neighbouring or proxy resource in this path",
+  "one_role_or_direction": "sec_fail_binding.patch",
+  "reads_only": "n/a: the protected outcome is a delivered authorization result, not a read or a write of a stored resource",
+  "check_after_adjustment": "n/a: the supplied target is trimmed before the decision and is not otherwise adjusted between the decision and its use; a post-decision adjustment would be a constructed shape with no exploit here",
+  "unlisted_route": "sec_fail_legacy.patch",
+  "malformed_identity": "sec_fail_malformed.patch",
+  "missing_authority": "n/a: no authority, secret or role lookup can fail open; the decision is made from the registered callback itself",
+  "adjacent_api": "func_fail_exact.patch"
+ },
+ "traps": [
+  {
+   "id": "t-target-shape",
+   "shape": "shape a plausible check mishandles: a look-alike host, a user-info authority, a longer path, a fragment, a different port and an unparseable value are only string prefixes of the registered callback; the comparison must use endpoint components and reject what it cannot parse",
+   "where": "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java:33-37",
+   "security_tests": [
+    "AuthorizationTargetTest:rejectsLookalikeHost",
+    "AuthorizationTargetTest:rejectsUserInfoAuthority",
+    "AuthorizationTargetTest:rejectsSiblingPath",
+    "AuthorizationTargetTest:rejectsPathLookalike",
+    "AuthorizationTargetTest:rejectsFragmentTarget",
+    "AuthorizationTargetTest:rejectsForeignPort",
+    "AuthorizationTargetTest:rejectsUnparseableTarget"
+   ],
+   "coupled_functional_tests": [
+    "AuthorizationFlowTest"
+   ],
+   "security_fail_patch": "sec_fail_shape.patch",
+   "realistic_because": "this is the published vulnerability's own comparison; the shapes are the ones a string-prefix check cannot tell apart from the registered callback"
+  },
+  {
+   "id": "t-code-binding",
+   "shape": "producer off the check's path: the redemption check reads the target recorded with the issued code in the serialized code store; the check never calls that producer, and the recorded value must also be the client default when the caller supplied no target",
+   "where": "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/code/DefaultAuthorizationCodeGranter.java:82-109; .../code/AuthorizationCodeCache.java:15-25",
+   "security_tests": [
+    "TokenBindingTest:tokenRejectsDifferentTargetOnGet",
+    "TokenBindingTest:tokenRejectsDifferentTargetOnPost",
+    "TokenBindingTest:tokenRejectsMissingTargetAfterNonDefaultTarget",
+    "TokenBindingTest:tokenRejectsAnotherCompatibleTargetAfterDefaultTarget",
+    "LegacyAuthorizationTest:legacyIssuedCodeIsBoundToItsTarget"
+   ],
+   "coupled_functional_tests": [
+    "TokenExchangeTest"
+   ],
+   "security_fail_patch": "sec_fail_binding.patch",
+   "realistic_because": "real upstream code; the authorization and redemption requests are separate, and the only shared state between them is the serialized code record"
+  },
+  {
+   "id": "t-compatible-variants",
+   "shape": "coupled must-keep-working: extra query parameters, a deeper path below the registered one and a sub-path of a registered bare origin are legitimate targets the server accepts today; an exact-equality fix breaks them",
+   "where": "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/OAuth2Client.java:33-37",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "AuthorizationFlowTest",
+    "TokenExchangeTest",
+    "LegacyMappingTest"
+   ],
+   "security_fail_patch": "func_fail_exact.patch",
+   "realistic_because": "the pinned project's own test asserts an extra-query variant is accepted, so the tolerant behaviour is a real contract"
+  },
+  {
+   "id": "t-older-mapping",
+   "shape": "route where the protection never existed: a second authorization mapping kept for old clients returns the supplied target without validating it",
+   "where": "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java:90-125 (INJECTED)",
+   "security_tests": [
+    "LegacyAuthorizationTest:legacyRejectsForeignTarget",
+    "LegacyAuthorizationTest:legacyRejectsSiblingPath",
+    "LegacyAuthorizationTest:legacyRejectsLookalikeHost"
+   ],
+   "coupled_functional_tests": [
+    "LegacyMappingTest"
+   ],
+   "security_fail_patch": "sec_fail_legacy.patch",
+   "realistic_because": "plausible maintainer code for an old-client compatibility mapping; the published fix never touches it"
+  },
+  {
+   "id": "t-refusal-echo",
+   "shape": "route where the protection never existed: the refusal path returns the supplied target as an error redirect, including when the client is unknown or the target was just rejected",
+   "where": "hsweb-authorization/hsweb-authorization-oauth2/src/main/java/org/hswebframework/web/oauth2/server/web/OAuth2AuthorizeController.java:80-88 (INJECTED)",
+   "security_tests": [
+    "ErrorPathTest:errorPathDoesNotEchoForeignTarget",
+    "ErrorPathTest:errorPathDoesNotEchoTargetForUnknownClient"
+   ],
+   "coupled_functional_tests": [
+    "AuthorizationFlowTest:unknownClientIsRefusedCleanly"
+   ],
+   "security_fail_patch": "sec_fail_error.patch",
+   "realistic_because": "plausible maintainer code for OAuth2-style error responses; the published fix only changes the success path and never touches the refusal path"
+  }
+ ],
+ "status": "built"
+}
