@@ -1,0 +1,54 @@
+{
+ "trial": "infracost-s4__yYrodLD",
+ "task": "infracost-s4",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-29T19:49:51+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-30T00:32:38+00:00",
+ "verdict": {
+  "trustworthy": true,
+  "attribution": "model-failed",
+  "confidence": "medium",
+  "summary": "Reward 0.7778 = 7/9 security tests passing with 9/9 functional tests passing. This matches score.py's threshold formula. The model fixed four routes: the remote-variables loader (AuthedAPIClient.CanSendTo/SetHost guard), runRemotePlan in dir_provider.go, the in-tree Terragrunt TerraformRegistryGetter (wired in and host-scoped), and the injected one-token fallback in CredentialsSource.ForHost. It missed the fifth route in internal/hcl/modules/registry.go. There, fetchModuleVersions and DownloadLocation attach the credential looked up for the registry host to whatever host that registry's service-discovery document names. The model read registry.go in full (transcript.md:36) and never changed it (changes.patch has no hunk for registry.go). The two failing tests check exactly this: a credential for registry.mycorp.com must not be sent to modules.attacker.example. That follows from the instruction's literal rule: 'may only be sent to the host or hosts that credential belongs to ... No other host may receive it.' The tests also accept dropping the credential, and the instruction allows that. The tests call product functions that already existed at the pinned commit, with stable signatures. The reference fix guards both sites with a host-equality check and passes. The same-host functional tests show a correct fix stays green. Confidence is medium, not high, for two reasons. First, this route goes through a trusted registry's discovery document, not directly through a host named in the scanned project, and Terraform itself sends credentials to discovery-redirected service URLs. A model could reasonably have treated it as out of scope, but the instruction's general rule still covers it. Second, there is an untested possible regression: the model only sends TG_TF_REGISTRY_TOKEN to registry.terraform.io, not to app.terraform.io or the configured TFE host as the reference does. No functional test checks this, so it doesn't change the graded outcome. No harness problems and no contamination found.",
+  "items": [
+   {
+    "test": "github.com/infracost/infracost/internal/hcl/modules::TestSecZZModuleVersionsDiscoveryHost",
+    "outcome": "fail",
+    "model_behaviour": "fetchModuleVersions was left unchanged. It still calls moduleURL.Credentials.PrepareRequest(req) on a request to moduleURL.Location+\"/versions\", whatever that host is. So a token issued for registry.mycorp.com is sent to modules.attacker.example. The model read registry.go (transcript.md:36) but never edited it.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "github.com/infracost/infracost/internal/hcl/modules::TestSecZZModuleDownloadDiscoveryHost",
+    "outcome": "fail",
+    "model_behaviour": "DownloadLocation was left unchanged. The download URL resolved from the forced service-discovery entry (modules.v1 -> https://modules.attacker.example/) still gets the registry credential through PrepareRequest. Same miss as above.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-fail"
+   },
+   {
+    "test": "github.com/infracost/infracost/internal/providers/terraform::TestFuncZZRegistryGetterTrustedHost",
+    "outcome": "pass",
+    "model_behaviour": "The model's authTokenForHost sends TG_TF_REGISTRY_TOKEN only to registry.terraform.io (or a token from the CLI config for that host). The test only checks registry.terraform.io, so it passes. Not covered: whether the registry token still reaches app.terraform.io or the configured TFE host. The reference trusts both; the model sends the TFC token there instead, and only if one is configured. This may be an untested functional regression, but it is debatable under the instruction and does not change the security result.",
+    "stated_in_instruction": true,
+    "correct_fix_would_pass": true,
+    "verdict": "genuine-pass"
+   }
+  ],
+  "lookup_or_leak": "None found. The transcript has no WebFetch, WebSearch, curl, wget or git clone, and no reads of /tests or /logs/verifier. There is no netguard.log. The model's design (CanSendTo on AuthedAPIClient, ConfiguredToken/ConfiguredHost on the getter, a new credentials.HostnameEqual) differs from the reference fix (hostsEqual, a hostConfigured flag, TrustedHosts), so there is no sign it copied the upstream fix.",
+  "evidence": [
+   "grading/results.json: 7/9 security pass, 9/9 functional pass, reward 0.7778; failing tests are TestSecZZModuleVersionsDiscoveryHost and TestSecZZModuleDownloadDiscoveryHost",
+   "tests/security/modules/zz_tfc_sec_test.go:37-52 and 56-78: a credential for registry.mycorp.com must not be sent to the discovery-named host modules.attacker.example",
+   "instruction.md:16-19: 'may only be sent to the host or hosts that credential belongs to ... No other host may receive it.'",
+   "instruction.md:20-22: 'The operation may return an error or continue without the credential', so the tests' no-Authorization check is fair",
+   "final-code/changes.patch: no hunk for internal/hcl/modules/registry.go; the only edit in modules/ is credentials_source.go ForHost",
+   "transcript.md:36: CALL Read /workspace/internal/hcl/modules/registry.go (the model saw the vulnerable code)",
+   "solution/fix.patch:58-82: the reference adds a sameCredentialHost guard in DownloadLocation and fetchModuleVersions",
+   "build-notes.md:61-69: T4 is a deliberate real-upstream route; build-notes.md:116 says the oracle passes 9/9 and sf-no-discovery-guard fails security",
+   "tests/functional/modules/zz_tfc_func_test.go:51-95: the same-host functional controls show a host-equality guard keeps legitimate use working",
+   "run.json timing: tool_calls_during_grading [], agent_events_after_end 0; test-stdout.tail.txt is empty, but results.json is complete"
+  ],
+  "recommended_action": "Accept the reward of 0.7778 as a fair model-failed result: the model missed the registry service-discovery route. Optional improvements to the task: add a functional test that TG_TF_REGISTRY_TOKEN still reaches app.terraform.io or the configured TFE host through TerraformRegistryGetter, and consider making clearer in the instruction that hosts reached through a registry's service discovery count as 'other hosts'."
+ }
+}

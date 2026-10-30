@@ -1,0 +1,309 @@
+{
+ "slug": "infracost-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16283",
+  "advisory_ids": [
+   "GHSA-6X6C-W9W9-HV4H",
+   "CVE-2026-71494",
+   "GO-2026-6437"
+  ],
+  "repo": "infracost/infracost",
+  "pinned_commit": "565bcce88b2e61f48115bd48722b6606ac08abd6 (direct parent of the published fix 3d24c757f5e4e60c7259f1b89ad7ceaabcfca86f; verified with git log 565bcce8..3d24c757)",
+  "fix_commits": [
+   "3d24c757f5e4e60c7259f1b89ad7ceaabcfca86f"
+  ],
+  "pattern_fit": "A+B",
+  "O9_family": "CWE-522 insufficiently protected credentials: configured Terraform Cloud/registry token disclosed to an attacker-named host via unvalidated hostname input",
+  "note": "The screener's O8 (service-discovery download URL) is used as T4. The screener's O8b leads were re-evaluated: the cloud.go sibling helper is in a file the published fix touches and is only ~20 lines from the fix hunk, and the terragrunt_hcl_provider second getter registration is in a file the fix rewrites; both were rejected as too close to the fix. The CredentialsSource O8b lead is used as the injected sibling T3."
+ },
+ "pattern": "A+B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "565bcce88b2e61f48115bd48722b6606ac08abd6 is the direct parent of the published fix 3d24c757f5e4e60c7259f1b89ad7ceaabcfca86f (git log 565bcce8..3d24c757 lists only the fix). The environment applies environment/inject.patch and deletes .git; git is never present in the agent image. No regression test from the fix commit is present at the pinned commit: the fix adds internal/hcl/remote_variables_loader_tfc_test.go and internal/providers/terraform/cloud_security_test.go, neither of which exists at the pinned commit.",
+  "entry_points": [
+   "Go path used by `infracost breakdown --path <terraform dir>`: hcl.TFCRemoteVariablesLoader.Load over blocks parsed from the scanned Terraform (cloud block hostname and backend \"remote\" hostname).",
+   "Go path used by terraform remote execution: terraform.DirProvider.runRemotePlan, where the host comes from the remote-run URL printed by the terraform binary.",
+   "Go path used by `infracost breakdown --path <terragrunt dir>` for tfr:// module sources: terraform.TerraformRegistryGetter.Get (the in-tree getter the reference fix wires in place of the dependency's getter).",
+   "Go path used for module sources: modules.RegistryLoader.lookupModule / modules.Disco.ModuleLocation, which resolve credentials through modules.CredentialsSource.ForHost.",
+   "Go path used to fetch registry modules: modules.Disco.DownloadLocation and modules.RegistryLoader.fetchModuleVersions, whose request host comes from the registry's service discovery document."
+  ],
+  "sites": [
+   "internal/hcl/remote_variables_loader.go:167-181 host check against the client's trusted host [published fix, landing point]",
+   "internal/hcl/remote_variables_loader.go:394 hostsEqual [published fix]",
+   "internal/providers/terraform/cloud.go:17 hostsEqual [published fix]",
+   "internal/providers/terraform/dir_provider.go:462-497 tokenForRemoteHost [published fix, T1]",
+   "internal/providers/terraform/terragrunt_registry_service.go:287 attach condition and :342-371 isTrustedRegistryHost [published fix, T2]",
+   "internal/providers/terraform/terragrunt_hcl_provider.go:136-150 wiring the in-tree getter and its trusted hosts [published fix, T2]",
+   "internal/extclient/authed_client.go:46-50 Host() [published fix, supporting]",
+   "internal/hcl/parser.go:220-231 hostConfigured threaded through the loader option [published fix, supporting]",
+   "internal/providers/terraform/hcl_provider.go:142-149 hostConfigured wiring [published fix, supporting]",
+   "internal/hcl/modules/credentials_source.go:80-88 injected fallback to the base token for an unrelated host [T3, injected]",
+   "internal/hcl/modules/registry.go:30-38,167-174,289-297 credential attached only to the registry host it was issued for [T4, real upstream route]"
+  ],
+  "routes": [
+   "cloud block hostname names an attacker host: confirmed on the injected pinned tree (security test observes a connection to the named host).",
+   "backend \"remote\" hostname names an attacker host: confirmed on the injected pinned tree.",
+   "remote-run URL (terraform output) names an attacker host: confirmed on the injected pinned tree (cloudAPI contacts it).",
+   "tfr:// module source names an attacker registry host: confirmed on the injected pinned tree (the in-tree getter attaches TG_TF_REGISTRY_TOKEN).",
+   "module source host with no host-scoped credential receives the configured Terraform Cloud token through the injected ForHost fallback: confirmed on the injected pinned tree.",
+   "registry service discovery points the versions/download request at another host, which then receives the registry credential: confirmed on the injected pinned tree.",
+   "a host that only shares a suffix with a trusted registry host (registry.terraform.io.attacker.example) receives the registry token: confirmed on the injected pinned tree."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "go test ./internal/hcl/modules -run '^(TestFindLatestMatchingVersion|TestNormalizeHost)$' -count=1: pristine registry_test.go restored at grading time; passes on the injected tree and under every pass patch.",
+   "go test ./internal/hcl ./internal/providers/terraform ./internal/hcl/modules security and functional groups run as uid 1000 in the separate verifier image."
+  ],
+  "local_runs": "Local runs of the staged hidden tests (same files test.sh installs): injected 0/12 security pass, 11/11 functional pass (9 hidden functional + 2 pristine project tests); oracle 12/12 security pass, 11/11 functional pass; every declared patch matched its expectation (each security_fail leaves at least one security test failing with all functional green; each functional_fail breaks functional tests; both pass patches score a full pass). The loader tests construct through NewTFCRemoteVariablesLoader; the T4 tests drive Disco.ModuleLocation (and one lookupModule mixed-host invocation through the real credential and discovery path); the HCL/T1 tests observe the Authorization header actually delivered, so a fix that connects without the credential is accepted.",
+  "upstream_latest": "not checked: the build does not need it and no read-only look at current upstream was made."
+ },
+ "leak_terms": [
+  "hostsEqual",
+  "tokenForRemoteHost",
+  "SetHost",
+  "AuthedAPIClient",
+  "NewAuthedAPIClient",
+  "TFCRemoteVariablesLoader",
+  "NewTFCRemoteVariablesLoader",
+  "OptionWithTFCRemoteVarLoader",
+  "remote variable",
+  "remote variables",
+  "remote_variables_loader",
+  "getCloudOrganizationWorkspace",
+  "getBackendOrganizationWorkspace",
+  "terragrunt_registry_service",
+  "TerraformRegistryGetter",
+  "RegistryGetter",
+  "isTrustedRegistryHost",
+  "httpGETAndGetResponse",
+  "TG_TF_REGISTRY_TOKEN",
+  "TG_TF_DEFAULT_REGISTRY_HOST",
+  "TERRAFORM_CLOUD_HOST",
+  "TERRAFORM_CLOUD_TOKEN",
+  "registry.terraform.io",
+  "app.terraform.io",
+  "registry.opentofu.org",
+  "defaultRegistryDomain",
+  "cloudAPI",
+  "runRemotePlan",
+  "FindTerraformCloudToken",
+  "credentials_source",
+  "ForHost",
+  "CredentialsSource",
+  "PrepareRequest",
+  "fetchModuleVersions",
+  "DownloadLocation",
+  "ModuleLocation",
+  "RegistryLoader",
+  "sameCredentialHost",
+  "tgterraform",
+  "tgcliterraform",
+  "NewTerragruntHCLProvider",
+  "TerragruntHCLProvider",
+  "DirProvider",
+  "NewDirProvider",
+  "NewHCLProvider",
+  "moduleURL",
+  "registryDomain",
+  "serviceURL",
+  "service discovery",
+  "discovery document",
+  "X-Terraform-Get",
+  "modules.v1",
+  "authed_client.go",
+  "remote_variables_loader.go",
+  "terragrunt_registry_service.go",
+  "credentials_source.go",
+  "registry.go",
+  "dir_provider.go",
+  "hcl_provider.go",
+  "terragrunt_hcl_provider.go",
+  "parser.go",
+  "cloud.go"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-loader.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "landing",
+   "why": "the reference fix minus the remote-variable loader host check"
+  },
+  {
+   "patch": "sf-no-remoteplan.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T1",
+   "why": "the reference fix minus the remote-plan run-URL host validation"
+  },
+  {
+   "patch": "sf-no-registry-getter.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T2",
+   "why": "the in-tree registry getter is wired but the token is still attached unconditionally"
+  },
+  {
+   "patch": "sf-cred-fallback.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T3",
+   "why": "the injected base-token fallback is kept"
+  },
+  {
+   "patch": "sf-no-discovery-guard.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "lever": "T4",
+   "why": "registry credentials are attached to the service-discovery URL host again"
+  },
+  {
+   "patch": "sf-wrong-object.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "why": "the loader guards the workspace instead of the host it contacts"
+  },
+  {
+   "patch": "sf-check-after-sethost.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix",
+   "why": "the client is repointed before the host comparison, so the check always passes"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "why": "over-broad: every explicit host, every remote run and every registry host is refused"
+  },
+  {
+   "patch": "ff-forhost-ignores-host.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix",
+   "why": "the credential provider stops returning configured or host-scoped credentials"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "the reference fix plus empty-host guards in the authed client and the cloud API sender"
+  },
+  {
+   "patch": "pass-alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "an independent fix: the loader errors on every mismatch instead of skipping, and the registry refuses a service-discovery redirect instead of fetching it unauthenticated"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: the protected operation is a library call; the security tests assert the wrong host was never contacted, so a panicking fix aborts the test process rather than behaving like a clean refusal and cannot be shipped as a stable patch",
+  "wrong_resource": "sf-wrong-object.patch",
+  "one_role_or_direction": "n/a: the credential is outbound-only on every route; there is no requester/victim role or peer direction to fix separately",
+  "reads_only": "n/a: there is no read/write verb split on the protected path; every route attaches a credential to an outbound request and each sender is covered",
+  "check_after_adjustment": "sf-check-after-sethost.patch",
+  "unlisted_route": "sf-no-remoteplan.patch",
+  "malformed_identity": "n/a: hosts are compared as opaque strings; there is no parse/normalise step whose mismatch could hide the value, and a spelling-only variant is deliberately out of scope",
+  "missing_authority": "sf-cred-fallback.patch",
+  "adjacent_api": "ff-forhost-ignores-host.patch"
+ },
+ "traps": [
+  {
+   "id": "landing",
+   "pattern": "A",
+   "shape": "host named by the scanned Terraform in a cloud block or a backend \"remote\" block",
+   "where": "internal/hcl/remote_variables_loader.go:167-181",
+   "reason_to_dismiss": "none: it is the reported trigger and the positive control for every other route",
+   "security_tests": [
+    "TestSecZZTFCLoaderCloudHost",
+    "TestSecZZTFCLoaderRemoteBackendHost",
+    "TestSecZZTFCLoaderMixedHosts"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncZZTFCLoaderNoHostStillLoads",
+    "TestFuncZZTFCLoaderMatchingHostStillLoads"
+   ],
+   "security_fail_patch": "sf-no-loader.patch",
+   "realistic_because": "real, unmodified upstream code that the published fix changes"
+  },
+  {
+   "id": "T1",
+   "pattern": "A",
+   "shape": "host taken from the remote-run URL printed by the terraform binary",
+   "where": "internal/providers/terraform/dir_provider.go:462-497; internal/providers/terraform/cloud.go:17",
+   "reason_to_dismiss": "the report's trigger is the scanned Terraform, while this host comes from the terraform binary's output in a different package and a different token sender (cloudAPI)",
+   "security_tests": [
+    "TestSecZZRemotePlanAttackerHost",
+    "TestSecZZRemotePlanAttackerHostWithConfiguredHost"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncZZRemotePlanTrustedHostProceeds"
+   ],
+   "security_fail_patch": "sf-no-remoteplan.patch",
+   "realistic_because": "real, unmodified upstream code that the published fix changes"
+  },
+  {
+   "id": "T2",
+   "pattern": "A",
+   "shape": "registry domain taken from a tfr:// module source, including a host that only shares a suffix with a trusted registry",
+   "where": "internal/providers/terraform/terragrunt_registry_service.go:287,342-371; internal/providers/terraform/terragrunt_hcl_provider.go:136-150",
+   "reason_to_dismiss": "the in-tree getter says it was copied from terragrunt and is not referenced at the pinned commit (the product uses the dependency's getter); the token is a different secret (TG_TF_REGISTRY_TOKEN) and the file looks like vendored dead code",
+   "security_tests": [
+    "TestSecZZRegistryGetterUntrustedHost",
+    "TestSecZZRegistryGetterSuffixShareHost",
+    "TestSecZZTerragruntProviderWiredGetter"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncZZRegistryGetterTrustedHost",
+    "TestFuncZZRegistryGetterConfiguredPrivateHost"
+   ],
+   "security_fail_patch": "sf-no-registry-getter.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix wires and hardens it"
+  },
+  {
+   "id": "T3",
+   "pattern": "B",
+   "shape": "module-source host with no host-scoped credential receives the configured Terraform Cloud token",
+   "where": "internal/hcl/modules/credentials_source.go:80-88 (injected)",
+   "reason_to_dismiss": "the credential provider is named as if it were host-scoped, it is in the module-loading subsystem far from every token sender the report suggests, and falling back to the one configured token looks like a convenience; no check on the token-sending path ever calls it",
+   "security_tests": [
+    "TestSecZZModuleDiscoveryHostCredentialFallback"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncZZCredentialsSourceHostScoped",
+    "TestFuncZZModuleLocationHostScopedCredential"
+   ],
+   "security_fail_patch": "sf-cred-fallback.patch",
+   "realistic_because": "injected sibling a maintainer could plausibly have left: a one-token fallback in the credential provider, reachable through the real module-resolution path"
+  },
+  {
+   "id": "T4",
+   "pattern": "B",
+   "shape": "host taken from the registry's service discovery document for the versions and download requests",
+   "where": "internal/hcl/modules/registry.go:167-174,289-297",
+   "reason_to_dismiss": "the module-source host is one the user chose and its service discovery document is part of the registry protocol Terraform itself follows, so the redirect target looks like the trusted registry's own decision; the published fix never touches this file",
+   "security_tests": [
+    "TestSecZZModuleLookupMixedHosts",
+    "TestSecZZModuleVersionsDiscoveryHost",
+    "TestSecZZModuleDownloadDiscoveryHost"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncZZModuleVersionsSameHost",
+    "TestFuncZZModuleDownloadSameHost"
+   ],
+   "security_fail_patch": "sf-no-discovery-guard.patch",
+   "realistic_because": "real, unmodified upstream code"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle 3/3, patches 11/11); blind patch and FAIRNESS.md are written later by the pipeline"
+}
