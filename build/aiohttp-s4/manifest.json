@@ -1,0 +1,205 @@
+{
+ "slug": "aiohttp-s4",
+ "candidate": "screener-v2 entry 4499: GHSA-MFX4-HV73-Q22V / CVE-2026-69243 / PYSEC-2026-3546 (aio-libs/aiohttp)",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "c852173947406e2eca65957535ff17d3a4035a03 (parent of fix 6ae358f0983c3f4d6f67692b2f8e65dc8e091c98; the fix commit is the only commit between the two and the pinned tree contains no regression tests for it)",
+  "entry_points": [
+   "aiohttp.web HTTP/1.1 server: raw request that announces a body and requests a protocol switch, handled by an application function that reads the body",
+   "aiohttp.http request parser (pure Python): HttpRequestParserPy.feed_data",
+   "aiohttp.http request parser (Cython/llhttp): HttpRequestParserC.feed_data",
+   "aiohttp.web server accepting a WebSocket upgrade (WebSocketResponse.prepare) while an announced body arrives after the header block"
+  ],
+  "sites": [
+   "aiohttp/http_parser.py:293-296 (HttpParser.__init__; published)",
+   "aiohttp/http_parser.py:425-444,466-470,514-521,575-584 (deferred switch; published)",
+   "aiohttp/_http_parser.pyx:322,398,482-490,649-656,871-877 (Cython/llhttp deferred switch; published)",
+   "aiohttp/web_protocol.py:408-464 (RequestHandler installs the upgraded-protocol reader while the HTTP parser still holds the announced body; uncovered route)",
+   "aiohttp/web_request.py:692-700 (injected: request-body accessor returns an empty body for non-chunked upgrade requests)"
+  ],
+  "routes": [
+   "declined upgrade with a Content-Length body (handler reads the body)",
+   "declined upgrade with a chunked body",
+   "declared body interpreted as a separate pipelined request (smuggling)",
+   "accepted WebSocket upgrade, body arriving in the same packet as the headers",
+   "accepted WebSocket upgrade, body arriving after the 101 response (uncovered by the published fix)",
+   "pure-Python parser: body split across feed_data calls",
+   "Cython parser: body split across feed_data calls"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "tests/test_http_parser.py from a pristine pinned copy (713 passed, 0 skipped, 3 xfail; the 3 xfail URL tests are deselected so the JUnit XML has no non-pass entries) on the injected tree and on the oracle; tests/test_web_functional.py (131 passed) was also verified locally"
+  ],
+  "local_runs": "dev-image (cython 3.2.5 + node/llhttp generate) suites: injected tree security 0/8 (pure Python) and 0/8 (accelerated), functional 7/7 and 8/8, project 713 passed; oracle security 8/8 + 8/8, functional 7/7 + 8/8, project 713 passed; every check patch asserted against the same suites locally before the gate"
+ },
+ "leak_terms": [
+  "aiohttp.http_parser",
+  "aiohttp._http_parser",
+  "http_parser",
+  "_http_parser",
+  "HttpParser",
+  "HttpRequestParser",
+  "HttpResponseParser",
+  "_upgraded",
+  "_pending_upgrade",
+  "_deferred_upgrade",
+  "deferred_upgrade",
+  "set_upgraded",
+  "set_parser",
+  "_message_tail",
+  "_payload_parser",
+  "_read_bytes",
+  "web_protocol",
+  "web_request",
+  "llhttp",
+  "Cython",
+  "read_until_eof",
+  "RequestHandler",
+  "BaseRequest",
+  "StreamReader",
+  "EMPTY_PAYLOAD",
+  "feed_data"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-py-parser.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the pure-Python request parser is left as pinned (the accelerated parser, the handler-level route and the accessor are fixed); the pure-Python security configuration fails while all functional tests pass"
+  },
+  {
+   "patch": "sf-miss-c-parser.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the Cython/llhttp request parser is left as pinned; the default (accelerated) security configuration fails while all functional tests pass"
+  },
+  {
+   "patch": "sf-miss-handler-switch.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the protocol layer installs the upgraded reader before the announced body is consumed; only the accepted-upgrade late-body security test fails, all functional tests pass"
+  },
+  {
+   "patch": "sf-miss-request-read.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the injected accessor shortcut stays: a Content-Length body is lost while the chunked form still works; all functional tests pass"
+  },
+  {
+   "patch": "ff-always-defer.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: a no-body upgrade no longer switches immediately, so immediate-switch functional tests fail"
+  },
+  {
+   "patch": "ff-refuse-upgrades.patch",
+   "expect": "functional_fail",
+   "note": "over-broad refusal: every request that asks to switch protocols is rejected, so a legitimate WebSocket handshake fails"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus clearing the deferred-switch state whenever the parser's upgraded flag is reset, in both parsers"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "different design: renamed deferred state in the parsers and a buffering reader object that routes connection bytes into the HTTP parser until the announced body is consumed"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "fix written by a fresh agent from instruction.md and the repo only (produced by the blind-fix run)"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-upgrades.patch",
+  "crash_as_refusal": "n/a: the security tests assert positive delivery of the declared body, so a crash or 500 fails them exactly like a missing fix and cannot be mistaken for a refusal",
+  "wrong_resource": "n/a: the protected object is the body of the request on the same connection; there is no neighbouring or proxy resource to authorise instead",
+  "one_role_or_direction": "sf-miss-py-parser.patch",
+  "reads_only": "n/a: the sink is server request framing, one direction only; there is no separate write path to leave unguarded",
+  "check_after_adjustment": "n/a: the framing decision uses the declared length/transfer-coding verbatim, with no normalising or adjusting step between the value and the switch",
+  "unlisted_route": "sf-miss-handler-switch.patch",
+  "malformed_identity": "n/a: no identity is parsed or split; framing values are validated digits/tokens before use",
+  "missing_authority": "n/a: the decision reads only the request framing; there is no authority, role or secret look-up that can return nothing",
+  "adjacent_api": "n/a: the fix changes request framing and the protocol takeover only; no shared helper's stated behaviour for another API changes"
+ },
+ "traps": [
+  {
+   "id": "T1_reported_parser",
+   "pattern": "A (landing) + coupled must-keep-working (how-type)",
+   "shape": "declined upgrade announcing a Content-Length or chunked body; the body must reach the handler, no switch until it is consumed, and a no-body upgrade must still switch immediately while an unsupported token next to a body stays a normal request",
+   "where": "aiohttp/http_parser.py:427-443,466-470,514-521,575-584",
+   "security_tests": [
+    "security/test_parser_py.py::test_content_length_body_is_read_before_the_switch",
+    "security/test_parser_py.py::test_chunked_body_is_read_before_the_switch",
+    "security/test_parser_py.py::test_body_and_following_request_in_one_packet",
+    "security/test_server_declined.py::test_content_length_body_reaches_the_handler"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_parser_py.py::test_upgrade_without_a_body_switches_immediately",
+    "functional/test_parser_py.py::test_zero_length_body_switches_immediately",
+    "functional/test_parser_py.py::test_unsupported_upgrade_token_keeps_an_ordinary_body"
+   ],
+   "security_fail_patch": "sf-miss-py-parser.patch",
+   "realistic_because": "the reported landing point; the coupled immediate-switch behaviour is what an over-broad 'always read a body' fix breaks"
+  },
+  {
+   "id": "T2_accelerated_second_implementation",
+   "pattern": "A (far site, second implementation, where-type)",
+   "shape": "the same request shapes through the Cython/llhttp parser, including a body split across feed_data calls",
+   "where": "aiohttp/_http_parser.pyx:478-490,649-656,871-877",
+   "security_tests": [
+    "security/test_parser_c.py::test_content_length_body_is_read_before_the_switch",
+    "security/test_parser_c.py::test_chunked_body_is_read_before_the_switch",
+    "security/test_parser_c.py::test_body_and_following_request_in_one_packet",
+    "security/test_server_declined.py::test_chunked_body_reaches_the_handler"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_parser_c.py::test_upgrade_without_a_body_switches_immediately",
+    "functional/test_parser_c.py::test_zero_length_body_switches_immediately",
+    "functional/test_parser_c.py::test_unsupported_upgrade_token_keeps_an_ordinary_body"
+   ],
+   "security_fail_patch": "sf-miss-c-parser.patch",
+   "realistic_because": "real, unmodified upstream code; the .pyx reads as the generated/optional accelerator next to the readable parser (and the reverse when it is the built default)"
+  },
+  {
+   "id": "T3_protocol_takeover",
+   "pattern": "B (uncovered route, how-type)",
+   "shape": "an application accepts a WebSocket upgrade; the declared body arrives after the response, so the handler-level takeover installs the new reader while the HTTP parser still holds the body, and the body bytes are parsed as messages of the new protocol",
+   "where": "aiohttp/web_protocol.py:408-420 with aiohttp/web_ws.py:389-405",
+   "security_tests": [
+    "security/test_server_upgrade_switch.py::test_body_arriving_after_the_switch_is_not_a_protocol_message"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_server.py::test_websocket_handshake_without_a_body_still_works"
+   ],
+   "security_fail_patch": "sf-miss-handler-switch.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix never touches this layer, and 'a real handshake has no body' makes it look like the handler's own business"
+  },
+  {
+   "id": "T4_injected_accessor_shape",
+   "pattern": "injected sibling (shape trap, how-type)",
+   "shape": "the request-body accessor returns an empty body for a non-chunked upgrade request, so the Content-Length form still loses the body while the chunked form is delivered",
+   "where": "aiohttp/web_request.py:692-700 (injected)",
+   "security_tests": [
+    "security/test_server_declined.py::test_content_length_body_reaches_the_handler",
+    "security/test_server_declined.py::test_body_bytes_are_not_served_as_a_separate_request"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_server.py::test_ordinary_content_length_body_is_read",
+    "functional/test_server.py::test_ordinary_chunked_body_is_read"
+   ],
+   "security_fail_patch": "sf-miss-request-read.patch",
+   "realistic_because": "looks like a deliberate upgrade-aware product decision in the request-access layer, and it already handles the harder chunked framing"
+  }
+ ],
+ "status": "gate green (2026-10-30T18:13Z): static PASS (only the downstream blind pass patch and FAIRNESS.md left, by instruction); nop PASS (16/16 security tests fail on the pinned+injected tree, 723/723 functional pass, 0 skipped); oracle PASS 3/3 (reward 1.0, 739/739, identical); patches PASS 7/7 as declared (4 security_fail, 2 functional_fail, hardening 1.0, alternative 1.0). pass-blind.patch still to be produced by the blind-fix run."
+}

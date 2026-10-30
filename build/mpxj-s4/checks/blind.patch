@@ -1,0 +1,143 @@
+diff -ruN a/src/main/java/org/mpxj/common/ArchivePathHelper.java b/src/main/java/org/mpxj/common/ArchivePathHelper.java
+--- a/src/main/java/org/mpxj/common/ArchivePathHelper.java	1970-01-01 00:00:00.000000000 +0000
++++ b/src/main/java/org/mpxj/common/ArchivePathHelper.java	2026-10-30 18:13:11.063137111 +0000
+@@ -0,0 +1,69 @@
++/*
++ * file:       ArchivePathHelper.java
++ * author:     MPXJ contributors
++ * copyright:  (c) Packwood Software 2025
++ * date:       30/10/2025
++ */
++
++/*
++ * This library is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by the
++ * Free Software Foundation; either version 2.1 of the License, or (at your
++ * option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, write to the Free Software Foundation, Inc.,
++ * 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
++ */
++
++package org.mpxj.common;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
++
++/**
++ * Helpers for resolving the names found inside archive entries.
++ *
++ * An archive entry name is supplied by whoever built the archive and is
++ * therefore untrusted. Before an entry is written or a directory is created
++ * for it, its name must be resolved against the directory the archive is
++ * being expanded into, and the result must still be inside that directory.
++ * Names containing ".." components, absolute names and names which reach a
++ * symbolic link pointing outside the expansion directory all fail this test.
++ */
++public final class ArchivePathHelper
++{
++   /**
++    * Resolve an archive entry name against the directory being expanded.
++    *
++    * @param directory directory the archive is expanded into
++    * @param entryName name taken from the archive entry
++    * @return File instance representing the entry inside the directory
++    * @throws IOException if the name resolves outside the directory
++    */
++   public static File resolveEntryPath(File directory, String entryName) throws IOException
++   {
++      File entry = new File(directory, entryName);
++      Path directoryPath = directory.getCanonicalFile().toPath();
++      Path entryPath = entry.getCanonicalFile().toPath();
++      if (!entryPath.startsWith(directoryPath))
++      {
++         throw new IOException("Archive entry is outside of the extraction directory: " + entryName);
++      }
++      return entry;
++   }
++
++   /**
++    * Private constructor to prevent instantiation.
++    */
++   private ArchivePathHelper()
++   {
++      // do nothing
++   }
++}
+diff -ruN a/src/main/java/org/mpxj/common/InputStreamHelper.java b/src/main/java/org/mpxj/common/InputStreamHelper.java
+--- a/src/main/java/org/mpxj/common/InputStreamHelper.java	2026-10-30 17:56:10.000000000 +0000
++++ b/src/main/java/org/mpxj/common/InputStreamHelper.java	2026-10-30 18:13:14.815195224 +0000
+@@ -189,13 +189,7 @@
+             break;
+          }
+ 
+-         File file = new File(dir, entry.getName());
+-
+-         // https://snyk.io/research/zip-slip-vulnerability
+-         if (!file.getCanonicalFile().toPath().startsWith(dir.getCanonicalFile().toPath()))
+-         {
+-            throw new IOException("Entry is outside of the target dir: " + entry.getName());
+-         }
++         File file = ArchivePathHelper.resolveEntryPath(dir, entry.getName());
+ 
+          if (entry.isDirectory())
+          {
+diff -ruN a/src/main/java/org/mpxj/common/TarHelper.java b/src/main/java/org/mpxj/common/TarHelper.java
+--- a/src/main/java/org/mpxj/common/TarHelper.java	2026-10-30 17:56:15.000000000 +0000
++++ b/src/main/java/org/mpxj/common/TarHelper.java	2026-10-30 18:13:14.329187697 +0000
+@@ -101,7 +101,7 @@
+          String entryName = pendingName == null ? (prefix.isEmpty() ? name : prefix + "/" + name) : pendingName;
+          pendingName = null;
+ 
+-         File file = new File(dir, entryName);
++         File file = ArchivePathHelper.resolveEntryPath(dir, entryName);
+ 
+          if (typeFlag == '5')
+          {
+diff -ruN a/src/main/java/org/mpxj/primavera/p3/P3PRXFileReader.java b/src/main/java/org/mpxj/primavera/p3/P3PRXFileReader.java
+--- a/src/main/java/org/mpxj/primavera/p3/P3PRXFileReader.java	2026-10-30 17:56:10.000000000 +0000
++++ b/src/main/java/org/mpxj/primavera/p3/P3PRXFileReader.java	2026-10-30 18:13:13.272171325 +0000
+@@ -31,6 +31,7 @@
+ 
+ import org.mpxj.MPXJException;
+ import org.mpxj.ProjectFile;
++import org.mpxj.common.ArchivePathHelper;
+ import org.mpxj.common.ByteArrayHelper;
+ import org.mpxj.common.FileHelper;
+ import org.mpxj.common.FixedLengthInputStream;
+@@ -99,7 +100,7 @@
+ 
+       int dataSizeValue = getInt(dataSize, 0);
+       String fileNameValue = getString(fileName, 0);
+-      File file = new File(dir, fileNameValue);
++      File file = ArchivePathHelper.resolveEntryPath(dir, fileNameValue);
+ 
+       if (dataSizeValue == 0)
+       {
+diff -ruN a/src/main/java/org/mpxj/primavera/suretrak/SureTrakSTXFileReader.java b/src/main/java/org/mpxj/primavera/suretrak/SureTrakSTXFileReader.java
+--- a/src/main/java/org/mpxj/primavera/suretrak/SureTrakSTXFileReader.java	2026-10-30 17:56:10.000000000 +0000
++++ b/src/main/java/org/mpxj/primavera/suretrak/SureTrakSTXFileReader.java	2026-10-30 18:13:14.012182787 +0000
+@@ -31,6 +31,7 @@
+ 
+ import org.mpxj.MPXJException;
+ import org.mpxj.ProjectFile;
++import org.mpxj.common.ArchivePathHelper;
+ import org.mpxj.common.ByteArrayHelper;
+ import org.mpxj.common.FileHelper;
+ import org.mpxj.common.FixedLengthInputStream;
+@@ -87,7 +88,7 @@
+       int dataSizeValue = getInt(dataSize, 0);
+       String fileNameValue = getString(fileName, 0);
+ 
+-      File file = new File(dir, fileNameValue);
++      File file = ArchivePathHelper.resolveEntryPath(dir, fileNameValue);
+       if (dataSizeValue == 0)
+       {
+          FileHelper.createNewFile(file);

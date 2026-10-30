@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/aiohttp-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/aiohttp-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 136,
+ "duration_ms": 559931,
+ "total_cost_usd": 3.7382592000000017,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "9e9bab71-4306-438e-9dd6-91f1d3a94c36",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 100651,
+   "outputTokens": 58569,
+   "cacheReadInputTokens": 10821376,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 3.7382592000000017,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "## Result\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/aiohttp-s4/blind.patch` (a/ b/ paths, applies with `patch -p1`; dry-run on a fresh `pristine` copy clean)\n**Mechanisms:** `/home/runner/.tb-graders/cwe/blind/aiohttp-s4/mechanisms.md`; probes at `probe/probe_properties.py`\n\n### Fix summary (5 lines)\n1. **Readable parser (`http_parser.py`)** \u2014 an upgrade no longer switches at head-complete when a body is framed; `_pending_upgrade` is armed (CL>0 or chunked), the normal payload stream is created, and `_upgraded` flips only when the payload reports complete, with the remainder returned as the new protocol's tail. No-body/CL:0 switches stay immediate; unsupported tokens stay ordinary readable requests.\n2. **Cython/llhttp parser (`_http_parser.pyx`)** \u2014 removed the forced `return 2` header pause so llhttp parses the announced body and pauses only at message end; `_pending_upgrade` is released to `_upgraded` in the `HPE_PAUSED_UPGRADE` branch (also CONNECT/101). An unsupported token clears llhttp's `upgrade` flag so trailing bytes are no longer dropped.\n3. **Protocol takeover (`web_protocol.py`)** \u2014 `set_parser()` holds the handler-supplied WebSocket reader in `_deferred_payload_parser` while `parser.pending_upgrade`; `data_received()` installs it and delivers the post-body tail only after the body is complete and the switch is real.\n4. **Accessor (`web_request.py`)** \u2014 removed the injected shortcut that returned `b\"\"` for non-chunked upgrade requests, so `read()` delivers the declared body under every framing.\n5. **Declined upgrades** \u2014 the parser-level deferral releases correctly and `finish_response()`'s reset reparses the pipelined tail; `set_upgraded(False)` intentionally does not clear a still-pending body deferral.\n\n### Verification (exact gate commands, fresh `pristine` + `patch -p1` + re-cythonize/rebuild)\n- security py **8/8**, security C **8/8**, functional py **7/7**, functional C **8/8**\n- project `tests/test_http_parser.py` (with the gate's three deselects) **708 passed, 0 skipped** with optional compression backends installed\n- extra probes pass on both parser builds: byte-by-byte CL/chunked delivery, zero-length chunked body, unsupported-token continuation, no-body tail, server-level split WebSocket body, and body-then-following-request.",
+ "status": "ok"
+}

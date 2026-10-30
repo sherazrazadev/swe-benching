@@ -1,0 +1,182 @@
+diff -ruN a/utils/render-ssr-error/src/encode.js b/utils/render-ssr-error/src/encode.js
+--- a/utils/render-ssr-error/src/encode.js	1970-01-01 00:00:00.000000000 +0000
++++ b/utils/render-ssr-error/src/encode.js	2026-10-30 18:18:22.322665171 +0000
+@@ -0,0 +1,50 @@
++// Encoding helpers for values that end up inside the error page. Both helpers are
++// context aware: a value may only ever travel as data for the context it is placed
++// in, never as document syntax.
++
++const LINE_SEPARATOR = String.fromCharCode(0x2028)
++const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029)
++
++const SCRIPT_ESCAPES = {
++  '<': '\\u003C',
++  '>': '\\u003E',
++  '&': '\\u0026',
++  [LINE_SEPARATOR]: '\\u2028',
++  [PARAGRAPH_SEPARATOR]: '\\u2029'
++}
++
++/**
++ * Serialise a value for a JavaScript expression inside an inline <script>.
++ * Beyond the JSON encoding, every character that could open a tag or end the
++ * script element is written as a \u escape, so the browser's HTML tokenizer
++ * sees only text.
++ *
++ * @param {unknown} value
++ */
++export function encodeScriptData(value) {
++  return JSON.stringify(value)
++    .replace(/[<>&]/g, character => SCRIPT_ESCAPES[character])
++    .replaceAll(LINE_SEPARATOR, SCRIPT_ESCAPES[LINE_SEPARATOR])
++    .replaceAll(PARAGRAPH_SEPARATOR, SCRIPT_ESCAPES[PARAGRAPH_SEPARATOR])
++}
++
++const ATTRIBUTE_ESCAPES = {
++  '&': '&amp;',
++  '<': '&lt;',
++  '>': '&gt;',
++  '"': '&quot;',
++  "'": '&#39;'
++}
++
++/**
++ * Encode a value for a quoted HTML attribute, including the quote character
++ * that delimits the attribute.
++ *
++ * @param {unknown} value
++ */
++export function encodeAttribute(value) {
++  return String(value).replace(
++    /[&<>"']/g,
++    character => ATTRIBUTE_ESCAPES[character]
++  )
++}
+diff -ruN a/utils/render-ssr-error/src/env.js b/utils/render-ssr-error/src/env.js
+--- a/utils/render-ssr-error/src/env.js	2026-10-30 17:51:47.000000000 +0000
++++ b/utils/render-ssr-error/src/env.js	2026-10-30 18:17:58.531216018 +0000
+@@ -45,7 +45,16 @@
+   return Object.keys(req.headers).reduce((acc, name) => {
+     acc[name] = req.headers[name]
+     return acc
+-  }, {})
++  }, Object.create(null))
++}
++
++function decodeCookieValue(value) {
++  try {
++    return decodeURIComponent(value)
++  } catch {
++    // A malformed escape is still a legitimate value; show it as received.
++    return value
++  }
+ }
+ 
+ /**
+@@ -53,19 +62,18 @@
+  */
+ function getCookiesData(req) {
+   const { cookie } = req.headers
+-  if (cookie === void 0) return {}
+-  return cookie.split('; ').reduce((acc, entry) => {
++  if (cookie === void 0) return Object.create(null)
++
++  return cookie.split(';').reduce((acc, entry) => {
+     const parts = entry.split('=')
+-    acc[parts.shift().trim()] = decodeURIComponent(parts.join('='))
+-    return acc
+-  }, {})
+-}
++    const name = parts.shift().trim()
++
++    if (name !== '') {
++      acc[name] = decodeCookieValue(parts.join('=').trim())
++    }
+ 
+-function getEnvironmentVariablesData() {
+-  return Object.keys(process.env).reduce((acc, name) => {
+-    acc[name] = process.env[name]
+     return acc
+-  }, {})
++  }, Object.create(null))
+ }
+ 
+ /**
+@@ -75,7 +83,6 @@
+   return {
+     Request: getRequestData(req),
+     Headers: getHeadersData(req),
+-    Cookies: getCookiesData(req),
+-    'Shell environment variables': getEnvironmentVariablesData()
++    Cookies: getCookiesData(req)
+   }
+ }
+diff -ruN a/utils/render-ssr-error/src/index.js b/utils/render-ssr-error/src/index.js
+--- a/utils/render-ssr-error/src/index.js	2026-10-30 17:51:51.000000000 +0000
++++ b/utils/render-ssr-error/src/index.js	2026-10-30 18:17:55.582157193 +0000
+@@ -4,6 +4,7 @@
+ import { getStack } from './stack.js'
+ import { getEnv } from './env.js'
+ import { renderRequestContext } from './request-context.js'
++import { encodeScriptData } from './encode.js'
+ 
+ function readFile(target) {
+   return readFileSync(
+@@ -48,9 +49,6 @@
+     },
+ 
+     errorHtml:
+-      before +
+-      JSON.stringify(data).replaceAll('</script>', String.raw`<\/script>`) +
+-      after +
+-      renderRequestContext(req)
++      before + encodeScriptData(data) + after + renderRequestContext(req)
+   }
+ }
+diff -ruN a/utils/render-ssr-error/src/request-context.js b/utils/render-ssr-error/src/request-context.js
+--- a/utils/render-ssr-error/src/request-context.js	2026-10-30 17:51:51.000000000 +0000
++++ b/utils/render-ssr-error/src/request-context.js	2026-10-30 18:18:01.114267191 +0000
+@@ -1,10 +1,4 @@
+-function escapeAttribute(value) {
+-  return String(value)
+-    .replaceAll('&', '&amp;')
+-    .replaceAll('<', '&lt;')
+-    .replaceAll('>', '&gt;')
+-    .replaceAll('"', '&quot;')
+-}
++import { encodeAttribute, encodeScriptData } from './encode.js'
+ 
+ function getRequestSummary(req) {
+   return {
+@@ -15,21 +9,8 @@
+   }
+ }
+ 
+-function getRuntimeEnvironment() {
+-  const result = {}
+-
+-  for (const name of Object.keys(process.env)) {
+-    if (name.startsWith('QUASAR_')) {
+-      result[name] = process.env[name]
+-    }
+-  }
+-
+-  return result
+-}
+-
+ export function getRequestRuntime(req) {
+   return {
+-    runtime: getRuntimeEnvironment(),
+     summary: getRequestSummary(req)
+   }
+ }
+@@ -39,7 +20,7 @@
+   const runtime = getRequestRuntime(req)
+ 
+   return (
+-    `\n    <div class="app-request-context" data-request-context='${escapeAttribute(JSON.stringify(summary))}'></div>` +
+-    `\n    <script>globalThis.__Q_SSR_ERROR_CONTEXT__ = ${JSON.stringify(runtime)}</script>`
++    `\n    <div class="app-request-context" data-request-context='${encodeAttribute(JSON.stringify(summary))}'></div>` +
++    `\n    <script>globalThis.__Q_SSR_ERROR_CONTEXT__ = ${encodeScriptData(runtime)}</script>`
+   )
+ }

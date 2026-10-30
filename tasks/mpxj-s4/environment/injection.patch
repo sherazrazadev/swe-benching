@@ -1,0 +1,457 @@
+diff --git a/src/main/java/org/mpxj/common/TarHelper.java b/src/main/java/org/mpxj/common/TarHelper.java
+new file mode 100644
+index 0000000000..8101e5e66d
+--- /dev/null
++++ b/src/main/java/org/mpxj/common/TarHelper.java
+@@ -0,0 +1,365 @@
++/*
++ * file:       TarHelper.java
++ * author:     Jon Iles
++ * copyright:  (c) Packwood Software 2025
++ * date:       17/02/2025
++ */
++
++/*
++ * This library is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by the
++ * Free Software Foundation; either version 2.1 of the License, or (at your
++ * option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, write to the Free Software Foundation, Inc.,
++ * 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
++ */
++
++package org.mpxj.common;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Helper methods for expanding tar archives. Some of the tools used to
++ * distribute schedule data package the exported files inside a tar archive,
++ * so we expand the archive into a temporary directory and then let the
++ * universal reader look for a schedule file within it.
++ */
++public final class TarHelper
++{
++   /**
++    * Expands a tar file input stream into a temporary directory.
++    *
++    * @param inputStream tar file input stream
++    * @return File instance representing the temporary directory
++    */
++   public static File expandToTempDir(InputStream inputStream) throws IOException
++   {
++      File dir = FileHelper.createTempDir();
++      expand(dir, inputStream);
++      return dir;
++   }
++
++   /**
++    * Expands the entries in a tar file input stream into the supplied directory.
++    *
++    * @param dir target directory
++    * @param inputStream tar file input stream
++    */
++   private static void expand(File dir, InputStream inputStream) throws IOException
++   {
++      String pendingName = null;
++      byte[] header = new byte[BLOCK_SIZE];
++
++      while (readBlock(inputStream, header))
++      {
++         if (isZeroBlock(header))
++         {
++            break;
++         }
++
++         char typeFlag = (char) (header[TYPE_FLAG_OFFSET] & 0xFF);
++         long size = readOctal(header, SIZE_OFFSET, SIZE_LENGTH);
++
++         if (typeFlag == 'x' || typeFlag == 'g')
++         {
++            // PAX extended header: the records it contains override the
++            // values in the ustar header for the entry which follows.
++            Map<String, String> records = readPaxRecords(readData(inputStream, size));
++            if (typeFlag == 'x' && records.containsKey("path"))
++            {
++               pendingName = records.get("path");
++            }
++            skipPadding(inputStream, size);
++            continue;
++         }
++
++         if (typeFlag == 'L')
++         {
++            // GNU long name: the data block carries the name of the
++            // entry which follows.
++            pendingName = readName(readData(inputStream, size));
++            skipPadding(inputStream, size);
++            continue;
++         }
++
++         String name = getString(header, NAME_OFFSET, NAME_LENGTH);
++         String prefix = getString(header, PREFIX_OFFSET, PREFIX_LENGTH);
++         String entryName = pendingName == null ? (prefix.isEmpty() ? name : prefix + "/" + name) : pendingName;
++         pendingName = null;
++
++         File file = new File(dir, entryName);
++
++         if (typeFlag == '5')
++         {
++            FileHelper.mkdirsQuietly(file);
++            skipData(inputStream, size);
++            continue;
++         }
++
++         File parent = file.getParentFile();
++         if (parent != null)
++         {
++            FileHelper.mkdirsQuietly(parent);
++         }
++
++         try (OutputStream os = Files.newOutputStream(file.toPath()))
++         {
++            copyData(inputStream, os, size);
++         }
++
++         skipPadding(inputStream, size);
++      }
++   }
++
++   /**
++    * Read a complete block from the input stream.
++    *
++    * @param inputStream input stream
++    * @param block block to fill
++    * @return true if a complete block was read
++    */
++   private static boolean readBlock(InputStream inputStream, byte[] block) throws IOException
++   {
++      int offset = 0;
++      while (offset < block.length)
++      {
++         int bytesRead = inputStream.read(block, offset, block.length - offset);
++         if (bytesRead == -1)
++         {
++            return false;
++         }
++         offset += bytesRead;
++      }
++      return true;
++   }
++
++   /**
++    * Determine if a block is filled with zero bytes, which marks the end of the archive.
++    *
++    * @param block block to test
++    * @return true if the block is empty
++    */
++   private static boolean isZeroBlock(byte[] block)
++   {
++      for (byte b : block)
++      {
++         if (b != 0)
++         {
++            return false;
++         }
++      }
++      return true;
++   }
++
++   /**
++    * Read the data for an entry.
++    *
++    * @param inputStream input stream
++    * @param size number of bytes to read
++    * @return data read from the input stream
++    */
++   private static byte[] readData(InputStream inputStream, long size) throws IOException
++   {
++      byte[] data = new byte[(int) size];
++      int offset = 0;
++      while (offset < data.length)
++      {
++         int bytesRead = inputStream.read(data, offset, data.length - offset);
++         if (bytesRead == -1)
++         {
++            throw new IOException("Unexpected end of file");
++         }
++         offset += bytesRead;
++      }
++      return data;
++   }
++
++   /**
++    * Copy the data for an entry to the output stream.
++    *
++    * @param inputStream input stream
++    * @param os output stream
++    * @param size number of bytes to copy
++    */
++   private static void copyData(InputStream inputStream, OutputStream os, long size) throws IOException
++   {
++      byte[] buffer = new byte[BLOCK_SIZE];
++      long remaining = size;
++      while (remaining > 0)
++      {
++         int bytesRead = inputStream.read(buffer, 0, (int) Math.min(buffer.length, remaining));
++         if (bytesRead == -1)
++         {
++            throw new IOException("Unexpected end of file");
++         }
++         os.write(buffer, 0, bytesRead);
++         remaining -= bytesRead;
++      }
++   }
++
++   /**
++    * Skip the data for an entry.
++    *
++    * @param inputStream input stream
++    * @param size number of bytes to skip
++    */
++   private static void skipData(InputStream inputStream, long size) throws IOException
++   {
++      long remaining = size;
++      while (remaining > 0)
++      {
++         long skipped = inputStream.skip(remaining);
++         if (skipped == 0)
++         {
++            if (inputStream.read() == -1)
++            {
++               throw new IOException("Unexpected end of file");
++            }
++            skipped = 1;
++         }
++         remaining -= skipped;
++      }
++   }
++
++   /**
++    * Skip the padding bytes which align an entry's data to a block boundary.
++    *
++    * @param inputStream input stream
++    * @param size size of the entry's data
++    */
++   private static void skipPadding(InputStream inputStream, long size) throws IOException
++   {
++      long padding = (BLOCK_SIZE - (size % BLOCK_SIZE)) % BLOCK_SIZE;
++      skipData(inputStream, padding);
++   }
++
++   /**
++    * Read the records from a PAX extended header.
++    *
++    * @param data extended header data
++    * @return map of record names to values
++    */
++   private static Map<String, String> readPaxRecords(byte[] data)
++   {
++      Map<String, String> records = new HashMap<>();
++      String text = new String(data, StandardCharsets.ISO_8859_1);
++      int index = 0;
++      while (index < text.length())
++      {
++         int space = text.indexOf(' ', index);
++         if (space == -1)
++         {
++            break;
++         }
++
++         int length;
++         try
++         {
++            length = Integer.parseInt(text.substring(index, space));
++         }
++
++         catch (NumberFormatException ex)
++         {
++            break;
++         }
++
++         if (length <= 0 || index + length > text.length())
++         {
++            break;
++         }
++
++         String record = text.substring(space + 1, index + length - 1);
++         int equals = record.indexOf('=');
++         if (equals > 0)
++         {
++            records.put(record.substring(0, equals), record.substring(equals + 1));
++         }
++         index += length;
++      }
++      return records;
++   }
++
++   /**
++    * Read a NUL terminated name from an entry's data.
++    *
++    * @param data entry data
++    * @return name
++    */
++   private static String readName(byte[] data)
++   {
++      return getString(data, 0, data.length);
++   }
++
++   /**
++    * Read a NUL terminated string from a byte array.
++    *
++    * @param data byte array
++    * @param offset offset into the array
++    * @param length maximum number of bytes to read
++    * @return string value
++    */
++   private static String getString(byte[] data, int offset, int length)
++   {
++      StringBuilder buffer = new StringBuilder();
++      for (int loop = 0; loop < length && offset + loop < data.length; loop++)
++      {
++         char c = (char) (data[offset + loop] & 0xFF);
++         if (c == 0)
++         {
++            break;
++         }
++         buffer.append(c);
++      }
++      return buffer.toString();
++   }
++
++   /**
++    * Read an octal number from a byte array.
++    *
++    * @param data byte array
++    * @param offset offset into the array
++    * @param length field length
++    * @return numeric value
++    */
++   private static long readOctal(byte[] data, int offset, int length)
++   {
++      long result = 0;
++      for (int loop = 0; loop < length; loop++)
++      {
++         char c = (char) (data[offset + loop] & 0xFF);
++         if (c == 0 || c == ' ')
++         {
++            if (result != 0)
++            {
++               break;
++            }
++            continue;
++         }
++         result = (result << 3) + (c - '0');
++      }
++      return result;
++   }
++
++   private static final int BLOCK_SIZE = 512;
++   private static final int NAME_OFFSET = 0;
++   private static final int NAME_LENGTH = 100;
++   private static final int SIZE_OFFSET = 124;
++   private static final int SIZE_LENGTH = 12;
++   private static final int TYPE_FLAG_OFFSET = 156;
++   private static final int PREFIX_OFFSET = 345;
++   private static final int PREFIX_LENGTH = 155;
++}
+diff --git a/src/main/java/org/mpxj/reader/UniversalProjectReader.java b/src/main/java/org/mpxj/reader/UniversalProjectReader.java
+index 89ea65d49e..76b59d83c6 100644
+--- a/src/main/java/org/mpxj/reader/UniversalProjectReader.java
++++ b/src/main/java/org/mpxj/reader/UniversalProjectReader.java
+@@ -54,6 +54,7 @@ import org.mpxj.common.ConnectionHelper;
+ import org.mpxj.common.FileHelper;
+ import org.mpxj.common.InputStreamHelper;
+ import org.mpxj.common.SQLite;
++import org.mpxj.common.TarHelper;
+ import org.mpxj.conceptdraw.ConceptDrawProjectReader;
+ import org.mpxj.edrawproject.EdrawProjectReader;
+ import org.mpxj.fasttrack.FastTrackReader;
+@@ -454,6 +455,11 @@ public final class UniversalProjectReader extends AbstractProjectReader
+             return handleZipFile(bis);
+          }
+ 
++         if (matchesFingerprint(buffer, TAR_FINGERPRINT, TAR_MAGIC_OFFSET))
++         {
++            return handleTarFile(bis);
++         }
++
+          if (matchesFingerprint(buffer, PHOENIX_FINGERPRINT))
+          {
+             return new StreamReaderProxy(configure(new PhoenixReader()), new PhoenixInputStream(bis));
+@@ -545,6 +551,23 @@ public final class UniversalProjectReader extends AbstractProjectReader
+       return Arrays.equals(fingerprint, Arrays.copyOf(buffer, fingerprint.length));
+    }
+ 
++   /**
++    * Determine if the buffer matches a fingerprint byte array at a given offset.
++    *
++    * @param buffer bytes from file
++    * @param fingerprint fingerprint bytes
++    * @param offset offset into the buffer
++    * @return true if the file matches the fingerprint
++    */
++   private boolean matchesFingerprint(byte[] buffer, byte[] fingerprint, int offset)
++   {
++      if (offset < 0 || offset + fingerprint.length > buffer.length)
++      {
++         return false;
++      }
++      return Arrays.equals(fingerprint, Arrays.copyOfRange(buffer, offset, offset + fingerprint.length));
++   }
++
+    /**
+     * Determine if the buffer, when expressed as text, matches a fingerprint regular expression.
+     *
+@@ -713,6 +736,20 @@ public final class UniversalProjectReader extends AbstractProjectReader
+       return handleDirectory(dir);
+    }
+ 
++   /**
++    * We have identified that we have a tar file. Expand the contents into
++    * a temporary directory and process.
++    *
++    * @param stream schedule data
++    * @return ProjectFile instance
++    */
++   private ProjectReaderProxy handleTarFile(InputStream stream) throws Exception
++   {
++      File dir = TarHelper.expandToTempDir(stream);
++      m_cleanup.push(() -> FileHelper.deleteQuietly(dir));
++      return handleDirectory(dir);
++   }
++
+    /**
+     * Open and read a file.
+     *
+@@ -1084,6 +1121,16 @@ public final class UniversalProjectReader extends AbstractProjectReader
+       (byte) 'K'
+    };
+ 
++   private static final byte[] TAR_FINGERPRINT = {
++      (byte) 'u',
++      (byte) 's',
++      (byte) 't',
++      (byte) 'a',
++      (byte) 'r'
++   };
++
++   private static final int TAR_MAGIC_OFFSET = 257;
++
+    private static final byte[] PHOENIX_FINGERPRINT = {
+       (byte) 'P',
+       (byte) 'P',

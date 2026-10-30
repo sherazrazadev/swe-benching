@@ -1,0 +1,162 @@
+diff --git a/util/git/git.go b/util/git/git.go
+index 01e0ebf..47b4957 100644
+--- a/util/git/git.go
++++ b/util/git/git.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/url"
++	"os/exec"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -133,6 +134,13 @@ func IsHTTPURL(url string) bool {
+ 
+ // TestRepo tests if a repo exists and is accessible with the given credentials
+ func TestRepo(repo string, creds Creds, insecure bool, enableLfs bool, proxy string, noProxy string) error {
++	if proxy != "" {
++		if isSSH, _ := IsSSHURL(repo); isSSH {
++			if err := checkProxyConnection(proxy); err != nil {
++				return fmt.Errorf("unable to reach the proxy configured for the repository: %w", err)
++			}
++		}
++	}
+ 	client, err := NewClient(repo, creds, insecure, enableLfs, proxy, noProxy)
+ 	if err != nil {
+ 		return fmt.Errorf("unable to initialize git client: %w", err)
+@@ -144,6 +152,24 @@ func TestRepo(repo string, creds Creds, insecure bool, enableLfs bool, proxy str
+ 	return nil
+ }
+ 
++// checkProxyConnection verifies that the SOCKS5 proxy configured for an SSH
++// repository accepts connections before the repository is tested.
++func checkProxyConnection(proxy string) error {
++	parsedProxyURL, err := url.Parse(proxy)
++	if err != nil {
++		return fmt.Errorf("could not parse proxy URL: %w", err)
++	}
++	cmd := exec.Command("sh", "-c", fmt.Sprintf(
++		"timeout 5 connect-proxy -S '%s:%s' -5 127.0.0.1 22",
++		parsedProxyURL.Hostname(),
++		parsedProxyURL.Port(),
++	))
++	if out, err := cmd.CombinedOutput(); err != nil {
++		return fmt.Errorf("proxy connection check failed: %s: %w", strings.TrimSpace(string(out)), err)
++	}
++	return nil
++}
++
+ // IsShortRef determines if the supplied revision is a short ref (e.g. "master" instead of "refs/heads/master").
+ // ref.Name().Short() is an expensive call to be performed in a loop over all refs in a repository, so we want to avoid calling it if we can determine up front that the supplied revision is not a short ref.
+ // The intention is to optimize for a case where the full ref string is supplied, as comparing the full ref string is cheaper than calling Short() on every ref in the loop.
+diff --git a/util/kustomize/kustomize.go b/util/kustomize/kustomize.go
+index 18e3d0c..49236a8 100644
+--- a/util/kustomize/kustomize.go
++++ b/util/kustomize/kustomize.go
+@@ -409,6 +409,10 @@ func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOp
+ 	if err != nil {
+ 		return nil, nil, nil, fmt.Errorf("failed to install helm wrapper for kustomize build: %w", err)
+ 	}
++	cmd.Env, err = withProxyWrapper(cmd.Env, k.proxy)
++	if err != nil {
++		return nil, nil, nil, fmt.Errorf("failed to install git proxy wrapper for kustomize build: %w", err)
++	}
+ 	cmd.Dir = k.repoRoot
+ 	commands = append(commands, executil.GetCommandArgsToLog(cmd))
+ 	out, err := executil.Run(cmd)
+diff --git a/util/kustomize/proxywrapper.go b/util/kustomize/proxywrapper.go
+new file mode 100644
+index 0000000..3282784
+--- /dev/null
++++ b/util/kustomize/proxywrapper.go
+@@ -0,0 +1,90 @@
++package kustomize
++
++import (
++	"fmt"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++
++	log "github.com/sirupsen/logrus"
++)
++
++// proxyWrapperScriptTmpl is a POSIX shell wrapper that is installed ahead of the real `git`
++// binary on the PATH of the `kustomize build` subprocess.
++//
++// Kustomize resolves remote bases with a `git fetch` of the base's repository. When the
++// Application's repository is configured with a proxy, the fetch should use the same SOCKS5
++// proxy as the rest of the repository access, so the wrapper exports a GIT_SSH_COMMAND before
++// handing the invocation to the next git on the PATH.
++//
++// %[1]s is the absolute path of the git binary to exec, %[2]s and %[3]s are the proxy host and
++// port, and %[4]s is the shell command connect-proxy should run.
++const proxyWrapperScriptTmpl = `#!/bin/sh
++REAL_GIT='%[1]s'
++GIT_SSH_COMMAND="ssh -o ProxyCommand='connect-proxy -S %[2]s:%[3]s -5 %%h %%p'"
++export GIT_SSH_COMMAND
++exec "$REAL_GIT" "$@"
++`
++
++func buildProxyWrapperScript(realGit, host, port string) string {
++	return fmt.Sprintf(proxyWrapperScriptTmpl, realGit, host, port)
++}
++
++// lookPathIn resolves name against the PATH entry in env, falling back to the process PATH.
++func lookPathIn(env []string, name string) (string, error) {
++	for _, e := range env {
++		pathValue, ok := strings.CutPrefix(e, "PATH=")
++		if !ok {
++			continue
++		}
++		for _, dir := range filepath.SplitList(pathValue) {
++			candidate := filepath.Join(dir, name)
++			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
++				return candidate, nil
++			}
++		}
++	}
++	return exec.LookPath(name)
++}
++
++// withProxyWrapper returns env with a git wrapper directory prepended to PATH so that any
++// `git fetch` kustomize runs to resolve a remote base exports the repository proxy before the
++// fetch. If git is not available, env is returned unchanged.
++func withProxyWrapper(env []string, proxy string) ([]string, error) {
++	if proxy == "" {
++		return env, nil
++	}
++	parsedProxyURL, err := url.Parse(proxy)
++	if err != nil {
++		return nil, fmt.Errorf("could not parse proxy URL: %w", err)
++	}
++	realGit, err := lookPathIn(env, "git")
++	if err != nil {
++		log.Warnf("git not found on PATH; kustomize proxy wrapper not installed: %v", err)
++		return env, nil
++	}
++	dir, err := os.MkdirTemp("", "argocd-git-proxy-")
++	if err != nil {
++		return nil, fmt.Errorf("failed to create git proxy wrapper dir: %w", err)
++	}
++	script := buildProxyWrapperScript(realGit, parsedProxyURL.Hostname(), parsedProxyURL.Port())
++	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o700); err != nil {
++		return nil, fmt.Errorf("failed to write git proxy wrapper: %w", err)
++	}
++	out := make([]string, 0, len(env)+1)
++	found := false
++	for _, e := range env {
++		if pathValue, ok := strings.CutPrefix(e, "PATH="); ok {
++			out = append(out, "PATH="+dir+string(os.PathListSeparator)+pathValue)
++			found = true
++		} else {
++			out = append(out, e)
++		}
++	}
++	if !found {
++		out = append(out, "PATH="+dir)
++	}
++	return out, nil
++}

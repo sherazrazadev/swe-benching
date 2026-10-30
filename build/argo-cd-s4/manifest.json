@@ -1,0 +1,276 @@
+{
+ "slug": "argo-cd-s4",
+ "candidate": {
+  "repo": "argoproj/argo-cd",
+  "advisory": "GHSA-J6CW-G6P4-7HCH / CVE-2026-55797",
+  "cwe": "CWE-78",
+  "vulnerable_commit": "ba80c9664880306b5c17404ea71af877e9190f94",
+  "fix_commit": "1e3ddd0b7250aa23f489956b5fab8c13d0493a9f",
+  "track": "injected"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "repo-server repository access: the repository connection test (git.TestRepo), manifest generation through the kustomize builder, and the SSH credential environment builder reached from Repository.GetGitCreds; CLI/API surface is argocd repo add --proxy and repository/credential-template configuration",
+  "sites": [
+   "util/git/creds.go:384 (reported: ProxyCommand built by string interpolation) and :338 SSHCreds.Environ / :305 NewSSHCreds",
+   "pkg/apis/application/v1alpha1/repository_types.go:211 CopyCredentialsFrom (credential-template merge) and :284 GetGitCreds -> NewSSHCreds",
+   "util/git/client.go:346 GetRepoHTTPClient -> util/proxy/proxy.go:46 GetCallback (plain HTTP(S) repository route; published fix validated only the credential constructors)",
+   "util/proxy/proxy.go:26 UpsertEnv (subprocess proxy environment used by git, helm and kustomize)",
+   "util/git/git.go:135 TestRepo (injected: SSH proxy reachability preflight builds a shell command)",
+   "util/kustomize/kustomize.go:404 + new util/kustomize/proxywrapper.go (injected: remote-base git wrapper exports GIT_SSH_COMMAND)"
+  ],
+  "routes": [
+   "SSH repository proxy value through SSHCreds.Environ into the shell-run GIT_SSH_COMMAND",
+   "repository proxy merged from a stored credential template into GetGitCreds",
+   "HTTP(S) repository proxy value into the HTTP client transport",
+   "repository proxy value into the subprocess proxy environment",
+   "SSH repository connection test proxy preflight (injected)",
+   "kustomize remote-base git wrapper on the subprocess PATH (injected)"
+  ],
+  "services": [],
+  "project_tests_run": "yes \u2014 go test ./util/git -run 'Test_SSHCreds|Test_HTTPSCreds|Test_GitHubAppCreds', go test ./util/kustomize, go test ./util/proxy run offline in the image at the pinned+injected commit; the image build also compiles ./util/git ./util/kustomize ./util/proxy ./pkg/apis/application/v1alpha1",
+  "local_matrix": "pinned+injected: 25/25 security testcases fail (0 pass) and 21/21 functional testcases pass; oracle: 36/36 security and 21/21 functional pass; check-patch matrix (security/functional): sf-no-ssh F/P, sf-no-http F/P, sf-no-env F/P, sf-no-preflight F/P, sf-no-kustomize F/P, sf-ssh-only F/P, sf-crash F/P, functional_fail_refuse_all P/F, functional_fail_overbroad P/F, functional_fail_adjacent P/F, pass_hardening P/P, pass_alternative_inline P/P",
+  "gate": {
+   "static": "PASSED",
+   "nop": "PASSED (25 security testcases fail, 21 functional pass)",
+   "oracle": "PASSED 3/3 runs, reward 1.0 each",
+   "patches": "PASSED 12/12 declared outcomes (blind written later by run_blindfix)"
+  }
+ },
+ "leak_terms": [
+  "GIT_SSH_COMMAND",
+  "ProxyCommand",
+  "connect-proxy",
+  "NewSSHCreds",
+  "SSHCreds",
+  "GetRepoHTTPClient",
+  "UpsertEnv",
+  "GetCallback",
+  "TestRepo",
+  "checkProxyConnection",
+  "withProxyWrapper",
+  "ValidateSSHURL",
+  "ValidateHTTPURL",
+  "ValidateURL",
+  "CopyCredentialsFrom",
+  "GetGitCreds",
+  "RepoCreds",
+  "creds.go",
+  "client.go",
+  "git.go",
+  "proxy.go",
+  "validate.go",
+  "proxywrapper.go",
+  "kustomize.go",
+  "util/git",
+  "util/proxy",
+  "util/kustomize"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-ssh.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-ssh-shell",
+    "ar4-merge-route"
+   ]
+  },
+  {
+   "patch": "sf-no-http.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-http-transport"
+   ]
+  },
+  {
+   "patch": "sf-no-env.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-subprocess-env"
+   ]
+  },
+  {
+   "patch": "sf-no-preflight.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-preflight"
+   ]
+  },
+  {
+   "patch": "sf-no-kustomize.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-kustomize-wrapper"
+   ]
+  },
+  {
+   "patch": "sf-ssh-only.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-http-transport",
+    "ar4-subprocess-env",
+    "ar4-preflight",
+    "ar4-kustomize-wrapper"
+   ]
+  },
+  {
+   "patch": "sf-crash.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "ar4-ssh-shell"
+   ],
+   "note": "crashes instead of refusing"
+  },
+  {
+   "patch": "functional_fail_refuse_all.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "functional_fail_overbroad.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "functional_fail_adjacent.patch",
+   "kind": "functional_fail",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "kind": "hardening",
+   "expect": "pass"
+  },
+  {
+   "patch": "pass_alternative_inline.patch",
+   "kind": "alternative",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "functional_fail_refuse_all.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "n/a: no resource-authorization decision is involved; the flaw is value validation before use",
+  "one_role_or_direction": "n/a: one trust boundary (repository proxy configuration), no roles, peers or directions",
+  "reads_only": "n/a: the flaw is in credential/proxy construction, not a read/write split",
+  "check_after_adjustment": "n/a: no normalising or adjusting step sits between the check and the use",
+  "unlisted_route": "sf-ssh-only.patch",
+  "malformed_identity": "n/a: no identity or principal parsing is involved",
+  "missing_authority": "n/a: no authority or secret lookup guards the use",
+  "adjacent_api": "functional_fail_adjacent.patch"
+ },
+ "traps": [
+  {
+   "id": "ar4-ssh-shell",
+   "shape": "PROXY_HOSTNAME_CONTAINS_SHELL_SYNTAX",
+   "where": "util/git/creds.go:384 (Environ) and :305 NewSSHCreds",
+   "security_tests": [
+    "TestSSHProxyHostCannotRunShell",
+    "TestSSHUnusableProxyValuesAreNotUsed"
+   ],
+   "coupled_functional_tests": [
+    "TestSSHValidProxiesKeepWorking",
+    "TestSSHUnparseableProxyKeepsCleanup"
+   ],
+   "security_fail_patch": "sf-no-ssh.patch",
+   "realistic_because": "reported site; a value copied verbatim into a single-quoted shell command"
+  },
+  {
+   "id": "ar4-merge-route",
+   "shape": "PROXY_VALUE_FROM_STORED_CREDENTIAL_TEMPLATE",
+   "where": "pkg/apis/application/v1alpha1/repository_types.go:211 CopyCredentialsFrom -> :284 GetGitCreds",
+   "security_tests": [
+    "TestMergedCredentialTemplateProxyCannotRunShell"
+   ],
+   "coupled_functional_tests": [
+    "TestMergedCredentialTemplateProxyKeepsWorking"
+   ],
+   "security_fail_patch": "sf-no-ssh.patch",
+   "realistic_because": "real, unmodified upstream code; the advisory names credential templates as a source of the proxy"
+  },
+  {
+   "id": "ar4-http-transport",
+   "shape": "PROXY_VALUE_REACHES_NETWORK_CLIENT_WITHOUT_CHECK",
+   "where": "util/git/client.go:346 GetRepoHTTPClient -> util/proxy/proxy.go:46 GetCallback",
+   "security_tests": [
+    "TestHTTPClientProxyValueIsNotUsed"
+   ],
+   "coupled_functional_tests": [
+    "TestHTTPClientValidProxyIsUsed"
+   ],
+   "security_fail_patch": "sf-no-http.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix checked the credential constructors but the plain HTTP(S) route passes the proxy separately"
+  },
+  {
+   "id": "ar4-subprocess-env",
+   "shape": "PROXY_VALUE_REACHES_SUBPROCESS_ENVIRONMENT_WITHOUT_CHECK",
+   "where": "util/proxy/proxy.go:26 UpsertEnv (called by util/git/client.go:1907, util/helm/cmd.go:83, util/kustomize/kustomize.go:398)",
+   "security_tests": [
+    "TestSubprocessProxyEnvironmentIsNotUsed"
+   ],
+   "coupled_functional_tests": [
+    "TestSubprocessProxyEnvironmentKeepsValidProxy",
+    "TestSubprocessProxyEnvironmentWithoutProxyUnchanged"
+   ],
+   "security_fail_patch": "sf-no-env.patch",
+   "realistic_because": "real, unmodified upstream code; a shared helper that every subprocess proxy path uses"
+  },
+  {
+   "id": "ar4-preflight",
+   "shape": "SECOND_SHELL_SINK_IN_CONNECTION_TEST",
+   "where": "util/git/git.go:135 TestRepo (injected preflight)",
+   "security_tests": [
+    "TestSSHConnectionTestProxyCannotRunShell"
+   ],
+   "coupled_functional_tests": [
+    "TestSSHConnectionTestUsesValidProxy"
+   ],
+   "security_fail_patch": "sf-no-preflight.patch",
+   "realistic_because": "injected: plausible maintainer preflight that copies the same quoted interpolation technique"
+  },
+  {
+   "id": "ar4-kustomize-wrapper",
+   "shape": "SECOND_SHELL_SINK_IN_GENERATED_WRAPPER",
+   "where": "util/kustomize/kustomize.go:404 + new util/kustomize/proxywrapper.go (injected)",
+   "security_tests": [
+    "TestKustomizeRemoteBaseProxyCannotRunShell"
+   ],
+   "coupled_functional_tests": [
+    "TestKustomizeRemoteBaseWithValidProxy"
+   ],
+   "security_fail_patch": "sf-no-kustomize.patch",
+   "realistic_because": "injected: this repo already ships generated /bin/sh wrappers for git and helm; a proxy wrapper written the same way"
+  },
+  {
+   "id": "ar4-coupled-legit",
+   "shape": "LEGIT_VALUES_A_PLAUSIBLE_CHECK_MISHANDLES",
+   "where": "util/git/creds.go:384 and util/proxy/validate.go (legitimate authenticated, IPv6, socks5h and boundary-port proxies)",
+   "security_tests": [
+    "TestSSHUnusableProxyValuesAreNotUsed"
+   ],
+   "coupled_functional_tests": [
+    "TestSSHValidProxiesKeepWorking",
+    "TestSubprocessProxyEnvironmentKeepsValidProxy",
+    "TestMergedCredentialTemplateProxyKeepsWorking"
+   ],
+   "security_fail_patch": "n/a: this lever is caught by the functional suite",
+   "realistic_because": "a strict allowlist over '@', '[', ']' or ':' breaks legitimate authenticated and IPv6 proxies; MiMo tends to over-harden"
+  }
+ ],
+ "status": "built; gate passed static/nop/oracle/patches"
+}

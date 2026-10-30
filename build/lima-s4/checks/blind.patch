@@ -1,0 +1,153 @@
+diff -ruN a/cmd/lima-guestagent/daemon_linux.go b/cmd/lima-guestagent/daemon_linux.go
+--- a/cmd/lima-guestagent/daemon_linux.go	2026-10-30 18:11:10.000000000 +0000
++++ b/cmd/lima-guestagent/daemon_linux.go	2026-10-30 18:28:12.638517352 +0000
+@@ -59,9 +59,29 @@
+ 	daemonCommand.Flags().Int("vsock-port", 0, "Use vsock server instead a UNIX socket")
+ 	daemonCommand.Flags().String("virtio-port", "", "Use virtio server instead a UNIX socket")
+ 	daemonCommand.Flags().Bool("rootless", false, "Run the agent without privileges for debugging (port forwarding is unavailable)")
++	daemonCommand.Flags().Int("owner-uid", 0, "UID of the main user that may use the UNIX control socket (0 for the account running the agent)")
+ 	return daemonCommand
+ }
+ 
++// restrictControlSocket makes the UNIX control socket reachable only by the
++// instance's main user. The agent's privileged mode runs as root, so the
++// requested owner has to be applied explicitly before the mode is narrowed;
++// otherwise the main user (who reaches the socket through the host) would be
++// locked out along with every other account. A non-positive owner means the
++// account running the agent: root for the privileged daemon, which then serves
++// root alone.
++func restrictControlSocket(path string, ownerUID int) error {
++	if ownerUID <= 0 {
++		ownerUID = os.Geteuid()
++	}
++	if ownerUID != os.Geteuid() {
++		if err := os.Chown(path, ownerUID, -1); err != nil {
++			return err
++		}
++	}
++	return os.Chmod(path, 0o600)
++}
++
+ func daemonAction(cmd *cobra.Command, _ []string) error {
+ 	ctx := cmd.Context()
+ 	runtimeDir, err := cmd.Flags().GetString("runtime-dir")
+@@ -88,6 +108,10 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	ownerUID, err := cmd.Flags().GetInt("owner-uid")
++	if err != nil {
++		return err
++	}
+ 	if tick == 0 {
+ 		return errors.New("tick must be specified")
+ 	}
+@@ -133,7 +157,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		if err := os.Chmod(socket, 0o777); err != nil {
++		if err := restrictControlSocket(socket, ownerUID); err != nil {
+ 			return err
+ 		}
+ 		l = socketL
+@@ -158,7 +182,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		if err := os.Chmod(socket, 0o777); err != nil {
++		if err := restrictControlSocket(socket, ownerUID); err != nil {
+ 			return err
+ 		}
+ 		l = socketL
+diff -ruN a/cmd/lima-guestagent/install_systemd_linux.go b/cmd/lima-guestagent/install_systemd_linux.go
+--- a/cmd/lima-guestagent/install_systemd_linux.go	2026-10-30 18:11:06.000000000 +0000
++++ b/cmd/lima-guestagent/install_systemd_linux.go	2026-10-30 18:28:20.865702157 +0000
+@@ -29,6 +29,7 @@
+ 	installSystemdCommand.Flags().Bool("guestagent-updated", false, "Indicate that the guest agent has been updated")
+ 	installSystemdCommand.Flags().Int("vsock-port", 0, "Use vsock server on specified port")
+ 	installSystemdCommand.Flags().String("virtio-port", "", "Use virtio server instead a UNIX socket")
++	installSystemdCommand.Flags().Int("owner-uid", 0, "UID of the main user that may use the UNIX control socket (0 for root)")
+ 	return installSystemdCommand
+ }
+ 
+@@ -46,11 +47,15 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	ownerUID, err := cmd.Flags().GetInt("owner-uid")
++	if err != nil {
++		return err
++	}
+ 	debug, err := cmd.Flags().GetBool("debug")
+ 	if err != nil {
+ 		return err
+ 	}
+-	unit, err := generateSystemdUnit(vsockPort, virtioPort, debug)
++	unit, err := generateSystemdUnit(vsockPort, virtioPort, ownerUID, debug)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -107,7 +112,7 @@
+ //go:embed lima-guestagent.TEMPLATE.service
+ var systemdUnitTemplate string
+ 
+-func generateSystemdUnit(vsockPort int, virtioPort string, debug bool) ([]byte, error) {
++func generateSystemdUnit(vsockPort int, virtioPort string, ownerUID int, debug bool) ([]byte, error) {
+ 	selfExeAbs, err := os.Executable()
+ 	if err != nil {
+ 		return nil, err
+@@ -120,6 +125,12 @@
+ 	if virtioPort != "" {
+ 		args = append(args, fmt.Sprintf("--virtio-port %s", virtioPort))
+ 	}
++	// Carry the main user across the reboot: the unit starts the daemon long
++	// after the boot-time installer has run, so the socket owner must be part
++	// of the unit's command line rather than inherited environment.
++	if ownerUID > 0 {
++		args = append(args, fmt.Sprintf("--owner-uid %d", ownerUID))
++	}
+ 	if debug {
+ 		args = append(args, "--debug")
+ 	}
+diff -ruN a/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh b/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh
+--- a/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh	2026-10-30 18:11:10.000000000 +0000
++++ b/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh	2026-10-30 18:28:32.171976313 +0000
+@@ -51,7 +51,7 @@
+ 			description="Forward ports to the lima-hostagent"
+ 
+ 			command=${LIMA_CIDATA_GUEST_INSTALL_PREFIX}/bin/lima-guestagent
+-			command_args="daemon --debug=${LIMA_CIDATA_DEBUG} --vsock-port \"${LIMA_CIDATA_VSOCK_PORT}\" --virtio-port \"${LIMA_CIDATA_VIRTIO_PORT}\""
++			command_args="daemon --debug=${LIMA_CIDATA_DEBUG} --vsock-port \"${LIMA_CIDATA_VSOCK_PORT}\" --virtio-port \"${LIMA_CIDATA_VIRTIO_PORT}\" --owner-uid \"${LIMA_CIDATA_UID}\""
+ 			command_background=true
+ 			pidfile="/run/lima-guestagent.pid"
+ 		EOF
+@@ -75,9 +75,9 @@
+ 	rm -f "${LIMA_CIDATA_HOME}/.config/systemd/user/lima-guestagent.service"
+ 
+ 	if [ "${LIMA_CIDATA_VSOCK_PORT}" != "0" ]; then
+-		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}"
++		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}" --owner-uid "${LIMA_CIDATA_UID}"
+ 	elif [ "${LIMA_CIDATA_VIRTIO_PORT}" != "" ]; then
+-		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}"
++		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}" --owner-uid "${LIMA_CIDATA_UID}"
+ 	elif ! command -v systemctl >/dev/null 2>&1; then
+ 		# No service manager is available; fall back to a plain SysV-style init script.
+ 		print_sysv_env() {
+@@ -99,7 +99,7 @@
+ 
+ 				case "$1" in
+ 				start)
+-					${LIMA_CIDATA_GUEST_INSTALL_PREFIX}/bin/lima-guestagent daemon --debug="${LIMA_CIDATA_DEBUG}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}" &
++					${LIMA_CIDATA_GUEST_INSTALL_PREFIX}/bin/lima-guestagent daemon --debug="${LIMA_CIDATA_DEBUG}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}" --owner-uid "${LIMA_CIDATA_UID}" &
+ 					echo $! >/run/lima-guestagent.pid
+ 					;;
+ 				stop)
+@@ -133,6 +133,6 @@
+ 		chmod 755 /etc/init.d/lima-guestagent
+ 		/etc/init.d/lima-guestagent start
+ 	else
+-		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}"
++		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --owner-uid "${LIMA_CIDATA_UID}"
+ 	fi
+ fi

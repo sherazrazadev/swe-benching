@@ -1,0 +1,284 @@
+diff -ruN a/go.mod b/go.mod
+--- a/go.mod	2026-10-30 17:57:25.000000000 +0000
++++ b/go.mod	2026-10-30 18:25:34.373849443 +0000
+@@ -24,6 +24,7 @@
+ 	github.com/weppos/publicsuffix-go v0.50.3
+ 	go.uber.org/dig v1.19.0
+ 	golang.org/x/crypto v0.54.0
++	golang.org/x/net v0.57.0
+ 	golang.org/x/oauth2 v0.36.0
+ 	golang.org/x/tools v0.48.0
+ 	gopkg.in/yaml.v3 v3.0.1
+@@ -135,7 +136,6 @@
+ 	golang.org/x/arch v0.22.0 // indirect
+ 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
+ 	golang.org/x/mod v0.38.0 // indirect
+-	golang.org/x/net v0.57.0 // indirect
+ 	golang.org/x/sync v0.22.0 // indirect
+ 	golang.org/x/sys v0.47.0 // indirect
+ 	golang.org/x/term v0.45.0 // indirect
+diff -ruN a/internal/service/access_controls_service.go b/internal/service/access_controls_service.go
+--- a/internal/service/access_controls_service.go	2026-10-30 17:57:25.000000000 +0000
++++ b/internal/service/access_controls_service.go	2026-10-30 18:26:01.961829353 +0000
+@@ -4,6 +4,7 @@
+ 	"strings"
+ 
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
++	"github.com/tinyauthapp/tinyauth/internal/utils"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+ 	"go.uber.org/dig"
+ )
+@@ -38,13 +39,15 @@
+ func (service *AccessControlsService) lookupStaticACLs(domain string) *model.App {
+ 	var nameMatch *model.App
+ 
++	canonicalDomain := utils.CanonicalHost(domain)
++
+ 	// First try to find a matching app by domain, then fallback to matching by app name (subdomain)
+ 	for app, config := range service.config.Apps {
+-		if config.Config.Domain == domain {
++		if utils.CanonicalHost(config.Config.Domain) == canonicalDomain {
+ 			service.log.App.Debug().Str("name", app).Msg("Found matching container by domain")
+ 			return &config
+ 		}
+-		if strings.SplitN(domain, ".", 2)[0] == app {
++		if strings.SplitN(canonicalDomain, ".", 2)[0] == utils.CanonicalAppName(app) {
+ 			service.log.App.Debug().Str("name", app).Msg("Found matching container by app name")
+ 			nameMatch = &config
+ 		}
+diff -ruN a/internal/service/configmap_service.go b/internal/service/configmap_service.go
+--- a/internal/service/configmap_service.go	2026-10-30 17:58:03.000000000 +0000
++++ b/internal/service/configmap_service.go	2026-10-30 18:26:13.783242721 +0000
+@@ -12,6 +12,7 @@
+ 
+ 	"github.com/steveiliop56/ding"
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
++	"github.com/tinyauthapp/tinyauth/internal/utils"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+ 	"go.uber.org/dig"
+@@ -164,22 +165,26 @@
+ 	}
+ 
+ 	apps := make(map[string]configMapEntry)
+-	domains := make(map[string]string)
+-	names := make(map[string]string)
++
++	// The mount and the app's own configuration may spell the same host
++	// differently, so the declared hosts are compared in canonical form.
++	canonicalHosts := make([]string, 0, len(hosts))
++
++	for _, host := range hosts {
++		canonicalHosts = append(canonicalHosts, utils.CanonicalHost(host))
++	}
+ 
+ 	for appName, appLabels := range decoded.Apps {
+ 		if appLabels.Config.Domain == "" {
+ 			continue
+ 		}
+ 
+-		if len(hosts) > 0 && !slices.Contains(hosts, appLabels.Config.Domain) {
++		if len(hosts) > 0 && !slices.Contains(canonicalHosts, utils.CanonicalHost(appLabels.Config.Domain)) {
+ 			k.log.App.Warn().Str("appName", appName).Str("domain", appLabels.Config.Domain).Msg("App domain does not match any host defined in the configmap, skipping")
+ 			continue
+ 		}
+ 
+ 		apps[appName] = configMapEntry{name: appName, app: appLabels}
+-		domains[appLabels.Config.Domain] = appName
+-		names[appName] = appName
+ 	}
+ 
+ 	k.replace(apps)
+@@ -200,9 +205,11 @@
+ 	k.domains = make(map[string]string)
+ 	k.names = make(map[string]string)
+ 
++	// Index by canonical address and canonical app name so that every spelling
++	// of a request resolves to the same registered rule.
+ 	for appName, entry := range apps {
+-		k.domains[entry.app.Config.Domain] = appName
+-		k.names[appName] = appName
++		k.domains[utils.CanonicalHost(entry.app.Config.Domain)] = appName
++		k.names[utils.CanonicalAppName(appName)] = appName
+ 	}
+ }
+ 
+@@ -252,14 +259,16 @@
+ 		return nil, nil
+ 	}
+ 
+-	app := k.getByDomain(appDomain)
++	canonicalDomain := utils.CanonicalHost(appDomain)
++
++	app := k.getByDomain(canonicalDomain)
+ 
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Msg("Found labels in cache by domain")
+ 		return app, nil
+ 	}
+ 
+-	appName := strings.SplitN(appDomain, ".", 2)[0]
++	appName := utils.CanonicalAppName(strings.SplitN(canonicalDomain, ".", 2)[0])
+ 	app = k.getByAppName(appName)
+ 
+ 	if app != nil {
+diff -ruN a/internal/service/docker_service.go b/internal/service/docker_service.go
+--- a/internal/service/docker_service.go	2026-10-30 17:57:25.000000000 +0000
++++ b/internal/service/docker_service.go	2026-10-30 18:26:06.545989517 +0000
+@@ -6,6 +6,7 @@
+ 
+ 	"github.com/steveiliop56/ding"
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
++	"github.com/tinyauthapp/tinyauth/internal/utils"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+ 	"go.uber.org/dig"
+@@ -92,13 +93,15 @@
+ 
+ 		var nameMatch *model.App
+ 
++		canonicalDomain := utils.CanonicalHost(appDomain)
++
+ 		// First try to find a matching app by domain, then fallback to matching by app name (subdomain)
+ 		for appName, appLabels := range labels.Apps {
+-			if appLabels.Config.Domain == appDomain {
++			if utils.CanonicalHost(appLabels.Config.Domain) == canonicalDomain {
+ 				docker.log.App.Debug().Str("id", inspect.ID).Str("name", inspect.Name).Msg("Found matching container by domain")
+ 				return &appLabels, nil
+ 			}
+-			if strings.SplitN(appDomain, ".", 2)[0] == appName {
++			if strings.SplitN(canonicalDomain, ".", 2)[0] == utils.CanonicalAppName(appName) {
+ 				docker.log.App.Debug().Str("id", inspect.ID).Str("name", inspect.Name).Msg("Found matching container by app name")
+ 				nameMatch = &appLabels
+ 			}
+diff -ruN a/internal/service/kubernetes_service.go b/internal/service/kubernetes_service.go
+--- a/internal/service/kubernetes_service.go	2026-10-30 17:57:25.000000000 +0000
++++ b/internal/service/kubernetes_service.go	2026-10-30 18:26:18.474406844 +0000
+@@ -10,6 +10,7 @@
+ 
+ 	"github.com/steveiliop56/ding"
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
++	"github.com/tinyauthapp/tinyauth/internal/utils"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+ 	"go.uber.org/dig"
+@@ -253,18 +254,24 @@
+ 		k.removeIngress(namespace, name)
+ 		return
+ 	}
++	canonicalHosts := make([]string, 0, len(hosts))
++
++	for _, host := range hosts {
++		canonicalHosts = append(canonicalHosts, utils.CanonicalHost(host))
++	}
++
+ 	var apps []ingressApp
+ 	for appName, appLabels := range labels.Apps {
+ 		if appLabels.Config.Domain == "" {
+ 			continue
+ 		}
+-		if len(hosts) > 0 && !slices.Contains(hosts, appLabels.Config.Domain) {
++		if len(hosts) > 0 && !slices.Contains(canonicalHosts, utils.CanonicalHost(appLabels.Config.Domain)) {
+ 			k.log.App.Warn().Str("namespace", namespace).Str("name", name).Str("appName", appName).Str("domain", appLabels.Config.Domain).Msg("App domain does not match any hosts defined in ingress rules, skipping")
+ 			continue
+ 		}
+ 		apps = append(apps, ingressApp{
+-			domain:  appLabels.Config.Domain,
+-			appName: appName,
++			domain:  utils.CanonicalHost(appLabels.Config.Domain),
++			appName: utils.CanonicalAppName(appName),
+ 			app:     appLabels,
+ 		})
+ 	}
+@@ -369,12 +376,13 @@
+ 	}
+ 
+ 	// First check cache
+-	app := k.getByDomain(appDomain)
++	canonicalDomain := utils.CanonicalHost(appDomain)
++	app := k.getByDomain(canonicalDomain)
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Msg("Found labels in cache by domain")
+ 		return app, nil
+ 	}
+-	appName := strings.SplitN(appDomain, ".", 2)[0]
++	appName := utils.CanonicalAppName(strings.SplitN(canonicalDomain, ".", 2)[0])
+ 	app = k.getByAppName(appName)
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Str("appName", appName).Msg("Found labels in cache by app name")
+diff -ruN a/internal/utils/host_utils.go b/internal/utils/host_utils.go
+--- a/internal/utils/host_utils.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/utils/host_utils.go	2026-10-30 18:27:08.525142407 +0000
+@@ -0,0 +1,72 @@
++package utils
++
++import (
++	"net"
++	"net/url"
++	"strings"
++
++	"golang.org/x/net/idna"
++)
++
++// CanonicalHost reduces the different spellings of the same host to a single
++// comparable form. Reverse proxies do not agree on how they report the host
++// they handled: the same application can arrive with different letter case, a
++// trailing root dot, an explicit port or an internationalised label. Access
++// rules are looked up by the identity of the application, not by the way its
++// address happens to be written, so every host comparison is made on this
++// canonical form.
++//
++// The result is lower case ASCII, without userinfo, without a port and without
++// the trailing root dot. When the input cannot be parsed as an address it is
++// still lower cased and stripped of a trailing dot, which keeps matching as
++// strict as it was before rather than making an unparsed host match a rule.
++func CanonicalHost(input string) string {
++	host := strings.TrimSpace(input)
++	if host == "" {
++		return ""
++	}
++
++	// An IPv6 literal is ambiguous with a host:port pair, so recognise it
++	// before URL parsing. Proxies send it bracketed, but accept it bare too.
++	literal := host
++	if strings.HasPrefix(literal, "[") {
++		if end := strings.Index(literal, "]"); end > 0 {
++			literal = literal[1:end]
++		}
++	}
++
++	if ip := net.ParseIP(literal); ip != nil {
++		return ip.String()
++	}
++
++	// Parse the input as a URL authority. This drops a supplied scheme,
++	// any userinfo and an explicit port in one step.
++	address := host
++	if !strings.Contains(address, "://") {
++		address = "//" + address
++	}
++
++	if parsed, err := url.Parse(address); err == nil && parsed.Hostname() != "" {
++		host = parsed.Hostname()
++	}
++
++	host = strings.ToLower(host)
++	host = strings.TrimSuffix(host, ".")
++
++	// A Unicode label such as "bücher" is the same host as its ASCII
++	// "xn--bcher-kva" form; compare them in the ASCII form. A failing
++	// conversion (for example a label with an underscore) keeps the
++	// lower-cased host.
++	if ascii, err := idna.Lookup.ToASCII(host); err == nil && ascii != "" {
++		host = ascii
++	}
++
++	return host
++}
++
++// CanonicalAppName normalises the application name that the short-name
++// fallback compares against the first label of a host. Application names are
++// case insensitive for the same reason host names are.
++func CanonicalAppName(name string) string {
++	return strings.ToLower(strings.TrimSpace(name))
++}

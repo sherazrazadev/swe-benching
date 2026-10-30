@@ -1,0 +1,126 @@
+diff --git a/cmd/lima-guestagent/daemon_linux.go b/cmd/lima-guestagent/daemon_linux.go
+index b247285..545f598 100644
+--- a/cmd/lima-guestagent/daemon_linux.go
++++ b/cmd/lima-guestagent/daemon_linux.go
+@@ -8,6 +8,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"os/signal"
++	"path/filepath"
+ 	"syscall"
+ 	"time"
+ 
+@@ -57,6 +58,7 @@ func newDaemonCommand() *cobra.Command {
+ 	daemonCommand.Flags().Duration("tick", 3*time.Second, "Tick for polling events")
+ 	daemonCommand.Flags().Int("vsock-port", 0, "Use vsock server instead a UNIX socket")
+ 	daemonCommand.Flags().String("virtio-port", "", "Use virtio server instead a UNIX socket")
++	daemonCommand.Flags().Bool("rootless", false, "Run the agent without privileges for debugging (port forwarding is unavailable)")
+ 	return daemonCommand
+ }
+ 
+@@ -82,12 +84,19 @@ func daemonAction(cmd *cobra.Command, _ []string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	rootless, err := cmd.Flags().GetBool("rootless")
++	if err != nil {
++		return err
++	}
+ 	if tick == 0 {
+ 		return errors.New("tick must be specified")
+ 	}
+-	if os.Geteuid() != 0 {
++	if !rootless && os.Geteuid() != 0 {
+ 		return errors.New("must run as the root user")
+ 	}
++	if rootless {
++		socket = filepath.Join(runtimeDir, "lima-guestagent.sock")
++	}
+ 
+ 	logrus.Infof("event tick: %v", tick)
+ 	simpleTicker := ticker.NewSimpleTicker(time.NewTicker(tick))
+@@ -118,7 +127,18 @@ func daemonAction(cmd *cobra.Command, _ []string) error {
+ 	}
+ 
+ 	var l net.Listener
+-	if virtioPort != "" {
++	if rootless {
++		var lc net.ListenConfig
++		socketL, err := lc.Listen(ctx, "unix", socket)
++		if err != nil {
++			return err
++		}
++		if err := os.Chmod(socket, 0o777); err != nil {
++			return err
++		}
++		l = socketL
++		logrus.Infof("serving the guest agent on %#q (rootless)", socket)
++	} else if virtioPort != "" {
+ 		qemuL, err := serialport.Listen("/dev/virtio-ports/" + virtioPort)
+ 		if err != nil {
+ 			return err
+diff --git a/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh b/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh
+index b01d0fc..17fef87 100644
+--- a/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh
++++ b/pkg/cidata/cidata.TEMPLATE.d/boot.Linux/25-guestagent-base.sh
+@@ -78,6 +78,60 @@ else
+ 		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}"
+ 	elif [ "${LIMA_CIDATA_VIRTIO_PORT}" != "" ]; then
+ 		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}"
++	elif ! command -v systemctl >/dev/null 2>&1; then
++		# No service manager is available; fall back to a plain SysV-style init script.
++		print_sysv_env() {
++			sed -E 's/^([^=]+)=(.*)/\1="\2"/' "${LIMA_CIDATA_MNT}/lima.env"
++		}
++		print_sysv_script() {
++			cat <<-'EOF'
++				#!/bin/sh
++				### BEGIN INIT INFO
++				# Provides:          lima-guestagent
++				# Required-Start:    $local_fs $network
++				# Required-Stop:     $local_fs $network
++				# Default-Start:     2 3 4 5
++				# Default-Stop:      0 1 6
++				# Short-Description: Forward ports to the lima-hostagent
++				### END INIT INFO
++
++				[ -f /etc/default/lima-guestagent ] && . /etc/default/lima-guestagent
++
++				case "$1" in
++				start)
++					${LIMA_CIDATA_GUEST_INSTALL_PREFIX}/bin/lima-guestagent daemon --debug="${LIMA_CIDATA_DEBUG}" --vsock-port "${LIMA_CIDATA_VSOCK_PORT}" --virtio-port "${LIMA_CIDATA_VIRTIO_PORT}" &
++					echo $! >/run/lima-guestagent.pid
++					;;
++				stop)
++					if [ -f /run/lima-guestagent.pid ]; then
++						kill "$(cat /run/lima-guestagent.pid)" 2>/dev/null || true
++						rm -f /run/lima-guestagent.pid
++					fi
++					;;
++				restart)
++					"$0" stop
++					sleep 1
++					"$0" start
++					;;
++				*)
++					echo "Usage: $0 {start|stop|restart}" >&2
++					exit 1
++					;;
++				esac
++			EOF
++		}
++		if [ "${guestagent_updated}" = "false" ] &&
++			[ "$(print_sysv_env | sha256sum)" = "$(sha256sum </etc/default/lima-guestagent 2>/dev/null)" ] &&
++			[ "$(print_sysv_script | sha256sum)" = "$(sha256sum </etc/init.d/lima-guestagent 2>/dev/null)" ]; then
++			echo "lima-guestagent service already up-to-date"
++			exit 0
++		fi
++
++		mkdir -p /etc/default
++		print_sysv_env >/etc/default/lima-guestagent
++		print_sysv_script >/etc/init.d/lima-guestagent
++		chmod 755 /etc/init.d/lima-guestagent
++		/etc/init.d/lima-guestagent start
+ 	else
+ 		sudo "${LIMA_CIDATA_GUEST_INSTALL_PREFIX}"/bin/lima-guestagent install-systemd --debug="${LIMA_CIDATA_DEBUG}" --guestagent-updated="${guestagent_updated}"
+ 	fi

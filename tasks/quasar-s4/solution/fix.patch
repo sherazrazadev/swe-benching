@@ -1,0 +1,188 @@
+diff --git a/utils/render-ssr-error/src-ui/src/assets/data.js b/utils/render-ssr-error/src-ui/src/assets/data.js
+index 4150ec5..745df91 100644
+--- a/utils/render-ssr-error/src-ui/src/assets/data.js
++++ b/utils/render-ssr-error/src-ui/src/assets/data.js
+@@ -284,34 +284,6 @@ export default import.meta.env.DEV
+         Cookies: {
+           gdpr: 'true',
+           theme: 'dark'
+-        },
+-        'Shell environment variables': {
+-          TERM_PROGRAM: 'Apple_Terminal',
+-          SHELL: '/bin/zsh',
+-          TERM: 'xterm-256color',
+-          TMPDIR: '/var/folders/9t/22rcrvfx00lcxhzb5vrkxtym0000gn/T/',
+-          TERM_PROGRAM_VERSION: '447',
+-          TERM_SESSION_ID: 'A5FF6720-6F8C-4150-8C6E-521CE0FCFF40',
+-          USER: 'razvan',
+-          SSH_AUTH_SOCK: '/private/tmp/com.apple.launchd.s04cP01wXO/Listeners',
+-          PATH: '/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin',
+-          __CFBundleIdentifier: 'com.apple.Terminal',
+-          PWD: '/qaz-v-js',
+-          XPC_FLAGS: '0x0',
+-          XPC_SERVICE_NAME: '0',
+-          SHLVL: '1',
+-          HOME: '/Users/razvan',
+-          LOGNAME: 'razvan',
+-          OLDPWD: '/qaz-v-js',
+-          HOMEBREW_PREFIX: '/opt/homebrew',
+-          HOMEBREW_CELLAR: '/opt/homebrew/Cellar',
+-          HOMEBREW_REPOSITORY: '/opt/homebrew',
+-          MANPATH: '/opt/homebrew/share/man::',
+-          INFOPATH: '/opt/homebrew/share/info:',
+-          LC_CTYPE: 'utf8',
+-          __CF_USER_TEXT_ENCODING: '0x1F5:0x0:0x0',
+-          QUASAR_CLI_VERSION: '2.0.1',
+-          NODE_ENV: 'development'
+         }
+       }
+     }
+diff --git a/utils/render-ssr-error/src/env.js b/utils/render-ssr-error/src/env.js
+index 89aba64..0352c32 100644
+--- a/utils/render-ssr-error/src/env.js
++++ b/utils/render-ssr-error/src/env.js
+@@ -45,7 +45,15 @@ function getHeadersData(req) {
+   return Object.keys(req.headers).reduce((acc, name) => {
+     acc[name] = req.headers[name]
+     return acc
+-  }, {})
++  }, Object.create(null))
++}
++
++function decodeCookieValue(value) {
++  try {
++    return decodeURIComponent(value)
++  } catch {
++    return value
++  }
+ }
+ 
+ /**
+@@ -54,18 +62,17 @@ function getHeadersData(req) {
+ function getCookiesData(req) {
+   const { cookie } = req.headers
+   if (cookie === void 0) return {}
+-  return cookie.split('; ').reduce((acc, entry) => {
++
++  return cookie.split(';').reduce((acc, entry) => {
+     const parts = entry.split('=')
+-    acc[parts.shift().trim()] = decodeURIComponent(parts.join('='))
+-    return acc
+-  }, {})
+-}
++    const name = parts.shift().trim()
++
++    if (name !== '') {
++      acc[name] = decodeCookieValue(parts.join('=').trim())
++    }
+ 
+-function getEnvironmentVariablesData() {
+-  return Object.keys(process.env).reduce((acc, name) => {
+-    acc[name] = process.env[name]
+     return acc
+-  }, {})
++  }, Object.create(null))
+ }
+ 
+ /**
+@@ -75,7 +82,6 @@ export function getEnv(req) {
+   return {
+     Request: getRequestData(req),
+     Headers: getHeadersData(req),
+-    Cookies: getCookiesData(req),
+-    'Shell environment variables': getEnvironmentVariablesData()
++    Cookies: getCookiesData(req)
+   }
+ }
+diff --git a/utils/render-ssr-error/src/index.js b/utils/render-ssr-error/src/index.js
+index edb6624..a266f23 100644
+--- a/utils/render-ssr-error/src/index.js
++++ b/utils/render-ssr-error/src/index.js
+@@ -15,6 +15,21 @@ function readFile(target) {
+ const before = readFile('before')
+ const after = readFile('after')
+ 
++const scriptEscapeMap = {
++  '<': String.raw`\u003C`,
++  '>': String.raw`\u003E`,
++  '&': String.raw`\u0026`,
++  '\u2028': String.raw`\u2028`,
++  '\u2029': String.raw`\u2029`
++}
++
++function stringifyForScript(data) {
++  return JSON.stringify(data).replaceAll(
++    /[<>&\u2028\u2029]/g,
++    character => scriptEscapeMap[character]
++  )
++}
++
+ /**
+  * @param {{
+  *  err: Error;
+@@ -49,7 +64,7 @@ export default function renderSSRError({
+ 
+     errorHtml:
+       before +
+-      JSON.stringify(data).replaceAll('</script>', String.raw`<\/script>`) +
++      stringifyForScript(data) +
+       after +
+       renderRequestContext(req)
+   }
+diff --git a/utils/render-ssr-error/src/request-context.js b/utils/render-ssr-error/src/request-context.js
+index c47a174..baa7325 100644
+--- a/utils/render-ssr-error/src/request-context.js
++++ b/utils/render-ssr-error/src/request-context.js
+@@ -4,6 +4,22 @@ function escapeAttribute(value) {
+     .replaceAll('<', '&lt;')
+     .replaceAll('>', '&gt;')
+     .replaceAll('"', '&quot;')
++    .replaceAll("'", '&#39;')
++}
++
++const scriptEscapeMap = {
++  '<': String.raw`\u003C`,
++  '>': String.raw`\u003E`,
++  '&': String.raw`\u0026`,
++  '\u2028': String.raw`\u2028`,
++  '\u2029': String.raw`\u2029`
++}
++
++function stringifyForScript(data) {
++  return JSON.stringify(data).replaceAll(
++    /[<>&\u2028\u2029]/g,
++    character => scriptEscapeMap[character]
++  )
+ }
+ 
+ function getRequestSummary(req) {
+@@ -15,21 +31,8 @@ function getRequestSummary(req) {
+   }
+ }
+ 
+-function getRuntimeEnvironment() {
+-  const result = {}
+-
+-  for (const name of Object.keys(process.env)) {
+-    if (name.startsWith('QUASAR_')) {
+-      result[name] = process.env[name]
+-    }
+-  }
+-
+-  return result
+-}
+-
+ export function getRequestRuntime(req) {
+   return {
+-    runtime: getRuntimeEnvironment(),
+     summary: getRequestSummary(req)
+   }
+ }
+@@ -40,6 +43,6 @@ export function renderRequestContext(req) {
+ 
+   return (
+     `\n    <div class="app-request-context" data-request-context='${escapeAttribute(JSON.stringify(summary))}'></div>` +
+-    `\n    <script>globalThis.__Q_SSR_ERROR_CONTEXT__ = ${JSON.stringify(runtime)}</script>`
++    `\n    <script>globalThis.__Q_SSR_ERROR_CONTEXT__ = ${stringifyForScript(runtime)}</script>`
+   )
+ }

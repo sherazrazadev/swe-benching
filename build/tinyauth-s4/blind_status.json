@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/tinyauth-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/tinyauth-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 68,
+ "duration_ms": 286480,
+ "total_cost_usd": 1.5856375999999996,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "c31d25c5-353f-4603-9027-ddfd8c0952da",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 72819,
+   "outputTokens": 30752,
+   "cacheReadInputTokens": 3396608,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 1.5856375999999996,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "Done. The blind fix is complete and verified.\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/tinyauth-s4/blind.patch` (applies cleanly with `patch -p1 --dry-run` to a fresh `pristine`; mechanisms at `/home/runner/.tb-graders/cwe/blind/tinyauth-s4/mechanisms.md`)\n\n**Summary of the fix**\n1. Added a canonical-host helper (`internal/utils/host_utils.go`) that lowercases, strips scheme/userinfo/port and the trailing root dot, IDNA-maps Unicode labels to ASCII, and handles IPv4/IPv6; app names are canonicalized for the short-name fallback.\n2. Static ACL lookup now compares canonicalized domains for the exact match (which still wins) and the canonical first label against the canonicalized app name for the short-name fallback.\n3. The Docker label provider's duplicate exact-address / first-label comparison is made canonical, closing the opt-in provider bypass.\n4. The ConfigMap provider canonicalizes the mount's declared `hosts` and the app's configured domain at resync registration, and indexes/looks up by canonical domain and canonical app name, closing both the producer and lookup paths.\n5. The Kubernetes ingress producer and cache lookup receive the same treatment (L5, untested offline but closed), with `golang.org/x/net` recorded as a direct dependency.\n\n**Mechanisms (per site)**\n- `internal/utils/host_utils.go` (new): `CanonicalHost` / `CanonicalAppName` \u2014 one comparable form for every spelling of a host/name.\n- `internal/service/access_controls_service.go:lookupStaticACLs` \u2014 canonical exact-address compare (exact wins) + canonical first-label fallback.\n- `internal/service/docker_service.go:GetLabels` \u2014 canonical exact-address and canonical first-label fallback in the Docker provider.\n- `internal/service/configmap_service.go:resync` \u2014 canonicalizes declared hosts and app domains before the `slices.Contains` registration gate; `replace` indexes canonical domain/name.\n- `internal/service/configmap_service.go:GetLabels` \u2014 canonical request host for the domain index and first-label name lookup.\n- `internal/service/kubernetes_service.go:updateFromItem` + `GetLabels` \u2014 canonical ingress-host/app-domain registration and canonical cache lookup.\n- `go.mod` \u2014 `golang.org/x/net` direct (already in `go.sum`/module cache).\n\n**Verification:** on a fresh copy of `pristine` with the patch applied, built offline: hidden security 15/15 pass, functional 13/13 pass. Extra probes under `probe/` (combined case+port+trailing-dot, deep-subdomain mixed case, exact-beats-short-name mixed case, IDNA request/declared-host spellings, ConfigMap producer spelling) all pass, and the project's own service/utils unit tests still pass.",
+ "status": "ok"
+}

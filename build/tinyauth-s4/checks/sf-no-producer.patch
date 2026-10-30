@@ -1,0 +1,518 @@
+diff --git a/internal/controller/oauth_controller.go b/internal/controller/oauth_controller.go
+index 27fca20..ee0f92f 100644
+--- a/internal/controller/oauth_controller.go
++++ b/internal/controller/oauth_controller.go
+@@ -1,9 +1,9 @@
+ package controller
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+-	"net/url"
+ 	"strings"
+ 	"time"
+ 
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/tinyauthapp/tinyauth/internal/service"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"github.com/tinyauthapp/tinyauth/pkg/validators"
+ 	"go.uber.org/dig"
+ 
+ 	"github.com/gin-gonic/gin"
+@@ -311,54 +312,46 @@ func (controller *OAuthController) getCookieDomain() string {
+ }
+ 
+ func (controller *OAuthController) isRedirectSafe(redirectURI string) bool {
+-	u, err := url.Parse(redirectURI)
++	v := validators.NewDomainValidator(validators.DomainValidatorOptions{
++		WithScheme: true,
++		WithPort:   true,
++	})
++
++	_, err := v.SafeHostname(controller.runtime.AppURL)
+ 
+ 	if err != nil {
+-		controller.log.App.Error().Err(err).Msg("Failed to parse redirect URI")
++		controller.log.App.Error().Err(err).Msg("App URL is invalid, cannot validate redirect URI")
+ 		return false
+ 	}
+ 
+-	if u.Scheme == "" || u.Host == "" {
+-		controller.log.App.Warn().Msg("Redirect URI has invalid scheme or host")
+-		return false
++	err = v.Validate(redirectURI, controller.runtime.AppURL)
++
++	if err == nil {
++		return true
+ 	}
+ 
+-	au, err := url.Parse(controller.runtime.AppURL)
++	controller.log.App.Debug().Err(err).Msg("Failed to validate redirect URI")
+ 
+-	if err != nil {
+-		controller.log.App.Error().Err(err).Msg("Failed to parse app URL")
++	if errors.Is(err, validators.ErrInvalidURL) ||
++		errors.Is(err, validators.ErrSchemeMismatch) ||
++		errors.Is(err, validators.ErrPortMismatch) {
+ 		return false
+ 	}
+ 
+-	if u.Scheme != au.Scheme {
+-		controller.log.App.Warn().Msg("Redirect URI scheme does not match app URL scheme")
++	if !controller.config.Auth.SubdomainsEnabled {
+ 		return false
+ 	}
+ 
+-	getEffectivePort := func(u *url.URL) string {
+-		if u.Port() != "" {
+-			return u.Port()
+-		}
+-		if u.Scheme == "https" {
+-			return "443"
+-		}
+-		return "80"
+-	}
+-
+-	if getEffectivePort(u) != getEffectivePort(au) {
+-		controller.log.App.Warn().Msg("Redirect URI port does not match app URL port")
+-		return false
+-	}
++	v = validators.NewDomainValidator(validators.DomainValidatorOptions{})
+ 
+-	if strings.EqualFold(u.Hostname(), au.Hostname()) {
+-		return true
+-	}
++	hostname, err := v.SafeHostname(redirectURI)
+ 
+-	if !controller.config.Auth.SubdomainsEnabled {
++	if err != nil {
++		controller.log.App.Error().Err(err).Msg("Failed to get safe hostname from redirect URI")
+ 		return false
+ 	}
+ 
+-	if strings.HasSuffix(strings.ToLower(u.Hostname()), "."+strings.ToLower(controller.runtime.CookieDomain)) {
++	if strings.HasSuffix(hostname, "."+strings.ToLower(controller.runtime.CookieDomain)) {
+ 		return true
+ 	}
+ 
+diff --git a/internal/service/access_controls_service.go b/internal/service/access_controls_service.go
+index 3615cce..bb76c2a 100644
+--- a/internal/service/access_controls_service.go
++++ b/internal/service/access_controls_service.go
+@@ -1,10 +1,12 @@
+ package service
+ 
+ import (
++	"errors"
+ 	"strings"
+ 
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"github.com/tinyauthapp/tinyauth/pkg/validators"
+ 	"go.uber.org/dig"
+ )
+ 
+@@ -38,13 +40,19 @@ func NewAccessControlsService(i AccessControlServiceInput) *AccessControlsServic
+ func (service *AccessControlsService) lookupStaticACLs(domain string) *model.App {
+ 	var nameMatch *model.App
+ 
++	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
++
+ 	// First try to find a matching app by domain, then fallback to matching by app name (subdomain)
+ 	for app, config := range service.config.Apps {
+-		if config.Config.Domain == domain {
++		err := v.Validate(config.Config.Domain, domain)
++		if err == nil {
+ 			service.log.App.Debug().Str("name", app).Msg("Found matching container by domain")
+ 			return &config
+ 		}
+-		if strings.SplitN(domain, ".", 2)[0] == app {
++		if !errors.Is(err, validators.ErrHostnameMismatch) {
++			service.log.App.Debug().Str("name", app).Err(err).Msg("Domain validation failed")
++		}
++		if strings.HasPrefix(strings.ToLower(domain), strings.ToLower(app+".")) {
+ 			service.log.App.Debug().Str("name", app).Msg("Found matching container by app name")
+ 			nameMatch = &config
+ 		}
+diff --git a/internal/service/configmap_service.go b/internal/service/configmap_service.go
+index f316cd1..33ee57b 100644
+--- a/internal/service/configmap_service.go
++++ b/internal/service/configmap_service.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"github.com/tinyauthapp/tinyauth/pkg/validators"
+ 	"go.uber.org/dig"
+ )
+ 
+@@ -151,7 +152,7 @@ func (k *ConfigMapService) resync() {
+ 
+ 	if err != nil {
+ 		k.log.App.Warn().Err(err).Str("path", k.dir).Msg("Failed to read configmap volume, clearing app labels")
+-		k.replace(nil)
++		k.replace(nil, nil, nil)
+ 		return
+ 	}
+ 
+@@ -159,7 +160,7 @@ func (k *ConfigMapService) resync() {
+ 
+ 	if err != nil {
+ 		k.log.App.Warn().Err(err).Str("path", k.dir).Msg("Failed to decode configmap labels, clearing app labels")
+-		k.replace(nil)
++		k.replace(nil, nil, nil)
+ 		return
+ 	}
+ 
+@@ -179,10 +180,10 @@ func (k *ConfigMapService) resync() {
+ 
+ 		apps[appName] = configMapEntry{name: appName, app: appLabels}
+ 		domains[appLabels.Config.Domain] = appName
+-		names[appName] = appName
++		names[strings.ToLower(appName)] = appName
+ 	}
+ 
+-	k.replace(apps)
++	k.replace(apps, domains, names)
+ 
+ 	if len(apps) == 0 {
+ 		k.log.App.Debug().Str("path", k.dir).Msg("No app labels found in configmap volume")
+@@ -192,18 +193,13 @@ func (k *ConfigMapService) resync() {
+ 	k.log.App.Debug().Str("path", k.dir).Int("apps", len(apps)).Msg("ConfigMap label provider resync complete")
+ }
+ 
+-func (k *ConfigMapService) replace(apps map[string]configMapEntry) {
++func (k *ConfigMapService) replace(apps map[string]configMapEntry, domains map[string]string, names map[string]string) {
+ 	k.mu.Lock()
+ 	defer k.mu.Unlock()
+ 
+ 	k.apps = apps
+-	k.domains = make(map[string]string)
+-	k.names = make(map[string]string)
+-
+-	for appName, entry := range apps {
+-		k.domains[entry.app.Config.Domain] = appName
+-		k.names[appName] = appName
+-	}
++	k.domains = domains
++	k.names = names
+ }
+ 
+ func (k *ConfigMapService) getByDomain(domain string) *model.App {
+@@ -252,14 +248,22 @@ func (k *ConfigMapService) GetLabels(appDomain string) (*model.App, error) {
+ 		return nil, nil
+ 	}
+ 
+-	app := k.getByDomain(appDomain)
++	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
++
++	canonicalDomain := appDomain
++
++	if hostname, err := v.SafeHostname(appDomain); err == nil {
++		canonicalDomain = hostname
++	}
++
++	app := k.getByDomain(canonicalDomain)
+ 
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Msg("Found labels in cache by domain")
+ 		return app, nil
+ 	}
+ 
+-	appName := strings.SplitN(appDomain, ".", 2)[0]
++	appName := strings.ToLower(strings.SplitN(appDomain, ".", 2)[0])
+ 	app = k.getByAppName(appName)
+ 
+ 	if app != nil {
+diff --git a/internal/service/docker_service.go b/internal/service/docker_service.go
+index 49708b0..bd27c0b 100644
+--- a/internal/service/docker_service.go
++++ b/internal/service/docker_service.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"github.com/tinyauthapp/tinyauth/pkg/validators"
+ 	"go.uber.org/dig"
+ 
+ 	container "github.com/docker/docker/api/types/container"
+@@ -92,13 +93,15 @@ func (docker *DockerService) GetLabels(appDomain string) (*model.App, error) {
+ 
+ 		var nameMatch *model.App
+ 
++		v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
++
+ 		// First try to find a matching app by domain, then fallback to matching by app name (subdomain)
+ 		for appName, appLabels := range labels.Apps {
+-			if appLabels.Config.Domain == appDomain {
++			if v.Validate(appLabels.Config.Domain, appDomain) == nil {
+ 				docker.log.App.Debug().Str("id", inspect.ID).Str("name", inspect.Name).Msg("Found matching container by domain")
+ 				return &appLabels, nil
+ 			}
+-			if strings.SplitN(appDomain, ".", 2)[0] == appName {
++			if strings.HasPrefix(strings.ToLower(appDomain), strings.ToLower(appName+".")) {
+ 				docker.log.App.Debug().Str("id", inspect.ID).Str("name", inspect.Name).Msg("Found matching container by app name")
+ 				nameMatch = &appLabels
+ 			}
+diff --git a/internal/service/kubernetes_service.go b/internal/service/kubernetes_service.go
+index f065be7..79b6175 100644
+--- a/internal/service/kubernetes_service.go
++++ b/internal/service/kubernetes_service.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/tinyauthapp/tinyauth/internal/model"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
+ 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"github.com/tinyauthapp/tinyauth/pkg/validators"
+ 	"go.uber.org/dig"
+ 
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -253,18 +254,36 @@ func (k *KubernetesService) updateFromItem(item *unstructured.Unstructured) {
+ 		k.removeIngress(namespace, name)
+ 		return
+ 	}
++	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
++
++	canonicalHosts := make([]string, 0, len(hosts))
++
++	for _, host := range hosts {
++		canonicalHost, err := v.SafeHostname(host)
++		if err != nil {
++			canonicalHost = strings.ToLower(strings.TrimSuffix(host, "."))
++		}
++		canonicalHosts = append(canonicalHosts, canonicalHost)
++	}
++
+ 	var apps []ingressApp
+ 	for appName, appLabels := range labels.Apps {
+ 		if appLabels.Config.Domain == "" {
+ 			continue
+ 		}
+-		if len(hosts) > 0 && !slices.Contains(hosts, appLabels.Config.Domain) {
++
++		canonicalDomain, err := v.SafeHostname(appLabels.Config.Domain)
++		if err != nil {
++			canonicalDomain = strings.ToLower(strings.TrimSuffix(appLabels.Config.Domain, "."))
++		}
++
++		if len(hosts) > 0 && !slices.Contains(canonicalHosts, canonicalDomain) {
+ 			k.log.App.Warn().Str("namespace", namespace).Str("name", name).Str("appName", appName).Str("domain", appLabels.Config.Domain).Msg("App domain does not match any hosts defined in ingress rules, skipping")
+ 			continue
+ 		}
+ 		apps = append(apps, ingressApp{
+-			domain:  appLabels.Config.Domain,
+-			appName: appName,
++			domain:  canonicalDomain,
++			appName: strings.ToLower(appName),
+ 			app:     appLabels,
+ 		})
+ 	}
+@@ -369,12 +388,20 @@ func (k *KubernetesService) GetLabels(appDomain string) (*model.App, error) {
+ 	}
+ 
+ 	// First check cache
+-	app := k.getByDomain(appDomain)
++	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
++
++	canonicalDomain := appDomain
++
++	if hostname, err := v.SafeHostname(appDomain); err == nil {
++		canonicalDomain = hostname
++	}
++
++	app := k.getByDomain(canonicalDomain)
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Msg("Found labels in cache by domain")
+ 		return app, nil
+ 	}
+-	appName := strings.SplitN(appDomain, ".", 2)[0]
++	appName := strings.ToLower(strings.SplitN(appDomain, ".", 2)[0])
+ 	app = k.getByAppName(appName)
+ 	if app != nil {
+ 		k.log.App.Debug().Str("domain", appDomain).Str("appName", appName).Msg("Found labels in cache by app name")
+diff --git a/pkg/validators/domain_validator.go b/pkg/validators/domain_validator.go
+new file mode 100644
+index 0000000..adeb7a8
+--- /dev/null
++++ b/pkg/validators/domain_validator.go
+@@ -0,0 +1,179 @@
++// Package validators provides validators for various types of data.
++//
++// Domain validator is a simple utility that ensures two domains are exact
++// matches while ensuring that techniques used to bypass such checks do
++// not impact the validation.
++
++package validators
++
++import (
++	"fmt"
++	"net"
++	"net/url"
++	"slices"
++	"strings"
++
++	"golang.org/x/net/idna"
++)
++
++var (
++	ErrInvalidURL       = fmt.Errorf("invalid url")
++	ErrSchemeMismatch   = fmt.Errorf("scheme mismatch")
++	ErrPortMismatch     = fmt.Errorf("port mismatch")
++	ErrHostnameMismatch = fmt.Errorf("hostname mismatch")
++)
++
++// DomainValidatorOptions is a set of options for DomainValidator.
++type DomainValidatorOptions struct {
++	// Ensure domains have the same scheme.
++	WithScheme bool
++	// Ensure domains have the same port.
++	WithPort bool
++	// Specify a list of allowed schemes IF WithScheme is set to true.
++	// Leave empty to allow any scheme.
++	AllowedSchemes []string
++}
++
++// DomainValidator is a simple utility that ensures two domains are exact
++// matches while ensuring that techniques used to bypass such checks do
++// not impact the validation.
++type DomainValidator struct {
++	opts DomainValidatorOptions
++}
++
++// NewDomainValidator creates a new DomainValidator.
++func NewDomainValidator(opts DomainValidatorOptions) *DomainValidator {
++	return &DomainValidator{
++		opts: opts,
++	}
++}
++
++func (v *DomainValidator) getURL(i string) (*url.URL, error) {
++	u, err := url.Parse(i)
++
++	if !v.opts.WithScheme && (err != nil || u.Host == "") {
++		u, err = url.Parse("tinyauth://" + i)
++	}
++
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse input url: %w", err)
++	}
++
++	if u.Host == "" {
++		return nil, ErrInvalidURL
++	}
++
++	if v.opts.WithPort && !v.opts.WithScheme && u.Port() == "" {
++		return nil, fmt.Errorf("port validation is enabled but port is missing in input url and schemes are not enabled")
++	}
++
++	if v.opts.WithScheme {
++		// Empty scheme means that we parsed the url with the tinyauth:// placeholder
++		if u.Scheme == "tinyauth" {
++			return nil, fmt.Errorf("input url is missing scheme")
++		}
++		if len(v.opts.AllowedSchemes) > 0 && !slices.Contains(v.opts.AllowedSchemes, u.Scheme) {
++			return nil, fmt.Errorf("scheme %s not allowed", u.Scheme)
++		}
++	}
++
++	return u, nil
++}
++
++func (v *DomainValidator) getEffectivePort(u *url.URL) (string, bool) {
++	if u.Port() != "" {
++		return u.Port(), true
++	}
++	switch u.Scheme {
++	case "http":
++		return "80", true
++	case "https":
++		return "443", true
++	default:
++		return "", false
++	}
++}
++
++func (v *DomainValidator) formatHostname(hostname string) (string, error) {
++	hostname = strings.ToLower(hostname)
++	hostname = strings.TrimSuffix(hostname, ".")
++	if net.ParseIP(hostname) != nil {
++		return "", fmt.Errorf("ip addresses are not supported")
++	}
++	hostname, err := idna.Lookup.ToASCII(hostname)
++	if err != nil {
++		return "", fmt.Errorf("failed to convert hostname to ascii: %w", err)
++	}
++	return hostname, nil
++}
++
++// Validate ensures that two domains are exact matches with the
++// options defined in the DomainValidatorOptions. It ensures that the
++// inputs are proper URLs and contain a host. It lowercases the hostnames
++// and removes the trailing dot. Finally, it checks that the hostnames are
++// equal unless WithScheme or WithPort is set to true where it also
++// validates the scheme and port respectively.
++func (v *DomainValidator) Validate(expected, actual string) error {
++	eu, err := v.getURL(expected)
++
++	if err != nil {
++		return err
++	}
++
++	au, err := v.getURL(actual)
++
++	if err != nil {
++		return err
++	}
++
++	if v.opts.WithScheme {
++		if eu.Scheme != au.Scheme {
++			return ErrSchemeMismatch
++		}
++	}
++
++	if v.opts.WithPort {
++		eup, ok := v.getEffectivePort(eu)
++		if !ok {
++			return fmt.Errorf("failed to get effective port for url: %s", eu.String())
++		}
++		aup, ok := v.getEffectivePort(au)
++		if !ok {
++			return fmt.Errorf("failed to get effective port for url: %s", au.String())
++		}
++		if eup != aup {
++			return ErrPortMismatch
++		}
++	}
++
++	euf, err := v.formatHostname(eu.Hostname())
++
++	if err != nil {
++		return err
++	}
++
++	auf, err := v.formatHostname(au.Hostname())
++
++	if err != nil {
++		return err
++	}
++
++	if euf != auf {
++		return ErrHostnameMismatch
++	}
++
++	return nil
++}
++
++// SafeHostname uses the internal validation for domains that Validator uses
++// to parse a hostname. It ensures the input URL is a valid URL, that a host
++// is present and that the hostname is lowercased and without a trailing dot.
++func (v *DomainValidator) SafeHostname(input string) (string, error) {
++	u, err := v.getURL(input)
++
++	if err != nil {
++		return "", err
++	}
++
++	return v.formatHostname(u.Hostname())
++}

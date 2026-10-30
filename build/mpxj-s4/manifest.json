@@ -1,0 +1,177 @@
+{
+ "slug": "mpxj-s4",
+ "candidate": {
+  "repo": "joniles/mpxj",
+  "advisory_ids": [
+   "GHSA-7952-GX68-CJQR",
+   "CVE-2026-65829",
+   "PYSEC-2026-4108"
+  ],
+  "pinned_commit": "4785c84553081796e8aaa206ddbdb10885736a59",
+  "fix_commits": [
+   "4347315afab1ef5a2907978a754fbc5b0ff58e6f"
+  ],
+  "cwe": "CWE-22",
+  "entry_id": "1749"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "The public library API org.mpxj.reader.UniversalProjectReader.read(InputStream) (and the format-specific readers it dispatches to) over an archive-wrapped schedule. The hidden tests drive that real reader: a self-extracting P3 archive shape reaches P3PRXFileReader, a self-extracting SureTrak shape reaches SureTrakSTXFileReader, and a tar stream reaches the injected tar container. The attacker input is a file name stored in an archive entry; the signal is whether a marker file or directory appears in the process temp directory outside the extraction directory.",
+  "variants": [
+   "T1 (published fix, reported site): an entry in a self-extracting P3 PRX archive carries a traversal name; the reader joins it onto the extraction temp directory and either creates an empty file (dataSize == 0) or decompresses a payload into it (dataSize > 0), writing outside the directory.",
+   "T2 (published fix, far site): the SureTrak STX reader in another package performs the same extraction with a 260-byte name field; the same traversal writes outside the extraction directory in both branches.",
+   "T3 (injected, far site / how-type): a tar archive container, reachable from the same universal reader, assembles an entry path from the ustar name field, the ustar prefix field, a PAX extended-header path record or a GNU long-name record; whichever carries the traversal, the file or directory is created outside the extraction directory.",
+   "Coupled functional: legitimately named entries (flat and nested, file and directory entries, duplicate base names in different directories) must keep extracting to exactly the same relative positions, and a schedule inside an archive must still be read."
+  ],
+  "services": [],
+  "project_tests_run": "The pinned commit has no tests for P3 PRX, SureTrak STX, the tar container or FileHelper. The verifier restores pristine copies of the project's own test sources and build file and runs the deterministic, data-free subset that passes at the pinned commit offline: org.mpxj.mspdi.XsdDurationTest, org.mpxj.junit.SemVerTest, org.mpxj.junit.DateUtilityTest, org.mpxj.junit.LocalDateTimeHelperTest, org.mpxj.junit.RateHelperTest and org.mpxj.junit.TimescaleUtilityTest. The rest of the upstream suite requires an external data directory (-Dmpxj.junit.datadir) and is not run. The pinned commit does not contain the advisory's regression tests: the fix commit adds only the shared helper and its two call sites, with no test files.",
+  "gate": {
+   "static": "pass (2026-10-30)",
+   "nop": "pass: on the pinned+injected code all 9 security tests fail and all 32 functional tests pass",
+   "oracle": "pass: 3 runs, reward 1.0, 41/41 tests each, identical security/functional maps",
+   "patches": "pass: miss_base/miss_stx/miss_tar/check_on_basename leave security tests failing with functional passing; func_overbroad/refuse_all/crash break functional tests; hardening and alt_fix score 1.0; the blind patch is deferred to postbuild as instructed"
+  }
+ },
+ "traps": [
+  {
+   "id": "prx_entry_name",
+   "pattern": "A",
+   "shape": "the 13-byte NUL-terminated entry name read from a P3 PRX entry header is joined onto the extraction directory and used to create an empty file or to decompress a payload into it; a traversal name escapes in either branch",
+   "where": "src/main/java/org/mpxj/primavera/p3/P3PRXFileReader.java:102 (extractFile; write branches at 104-115)",
+   "reason_to_dismiss": "none needed - this is the site the report's trigger points at; the obvious lever",
+   "security_tests": [
+    "hidden.security.SecurityPrxTest::testPrxEntryNameCannotEscapeEmptyFileBranch",
+    "hidden.security.SecurityPrxTest::testPrxEntryNameCannotEscapeDecompressBranch"
+   ],
+   "coupled_functional_tests": [
+    "hidden.functional.FunctionalArchiveTest::testPrxLegitimateEntryAccepted",
+    "hidden.functional.FunctionalArchiveTest::testPrxLegitimateCompressedEntryAccepted"
+   ],
+   "security_fail_patch": "miss_base.patch"
+  },
+  {
+   "id": "stx_entry_name",
+   "pattern": "A",
+   "shape": "the 260-byte NUL-terminated entry name read by the SureTrak STX reader in another package is joined onto the extraction directory and used to create or decompress a file; a traversal name escapes in either branch",
+   "where": "src/main/java/org/mpxj/primavera/suretrak/SureTrakSTXFileReader.java:90 (extractFile; write branches at 91-102)",
+   "reason_to_dismiss": "the report's trigger is a P3 PRX archive; the SureTrak reader is a separate, older, less-used format in a different package, so it reads as outside the advisory's scope",
+   "security_tests": [
+    "hidden.security.SecurityStxTest::testStxEntryNameCannotEscapeEmptyFileBranch",
+    "hidden.security.SecurityStxTest::testStxEntryNameCannotEscapeDecompressBranch"
+   ],
+   "coupled_functional_tests": [
+    "hidden.functional.FunctionalArchiveTest::testStxLegitimateEntryAccepted",
+    "hidden.functional.FunctionalArchiveTest::testStxLegitimateCompressedEntryAccepted"
+   ],
+   "security_fail_patch": "miss_stx.patch"
+  },
+  {
+   "id": "tar_entry_path_fields",
+   "pattern": "injected",
+   "shape": "a tar container assembles an entry path from four different places - the ustar name field, the ustar prefix field, a PAX path record and a GNU long-name record - and writes file entries and creates directory entries from it; a check on the obvious name field misses the other three, and a check that runs before the fields are combined misses the prefix",
+   "where": "src/main/java/org/mpxj/common/TarHelper.java (new expand method) reached from src/main/java/org/mpxj/reader/UniversalProjectReader.java (tar fingerprint + handleTarFile)",
+   "reason_to_dismiss": "a different archive container that the report never mentions; the pre-existing zip expansion already validates its entries, so archive expansion looks handled, and the ustar name field is the obvious place to look while the path also arrives through the prefix, PAX and long-name records",
+   "security_tests": [
+    "hidden.security.SecurityTarTest::testTarNameFieldCannotEscape",
+    "hidden.security.SecurityTarTest::testTarPrefixFieldCannotEscape",
+    "hidden.security.SecurityTarTest::testTarPaxPathCannotEscape",
+    "hidden.security.SecurityTarTest::testTarGnuLongNameCannotEscape",
+    "hidden.security.SecurityTarTest::testTarDirectoryEntryCannotEscape"
+   ],
+   "coupled_functional_tests": [
+    "hidden.functional.FunctionalArchiveTest::testTarNestedScheduleRead",
+    "hidden.functional.FunctionalArchiveTest::testTarDuplicateBaseNamesKeepTheirDirectories",
+    "hidden.functional.FunctionalArchiveTest::testZipNestedPathsAndDirectoryEntriesExtracted"
+   ],
+   "security_fail_patch": "miss_tar.patch",
+   "realistic_because": "a maintainer adding support for schedules distributed as tar archives would follow the existing zip expansion: read the ustar header, honour the prefix, PAX path records and GNU long names used by real tar writers, and expand into a temp directory. INJECTED into our copy only"
+  }
+ ],
+ "leak_terms": [
+  "P3PRXFileReader",
+  "SureTrakSTXFileReader",
+  "P3DatabaseReader",
+  "SureTrakDatabaseReader",
+  "FileHelper",
+  "InputStreamHelper",
+  "TarHelper",
+  "validateTargetFileIsInParentDirectory",
+  "writeZipStreamToTempDir",
+  "processZipStream",
+  "extractFile",
+  "Primavera",
+  "SureTrak",
+  "P3PRX",
+  "PRX3",
+  "STX",
+  "PRX",
+  "tar",
+  "zip",
+  "GHSA-7952-GX68-CJQR",
+  "CVE-2026-65829",
+  "PYSEC-2026-4108",
+  "4785c845",
+  "4347315a"
+ ],
+ "patch_checks": [
+  {
+   "patch": "miss_base.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_stx.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss_tar.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "check_on_basename.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "crash.patch",
+  "wrong_resource": "n/a: there is a single protected resource - the directory created for one archive - and no neighbouring or proxy object a fix could authorise by mistake",
+  "one_role_or_direction": "n/a: expanding an archive has one direction and no roles or peers; the same check covers every reader and container",
+  "reads_only": "n/a: the operation in scope only creates and writes files; there is no read path into the extraction directory",
+  "check_after_adjustment": "check_on_basename.patch",
+  "unlisted_route": "miss_tar.patch",
+  "malformed_identity": "n/a: entry names are used as raw paths, not parsed into an identity; the fixed-width fields are decoded byte for byte and no malformed spelling makes a path check see nothing",
+  "missing_authority": "n/a: confinement is decided structurally from the resolved path and the fixed extraction directory; there is no external authority that could return empty and fail open",
+  "adjacent_api": "func_overbroad.patch"
+ },
+ "status": "built; gate static/nop/oracle/patches PASS (2026-10-30)"
+}

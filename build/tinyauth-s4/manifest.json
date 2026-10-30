@@ -1,0 +1,280 @@
+{
+ "slug": "tinyauth-s4",
+ "candidate": {
+  "advisory_ids": [
+   "GHSA-328G-JX67-V94G",
+   "CVE-2026-77560",
+   "GO-2026-6552"
+  ],
+  "repo": "tinyauthapp/tinyauth",
+  "pinned_commit": "79bcccbe43a28bc392dae432a91210ca297fb854",
+  "fix_commits": [
+   "e75605b2c534ec83525a33603e16d76baca13399",
+   "80bc87188ec3aabc5104c249eaa7b997973b9275"
+  ],
+  "family": "incorrect authorization / allowlist bypass through case- and encoding-sensitive hostname comparison (CWE-178, CWE-636, CWE-863)"
+ },
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "79bcccbe43a28bc392dae432a91210ca297fb854 (contains none of the fix's regression tests; pkg/validators is absent)",
+  "entry_point": "HTTP GET/HEAD /api/auth/:proxy (traefik|caddy|envoy|nginx), driven against the built server over a unix socket with the product's HTTP Basic authentication",
+  "sites": [
+   "internal/service/access_controls_service.go:38-53 (static config lookup; reported landing)",
+   "internal/service/configmap_service.go:149-190 (injected ConfigMap resync producer: hosts gate)",
+   "internal/service/configmap_service.go:249-275 (injected ConfigMap lookup)",
+   "internal/service/docker_service.go:71-114 (Docker container-label provider; real upstream second implementation)",
+   "internal/service/kubernetes_service.go:237-276 (ingress cache producer) and :365-386 (cache lookup) - oracle only, no cluster API offline",
+   "internal/controller/oauth_controller.go:313-366 (OAuth redirect comparison; oracle refactor, no security assertion)",
+   "pkg/validators/domain_validator.go (new shared helper added by the published fix)"
+  ],
+  "routes": [
+   "traefik/caddy ForwardAuth (x-forwarded-host header)",
+   "nginx AuthRequest (x-original-url URL)",
+   "envoy ExtAuthz (request Host)",
+   "static config ACL source",
+   "Docker label ACL source (fake Docker Engine API over a unix socket in the verifier)",
+   "ConfigMap mount ACL source (injected)"
+  ],
+  "input_shapes": [
+   "mixed capitalization",
+   "explicit port",
+   "trailing dot",
+   "internationalized (IDNA) spelling",
+   "mixed capitalization on the first-label app-name fallback"
+  ],
+  "services": [
+   "no external service; the verifier starts the built server on a unix socket and serves the Docker Engine API from an in-process fake over a unix socket"
+  ],
+  "project_tests_run": [
+   "go build ./... at the pinned+injected tree",
+   "go test ./internal/service/... ./internal/controller/... at the pinned+injected tree",
+   "the same two package trees at the reference tree (both pass)"
+  ],
+  "local_matrix": "injected pinned tree 0/15 security, 13/13 functional; reference 15/15 and 13/13; pass-hardening 15/15 and 13/13; pass-alt 15/15 and 13/13; sf-no-docker 3/15 security with 13/13 functional; sf-no-configmap 4/15 with 13/13; sf-no-producer 2/15 with 13/13; sf-static-case-only 11/15 with 13/13; sf-canonicalize-after-lookup 0/15 with 13/13; ff-exact-only 13/15 security with 10/13 functional; refuse-all 15/15 security with 1/13 functional; crash-as-refusal 0/15 with 6/13 functional",
+  "gate": {
+   "static": "PASSED (conformance, leaks, hidden-test content, exact-status scan)",
+   "nop": "PASSED (15/15 security fail on pinned+injected, 13/13 functional pass, reward 0.0)",
+   "oracle": "PASSED 3/3 runs, reward 1.0, 15/15 security and 13/13 functional, identical",
+   "patches": "PASSED 10/10 readable checks: 5 security_fail, 3 functional_fail, 2 pass at reward 1.0 (pass-hardening, pass-alt); blind declared and left for the blind stage"
+  }
+ },
+ "leak_terms": [
+  "lookupStaticACLs",
+  "GetAccessControls",
+  "GetLabels",
+  "LabelProvider",
+  "DomainValidator",
+  "NewDomainValidator",
+  "SafeHostname",
+  "configmap",
+  "kubernetes",
+  "docker",
+  "validator",
+  "idna",
+  "resync",
+  "SplitN",
+  "EqualFold",
+  "HasPrefix",
+  "label provider",
+  "ingress",
+  "annotation",
+  "access_controls_service.go",
+  "docker_service.go",
+  "kubernetes_service.go",
+  "configmap_service.go",
+  "oauth_controller.go",
+  "domain_validator.go",
+  "service_bootstrap.go",
+  "app_utils.go"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-producer.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L1-producer"
+   ],
+   "note": "reference minus the ConfigMap resync canonicalisation: a mount that declares the served host with different capitalisation never registers the rule, so the lookup has nothing to match"
+  },
+  {
+   "patch": "sf-no-configmap.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L1"
+   ],
+   "note": "reference minus the whole ConfigMap source (lookup and producer left at the pinned comparison)"
+  },
+  {
+   "patch": "sf-no-docker.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L2"
+   ],
+   "note": "reference minus the Docker label-provider canonicalisation"
+  },
+  {
+   "patch": "sf-static-case-only.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L1",
+    "L2",
+    "L3",
+    "L4-shapes"
+   ],
+   "note": "shallow fix: case-folds only the reported exact-address comparison; every provider, the fallback and the other spellings stay open"
+  },
+  {
+   "patch": "sf-canonicalize-after-lookup.patch",
+   "kind": "security_fail",
+   "expect": "security_fail",
+   "misses": [
+    "L1",
+    "L2",
+    "L3",
+    "L4"
+   ],
+   "note": "normalises the host only after the access decision has already been made"
+  },
+  {
+   "patch": "ff-exact-only.patch",
+   "kind": "overbroad",
+   "expect": "functional_fail",
+   "note": "canonical exact-address equality only: the first-label fallback is removed, so short-name deployments stop being protected"
+  },
+  {
+   "patch": "refuse-all.patch",
+   "kind": "refuse_all",
+   "expect": "functional_fail",
+   "note": "refuses every proxy request"
+  },
+  {
+   "patch": "crash-as-refusal.patch",
+   "kind": "crash_as_refusal",
+   "expect": "functional_fail",
+   "note": "panics instead of returning a clean refusal, so refusals become 500s"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "kind": "hardening",
+   "expect": "pass",
+   "note": "the reference plus defensive trimming, length and empty-name guards in the canonicaliser and the resync"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "kind": "alternative",
+   "expect": "pass",
+   "note": "a second design: a NormalizeHost/SameHost helper in the shared utils package instead of the published validator package; used at every selection site"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse-all.patch",
+  "crash_as_refusal": "crash-as-refusal.patch",
+  "wrong_resource": "n/a: a request names exactly one application through its host, and that application's rule is the only object the check can authorise; there is no neighbouring or proxy object behind it",
+  "one_role_or_direction": "n/a: local, OAuth and LDAP users all pass through the same per-application rule; there are no roles, peers or directions to fix one at a time",
+  "reads_only": "n/a: every HTTP method reaches the same proxy authorisation path; the product has no read/write split on this decision",
+  "check_after_adjustment": "sf-canonicalize-after-lookup.patch",
+  "unlisted_route": "sf-static-case-only.patch",
+  "malformed_identity": "sf-static-case-only.patch",
+  "missing_authority": "sf-static-case-only.patch",
+  "adjacent_api": "ff-exact-only.patch"
+ },
+ "traps": [
+  {
+   "id": "L1",
+   "type": "how",
+   "pattern": "A (injected far site, producer off the check's path)",
+   "shape": "a mounted-ConfigMap ACL source builds its index in a background resync; it registers an app only when the mount's declared hosts contain the app's configured address by exact string, and the lookup reads that index by raw strings. A mount that spells a served host differently from the app's address never registers the rule, so the request reaches the default allow policy.",
+   "where": "internal/service/configmap_service.go:149-190 (producer) and :249-275 (lookup)",
+   "security_tests": [
+    "TestConfigMapDeclaredHostSpelling",
+    "TestConfigMapDeclaredHostAndRequestSpelling",
+    "TestConfigMapMixedCaseHost",
+    "TestConfigMapPortAndTrailingDot"
+   ],
+   "coupled_functional_tests": [
+    "TestConfigMapExactAndShortName",
+    "TestConfigMapWithoutDeclaredHosts",
+    "TestConfigMapPermittedUserMixedCase"
+   ],
+   "security_fail_patch": "sf-no-producer.patch",
+   "realistic_because": "injected, but copied from the project's own Kubernetes ingress resync: two label providers and an ingress host gate already exist, and a ConfigMap-backed provider is the same maintenance addition without a cluster API"
+  },
+  {
+   "id": "L2",
+   "type": "where",
+   "pattern": "A (real upstream far site, second implementation)",
+   "shape": "the opt-in Docker container-label provider re-implements the exact-address and first-label comparison on raw strings, so a mixed-case, port-bearing or internationalised host selects no rule and the default allow policy admits the user.",
+   "where": "internal/service/docker_service.go:71-114",
+   "security_tests": [
+    "TestDockerLabelMixedCaseHost",
+    "TestDockerLabelExplicitPort",
+    "TestDockerLabelAppNameFallbackMixedCase"
+   ],
+   "coupled_functional_tests": [
+    "TestDockerLabelExactAndShortName",
+    "TestDockerLabelPermittedUserMixedCase"
+   ],
+   "security_fail_patch": "sf-no-docker.patch",
+   "realistic_because": "real, unmodified upstream code; the published provider rework replaces exactly this comparison"
+  },
+  {
+   "id": "L3",
+   "type": "how",
+   "pattern": "A (real upstream coupled behaviour)",
+   "shape": "the first-label app-name fallback and exact-address precedence: a canonical exact-address rewrite drops deployments addressed by short name (including deeper subdomains), while case-folding only the exact comparison leaves the mixed-case fallback bypass.",
+   "where": "internal/service/access_controls_service.go:38-53, internal/service/docker_service.go:96-104, internal/service/configmap_service.go:175-190,260-268",
+   "security_tests": [
+    "TestStaticAppNameFallbackMixedCase",
+    "TestStaticAppNameEqualsFirstLabelMixedCase",
+    "TestDockerLabelAppNameFallbackMixedCase"
+   ],
+   "coupled_functional_tests": [
+    "TestStaticShortNameFallback",
+    "TestExactAddressWinsOverShortName",
+    "TestDockerLabelExactAndShortName",
+    "TestConfigMapExactAndShortName"
+   ],
+   "security_fail_patch": "sf-static-case-only.patch",
+   "realistic_because": "real, unmodified upstream code; the published fix keeps the fallback and only makes it case-insensitive"
+  },
+  {
+   "id": "L4",
+   "type": "where",
+   "pattern": "A (reported landing point)",
+   "shape": "the static config lookup compares the request host to the configured address by raw string equality; any other spelling makes the rule invisible.",
+   "where": "internal/service/access_controls_service.go:38-53",
+   "security_tests": [
+    "TestStaticMixedCaseHost",
+    "TestStaticExplicitPort",
+    "TestStaticTrailingDot",
+    "TestStaticInternationalisedHost",
+    "TestStaticMixedCaseViaNginxRoute",
+    "TestStaticMixedCaseViaEnvoyRoute"
+   ],
+   "coupled_functional_tests": [
+    "TestStaticExactAddress",
+    "TestPermittedUserMixedCaseStatic",
+    "TestUncoveredHostFollowsAllowPolicy",
+    "TestUncoveredHostFollowsDenyPolicy",
+    "TestMatchingRuleResponseHeaders",
+    "TestMatchingRuleBasicAuth"
+   ],
+   "security_fail_patch": "sf-canonicalize-after-lookup.patch",
+   "realistic_because": "real, unmodified upstream code; this is the advisory's own landing point"
+  }
+ ],
+ "status": "built"
+}

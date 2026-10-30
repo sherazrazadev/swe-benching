@@ -1,0 +1,72 @@
+diff --git a/utils/render-ssr-error/src/index.js b/utils/render-ssr-error/src/index.js
+index 94dc8ff..edb6624 100644
+--- a/utils/render-ssr-error/src/index.js
++++ b/utils/render-ssr-error/src/index.js
+@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
+ import { getErrorDetails } from './error-details.js'
+ import { getStack } from './stack.js'
+ import { getEnv } from './env.js'
++import { renderRequestContext } from './request-context.js'
+ 
+ function readFile(target) {
+   return readFileSync(
+@@ -49,6 +50,7 @@ export default function renderSSRError({
+     errorHtml:
+       before +
+       JSON.stringify(data).replaceAll('</script>', String.raw`<\/script>`) +
+-      after
++      after +
++      renderRequestContext(req)
+   }
+ }
+diff --git a/utils/render-ssr-error/src/request-context.js b/utils/render-ssr-error/src/request-context.js
+new file mode 100644
+index 0000000..c47a174
+--- /dev/null
++++ b/utils/render-ssr-error/src/request-context.js
+@@ -0,0 +1,45 @@
++function escapeAttribute(value) {
++  return String(value)
++    .replaceAll('&', '&amp;')
++    .replaceAll('<', '&lt;')
++    .replaceAll('>', '&gt;')
++    .replaceAll('"', '&quot;')
++}
++
++function getRequestSummary(req) {
++  return {
++    uri: req.url,
++    method: req.method,
++    client: req.socket?.remoteAddress ?? '',
++    userAgent: req.headers['user-agent'] ?? ''
++  }
++}
++
++function getRuntimeEnvironment() {
++  const result = {}
++
++  for (const name of Object.keys(process.env)) {
++    if (name.startsWith('QUASAR_')) {
++      result[name] = process.env[name]
++    }
++  }
++
++  return result
++}
++
++export function getRequestRuntime(req) {
++  return {
++    runtime: getRuntimeEnvironment(),
++    summary: getRequestSummary(req)
++  }
++}
++
++export function renderRequestContext(req) {
++  const summary = getRequestSummary(req)
++  const runtime = getRequestRuntime(req)
++
++  return (
++    `\n    <div class="app-request-context" data-request-context='${escapeAttribute(JSON.stringify(summary))}'></div>` +
++    `\n    <script>globalThis.__Q_SSR_ERROR_CONTEXT__ = ${JSON.stringify(runtime)}</script>`
++  )
++}

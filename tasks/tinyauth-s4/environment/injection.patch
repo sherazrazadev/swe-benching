@@ -1,0 +1,351 @@
+diff --git a/internal/bootstrap/app_bootstrap.go b/internal/bootstrap/app_bootstrap.go
+index f82f8a1..f34acc6 100644
+--- a/internal/bootstrap/app_bootstrap.go
++++ b/internal/bootstrap/app_bootstrap.go
+@@ -39,6 +39,7 @@ type Services struct {
+ 	authService          *service.AuthService
+ 	dockerService        *service.DockerService
+ 	kubernetesService    *service.KubernetesService
++	configMapService     *service.ConfigMapService
+ 	ldapService          *service.LdapService
+ 	oauthBrokerService   *service.OAuthBrokerService
+ 	oidcService          *service.OIDCService
+diff --git a/internal/bootstrap/service_bootstrap.go b/internal/bootstrap/service_bootstrap.go
+index 11dbb69..c1ea958 100644
+--- a/internal/bootstrap/service_bootstrap.go
++++ b/internal/bootstrap/service_bootstrap.go
+@@ -71,11 +71,37 @@ func (app *BootstrapApp) setupServices() error {
+ 
+ func (app *BootstrapApp) getLabelProvider() (service.LabelProvider, error) {
+ 	switch app.config.LabelProvider {
+-	case "none", "docker", "kubernetes", "auto":
++	case "none", "docker", "kubernetes", "configmap", "auto":
+ 		if app.config.LabelProvider == "none" {
+ 			return nil, nil
+ 		}
+ 
++		if app.config.LabelProvider == "configmap" {
++			app.log.App.Debug().Msg("Using ConfigMap label provider")
++
++			err := app.dig.Provide(service.NewConfigMapService)
++
++			if err != nil {
++				return nil, fmt.Errorf("failed to provide configmap service: %w", err)
++			}
++
++			err = app.dig.Invoke(func(c *service.ConfigMapService) error {
++				app.services.configMapService = c
++				return nil
++			})
++
++			if err != nil {
++				return nil, fmt.Errorf("failed to invoke configmap service: %w", err)
++			}
++
++			if app.services.configMapService == nil {
++				app.log.App.Warn().Msg("ConfigMap label provider selected but could not be initialized, will continue without it")
++				return nil, nil
++			}
++
++			return app.services.configMapService, nil
++		}
++
+ 		useKubernetes := app.config.LabelProvider == "kubernetes" ||
+ 			(app.config.LabelProvider == "auto" && os.Getenv("KUBERNETES_SERVICE_HOST") != "")
+ 
+diff --git a/internal/model/config.go b/internal/model/config.go
+index c1a6115..c7e774e 100644
+--- a/internal/model/config.go
++++ b/internal/model/config.go
+@@ -102,9 +102,10 @@ func NewDefaultConfiguration(runtimeEnv RuntimeEnv) *Config {
+ }
+ 
+ type Config struct {
+-	AppURL        string             `description:"The base URL where the app is hosted." yaml:"appUrl,omitempty"`
+-	ConfigFile    string             `description:"Path to config file." yaml:"-" gen:"include"`
+-	LabelProvider string             `description:"Label provider to use for ACLs (auto, docker, kubernetes or none to disable). auto detects the environment." yaml:"labelProvider,omitempty"`
++	AppURL            string             `description:"The base URL where the app is hosted." yaml:"appUrl,omitempty"`
++	ConfigFile        string             `description:"Path to config file." yaml:"-" gen:"include"`
++	LabelProvider     string             `description:"Label provider to use for ACLs (auto, docker, kubernetes, configmap or none to disable). auto detects the environment." yaml:"labelProvider,omitempty"`
++	LabelProviderPath string             `description:"Path to the mounted ConfigMap directory used by the configmap label provider." yaml:"labelProviderPath,omitempty"`
+ 	Database      DatabaseConfig     `description:"Database configuration." yaml:"database,omitempty"`
+ 	Analytics     AnalyticsConfig    `description:"Analytics configuration." yaml:"analytics,omitempty"`
+ 	Resources     ResourcesConfig    `description:"Resources configuration." yaml:"resources,omitempty"`
+diff --git a/internal/service/configmap_service.go b/internal/service/configmap_service.go
+new file mode 100644
+index 0000000..f316cd1
+--- /dev/null
++++ b/internal/service/configmap_service.go
+@@ -0,0 +1,272 @@
++package service
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/steveiliop56/ding"
++	"github.com/tinyauthapp/tinyauth/internal/model"
++	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
++	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
++	"go.uber.org/dig"
++)
++
++const configMapResyncInterval = 1 * time.Minute
++
++// configMapEntry is a single app configuration read from the mounted volume.
++type configMapEntry struct {
++	name string
++	app  model.App
++}
++
++// ConfigMapService reads app ACLs from a directory mounted from a Kubernetes
++// ConfigMap. Every key of the ConfigMap becomes a file in the directory, so the
++// files are decoded with the same "tinyauth.apps.*" decoder the Docker and
++// ingress providers use. The optional "hosts" key lists the hostnames the
++// deployment serves; when present, an app is only registered if its configured
++// domain is one of them.
++type ConfigMapService struct {
++	log *logger.Logger
++	dir string
++
++	started bool
++	mu      sync.RWMutex
++	apps    map[string]configMapEntry
++	domains map[string]string
++	names   map[string]string
++}
++
++type ConfigMapServiceInput struct {
++	dig.In
++
++	Log    *logger.Logger
++	Ctx    context.Context
++	Ding   *ding.Ding
++	Config *model.Config
++}
++
++func NewConfigMapService(i ConfigMapServiceInput) (*ConfigMapService, error) {
++	dir := i.Config.LabelProviderPath
++
++	if dir == "" {
++		return nil, fmt.Errorf("configmap label provider selected but no path is configured")
++	}
++
++	info, err := os.Stat(dir)
++
++	if err != nil {
++		return nil, fmt.Errorf("failed to access configmap path %s: %w", dir, err)
++	}
++
++	if !info.IsDir() {
++		return nil, fmt.Errorf("configmap path %s is not a directory", dir)
++	}
++
++	service := &ConfigMapService{
++		log:     i.Log,
++		dir:     dir,
++		apps:    make(map[string]configMapEntry),
++		domains: make(map[string]string),
++		names:   make(map[string]string),
++	}
++
++	service.resync()
++
++	i.Ding.Go(func(ctx context.Context) {
++		ticker := time.NewTicker(configMapResyncInterval)
++
++		defer ticker.Stop()
++
++		for {
++			select {
++			case <-ctx.Done():
++				service.log.App.Debug().Msg("Shutting down configmap label provider")
++				return
++			case <-ticker.C:
++				service.resync()
++			}
++		}
++	}, ding.RingMajor)
++
++	service.started = true
++	i.Log.App.Debug().Str("path", dir).Msg("ConfigMap label provider started successfully")
++
++	return service, nil
++}
++
++func (k *ConfigMapService) readVolume() (map[string]string, []string, error) {
++	dirEntries, err := os.ReadDir(k.dir)
++
++	if err != nil {
++		return nil, nil, err
++	}
++
++	labels := make(map[string]string)
++	var hosts []string
++
++	for _, dirEntry := range dirEntries {
++		if dirEntry.IsDir() {
++			continue
++		}
++
++		// A mounted ConfigMap contains its own bookkeeping entries; skip them.
++		if strings.HasPrefix(dirEntry.Name(), "..") {
++			continue
++		}
++
++		content, err := os.ReadFile(filepath.Join(k.dir, dirEntry.Name()))
++
++		if err != nil {
++			k.log.App.Warn().Err(err).Str("key", dirEntry.Name()).Msg("Failed to read configmap entry, skipping")
++			continue
++		}
++
++		value := strings.TrimSpace(string(content))
++
++		if dirEntry.Name() == "hosts" {
++			for _, host := range strings.Split(value, "\n") {
++				host = strings.TrimSpace(host)
++
++				if host != "" {
++					hosts = append(hosts, host)
++				}
++			}
++			continue
++		}
++
++		labels[dirEntry.Name()] = value
++	}
++
++	return labels, hosts, nil
++}
++
++func (k *ConfigMapService) resync() {
++	labels, hosts, err := k.readVolume()
++
++	if err != nil {
++		k.log.App.Warn().Err(err).Str("path", k.dir).Msg("Failed to read configmap volume, clearing app labels")
++		k.replace(nil)
++		return
++	}
++
++	decoded, err := decoders.DecodeLabels[model.Apps](labels, "apps")
++
++	if err != nil {
++		k.log.App.Warn().Err(err).Str("path", k.dir).Msg("Failed to decode configmap labels, clearing app labels")
++		k.replace(nil)
++		return
++	}
++
++	apps := make(map[string]configMapEntry)
++	domains := make(map[string]string)
++	names := make(map[string]string)
++
++	for appName, appLabels := range decoded.Apps {
++		if appLabels.Config.Domain == "" {
++			continue
++		}
++
++		if len(hosts) > 0 && !slices.Contains(hosts, appLabels.Config.Domain) {
++			k.log.App.Warn().Str("appName", appName).Str("domain", appLabels.Config.Domain).Msg("App domain does not match any host defined in the configmap, skipping")
++			continue
++		}
++
++		apps[appName] = configMapEntry{name: appName, app: appLabels}
++		domains[appLabels.Config.Domain] = appName
++		names[appName] = appName
++	}
++
++	k.replace(apps)
++
++	if len(apps) == 0 {
++		k.log.App.Debug().Str("path", k.dir).Msg("No app labels found in configmap volume")
++		return
++	}
++
++	k.log.App.Debug().Str("path", k.dir).Int("apps", len(apps)).Msg("ConfigMap label provider resync complete")
++}
++
++func (k *ConfigMapService) replace(apps map[string]configMapEntry) {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++
++	k.apps = apps
++	k.domains = make(map[string]string)
++	k.names = make(map[string]string)
++
++	for appName, entry := range apps {
++		k.domains[entry.app.Config.Domain] = appName
++		k.names[appName] = appName
++	}
++}
++
++func (k *ConfigMapService) getByDomain(domain string) *model.App {
++	k.mu.RLock()
++	defer k.mu.RUnlock()
++
++	appName, ok := k.domains[domain]
++
++	if !ok {
++		return nil
++	}
++
++	entry, ok := k.apps[appName]
++
++	if !ok {
++		return nil
++	}
++
++	app := entry.app
++	return &app
++}
++
++func (k *ConfigMapService) getByAppName(appName string) *model.App {
++	k.mu.RLock()
++	defer k.mu.RUnlock()
++
++	key, ok := k.names[appName]
++
++	if !ok {
++		return nil
++	}
++
++	entry, ok := k.apps[key]
++
++	if !ok {
++		return nil
++	}
++
++	app := entry.app
++	return &app
++}
++
++func (k *ConfigMapService) GetLabels(appDomain string) (*model.App, error) {
++	if !k.started {
++		k.log.App.Debug().Str("domain", appDomain).Msg("ConfigMap label provider not started, skipping")
++		return nil, nil
++	}
++
++	app := k.getByDomain(appDomain)
++
++	if app != nil {
++		k.log.App.Debug().Str("domain", appDomain).Msg("Found labels in cache by domain")
++		return app, nil
++	}
++
++	appName := strings.SplitN(appDomain, ".", 2)[0]
++	app = k.getByAppName(appName)
++
++	if app != nil {
++		k.log.App.Debug().Str("domain", appDomain).Str("appName", appName).Msg("Found labels in cache by app name")
++		return app, nil
++	}
++
++	k.log.App.Debug().Str("domain", appDomain).Msg("No labels found for domain")
++	return nil, nil
++}

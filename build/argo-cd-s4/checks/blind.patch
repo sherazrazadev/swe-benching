@@ -1,0 +1,308 @@
+diff -ruN pristine/util/git/client.go app/util/git/client.go
+--- a/util/git/client.go	2026-10-30 18:23:40.000000000 +0000
++++ b/util/git/client.go	2026-10-30 19:06:46.522238714 +0000
+@@ -344,6 +344,13 @@
+ //     the server's certificate.
+ //   - Otherwise (and on non-fatal errors), a default HTTP client is returned.
+ func GetRepoHTTPClient(repoURL string, insecure bool, creds Creds, proxyURL string, noProxy string) *http.Client {
++	if proxyURL != "" && proxy.ValidateNetworkProxy(proxyURL) != nil {
++		// The repository proxy is untrusted configuration. Only a well-formed
++		// address may configure the transport; otherwise continue without one.
++		log.Warn("GetRepoHTTPClient: ignoring an unusable repository proxy address")
++		proxyURL = ""
++	}
++
+ 	// Default HTTP client
+ 	customHTTPClient := &http.Client{
+ 		// 15 second timeout by default
+diff -ruN pristine/util/git/creds.go app/util/git/creds.go
+--- a/util/git/creds.go	2026-10-30 18:23:40.000000000 +0000
++++ b/util/git/creds.go	2026-10-30 19:06:44.170229179 +0000
+@@ -39,6 +39,7 @@
+ 	argoutils "github.com/argoproj/argo-cd/v3/util"
+ 	certutil "github.com/argoproj/argo-cd/v3/util/cert"
+ 	utilio "github.com/argoproj/argo-cd/v3/util/io"
++	proxyutil "github.com/argoproj/argo-cd/v3/util/proxy"
+ 	"github.com/argoproj/argo-cd/v3/util/workloadidentity"
+ )
+ 
+@@ -376,10 +377,13 @@
+ 	// Handle SSH socks5 proxy settings
+ 	proxyEnv := []string{}
+ 	if c.proxy != "" {
+-		parsedProxyURL, err := url.Parse(c.proxy)
++		// Refuse anything that is not a plain SOCKS5 proxy address before any of
++		// it can reach the shell-interpreted GIT_SSH_COMMAND. Close the private
++		// key file so a refused value leaves nothing behind.
++		parsedProxyURL, err := proxyutil.ParseSSHProxy(c.proxy)
+ 		if err != nil {
+ 			sshCloser.Close()
+-			return nil, nil, fmt.Errorf("failed to set environment variables related to socks5 proxy, could not parse proxy URL '%s': %w", c.proxy, err)
++			return nil, nil, fmt.Errorf("failed to set environment variables related to socks5 proxy: %w", err)
+ 		}
+ 		args = append(args, "-o", fmt.Sprintf("ProxyCommand='connect-proxy -S %s:%s -5 %%h %%p'",
+ 			parsedProxyURL.Hostname(),
+diff -ruN pristine/util/git/git.go app/util/git/git.go
+--- a/util/git/git.go	2026-10-30 18:24:47.000000000 +0000
++++ b/util/git/git.go	2026-10-30 19:06:55.999274554 +0000
+@@ -11,6 +11,8 @@
+ 
+ 	"github.com/go-git/go-git/v5/plumbing"
+ 	"github.com/go-git/go-git/v5/plumbing/transport"
++
++	proxyutil "github.com/argoproj/argo-cd/v3/util/proxy"
+ )
+ 
+ // EnsurePrefix idempotently ensures that a base string has a given prefix.
+@@ -155,15 +157,16 @@
+ // checkProxyConnection verifies that the SOCKS5 proxy configured for an SSH
+ // repository accepts connections before the repository is tested.
+ func checkProxyConnection(proxy string) error {
+-	parsedProxyURL, err := url.Parse(proxy)
++	// The proxy value is untrusted repository configuration. Validate it first so
++	// that no part of it is executed, and then pass the destination as an
++	// argument instead of interpolating it into a shell command line.
++	parsedProxyURL, err := proxyutil.ParseSSHProxy(proxy)
+ 	if err != nil {
+-		return fmt.Errorf("could not parse proxy URL: %w", err)
++		return fmt.Errorf("repository proxy is not usable: %w", err)
+ 	}
+-	cmd := exec.Command("sh", "-c", fmt.Sprintf(
+-		"timeout 5 connect-proxy -S '%s:%s' -5 127.0.0.1 22",
+-		parsedProxyURL.Hostname(),
+-		parsedProxyURL.Port(),
+-	))
++	cmd := exec.Command("timeout", "5", "connect-proxy",
++		"-S", net.JoinHostPort(parsedProxyURL.Hostname(), parsedProxyURL.Port()),
++		"-5", "127.0.0.1", "22")
+ 	if out, err := cmd.CombinedOutput(); err != nil {
+ 		return fmt.Errorf("proxy connection check failed: %s: %w", strings.TrimSpace(string(out)), err)
+ 	}
+diff -ruN pristine/util/git/workaround.go app/util/git/workaround.go
+--- a/util/git/workaround.go	2026-10-30 18:23:40.000000000 +0000
++++ b/util/git/workaround.go	2026-10-30 19:07:09.822326803 +0000
+@@ -2,7 +2,6 @@
+ 
+ import (
+ 	"fmt"
+-	neturl "net/url"
+ 
+ 	"github.com/go-git/go-git/v5"
+ 	"github.com/go-git/go-git/v5/plumbing"
+@@ -10,6 +9,8 @@
+ 	"github.com/go-git/go-git/v5/plumbing/transport/client"
+ 	"github.com/go-git/go-git/v5/plumbing/transport/http"
+ 	"github.com/go-git/go-git/v5/utils/ioutil"
++
++	proxyutil "github.com/argoproj/argo-cd/v3/util/proxy"
+ )
+ 
+ // Below is a workaround for https://github.com/src-d/go-git/issues/1177: the `github.com/src-d/go-git` does not support disable SSL cert verification is a single repo.
+@@ -35,19 +36,21 @@
+ 		// use the default client for protocols other than HTTP/HTTPS
+ 		ep.InsecureSkipTLS = insecure
+ 		if proxy != "" {
+-			parsedProxyURL, err := neturl.Parse(proxy)
+-			if err != nil {
+-				return nil, nil, fmt.Errorf("failed to create client for url '%s', error parsing proxy url '%s': %w", url, proxy, err)
+-			}
+-			var proxyUsername, proxyPasswd string
+-			if parsedProxyURL.User != nil {
+-				proxyUsername = parsedProxyURL.User.Username()
+-				proxyPasswd, _ = parsedProxyURL.User.Password()
+-			}
+-			ep.Proxy = transport.ProxyOptions{
+-				URL:      fmt.Sprintf("%s://%s:%s", parsedProxyURL.Scheme, parsedProxyURL.Hostname(), parsedProxyURL.Port()),
+-				Username: proxyUsername,
+-				Password: proxyPasswd,
++			// The repository proxy is untrusted configuration. Only a usable
++			// SOCKS5 address may configure the transport proxy; otherwise the
++			// client continues without one.
++			parsedProxyURL, err := proxyutil.ParseSSHProxy(proxy)
++			if err == nil {
++				var proxyUsername, proxyPasswd string
++				if parsedProxyURL.User != nil {
++					proxyUsername = parsedProxyURL.User.Username()
++					proxyPasswd, _ = parsedProxyURL.User.Password()
++				}
++				ep.Proxy = transport.ProxyOptions{
++					URL:      fmt.Sprintf("%s://%s:%s", parsedProxyURL.Scheme, parsedProxyURL.Hostname(), parsedProxyURL.Port()),
++					Username: proxyUsername,
++					Password: proxyPasswd,
++				}
+ 			}
+ 		}
+ 		c, err := client.NewClient(ep)
+diff -ruN pristine/util/kustomize/proxywrapper.go app/util/kustomize/proxywrapper.go
+--- a/util/kustomize/proxywrapper.go	2026-10-30 18:24:47.000000000 +0000
++++ b/util/kustomize/proxywrapper.go	2026-10-30 19:07:01.415296427 +0000
+@@ -2,13 +2,14 @@
+ 
+ import (
+ 	"fmt"
+-	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strings"
+ 
+ 	log "github.com/sirupsen/logrus"
++
++	proxyutil "github.com/argoproj/argo-cd/v3/util/proxy"
+ )
+ 
+ // proxyWrapperScriptTmpl is a POSIX shell wrapper that is installed ahead of the real `git`
+@@ -56,9 +57,13 @@
+ 	if proxy == "" {
+ 		return env, nil
+ 	}
+-	parsedProxyURL, err := url.Parse(proxy)
++	parsedProxyURL, err := proxyutil.ParseSSHProxy(proxy)
+ 	if err != nil {
+-		return nil, fmt.Errorf("could not parse proxy URL: %w", err)
++		// The repository proxy is untrusted configuration. If it is not a plain
++		// SOCKS5 address, install no wrapper at all rather than writing any part
++		// of it into a generated shell script.
++		log.Warn("repository proxy is not usable; kustomize proxy wrapper not installed")
++		return env, nil
+ 	}
+ 	realGit, err := lookPathIn(env, "git")
+ 	if err != nil {
+diff -ruN pristine/util/proxy/proxy.go app/util/proxy/proxy.go
+--- a/util/proxy/proxy.go	2026-10-30 18:23:40.000000000 +0000
++++ b/util/proxy/proxy.go	2026-10-30 19:06:39.315209499 +0000
+@@ -28,6 +28,12 @@
+ 	if proxy == "" {
+ 		return cmd.Env
+ 	}
++	if ValidateNetworkProxy(proxy) != nil {
++		// The repository proxy is not a usable address. Do not put it (or any
++		// part of it) into the subprocess environment; leave the environment as
++		// it would be without a repository proxy.
++		return cmd.Env
++	}
+ 	// remove the existing proxy env variable if present
+ 	for i, env := range cmd.Env {
+ 		proxyEnv := strings.ToLower(env)
+@@ -42,6 +48,10 @@
+ // GetCallback returns the proxy callback function
+ func GetCallback(proxy string, noProxy string) func(*http.Request) (*url.URL, error) {
+ 	if proxy != "" {
++		if ValidateNetworkProxy(proxy) != nil {
++			// Never configure a network client with an unusable proxy value.
++			return DefaultProxyCallback
++		}
+ 		c := httpproxy.Config{
+ 			HTTPProxy:  proxy,
+ 			HTTPSProxy: proxy,
+diff -ruN pristine/util/proxy/validate.go app/util/proxy/validate.go
+--- a/util/proxy/validate.go	1970-01-01 00:00:00.000000000 +0000
++++ b/util/proxy/validate.go	2026-10-30 19:06:35.395193058 +0000
+@@ -0,0 +1,107 @@
++package proxy
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"net/url"
++	"strconv"
++	"strings"
++)
++
++// The proxy setting on a repository is untrusted configuration: any user who may
++// create or update a repository (or a stored credential template) can set it. It is
++// therefore only ever handed to a transport or to a subprocess when it is a plain
++// proxy address. Two scheme sets exist because an SSH connection speaks SOCKS5 only,
++// while the HTTP(S)/OCI transports also accept an HTTP proxy.
++
++var sshProxySchemes = map[string]struct{}{
++	"socks5":  {},
++	"socks5h": {},
++}
++
++var networkProxySchemes = map[string]struct{}{
++	"http":    {},
++	"https":   {},
++	"socks5":  {},
++	"socks5h": {},
++}
++
++// ParseSSHProxy parses raw as a proxy address usable by an SSH repository. The value
++// must have a SOCKS5 scheme, a hostname made only of letters, digits, dots and
++// hyphens (or a valid IP literal), and a numeric port in 1-65535.
++func ParseSSHProxy(raw string) (*url.URL, error) {
++	return parseProxyAddress(raw, sshProxySchemes)
++}
++
++// ParseNetworkProxy parses raw as a proxy address usable by the HTTP(S)/OCI network
++// clients. The value must have an HTTP, HTTPS or SOCKS5 scheme and the same shape of
++// host and port as ParseSSHProxy.
++func ParseNetworkProxy(raw string) (*url.URL, error) {
++	return parseProxyAddress(raw, networkProxySchemes)
++}
++
++// ValidateSSHProxy reports whether raw is a usable proxy address for an SSH
++// repository, without requiring the caller to keep the parsed URL.
++func ValidateSSHProxy(raw string) error {
++	_, err := ParseSSHProxy(raw)
++	return err
++}
++
++// ValidateNetworkProxy reports whether raw is a usable proxy address for a network
++// client, without requiring the caller to keep the parsed URL.
++func ValidateNetworkProxy(raw string) error {
++	_, err := ParseNetworkProxy(raw)
++	return err
++}
++
++func parseProxyAddress(raw string, schemes map[string]struct{}) (*url.URL, error) {
++	parsed, err := url.Parse(raw)
++	if err != nil {
++		return nil, fmt.Errorf("proxy address is not a URL: %w", err)
++	}
++	if _, ok := schemes[parsed.Scheme]; !ok {
++		return nil, fmt.Errorf("proxy address scheme %q is not supported here", parsed.Scheme)
++	}
++	host := parsed.Hostname()
++	if host == "" {
++		return nil, errors.New("proxy address has an empty host")
++	}
++	if !isPlainProxyHost(host) {
++		return nil, fmt.Errorf("proxy address host %q is not a plain hostname or IP literal", host)
++	}
++	portText := parsed.Port()
++	if portText == "" {
++		return nil, errors.New("proxy address has no port")
++	}
++	port, err := strconv.Atoi(portText)
++	if err != nil || port < 1 || port > 65535 {
++		return nil, fmt.Errorf("proxy address port %q is not a number from 1 to 65535", portText)
++	}
++	return parsed, nil
++}
++
++// isPlainProxyHost accepts a valid IP literal (v4 or v6) or a hostname built only
++// from letters, digits, dots and hyphens. Anything else - quotes, semicolons,
++// command substitution, whitespace - is refused.
++func isPlainProxyHost(host string) bool {
++	if net.ParseIP(host) != nil {
++		return true
++	}
++	if strings.ContainsRune(host, ':') {
++		// IPv6-shaped but not a valid address.
++		return false
++	}
++	for _, r := range host {
++		switch {
++		case r >= 'a' && r <= 'z':
++		case r >= 'A' && r <= 'Z':
++		case r >= '0' && r <= '9':
++		case r == '.':
++		case r == '-':
++		default:
++			return false
++		}
++	}
++	return true
++}
