@@ -4,11 +4,11 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 
 **ACCEPTED** = gate sound, both models failed all 3 runs, every failing run audited as the model's own failure (Claude Opus, `common/audit/postmortem.py`) and the fairness review READY (DeepSeek, `pipelines/sibling/9-fairness`), decided automatically. **REJECTED** = a model solved it, the owner dropped it, or it was still unfair after one repair (fairfix, re-gate and fresh trials). **in final checks** = passed the trials; audits, fairness, a repair or extra runs still under way, nothing recorded yet.
 
-## Totals (143 tasks)
+## Totals (149 tasks)
 
 | ACCEPTED | REJECTED | in final checks | incomplete | unsound | build failed | running |
 |---|---|---|---|---|---|---|
-| 3 | 123 | 1 | 1 | 7 | 2 | 6 |
+| 3 | 127 | 2 | 1 | 8 | 2 | 6 |
 
 ## Batches
 
@@ -40,7 +40,8 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 | [24](batch-24.md) | 2026-10-30T05:11Z | 6 | 0 | 6 | 0 | 0 | 0 | [41007009474](https://github.com/sherazrazadev/swe-benching/actions/runs/41007009474) |
 | [25](batch-25.md) | 2026-10-30T07:35Z | 6 | 0 | 6 | 0 | 0 | 0 | [41020966300](https://github.com/sherazrazadev/swe-benching/actions/runs/41020966300) |
 | [26](batch-26.md) | 2026-10-30T11:26Z | 6 | 0 | 5 | 1 | 0 | 0 | [41048108098](https://github.com/sherazrazadev/swe-benching/actions/runs/41048108098) |
-| [27](batch-27.md) | 2026-10-30T15:00Z | 6 | 0 | 0 | 6 | 0 | 0 | [41076729043](https://github.com/sherazrazadev/swe-benching/actions/runs/41076729043) |
+| [27](batch-27.md) | 2026-10-30T15:00Z | 6 | 0 | 4 | 1 | 1 | 0 | [41076729043](https://github.com/sherazrazadev/swe-benching/actions/runs/41076729043) |
+| [28](batch-28.md) | 2026-10-30T17:34Z | 6 | 0 | 0 | 6 | 0 | 0 | [41099990366](https://github.com/sherazrazadev/swe-benching/actions/runs/41099990366) |
 
 ## Accepted tasks (3)
 
