@@ -4,11 +4,11 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 
 **ACCEPTED** = gate sound, both models failed all 3 runs, every failing run audited as the model's own failure (Claude Opus, `common/audit/postmortem.py`) and the fairness review READY (DeepSeek, `pipelines/sibling/9-fairness`), decided automatically. **REJECTED** = a model solved it, the owner dropped it, or it was still unfair after one repair (fairfix, re-gate and fresh trials). **in final checks** = passed the trials; audits, fairness, a repair or extra runs still under way, nothing recorded yet.
 
-## Totals (107 tasks)
+## Totals (113 tasks)
 
-| ACCEPTED | REJECTED | incomplete | unsound | build failed | running |
-|---|---|---|---|---|---|
-| 3 | 90 | 1 | 6 | 1 | 6 |
+| ACCEPTED | REJECTED | in final checks | incomplete | unsound | build failed | running |
+|---|---|---|---|---|---|---|
+| 3 | 95 | 1 | 1 | 6 | 1 | 6 |
 
 ## Batches
 
@@ -33,8 +33,9 @@ Builds and trials run on GitHub-hosted runners (`.github/workflows/build.yml`), 
 | [17](batch-17.md) | 2026-10-29T05:11Z | 6 | 0 | 6 | 0 | 0 | 0 | [40821904116](https://github.com/sherazrazadev/swe-benching/actions/runs/40821904116) |
 | [18](batch-18.md) | 2026-10-29T11:25Z | 6 | 0 | 6 | 0 | 0 | 0 | [40865193701](https://github.com/sherazrazadev/swe-benching/actions/runs/40865193701) |
 | [19](batch-19.md) | 2026-10-29T11:41Z | 6 | 0 | 6 | 0 | 0 | 0 | [40867286825](https://github.com/sherazrazadev/swe-benching/actions/runs/40867286825) |
-| [20](batch-20.md) | 2026-10-29T12:52Z | 6 | 0 | 0 | 6 | 0 | 0 | [40876820128](https://github.com/sherazrazadev/swe-benching/actions/runs/40876820128) |
+| [20](batch-20.md) | 2026-10-29T12:52Z | 6 | 0 | 5 | 1 | 0 | 0 | [40876820128](https://github.com/sherazrazadev/swe-benching/actions/runs/40876820128) |
 | [21](batch-21.md) | 2026-10-29T17:11Z | 6 | 0 | 6 | 0 | 0 | 0 | [40918912698](https://github.com/sherazrazadev/swe-benching/actions/runs/40918912698) |
+| [22](batch-22.md) | 2026-10-30T00:02Z | 6 | 0 | 0 | 6 | 0 | 0 | [40977118064](https://github.com/sherazrazadev/swe-benching/actions/runs/40977118064) |
 
 ## Accepted tasks (3)
 
