@@ -9,4 +9,4 @@ Started 2026-10-29T00:45Z. [run 40796101408](https://github.com/sherazrazadev/sw
 | `core-s4` | sound | 1 | 1 | **REJECTED** |
 | `sigstore-js-s4` | sound | 1 | - | **REJECTED** |
 | `langroid-s4` | sound | 1 | 1 | **REJECTED** |
-| `swc-s4` | sound | 0.9231 0.9231 0 | 0 0 1 | **REJECTED** |
+| `swc-s4` | sound | 1 | 0 | **REJECTED** |
