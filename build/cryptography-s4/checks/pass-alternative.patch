@@ -1,0 +1,158 @@
+diff --git a/src/rust/cryptography-x509-verification/src/lib.rs b/src/rust/cryptography-x509-verification/src/lib.rs
+index 3906182..bc640bb 100644
+--- a/src/rust/cryptography-x509-verification/src/lib.rs
++++ b/src/rust/cryptography-x509-verification/src/lib.rs
+@@ -147,6 +147,7 @@ impl<'a, 'chain> NameChain<'a, 'chain> {
+ 
+     fn evaluate_single_constraint<B: CryptoOps>(
+         &self,
++        kind: SubtreeKind,
+         constraint: &GeneralName<'chain>,
+         san: &GeneralName<'chain>,
+         budget: &mut Budget,
+@@ -155,14 +156,18 @@ impl<'a, 'chain> NameChain<'a, 'chain> {
+ 
+         match (constraint, san) {
+             (GeneralName::DNSName(constraint), GeneralName::DNSName(name)) => {
+-                // NOTE: A DNS SAN can be a wildcard pattern instead of a normal DNS name.
+-                // These are handled by matching unconditionally on the inner name,
+-                // since a NC of `foo.com` will match both `foo.com` and any arbitrarily deep
+-                // subdomain of `foo.com`, where a wildcard SAN like `*.foo.com` will only
+-                // match exactly one subdomain of `foo.com`. Therefore, the NC's matching
+-                // set is a strict superset of any possible wildcard SAN pattern.
++                // NOTE: A DNS SAN can be a wildcard pattern (e.g. `*.foo.com`)
++                // rather than an ordinary DNS name. A wildcard represents a
++                // *set* of names, so the check depends on which subtree we're
++                // evaluating: a `permittedSubtrees` constraint must contain
++                // *every* name the wildcard can expand to, whereas an
++                // `excludedSubtrees` constraint matches if it overlaps the
++                // wildcard at all. We dispatch on `kind` accordingly.
+                 match (DNSConstraint::new(constraint.0), DNSPattern::new(name.0)) {
+-                    (Some(constraint), Some(name)) => Ok(Applied(constraint.matches(&name))),
++                    (Some(constraint), Some(name)) => Ok(Applied(match kind {
++                        SubtreeKind::Permitted => constraint.contains_pattern(&name),
++                        SubtreeKind::Excluded => constraint.matches(&name),
++                    })),
+                     (_, None) => Err(ValidationError::new(ValidationErrorKind::Other(format!(
+                         "unsatisfiable DNS name constraint: malformed SAN {}",
+                         name.0
+@@ -232,7 +237,12 @@ impl<'a, 'chain> NameChain<'a, 'chain> {
+             let mut permit = true;
+             if let Some(permitted_subtrees) = &constraints.permitted_subtrees {
+                 for p in permitted_subtrees.clone() {
+-                    let status = self.evaluate_single_constraint(&p.base, &san, budget)?;
++                    let status = self.evaluate_single_constraint(
++                        SubtreeKind::Permitted,
++                        &p.base,
++                        &san,
++                        budget,
++                    )?;
+                     if status.is_applied() {
+                         permit = status.is_match();
+                         if permit {
+@@ -250,7 +260,12 @@ impl<'a, 'chain> NameChain<'a, 'chain> {
+ 
+             if let Some(excluded_subtrees) = &constraints.excluded_subtrees {
+                 for e in excluded_subtrees.clone() {
+-                    let status = self.evaluate_single_constraint(&e.base, &san, budget)?;
++                    let status = self.evaluate_single_constraint(
++                        SubtreeKind::Excluded,
++                        &e.base,
++                        &san,
++                        budget,
++                    )?;
+                     if status.is_match() {
+                         return Err(ValidationError::new(ValidationErrorKind::Other(
+                             "excluded name constraint matched SAN".into(),
+@@ -284,6 +299,16 @@ struct ChainBuilder<'a, 'chain, B: CryptoOps> {
+     store: &'a Store<'chain, B>,
+ }
+ 
++/// Identifies which kind of name constraint subtree a SAN is being evaluated
++/// against. The two subtree kinds use different matching semantics for
++/// wildcard DNS SANs (containment vs. overlap); see [`DNSConstraint::permits`]
++/// and [`DNSConstraint::excludes`].
++#[derive(Clone, Copy)]
++enum SubtreeKind {
++    Permitted,
++    Excluded,
++}
++
+ // When applying a name constraint, we need to distinguish between a few different scenarios:
+ // * `Applied(true)`: The name constraint is the same type as the SAN and matches.
+ // * `Applied(false)`: The name constraint is the same type as the SAN and does not match.
+@@ -338,13 +363,8 @@ impl<'a, 'chain, B: CryptoOps> ChainBuilder<'a, 'chain, B> {
+         name_chain: NameChain<'_, 'chain>,
+         budget: &mut Budget,
+     ) -> ValidationResult<'chain, Chain<'chain, B>, B> {
+-        // Self-issued certificates are exempt from name constraints
+-        // (RFC 5280 4.2.1.10); the certificates beneath them are handled by
+-        // their own evaluation step.
+-        if !cert_is_self_issued(working_cert.certificate()) {
+-            if let Some(nc) = working_cert_extensions.get_extension(&NAME_CONSTRAINTS_OID) {
+-                name_chain.evaluate_constraints(&nc.value()?, budget)?;
+-            }
++        if let Some(nc) = working_cert_extensions.get_extension(&NAME_CONSTRAINTS_OID) {
++            name_chain.evaluate_constraints(&nc.value()?, budget)?;
+         }
+ 
+         // Look in the store's root set to see if the working cert is listed.
+diff --git a/src/rust/cryptography-x509-verification/src/policy/mod.rs b/src/rust/cryptography-x509-verification/src/policy/mod.rs
+index 3b8987b..ca33de4 100644
+--- a/src/rust/cryptography-x509-verification/src/policy/mod.rs
++++ b/src/rust/cryptography-x509-verification/src/policy/mod.rs
+@@ -185,7 +185,7 @@ impl Subject<'_> {
+     fn subject_alt_name_matches(&self, general_name: &GeneralName<'_>) -> bool {
+         match (general_name, self) {
+             (GeneralName::DNSName(pattern), Self::DNS(name)) => {
+-                dns_name_covers(pattern.0, name)
++                DNSPattern::new(pattern.0).is_some_and(|p| p.matches(name))
+             }
+             (GeneralName::IPAddress(addr), Self::IP(name)) => {
+                 IPAddress::from_bytes(addr) == Some(*name)
+@@ -201,25 +201,6 @@ impl Subject<'_> {
+     }
+ }
+ 
+-/// Returns true if the certificate name `pattern` covers the requested `name`.
+-///
+-/// A leading `*.` stands for the names below the pattern's base, so that a
+-/// single entry can serve the hosts that live under it; every other pattern
+-/// is compared as a plain name.
+-fn dns_name_covers(pattern: &str, name: &DNSName<'_>) -> bool {
+-    match DNSPattern::new(pattern) {
+-        Some(DNSPattern::Exact(exact)) => exact.as_str().eq_ignore_ascii_case(name.as_str()),
+-        Some(DNSPattern::Wildcard(base)) => {
+-            let candidate = name.as_str();
+-            let base = base.as_str();
+-            candidate.len() > base.len()
+-                && candidate.as_bytes()[candidate.len() - base.len() - 1] == b'.'
+-                && candidate[candidate.len() - base.len()..].eq_ignore_ascii_case(base)
+-        }
+-        None => false,
+-    }
+-}
+-
+ /// A `PolicyDefinition` describes user-configurable aspects of X.509 path validation.
+ pub struct PolicyDefinition<'a, B: CryptoOps> {
+     pub ops: B,
+diff --git a/src/rust/cryptography-x509-verification/src/types.rs b/src/rust/cryptography-x509-verification/src/types.rs
+index 86316f4..deb60a4 100644
+--- a/src/rust/cryptography-x509-verification/src/types.rs
++++ b/src/rust/cryptography-x509-verification/src/types.rs
+@@ -162,6 +162,15 @@ impl<'a> DNSConstraint<'a> {
+     /// _or_ if the pattern's inner name matches the constraint.
+     /// This allows us to reject DNS names like `*.example.com` when
+     /// the constraint is `example.com` or `bar.example.com`.
++    /// Returns true if every name the given pattern can represent lies
++    /// within this constraint's subtree.
++    pub fn contains_pattern(&self, pattern: &DNSPattern<'_>) -> bool {
++        match pattern {
++            DNSPattern::Exact(name) => self.matches(&DNSPattern::Exact(DNSName::clone(name))),
++            DNSPattern::Wildcard(base) => self.matches(&DNSPattern::Exact(DNSName::clone(base))),
++        }
++    }
++
+     pub fn matches(&self, name: &DNSPattern<'_>) -> bool {
+         match name {
+             DNSPattern::Exact(name) => {
