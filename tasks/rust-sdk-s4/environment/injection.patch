@@ -1,0 +1,67 @@
+diff --git a/crates/rmcp/src/transport/auth.rs b/crates/rmcp/src/transport/auth.rs
+index db1f353..3bd56a1 100644
+--- a/crates/rmcp/src/transport/auth.rs
++++ b/crates/rmcp/src/transport/auth.rs
+@@ -1984,16 +1984,61 @@ impl AuthorizationManager {
+             return Ok(None);
+         }
+ 
+-        let metadata = match serde_json::from_slice::<ResourceServerMetadata>(response.body()) {
++        let mut metadata = match serde_json::from_slice::<ResourceServerMetadata>(response.body()) {
+             Ok(metadata) => metadata,
+             Err(e) => {
+                 debug!("failed to parse resource metadata as JSON: {}", e);
+                 return Ok(None);
+             }
+         };
++        // Some deployments publish the authorization servers only in the
++        // origin-wide canonical document. Fold those in so that a document
++        // served from a path-inserted well-known location still discovers them.
++        let canonical_servers = self
++            .canonical_authorization_servers(resource_metadata_url)
++            .await;
++        if !canonical_servers.is_empty() {
++            let mut servers = canonical_servers;
++            if let Some(single) = metadata.authorization_server.take() {
++                servers.push(single);
++            }
++            if let Some(list) = metadata.authorization_servers.take() {
++                servers.extend(list);
++            }
++            metadata.authorization_servers = Some(servers);
++        }
+         Ok(Some(metadata))
+     }
+ 
++    /// Read the origin-wide canonical protected resource metadata document when
++    /// the discovered document came from a path-inserted location.
++    async fn canonical_authorization_servers(&self, resource_metadata_url: &Url) -> Vec<String> {
++        let mut canonical_url = self.base_url.clone();
++        canonical_url.set_query(None);
++        canonical_url.set_fragment(None);
++        canonical_url.set_path("/.well-known/oauth-protected-resource");
++        if canonical_url == *resource_metadata_url {
++            return Vec::new();
++        }
++        let Ok(response) = self.discovery_get(&canonical_url).await else {
++            return Vec::new();
++        };
++        if response.status() != StatusCode::OK {
++            return Vec::new();
++        }
++        let Ok(value) = serde_json::from_slice::<Value>(response.body()) else {
++            return Vec::new();
++        };
++        let mut servers = Vec::new();
++        if let Some(single) = value.get("authorization_server").and_then(Value::as_str) {
++            servers.push(single.to_string());
++        }
++        if let Some(list) = value.get("authorization_servers").and_then(Value::as_array) {
++            servers.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
++        }
++        servers
++    }
++
+     async fn discovery_get(&self, url: &Url) -> Result<HttpResponse, OAuthHttpClientError> {
+         let mut current_url = url.clone();
+         for _ in 0..MAX_OAUTH_DISCOVERY_REDIRECTS {

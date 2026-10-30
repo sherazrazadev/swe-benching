@@ -1,0 +1,296 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/snowflake/connector/ssl_wrap_socket.py b/src/snowflake/connector/ssl_wrap_socket.py
+--- a/src/snowflake/connector/ssl_wrap_socket.py	2026-10-30 07:57:43.000000000 +0000
++++ b/src/snowflake/connector/ssl_wrap_socket.py	2026-10-30 08:08:54.501075096 +0000
+@@ -28,6 +28,7 @@
+ from .vendored.urllib3 import connection as connection_
+ from .vendored.urllib3.contrib.pyopenssl import PyOpenSSLContext, WrappedSocket
+ from .vendored.urllib3.util import ssl_ as ssl_
++from .vendored.urllib3.util.ssl_match_hostname import CertificateError, match_hostname
+ 
+ DEFAULT_OCSP_MODE: OCSPMode = OCSPMode.FAIL_OPEN
+ FEATURE_OCSP_MODE: OCSPMode = DEFAULT_OCSP_MODE
+@@ -76,13 +77,93 @@
+         pass
+ 
+ 
+-def _build_context_with_partial_chain(cafile: str | None) -> PyOpenSSLContext:
+-    """Create PyOpenSSL context configured for CERT_REQUIRED and partial-chain trust."""
++def _unsigned_options(options: int) -> int:
++    """Return an ``SSLContext.options`` bitmask in the width pyOpenSSL expects.
++
++    ``ssl.SSLContext.options`` is backed by a signed, platform-width C long.
++    On a 32-bit Windows build the high bit of the usual default mask makes the
++    Python value negative, and cryptography refuses negative values when it
++    marshals the mask into an unsigned parameter.  Flip it back to the
++    intended unsigned 32-bit mask; non-negative values pass through untouched.
++    """
++    return options & 0xFFFFFFFF if options < 0 else options
++
++
++def _carry_caller_tls_settings(
++    dst: PyOpenSSLContext, src: ssl.SSLContext | None
++) -> None:
++    """Copy the caller's TLS policy from *src* onto the replacement *dst*.
++
++    The connector substitutes its own ``PyOpenSSLContext`` for the stdlib
++    context urllib3 built or the caller supplied.  Everything security-relevant
++    that survives the substitution has to be copied by hand; otherwise the swap
++    silently downgrades the connection (lower protocol floor, weaker
++    verification flags, or a forced-on verification the caller opted out of).
++    """
++    if not isinstance(src, ssl.SSLContext):
++        # Nothing to mirror.  Restore the hardening urllib3's
++        # create_urllib3_context() would have applied, rather than inheriting
++        # pyOpenSSL's more permissive defaults.
++        try:
++            dst.minimum_version = ssl.TLSVersion.TLSv1_2
++            dst.options |= ssl.OP_NO_COMPRESSION
++        except (AttributeError, ValueError, OSError, OpenSSL.SSL.Error):
++            pass
++        return
++
++    for setting in ("minimum_version", "maximum_version"):
++        try:
++            setattr(dst, setting, getattr(src, setting))
++        except (AttributeError, ValueError, OSError, OpenSSL.SSL.Error):
++            pass
++
++    try:
++        dst.verify_flags = src.verify_flags
++    except (AttributeError, ValueError, OSError, OpenSSL.SSL.Error):
++        pass
++
++    try:
++        dst.options |= _unsigned_options(src.options)
++    except (
++        AttributeError,
++        ValueError,
++        OSError,
++        OpenSSL.SSL.Error,
++        OverflowError,
++        TypeError,
++    ):
++        pass
++
++    try:
++        # CERT_NONE is an explicit opt-out of certificate verification.  Keep
++        # it so neither this context nor the post-handshake identity check
++        # turns verification back on behind the caller's back.
++        dst.verify_mode = src.verify_mode
++    except (
++        AttributeError,
++        ValueError,
++        OSError,
++        OpenSSL.SSL.Error,
++        OverflowError,
++        TypeError,
++    ):
++        pass
++
++
++def _build_context_with_partial_chain(
++    cafile: str | None, src_context: ssl.SSLContext | None = None
++) -> PyOpenSSLContext:
++    """Create PyOpenSSL context configured for CERT_REQUIRED and partial-chain trust.
++
++    When *src_context* is the stdlib context being replaced, its TLS policy is
++    carried over so that substitution does not weaken the connection.
++    """
+     ctx = PyOpenSSLContext(ssl_.PROTOCOL_TLS_CLIENT)
+     try:
+         ctx.verify_mode = ssl.CERT_REQUIRED
+     except Exception:
+         pass
++    _carry_caller_tls_settings(ctx, src_context)
+     _ensure_partial_chain_on_context(ctx, cafile)
+     return ctx
+ 
+@@ -144,6 +225,77 @@
+     connection_.ssl_wrap_socket = ssl_wrap_socket_with_ocsp
+ 
+ 
++def _server_name_text(server_hostname: Any) -> str | None:
++    """Return a textual server name, decoding the IDNA bytes urllib3 may pass."""
++    if server_hostname is None or isinstance(server_hostname, str):
++        return server_hostname
++    if isinstance(server_hostname, bytes):
++        try:
++            return server_hostname.decode("ascii")
++        except UnicodeDecodeError:
++            return server_hostname.decode("utf-8", "replace")
++    return str(server_hostname)
++
++
++def _address_literal_form(hostname: str) -> str:
++    """Return an address literal in the plain form a certificate names it.
++
++    ``is_ipaddress`` only recognises the bracketless, zone-less spelling.  Strip
++    the URI decorations first and use the result only if it really is an IP
++    literal; anything else (a DNS name) is returned exactly as given.
++    """
++    bare = hostname.strip("[]")
++    if "%" in bare:
++        bare = bare.rsplit("%", 1)[0]
++    return bare if ssl_.is_ipaddress(bare) else hostname
++
++
++def _verify_peer_identity(
++    wrapped_socket: WrappedSocket,
++    server_hostname: Any,
++    ssl_context: Any,
++) -> None:
++    """Refuse a peer whose certificate does not name *server_hostname*.
++
++    The pyOpenSSL context used to wrap the socket never performs hostname
++    verification itself, so the connector has to compare the peer certificate
++    with the name the caller asked for.  A missing name under required
++    verification is refused rather than treated as a wildcard, and an explicit
++    ``CERT_NONE`` opt-out is honoured (nothing can be asserted when the caller
++    disabled verification).
++    """
++    verify_mode = getattr(ssl_context, "verify_mode", ssl.CERT_REQUIRED)
++    if verify_mode == ssl.CERT_NONE:
++        return
++
++    hostname = _server_name_text(server_hostname)
++    if not hostname:
++        wrapped_socket.close()
++        raise CertificateError(
++            "cannot verify server identity: no server hostname was supplied"
++        )
++
++    cert = wrapped_socket.getpeercert()
++    if not cert:
++        wrapped_socket.close()
++        raise CertificateError(
++            "cannot verify server identity: the peer presented no certificate"
++        )
++    try:
++        match_hostname(cert, _address_literal_form(hostname))
++    except CertificateError as exc:
++        log.warning(
++            "Certificate did not match expected hostname: %s. Certificate: %s",
++            hostname,
++            cert,
++        )
++        # Preserve urllib3's convention so callers that catch CertificateError
++        # can inspect the offending certificate.
++        exc._peer_cert = cert  # type: ignore[attr-defined]
++        wrapped_socket.close()
++        raise
++
++
+ @wraps(ssl_.ssl_wrap_socket)
+ def ssl_wrap_socket_with_ocsp(*args: Any, **kwargs: Any) -> WrappedSocket:
+     # Bind passed args/kwargs to the underlying signature to support both positional and keyword calls
+@@ -158,15 +310,21 @@
+ 
+     # Ensure PyOpenSSL context with partial-chain is used if none or wrong type provided
+     provided_ctx = params.get("ssl_context")
++    cafile_for_ctx = _resolve_cafile(params)
+     if not isinstance(provided_ctx, PyOpenSSLContext):
+-        cafile_for_ctx = _resolve_cafile(params)
+-        params["ssl_context"] = _build_context_with_partial_chain(cafile_for_ctx)
++        # Carry the replaced stdlib context's TLS policy over to the
++        # replacement so the substitution does not weaken the connection.
++        params["ssl_context"] = _build_context_with_partial_chain(
++            cafile_for_ctx, src_context=provided_ctx
++        )
+     else:
+         # If a PyOpenSSLContext is provided, ensure it trusts the provided CA and partial-chain is enabled
+-        _ensure_partial_chain_on_context(provided_ctx, _resolve_cafile(params))
++        _ensure_partial_chain_on_context(provided_ctx, cafile_for_ctx)
+ 
+     ret = ssl_.ssl_wrap_socket(**params)
+ 
++    _verify_peer_identity(ret, server_hostname, params.get("ssl_context"))
++
+     log.debug(
+         "OCSP Mode: %s, OCSP response cache file name: %s",
+         FEATURE_OCSP_MODE.name,
+@@ -194,12 +352,36 @@
+     return ret
+ 
+ 
++def _verify_raw_peer_identity(
++    connection: OpenSSL.SSL.Connection, sock: Any, server_hostname: str
++) -> None:
++    """Match a raw pyOpenSSL connection's certificate against its server name.
++
++    ``_openssl_connect`` builds its connection without any stdlib context, so
++    the certificate is only ever inspected here; the identity comparison is
++    still mandatory for every caller of that helper.
++    """
++    cert = WrappedSocket(connection, sock).getpeercert()
++    if not cert:
++        connection.close()
++        raise CertificateError(
++            "cannot verify server identity: the peer presented no certificate"
++        )
++    try:
++        match_hostname(cert, _address_literal_form(server_hostname))
++    except CertificateError:
++        connection.close()
++        raise
++
++
+ def _openssl_connect(
+     hostname: str, port: int = 443, max_retry: int = 20, timeout: int | None = None
+ ) -> OpenSSL.SSL.Connection:
+-    """The OpenSSL connection without validating certificates.
++    """Open a raw OpenSSL connection and check the peer names *hostname*.
+ 
+-    This is used to diagnose SSL issues.
++    This is used to diagnose SSL issues; the returned connection is only ever
++    one to the requested server because the peer certificate is matched
++    against *hostname* before it is handed back.
+     """
+     err = None
+     sleeping_time = 1
+@@ -214,6 +396,7 @@
+             client_ssl.set_connect_state()
+             client_ssl.set_tlsext_host_name(hostname.encode("utf-8"))
+             client_ssl.do_handshake()
++            _verify_raw_peer_identity(client_ssl, client, hostname)
+             return client_ssl
+         except (
+             OpenSSL.SSL.SysCallError,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/snowflake/connector/tool/probe_connection.py b/src/snowflake/connector/tool/probe_connection.py
+--- a/src/snowflake/connector/tool/probe_connection.py	2026-10-30 07:57:45.000000000 +0000
++++ b/src/snowflake/connector/tool/probe_connection.py	2026-10-30 08:08:58.877033410 +0000
+@@ -7,24 +7,6 @@
+ 
+ from ..compat import urlsplit
+ from ..ssl_wrap_socket import _openssl_connect
+-from ..vendored.urllib3.util.ssl_match_hostname import CertificateError
+-
+-
+-def _certificate_names_host(connection, hostname):
+-    """Check that the certificate subject names the requested host."""
+-    certificate = connection.get_peer_certificate()
+-    if certificate is None:
+-        raise CertificateError("the server did not present a certificate")
+-    common_name = (certificate.get_subject().CN or "").strip().lower()
+-    host = hostname.strip().lower()
+-    if common_name.startswith("*."):
+-        matches = host.endswith("." + common_name[2:])
+-    else:
+-        matches = host == common_name
+-    if not matches:
+-        raise CertificateError(
+-            f"certificate does not name the requested host {hostname}"
+-        )
+ 
+ 
+ def probe_connection(url):
+@@ -42,8 +24,9 @@
+         }
+     except gaierror as e:
+         return {"err:": e}
++    # The shared helper only returns a connection whose peer certificate
++    # covers the requested host.
+     connection = _openssl_connect(parsed_url.hostname, parsed_url.port)
+-    _certificate_names_host(connection, parsed_url.hostname)
+ 
+     # certificates
+     certificates = []

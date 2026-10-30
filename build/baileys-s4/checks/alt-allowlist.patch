@@ -1,0 +1,74 @@
+diff --git a/src/Socket/chats.ts b/src/Socket/chats.ts
+index 2ca0dda2d9..bdfe609382 100644
+--- a/src/Socket/chats.ts
++++ b/src/Socket/chats.ts
+@@ -1214,7 +1214,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
+ 		// so app-state reads issued while the inbound buffer is still open use the current key
+ 		// rather than the previous one.
+ 		const sharedAppStateKeys = msg.message?.protocolMessage?.appStateSyncKeyShare?.keys
+-		if (sharedAppStateKeys?.length) {
++		if (msg.key.fromMe && sharedAppStateKeys?.length) {
+ 			await authState.keys.transaction(async () => {
+ 				for (const { keyData, keyId } of sharedAppStateKeys) {
+ 					const strKeyId = Buffer.from(keyId!.keyId!).toString('base64')
+@@ -1224,12 +1224,13 @@ export const makeChatsSocket = (config: SocketConfig) => {
+ 		}
+ 
+ 		const historyMsg = getHistoryMsg(msg.message!)
+-		const shouldProcessHistoryMsg = historyMsg
++		const isSelfOrigin = !!msg.key.fromMe
++		const shouldProcessHistoryMsg = isSelfOrigin && historyMsg
+ 			? shouldSyncHistoryMessage(historyMsg) &&
+ 				PROCESSABLE_HISTORY_TYPES.includes(historyMsg.syncType! as proto.HistorySync.HistorySyncType)
+ 			: false
+ 
+-		if (historyMsg && shouldProcessHistoryMsg) {
++		if (isSelfOrigin && historyMsg && shouldProcessHistoryMsg) {
+ 			const syncType = historyMsg.syncType as proto.HistorySync.HistorySyncType
+ 
+ 			// INITIAL_BOOTSTRAP — fire immediately, no progress check (same as WA Web K function)
+@@ -1280,7 +1281,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
+ 		}
+ 
+ 		// State machine: decide on sync and flush
+-		if (historyMsg && syncState === SyncState.AwaitingInitialSync) {
++		if (isSelfOrigin && historyMsg && syncState === SyncState.AwaitingInitialSync) {
+ 			if (awaitingSyncTimeout) {
+ 				clearTimeout(awaitingSyncTimeout)
+ 				awaitingSyncTimeout = undefined
+@@ -1334,7 +1335,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
+ 		])
+ 
+ 		// If the app state key arrives and we are waiting to sync, trigger the sync now.
+-		if (msg.message?.protocolMessage?.appStateSyncKeyShare && syncState === SyncState.Syncing) {
++		if (msg.key.fromMe && msg.message?.protocolMessage?.appStateSyncKeyShare && syncState === SyncState.Syncing) {
+ 			logger.info('App state sync key arrived, triggering app state sync')
+ 			await doAppStateSync()
+ 		}
+diff --git a/src/Utils/process-message.ts b/src/Utils/process-message.ts
+index c677244d01..3efe8ab1bf 100644
+--- a/src/Utils/process-message.ts
++++ b/src/Utils/process-message.ts
+@@ -330,6 +330,22 @@ const processMessage = async (
+ 
+ 	const protocolMsg = content?.protocolMessage
+ 	if (protocolMsg) {
++		// Control messages that another user is allowed to send. Anything else only ever
++		// originates from the account's own devices, so a non-self sender may not drive it.
++		const crossUserTypes = new Set<proto.Message.ProtocolMessage.Type>([
++			proto.Message.ProtocolMessage.Type.REVOKE,
++			proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
++			proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
++			proto.Message.ProtocolMessage.Type.GROUP_MEMBER_LABEL_CHANGE
++		])
++		if (!message.key.fromMe && protocolMsg.type != null && !crossUserTypes.has(protocolMsg.type)) {
++			logger?.warn(
++				{ msgId: message.key.id, type: protocolMsg.type },
++				'dropping self-only protocolMessage from a non-self origin'
++			)
++			return
++		}
++
+ 		switch (protocolMsg.type) {
+ 			case proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION:
+ 				const histNotification = protocolMsg.historySyncNotification!

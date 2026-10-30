@@ -1,0 +1,527 @@
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsJacksonModule.java
+index 5f8e57d7..7755c16c 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsJacksonModule.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsJacksonModule.java
+@@ -24,6 +24,7 @@ import tools.jackson.databind.module.SimpleModule;
+ import tools.jackson.databind.ser.std.ToStringSerializer;
+ 
+ import org.springframework.hateoas.CollectionModel;
++import org.springframework.hateoas.EntityModel;
+ import org.springframework.hateoas.Link;
+ import org.springframework.hateoas.RepresentationModel;
+ import org.springframework.hateoas.mediatype.hal.CollectionModelMixin;
+@@ -50,10 +51,14 @@ public class HalFormsJacksonModule extends SimpleModule {
+ 
+ 		setMixInAnnotation(Link.class, LinkMixin.class);
+ 		setMixInAnnotation(RepresentationModel.class, RepresentationModelMixin.class);
++		setMixInAnnotation(EntityModel.class, EntityModelMixin.class);
+ 		setMixInAnnotation(CollectionModel.class, CollectionModelMixin.class);
+ 		setMixInAnnotation(MediaType.class, MediaTypeMixin.class);
+ 	}
+ 
++	@JsonDeserialize(using = HalFormsTemplateDataDeserializer.class)
++	abstract static class EntityModelMixin {}
++
+ 	@JsonAppend(
+ 			props = @Prop(name = "_templates", value = HalFormsTemplatePropertyWriter.class, include = Include.NON_EMPTY))
+ 	abstract class RepresentationModelMixin extends org.springframework.hateoas.mediatype.hal.RepresentationModelMixin {}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
+new file mode 100644
+index 00000000..28713faf
+--- /dev/null
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2017-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype.hal.forms;
++
++import tools.jackson.core.JsonParser;
++import tools.jackson.databind.BeanProperty;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.ValueDeserializer;
++import tools.jackson.databind.node.ObjectNode;
++import tools.jackson.databind.type.TypeFactory;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.jspecify.annotations.Nullable;
++import org.springframework.hateoas.EntityModel;
++import org.springframework.hateoas.Links;
++import org.springframework.hateoas.RepresentationModel;
++import org.springframework.hateoas.mediatype.JacksonHelper;
++
++/**
++ * Reads a HAL-FORMS representation into an {@link EntityModel}, applying the values submitted through the templates
++ * carried by the document.
++ *
++ * @author Greg Turnquist
++ */
++final class HalFormsTemplateDataDeserializer extends ValueDeserializer<RepresentationModel<?>> {
++
++	private static final String LINKS = "_links";
++	private static final String TEMPLATES = "_templates";
++	private static final String PROPERTIES = "properties";
++	private static final String NAME = "name";
++	private static final String VALUE = "value";
++	private static final TypeFactory TYPE_FACTORY = TypeFactory.createDefaultInstance();
++
++	private final JavaType contentType;
++
++	HalFormsTemplateDataDeserializer() {
++		this(TYPE_FACTORY.constructType(Object.class));
++	}
++
++	HalFormsTemplateDataDeserializer(JavaType contentType) {
++		this.contentType = contentType;
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see tools.jackson.databind.ValueDeserializer#deserialize(tools.jackson.core.JsonParser, tools.jackson.databind.DeserializationContext)
++	 */
++	@Override
++	@SuppressWarnings("null")
++	public RepresentationModel<?> deserialize(JsonParser parser, DeserializationContext context) {
++
++		JsonNode node = context.readTree(parser);
++
++		if (!(node instanceof ObjectNode document)) {
++			return EntityModel.of(context.readTreeAsValue(node, Object.class));
++		}
++
++		JavaType rootType = JacksonHelper.findRootType(this.contentType);
++		Class<?> rawType = rootType.getRawClass();
++
++		JsonNode templates = document.get(TEMPLATES);
++		Links links = readLinks(document, context);
++
++		Object content = RepresentationModel.class.isAssignableFrom(rawType) //
++				? context.readTreeAsValue(document.deepCopy().without(List.of(LINKS, TEMPLATES)), Object.class) //
++				: context.readTreeAsValue(document.deepCopy().without(List.of(LINKS, TEMPLATES)), rootType);
++
++		if (templates != null) {
++			HalFormsTemplateValues.applyTo(content, extractValues(templates, context));
++		}
++
++		return EntityModel.of(content, links);
++	}
++
++	private static Map<String, Object> extractValues(@Nullable JsonNode templates, DeserializationContext context) {
++
++		Map<String, Object> values = new LinkedHashMap<>();
++
++		if (templates == null) {
++			return values;
++		}
++
++		for (String templateName : templates.propertyNames()) {
++
++			JsonNode properties = templates.get(templateName).get(PROPERTIES);
++
++			if (properties == null || !properties.isArray()) {
++				continue;
++			}
++
++			for (JsonNode property : properties) {
++
++				JsonNode name = property.get(NAME);
++				JsonNode value = property.get(VALUE);
++
++				if (name == null || value == null) {
++					continue;
++				}
++
++				values.put(name.asString(), context.readTreeAsValue(value, Object.class));
++			}
++		}
++
++		return values;
++	}
++
++	private static Links readLinks(ObjectNode document, DeserializationContext context) {
++
++		JsonNode links = document.get(LINKS);
++
++		if (links == null) {
++			return Links.NONE;
++		}
++
++		ObjectNode holder = (ObjectNode) context.createObjectNode();
++		holder.set(LINKS, links);
++
++		return context.readTreeAsValue(holder, RepresentationModel.class).getLinks();
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see tools.jackson.databind.ValueDeserializer#createContextual(tools.jackson.databind.DeserializationContext, tools.jackson.databind.BeanProperty)
++	 */
++	@Override
++	@SuppressWarnings("null")
++	public ValueDeserializer<?> createContextual(DeserializationContext context, @Nullable BeanProperty property) {
++
++		JavaType type = property == null ? context.getContextualType() : property.getType();
++
++		return new HalFormsTemplateDataDeserializer(type == null ? this.contentType : type);
++	}
++}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java
+new file mode 100644
+index 00000000..70a46e0f
+--- /dev/null
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2017-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype.hal.forms;
++
++import org.jspecify.annotations.Nullable;
++import org.springframework.beans.BeanUtils;
++import org.springframework.util.ReflectionUtils;
++
++import java.beans.PropertyDescriptor;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.Map;
++
++/**
++ * Applies the values submitted through a HAL-FORMS template to the object a document is read into.
++ *
++ * @author Greg Turnquist
++ */
++final class HalFormsTemplateValues {
++
++	private HalFormsTemplateValues() {}
++
++	/**
++	 * Applies the given values to the given target object.
++	 *
++	 * @param target can be {@literal null}.
++	 * @param values must not be {@literal null}.
++	 */
++	static void applyTo(@Nullable Object target, Map<String, Object> values) {
++
++		if (target == null) {
++			return;
++		}
++
++		values.forEach((name, value) -> {
++
++			PropertyDescriptor descriptor = BeanUtils.getPropertyDescriptor(target.getClass(), name);
++
++			if (descriptor == null || descriptor.getWriteMethod() == null) {
++				return;
++			}
++
++			Method writeMethod = descriptor.getWriteMethod();
++			ReflectionUtils.makeAccessible(writeMethod);
++
++			try {
++				writeMethod.invoke(target, value);
++			} catch (IllegalAccessException | InvocationTargetException e) {
++				throw new RuntimeException(e);
++			}
++		});
++	}
++}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/problem/HttpProblemDetailsMappingInformation.java b/src/main/java/org/springframework/hateoas/mediatype/problem/HttpProblemDetailsMappingInformation.java
+index 51748c39..2e7b9f65 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/problem/HttpProblemDetailsMappingInformation.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/HttpProblemDetailsMappingInformation.java
+@@ -15,9 +15,12 @@
+  */
+ package org.springframework.hateoas.mediatype.problem;
+ 
++import tools.jackson.databind.JacksonModule;
++
+ import java.util.Collections;
+ import java.util.List;
+ 
++import org.jspecify.annotations.NonNull;
+ import org.springframework.hateoas.MediaTypes;
+ import org.springframework.hateoas.config.HypermediaMappingInformation;
+ import org.springframework.http.MediaType;
+@@ -46,4 +49,14 @@ class HttpProblemDetailsMappingInformation implements HypermediaMappingInformati
+ 	public List<MediaType> getMediaTypes() {
+ 		return Collections.singletonList(MediaTypes.HTTP_PROBLEM_DETAILS_JSON);
+ 	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.springframework.hateoas.config.HypermediaMappingInformation#getJacksonModule()
++	 */
++	@NonNull
++	@Override
++	public JacksonModule getJacksonModule() {
++		return new ProblemJacksonModule();
++	}
+ }
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemJacksonModule.java
+new file mode 100644
+index 00000000..fdcb145d
+--- /dev/null
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemJacksonModule.java
+@@ -0,0 +1,40 @@
++/*
++ * Copyright 2020-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype.problem;
++
++import tools.jackson.core.Version;
++import tools.jackson.databind.annotation.JsonDeserialize;
++import tools.jackson.databind.module.SimpleModule;
++
++/**
++ * Jackson module to read HTTP Problem Details documents, including their additional payload.
++ *
++ * @author Oliver Drotbohm
++ */
++public class ProblemJacksonModule extends SimpleModule {
++
++	private static final long serialVersionUID = 6450242813977301783L;
++
++	public ProblemJacksonModule() {
++
++		super("problem-module", new Version(1, 0, 0, null, "org.springframework.hateoas", "spring-hateoas"));
++
++		setMixInAnnotation(Problem.ExtendedProblem.class, ExtendedProblemMixin.class);
++	}
++
++	@JsonDeserialize(using = ProblemPayloadDeserializer.class)
++	abstract static class ExtendedProblemMixin {}
++}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
+new file mode 100644
+index 00000000..29333657
+--- /dev/null
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
+@@ -0,0 +1,114 @@
++/*
++ * Copyright 2020-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype.problem;
++
++import tools.jackson.core.JsonParser;
++import tools.jackson.databind.BeanProperty;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
++import tools.jackson.databind.ValueDeserializer;
++import tools.jackson.databind.type.TypeFactory;
++
++import java.net.URI;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import org.jspecify.annotations.Nullable;
++
++/**
++ * Deserializes an {@link Problem.ExtendedProblem} from an HTTP Problem Details document, materializing the additional
++ * payload from the properties not defined by the problem itself.
++ *
++ * @author Oliver Drotbohm
++ */
++final class ProblemPayloadDeserializer extends ValueDeserializer<Problem.ExtendedProblem<?>> {
++
++	private static final String TYPE = "type";
++	private static final String TITLE = "title";
++	private static final String STATUS = "status";
++	private static final String DETAIL = "detail";
++	private static final String INSTANCE = "instance";
++	private static final TypeFactory TYPE_FACTORY = TypeFactory.createDefaultInstance();
++
++	private final JavaType contentType;
++
++	ProblemPayloadDeserializer() {
++		this(TYPE_FACTORY.constructType(Object.class));
++	}
++
++	ProblemPayloadDeserializer(JavaType contentType) {
++		this.contentType = contentType;
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see tools.jackson.databind.ValueDeserializer#deserialize(tools.jackson.core.JsonParser, tools.jackson.databind.DeserializationContext)
++	 */
++	@Override
++	@SuppressWarnings("unchecked")
++	public Problem.ExtendedProblem<?> deserialize(JsonParser parser, DeserializationContext context) {
++
++		Map<String, Object> document = new LinkedHashMap<>((Map<String, Object>) context.readValue(parser, Map.class));
++
++		Object type = document.remove(TYPE);
++		Object title = document.remove(TITLE);
++		Object status = document.remove(STATUS);
++		Object detail = document.remove(DETAIL);
++		Object instance = document.remove(INSTANCE);
++
++		JavaType payloadType = this.contentType.hasGenericTypes() //
++				? this.contentType.containedType(0) //
++				: context.getTypeFactory().constructType(Object.class);
++
++		Class<?> payloadClass = payloadType.getRawClass();
++
++		Object payload = payloadClass == Object.class || Map.class.isAssignableFrom(payloadClass) //
++				|| payloadClass.isInterface() //
++						? document //
++						: ProblemPayloadValues.create(payloadClass, document);
++
++		return new Problem.ExtendedProblem<>(toUri(type), title == null ? null : title.toString(),
++				toInteger(status), detail == null ? null : detail.toString(), toUri(instance), payload);
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see tools.jackson.databind.ValueDeserializer#createContextual(tools.jackson.databind.DeserializationContext, tools.jackson.databind.BeanProperty)
++	 */
++	@Override
++	@SuppressWarnings("null")
++	public ValueDeserializer<?> createContextual(DeserializationContext context, @Nullable BeanProperty property) {
++
++		JavaType type = property == null ? context.getContextualType() : property.getType();
++
++		return new ProblemPayloadDeserializer(type == null ? this.contentType : type);
++	}
++
++	@Nullable
++	private static URI toUri(@Nullable Object value) {
++		return value == null ? null : URI.create(value.toString());
++	}
++
++	@Nullable
++	private static Integer toInteger(@Nullable Object value) {
++
++		if (value == null) {
++			return null;
++		}
++
++		return value instanceof Number number ? number.intValue() : Integer.valueOf(value.toString());
++	}
++}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java
+new file mode 100644
+index 00000000..edbb323f
+--- /dev/null
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java
+@@ -0,0 +1,67 @@
++/*
++ * Copyright 2020-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype.problem;
++
++import org.springframework.beans.BeanUtils;
++import org.springframework.util.ReflectionUtils;
++
++import java.beans.PropertyDescriptor;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.Map;
++
++/**
++ * Creates the additional payload of an {@link Problem.ExtendedProblem} from the properties supplied by a document.
++ *
++ * @author Oliver Drotbohm
++ */
++final class ProblemPayloadValues {
++
++	private ProblemPayloadValues() {}
++
++	/**
++	 * Creates an instance of the given type from the given property values.
++	 *
++	 * @param type must not be {@literal null}.
++	 * @param properties must not be {@literal null}.
++	 * @param <T>
++	 * @return
++	 */
++	static <T> T create(Class<T> type, Map<String, Object> properties) {
++
++		T instance = BeanUtils.instantiateClass(type);
++
++		properties.forEach((name, value) -> {
++
++			PropertyDescriptor descriptor = BeanUtils.getPropertyDescriptor(type, name);
++
++			if (descriptor == null || descriptor.getWriteMethod() == null) {
++				return;
++			}
++
++			Method writeMethod = descriptor.getWriteMethod();
++			ReflectionUtils.makeAccessible(writeMethod);
++
++			try {
++				writeMethod.invoke(instance, value);
++			} catch (IllegalAccessException | InvocationTargetException e) {
++				throw new RuntimeException(e);
++			}
++		});
++
++		return instance;
++	}
++}

@@ -1,0 +1,118 @@
+diff -ruN a/src/Socket/chats.ts b/src/Socket/chats.ts
+--- a/src/Socket/chats.ts	2026-10-30 08:04:43.000000000 +0000
++++ b/src/Socket/chats.ts	2026-10-30 08:37:20.001995083 +0000
+@@ -1194,6 +1194,11 @@
+ 	}
+ 
+ 	const upsertMessage = ev.createBufferedFunction(async (msg: WAMessage, type: MessageUpsertType) => {
++		// `fromMe` is the message's origin: true only for the account's own devices. Control
++		// payloads that the account's devices alone may originate must not be applied here (or
++		// reach processMessage) when the message came from anyone else.
++		const isOwnDeviceMessage = !!msg.key.fromMe
++
+ 		ev.emit('messages.upsert', { messages: [msg], type })
+ 
+ 		if (!!msg.pushName) {
+@@ -1214,7 +1219,7 @@
+ 		// so app-state reads issued while the inbound buffer is still open use the current key
+ 		// rather than the previous one.
+ 		const sharedAppStateKeys = msg.message?.protocolMessage?.appStateSyncKeyShare?.keys
+-		if (sharedAppStateKeys?.length) {
++		if (isOwnDeviceMessage && sharedAppStateKeys?.length) {
+ 			await authState.keys.transaction(async () => {
+ 				for (const { keyData, keyId } of sharedAppStateKeys) {
+ 					const strKeyId = Buffer.from(keyId!.keyId!).toString('base64')
+@@ -1224,12 +1229,12 @@
+ 		}
+ 
+ 		const historyMsg = getHistoryMsg(msg.message!)
+-		const shouldProcessHistoryMsg = historyMsg
++		const shouldProcessHistoryMsg = isOwnDeviceMessage && historyMsg
+ 			? shouldSyncHistoryMessage(historyMsg) &&
+ 				PROCESSABLE_HISTORY_TYPES.includes(historyMsg.syncType! as proto.HistorySync.HistorySyncType)
+ 			: false
+ 
+-		if (historyMsg && shouldProcessHistoryMsg) {
++		if (isOwnDeviceMessage && historyMsg && shouldProcessHistoryMsg) {
+ 			const syncType = historyMsg.syncType as proto.HistorySync.HistorySyncType
+ 
+ 			// INITIAL_BOOTSTRAP — fire immediately, no progress check (same as WA Web K function)
+@@ -1280,7 +1285,7 @@
+ 		}
+ 
+ 		// State machine: decide on sync and flush
+-		if (historyMsg && syncState === SyncState.AwaitingInitialSync) {
++		if (isOwnDeviceMessage && historyMsg && syncState === SyncState.AwaitingInitialSync) {
+ 			if (awaitingSyncTimeout) {
+ 				clearTimeout(awaitingSyncTimeout)
+ 				awaitingSyncTimeout = undefined
+@@ -1334,7 +1339,11 @@
+ 		])
+ 
+ 		// If the app state key arrives and we are waiting to sync, trigger the sync now.
+-		if (msg.message?.protocolMessage?.appStateSyncKeyShare && syncState === SyncState.Syncing) {
++		if (
++			isOwnDeviceMessage &&
++			msg.message?.protocolMessage?.appStateSyncKeyShare &&
++			syncState === SyncState.Syncing
++		) {
+ 			logger.info('App state sync key arrived, triggering app state sync')
+ 			await doAppStateSync()
+ 		}
+diff -ruN a/src/Utils/process-message.ts b/src/Utils/process-message.ts
+--- a/src/Utils/process-message.ts	2026-10-30 08:04:43.000000000 +0000
++++ b/src/Utils/process-message.ts	2026-10-30 08:37:08.855759761 +0000
+@@ -48,6 +48,35 @@
+ 	getMessage: SocketConfig['getMessage']
+ }
+ 
++/**
++ * Protocol message types that a sender other than the account is allowed to drive.
++ *
++ * Every other protocol message is own-device-only: its branches touch state that belongs
++ * exclusively to the account's devices (history-sync progress, app-state sync keys, LID/PN
++ * identity mappings, account settings, or messages re-injected into the store). Treating the
++ * four types below as the whole foreign-permitted set means any current or future own-device
++ * type is refused by default rather than needing to be enumerated.
++ */
++const FOREIGN_PERMITTED_PROTOCOL_TYPES: ReadonlySet<number> = new Set<number>([
++	proto.Message.ProtocolMessage.Type.REVOKE,
++	proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
++	proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
++	proto.Message.ProtocolMessage.Type.GROUP_MEMBER_LABEL_CHANGE
++])
++
++/**
++ * Whether an inbound message must be refused because it carries an own-device-only protocol
++ * payload but was not sent by the account. `message.key.fromMe` is the message's origin.
++ */
++const isForeignOwnDeviceProtocolMessage = (
++	message: WAMessage,
++	protocolMsg: proto.Message.IProtocolMessage
++): boolean =>
++	!message.key.fromMe &&
++	protocolMsg.type !== null &&
++	protocolMsg.type !== undefined &&
++	!FOREIGN_PERMITTED_PROTOCOL_TYPES.has(protocolMsg.type)
++
+ const REAL_MSG_STUB_TYPES = new Set([
+ 	WAMessageStubType.CALL_MISSED_GROUP_VIDEO,
+ 	WAMessageStubType.CALL_MISSED_GROUP_VOICE,
+@@ -330,6 +359,17 @@
+ 
+ 	const protocolMsg = content?.protocolMessage
+ 	if (protocolMsg) {
++		// `content` is the normalised form, so this also covers control payloads nested inside
++		// ephemeral/view-once/document-with-caption/edited/group-status wrappers.
++		if (isForeignOwnDeviceProtocolMessage(message, protocolMsg)) {
++			logger?.warn(
++				{ msgId: message.key.id, protocolType: protocolMsg.type },
++				'refusing own-device protocol message from a sender that is not the account'
++			)
++
++			return
++		}
++
+ 		switch (protocolMsg.type) {
+ 			case proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION:
+ 				const histNotification = protocolMsg.historySyncNotification!

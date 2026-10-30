@@ -1,0 +1,177 @@
+diff --git a/src/core/lib/Charts.mjs b/src/core/lib/Charts.mjs
+index 6cb63f6..a70a900 100644
+--- a/src/core/lib/Charts.mjs
++++ b/src/core/lib/Charts.mjs
+@@ -153,7 +153,7 @@ export function getSeriesValues(input, recordDelimiter, fieldDelimiter, columnHe
+     );
+ 
+     let xValues = new Set();
+-    const series = {};
++    const series = Object.create(null);
+ 
+     values.forEach(row => {
+         const serie = row[0],
+@@ -163,14 +163,14 @@ export function getSeriesValues(input, recordDelimiter, fieldDelimiter, columnHe
+         if (Number.isNaN(val)) throw new OperationError("Values must be numbers in base 10.");
+ 
+         xValues.add(xVal);
+-        if (typeof series[serie] === "undefined") series[serie] = {};
++        if (typeof series[serie] === "undefined") series[serie] = Object.create(null);
+         series[serie][xVal] = val;
+     });
+ 
+     xValues = new Array(...xValues);
+ 
+     const seriesList = [];
+-    for (const seriesName in series) {
++    for (const seriesName of Object.keys(series)) {
+         const serie = series[seriesName];
+         seriesList.push({name: seriesName, data: serie});
+     }
+diff --git a/src/core/lib/Protocol.mjs b/src/core/lib/Protocol.mjs
+index dfb8b19..249cf08 100644
+--- a/src/core/lib/Protocol.mjs
++++ b/src/core/lib/Protocol.mjs
+@@ -8,6 +8,7 @@
+ 
+ import BigNumber from "bignumber.js";
+ import {toHexFast} from "../lib/Hex.mjs";
++import Utils from "../Utils.mjs";
+ 
+ /**
+  * Recursively displays a JSON object as an HTML table
+@@ -15,7 +16,9 @@ import {toHexFast} from "../lib/Hex.mjs";
+  * @param {Object} obj
+  * @returns string
+  */
+-export function objToTable(obj, nested=false) {
++export function objToTable(obj, nested=false, seen=new WeakSet()) {
++    if (obj === null || typeof obj !== "object" || seen.has(obj)) return "";
++    seen.add(obj);
+     let html = `<table
+         class='table table-sm table-nonfluid ${nested ? "mb-0 table-borderless" : "table-bordered"}'
+         style='table-layout: fixed; ${nested ? "margin: -1px !important;" : ""}'>`;
+@@ -25,15 +28,16 @@ export function objToTable(obj, nested=false) {
+             <th>Value</th>
+         </tr>`;
+ 
+-    for (const key in obj) {
+-        if (typeof obj[key] === "function")
++    for (const key of Object.keys(obj)) {
++        const value = obj[key];
++        if (typeof value === "function")
+             continue;
+ 
+-        html += `<tr><td style='word-wrap: break-word'>${key}</td>`;
+-        if (typeof obj[key] === "object")
+-            html += `<td style='padding: 0'>${objToTable(obj[key], true)}</td>`;
++        html += `<tr><td style='word-wrap: break-word'>${Utils.escapeHtml(String(key))}</td>`;
++        if (value !== null && typeof value === "object")
++            html += `<td style='padding: 0'>${objToTable(value, true, seen)}</td>`;
+         else
+-            html += `<td>${obj[key]}</td>`;
++            html += `<td>${Utils.escapeHtml(String(value))}</td>`;
+         html += "</tr>";
+     }
+     html += "</table>";
+diff --git a/src/core/operations/ParseHTTPHeaders.mjs b/src/core/operations/ParseHTTPHeaders.mjs
+index 8d0aacc..43ed5b5 100644
+--- a/src/core/operations/ParseHTTPHeaders.mjs
++++ b/src/core/operations/ParseHTTPHeaders.mjs
+@@ -5,6 +5,7 @@
+  */
+ 
+ import Operation from "../Operation.mjs";
++import Utils from "../Utils.mjs";
+ 
+ /**
+  * Parse HTTP Headers operation
+@@ -42,7 +43,7 @@ class ParseHTTPHeaders extends Operation {
+      */
+     run(input, args) {
+         const recordDelimiter = args[0] === "CRLF" ? "\r\n" : "\n";
+-        const headers = {};
++        const headers = Object.create(null);
+ 
+         input.split(recordDelimiter).forEach(line => {
+             const separator = line.indexOf(":");
+@@ -67,9 +68,10 @@ class ParseHTTPHeaders extends Operation {
+         let html = `<table class="table table-sm table-nonfluid table-bordered" style="table-layout: fixed;">
+             <tr><th>Field</th><th>Value</th></tr>`;
+ 
+-        for (const name in headers) {
+-            html += `<tr><td style="word-wrap: break-word">${name}</td>`;
+-            html += `<td>${headers[name]}</td></tr>`;
++        for (const name of Object.keys(headers)) {
++            const value = headers[name];
++            html += `<tr><td style="word-wrap: break-word">${Utils.escapeHtml(String(name))}</td>`;
++            html += `<td>${Utils.escapeHtml(String(value))}</td></tr>`;
+         }
+ 
+         html += "</table>";
+diff --git a/src/core/operations/PivotTable.mjs b/src/core/operations/PivotTable.mjs
+index 5ba7838..cea2701 100644
+--- a/src/core/operations/PivotTable.mjs
++++ b/src/core/operations/PivotTable.mjs
+@@ -5,6 +5,7 @@
+  */
+ 
+ import Operation from "../Operation.mjs";
++import Utils from "../Utils.mjs";
+ 
+ /**
+  * Pivot table operation
+@@ -55,7 +56,7 @@ class PivotTable extends Operation {
+             "Tab": "\t"
+         }[args[1]] || ",";
+ 
+-        const pivot = {};
++        const pivot = Object.create(null);
+ 
+         input.split(recordDelimiter).forEach(record => {
+             const cells = record.split(fieldDelimiter).map(cell => cell.trim());
+@@ -64,7 +65,7 @@ class PivotTable extends Operation {
+             const [row, column, value] = cells;
+             if (!row || !column) return;
+ 
+-            if (typeof pivot[row] === "undefined") pivot[row] = {};
++            if (typeof pivot[row] === "undefined") pivot[row] = Object.create(null);
+             pivot[row][column] = value;
+         });
+ 
+@@ -79,11 +80,11 @@ class PivotTable extends Operation {
+     present(pivot) {
+         const columns = [];
+ 
+-        for (const row in pivot) {
++        for (const row of Object.keys(pivot)) {
+             const cells = pivot[row];
+             if (cells === null || typeof cells !== "object") continue;
+ 
+-            for (const column in cells) {
++            for (const column of Object.keys(cells)) {
+                 if (!columns.includes(column)) columns.push(column);
+             }
+         }
+@@ -92,17 +93,17 @@ class PivotTable extends Operation {
+             <tr><th></th>`;
+ 
+         columns.forEach(column => {
+-            html += `<th>${column}</th>`;
++            html += `<th>${Utils.escapeHtml(String(column))}</th>`;
+         });
+         html += "</tr>";
+ 
+-        for (const row in pivot) {
++        for (const row of Object.keys(pivot)) {
+             const cells = pivot[row];
+-            html += `<tr><th>${row}</th>`;
++            html += `<tr><th>${Utils.escapeHtml(String(row))}</th>`;
+ 
+             columns.forEach(column => {
+                 const value = cells[column];
+-                html += `<td>${typeof value === "undefined" ? "" : value}</td>`;
++                html += `<td>${typeof value === "undefined" ? "" : Utils.escapeHtml(String(value))}</td>`;
+             });
+             html += "</tr>";
+         }

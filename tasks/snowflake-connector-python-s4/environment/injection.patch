@@ -1,0 +1,37 @@
+diff --git a/src/snowflake/connector/tool/probe_connection.py b/src/snowflake/connector/tool/probe_connection.py
+index 81546ce..66b12a4 100644
+--- a/src/snowflake/connector/tool/probe_connection.py
++++ b/src/snowflake/connector/tool/probe_connection.py
+@@ -7,6 +7,24 @@ from OpenSSL.crypto import FILETYPE_ASN1, dump_certificate
+ 
+ from ..compat import urlsplit
+ from ..ssl_wrap_socket import _openssl_connect
++from ..vendored.urllib3.util.ssl_match_hostname import CertificateError
++
++
++def _certificate_names_host(connection, hostname):
++    """Check that the certificate subject names the requested host."""
++    certificate = connection.get_peer_certificate()
++    if certificate is None:
++        raise CertificateError("the server did not present a certificate")
++    common_name = (certificate.get_subject().CN or "").strip().lower()
++    host = hostname.strip().lower()
++    if common_name.startswith("*."):
++        matches = host.endswith("." + common_name[2:])
++    else:
++        matches = host == common_name
++    if not matches:
++        raise CertificateError(
++            f"certificate does not name the requested host {hostname}"
++        )
+ 
+ 
+ def probe_connection(url):
+@@ -25,6 +43,7 @@ def probe_connection(url):
+     except gaierror as e:
+         return {"err:": e}
+     connection = _openssl_connect(parsed_url.hostname, parsed_url.port)
++    _certificate_names_host(connection, parsed_url.hostname)
+ 
+     # certificates
+     certificates = []

@@ -1,0 +1,171 @@
+diff --git a/mobsf/MobSF/urls.py b/mobsf/MobSF/urls.py
+index da90c1c..71eae91 100755
+--- a/mobsf/MobSF/urls.py
++++ b/mobsf/MobSF/urls.py
+@@ -39,7 +39,9 @@ from mobsf.MobSF.views.api import api_ios_device_analysis as api_iddz
+ from mobsf.StaticAnalyzer import tests
+ from mobsf.StaticAnalyzer.views.common import (
+     appsec,
++    artifacts,
+     async_task,
++    notes,
+     pdf,
+     shared_func,
+     suppression,
+@@ -106,6 +108,7 @@ urlpatterns = [
+     re_path(r'^api/v1/suppress_by_rule$', api_sz.api_suppress_by_rule_id),
+     re_path(r'^api/v1/suppress_by_files$', api_sz.api_suppress_by_files),
+     re_path(r'^api/v1/list_suppressions$', api_sz.api_list_suppressions),
++    re_path(r'^api/v1/scan_note$', api_sz.api_scan_note),
+     re_path(r'^api/v1/delete_suppression$', api_sz.api_delete_suppression),
+     # Dynamic Analysis
+     re_path(r'^api/v1/dynamic/get_apps$', api_dz.api_get_apps),
+@@ -277,6 +280,12 @@ if settings.API_ONLY == '0':
+         re_path(r'^suppress_by_files/$',
+                 suppression.suppress_by_files,
+                 name='suppress_by_files'),
++        re_path(r'^scan_note/$',
++                notes.save_scan_note,
++                name='scan_note'),
++        re_path(r'^clear_reports/$',
++                artifacts.clear_reports,
++                name='clear_reports'),
+         re_path(r'^list_suppressions/$',
+                 suppression.list_suppressions,
+                 name='list_suppressions'),
+diff --git a/mobsf/MobSF/views/api/api_static_analysis.py b/mobsf/MobSF/views/api/api_static_analysis.py
+index 436ce02..57aebd6 100755
+--- a/mobsf/MobSF/views/api/api_static_analysis.py
++++ b/mobsf/MobSF/views/api/api_static_analysis.py
+@@ -24,6 +24,7 @@ from mobsf.StaticAnalyzer.views.android.static_analyzer import static_analyzer
+ from mobsf.StaticAnalyzer.views.ios.views import view_source as ios_view_source
+ from mobsf.StaticAnalyzer.views.ios.static_analyzer import static_analyzer_ios
+ from mobsf.StaticAnalyzer.views.common.async_task import list_tasks
++from mobsf.StaticAnalyzer.views.common.notes import save_scan_note
+ from mobsf.StaticAnalyzer.views.common.shared_func import compare_apps
+ from mobsf.StaticAnalyzer.views.common.suppression import (
+     delete_suppression,
+@@ -124,6 +125,19 @@ def api_tasks(request):
+     return make_api_response(resp, 200)
+ 
+ 
++@request_method(['POST'])
++@csrf_exempt
++def api_scan_note(request):
++    """POST - Save a note for a scan."""
++    if 'hash' not in request.POST or 'note' not in request.POST:
++        return make_api_response(
++            {'error': 'Missing Parameters'}, 422)
++    resp = save_scan_note(request, True)
++    if isinstance(resp, dict) and resp.get('status') == 'failed':
++        return make_api_response(resp, 400)
++    return make_api_response(resp, 200)
++
++
+ @request_method(['POST'])
+ @csrf_exempt
+ def api_delete_scan(request):
+diff --git a/mobsf/StaticAnalyzer/views/common/artifacts.py b/mobsf/StaticAnalyzer/views/common/artifacts.py
+new file mode 100644
+index 0000000..e4ec51a
+--- /dev/null
++++ b/mobsf/StaticAnalyzer/views/common/artifacts.py
+@@ -0,0 +1,45 @@
++# -*- coding: utf_8 -*-
++"""Generated report artifact maintenance."""
++import logging
++from pathlib import Path
++
++from django.conf import settings
++from django.middleware.csrf import _does_token_match
++from django.http import HttpResponse
++
++from mobsf.MobSF.utils import (
++    is_md5,
++    print_n_send_error_response,
++)
++from mobsf.MobSF.views.authentication import login_required
++from mobsf.MobSF.views.authorization import (
++    Permissions,
++    permission_required,
++)
++
++logger = logging.getLogger(__name__)
++
++
++@login_required
++@permission_required(Permissions.DELETE)
++def clear_reports(request):
++    """Remove the generated report artifacts of a scan."""
++    checksum = request.GET.get('checksum', '')
++    if not is_md5(checksum):
++        return print_n_send_error_response(request, 'Invalid checksum')
++    removed = 0
++    dwd_dir = Path(settings.DWD_DIR)
++    try:
++        for item in dwd_dir.iterdir():
++            if item.is_file() and item.name.startswith(f'{checksum}-'):
++                item.unlink()
++                removed += 1
++    except OSError:
++        logger.exception('Cannot remove report artifacts')
++    token = request.GET.get('csrfmiddlewaretoken', '')
++    secret = request.COOKIES.get('csrftoken', '')
++    if not token or not secret or not _does_token_match(token, secret):
++        return print_n_send_error_response(request, 'Invalid request')
++    return HttpResponse(
++        '{"cleared": %d}' % removed,
++        content_type='application/json')
+diff --git a/mobsf/StaticAnalyzer/views/common/notes.py b/mobsf/StaticAnalyzer/views/common/notes.py
+new file mode 100644
+index 0000000..896c1de
+--- /dev/null
++++ b/mobsf/StaticAnalyzer/views/common/notes.py
+@@ -0,0 +1,47 @@
++# -*- coding: utf_8 -*-
++"""Per scan notes."""
++import logging
++from pathlib import Path
++
++from django.conf import settings
++from django.views.decorators.csrf import csrf_exempt
++from django.views.decorators.http import require_http_methods
++
++from mobsf.DynamicAnalyzer.views.common.shared import (
++    invalid_params,
++    send_response,
++)
++from mobsf.MobSF.utils import is_md5
++from mobsf.MobSF.views.authentication import login_required
++from mobsf.MobSF.views.authorization import (
++    Permissions,
++    permission_required,
++)
++
++logger = logging.getLogger(__name__)
++
++NOTE_FILE = 'note.txt'
++
++
++@csrf_exempt
++@login_required
++@permission_required(Permissions.SCAN)
++@require_http_methods(['POST'])
++def save_scan_note(request, api=False):
++    """Save a short note for a scan."""
++    try:
++        checksum = request.POST['hash' if api else 'checksum']
++        note = request.POST['note']
++    except KeyError:
++        return invalid_params(api)
++    if not is_md5(checksum) or len(note) > 1000:
++        return invalid_params(api)
++    scan_dir = Path(settings.UPLD_DIR) / checksum
++    if not scan_dir.is_dir():
++        return invalid_params(api)
++    try:
++        (scan_dir / NOTE_FILE).write_text(note, encoding='utf-8')
++    except OSError:
++        logger.exception('Cannot save the scan note')
++        return invalid_params(api)
++    return send_response({'status': 'ok'}, api)

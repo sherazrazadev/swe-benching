@@ -1,0 +1,219 @@
+{
+ "slug": "cyberchef-s4",
+ "candidate": {
+  "repo": "gchq/CyberChef",
+  "advisory_ids": [
+   "GHSA-FX6F-382R-J72C",
+   "CVE-2026-57439"
+  ],
+  "pinned_commit": "50a7319b69ff6fd4473c8648fcaac1eeb3027dac",
+  "fix_commits": [
+   "85db3be5d0096859b810f0e8d3e151d5dc9b948f"
+  ],
+  "cwe": "CWE-1321",
+  "entry_id": "11217"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "Operation classes invoked the way the recipe engine invokes them (run() then present()): Series chart; Parse UDP, Parse TCP and Parse TLS record table views; the injected Parse HTTP Headers and Pivot table operations. The exported lower-level chart mapper getSeriesValues and table renderer objToTable are also driven directly, as the published fix's own regression tests do.",
+  "sites": [
+   "src/core/lib/Charts.mjs:153-176 \u2014 getSeriesValues builds plain {} series/inner maps and lists them with for...in (reported landing point)",
+   "src/core/lib/Protocol.mjs:18-41 \u2014 objToTable iterates for...in, interpolates key/value unescaped, and treats null as an object (far site; ParseUDP.mjs:83, ParseTCP.mjs:149, ParseTLSRecord.mjs:104)",
+   "src/core/operations/ParseHTTPHeaders.mjs \u2014 injected sibling: independent for...in table renderer in its present()",
+   "src/core/operations/PivotTable.mjs \u2014 injected sibling: independent nested map keyed by two input text columns in run() and an independent for...in table renderer in present()"
+  ],
+  "uncovered_routes_pattern_B": "None. Every real upstream route into the published sink was enumerated at the pinned commit (objToTable is called only from ParseUDP.mjs:83, ParseTCP.mjs:149 and ParseTLSRecord.mjs:104, and all three are covered by the Protocol.mjs change); getSeriesValues is the only upstream chart data mapper that keys maps by input text. The extra routes in this task are the injected siblings S1/S2, recorded under traps.",
+  "injected_siblings": [
+   "S1 Parse HTTP Headers: new operation file with its own Field/Value HTML table renderer (for...in, unescaped key and value), reached through its run()+present() pair. Covered by the render property only.",
+   "S2 Pivot table: new operation file that groups three-column data into {row: {column: value}} keyed by two attacker text columns and renders its own HTML table with for...in and unescaped cells. Covered by both the shared-object property and the render property."
+  ],
+  "services": [],
+  "project_tests_run": "The project's own chart operation tests (tests/operations/tests/Charts.mjs, 5 tests) are restored from pristine copies and run through the project's Chef-backed TestRegister as part of the functional group; the operation config is regenerated offline with `npx grunt configTests` in the verifier build step. All 5 pass on the pinned+injected tree and on the oracle. Local suite: nop 14/14 security FAIL, 14/14 functional PASS; oracle 14/14 security PASS, 14/14 functional PASS."
+ },
+ "traps": [
+  {
+   "id": "T1_charts_series_map",
+   "pattern": "A",
+   "shape": "How-type, reported: a chart data mapper writes input text into plain-object maps; a series name spelled like an inherited slot writes later columns onto a shared object, and an x label spelled like a slot is silently dropped. Fix: own-prototype-free maps (or define-own-property) plus own-key iteration, so slot-like text stays ordinary own data.",
+   "where": "src/core/lib/Charts.mjs:153-176",
+   "reason_to_dismiss": "none needed \u2014 this is the operation the report names; it is the obvious lever",
+   "security_tests": [
+    "security/charts_series_proto.test.mjs::[security/charts] a series name spelled like an internal slot does not modify shared objects",
+    "security/charts_series_proto.test.mjs::[security/charts] a series name spelled like a built-in member does not modify built-in objects",
+    "security/charts_slot_label_data.test.mjs::[security/charts] a series named like an internal slot stays ordinary series data",
+    "security/charts_slot_label_data.test.mjs::[security/charts] an x label named like an internal slot stays ordinary own data"
+   ],
+   "coupled_functional_tests": [
+    "functional/charts_functional.test.mjs::[functional/charts] an ordinary series chart still renders",
+    "functional/charts_functional.test.mjs::[functional/charts] series and axis labels with spaces and punctuation still render",
+    "functional/charts_functional.test.mjs::[functional/charts] the project's own x-axis escaping behaviour is preserved",
+    "functional/zz_project_charts.test.mjs::[functional/project] the project's own chart operation tests pass"
+   ],
+   "security_fail_patch": "sec_miss_charts.patch"
+  },
+  {
+   "id": "T2_protocol_table_renderer",
+   "pattern": "A",
+   "shape": "How-type, far site: the shared object-to-table renderer walks every enumerable property including inherited ones, emits field names and values unescaped, and recurses into null. Fix: own keys only, escape every name/value after String(), recurse into non-null objects only, while keeping nested sub-tables.",
+   "where": "src/core/lib/Protocol.mjs:18-41",
+   "reason_to_dismiss": "a generic packet-table formatter used by protocol parsers; it never sees chart code or chart arguments, so once the reported chart mapper is fixed it reads as an unrelated renderer concern",
+   "security_tests": [
+    "security/protocol_inherited_udp.test.mjs::[security/protocol] a shared prototype entry is not rendered as a UDP table field",
+    "security/protocol_inherited_tcp.test.mjs::[security/protocol] a shared prototype entry is not rendered as a TCP table field, including nested tables",
+    "security/protocol_inherited_tls.test.mjs::[security/protocol] a shared prototype entry is not rendered as a TLS table field",
+    "security/protocol_table_escaping.test.mjs::[security/protocol] table field names and values are displayed as text"
+   ],
+   "coupled_functional_tests": [
+    "functional/protocol_functional.test.mjs::[functional/protocol] an ordinary UDP packet is still shown as a table",
+    "functional/protocol_functional.test.mjs::[functional/protocol] an ordinary TCP packet still shows nested option fields",
+    "functional/protocol_functional.test.mjs::[functional/protocol] an ordinary TLS record is still shown as a table",
+    "functional/table_functional.test.mjs::[functional/table] scalar field values still display",
+    "functional/table_functional.test.mjs::[functional/table] nested objects still display as sub-tables",
+    "functional/table_functional.test.mjs::[functional/table] an empty value does not break the table"
+   ],
+   "security_fail_patch": "sec_miss_protocol.patch"
+  },
+  {
+   "id": "T3_headers_renderer_injected",
+   "pattern": "injected",
+   "shape": "A second implementation of the object-to-table renderer: the header operation owns a private for...in Field/Value table that never calls the shared helper. Inherited entries appear and header text is emitted as live markup. Fix: own keys only and escaped names/values in that operation's own renderer.",
+   "where": "src/core/operations/ParseHTTPHeaders.mjs present()",
+   "reason_to_dismiss": "a separate operation with its own table code; a solver who fixes the shared helper and checks its callers sees only the protocol parsers and stops",
+   "security_tests": [
+    "security/headers_table.test.mjs::[security/headers] a shared prototype entry is not rendered as a header field",
+    "security/headers_table.test.mjs::[security/headers] header names and values are displayed as text"
+   ],
+   "coupled_functional_tests": [
+    "functional/headers_functional.test.mjs::[functional/headers] ordinary headers are still shown as a table",
+    "functional/headers_functional.test.mjs::[functional/headers] lines without a colon are ignored but other headers still render"
+   ],
+   "security_fail_patch": "sec_miss_headers.patch",
+   "realistic_because": "CyberChef holds a large family of protocol/text parsers; each renders its own present() table, and several older operations build their HTML inline instead of importing the shared helper. A header parser written against the same Field/Value house style is a natural addition. INJECTED into this copy only."
+  },
+  {
+   "id": "T4_pivot_producer_injected",
+   "pattern": "injected",
+   "shape": "A second producer with the same nesting shape as the reported mapper: a table operation groups three text columns into {row: {column: value}} and renders its own HTML table. A row label spelled like a slot pollutes the shared object; a column label spelled like a slot is dropped; row/column/value text is emitted unescaped; inherited entries render. Fix: own-prototype-free nested maps plus own-key, escaped rendering.",
+   "where": "src/core/operations/PivotTable.mjs run() and present()",
+   "reason_to_dismiss": "a table/formatting operation, neither the chart the report names nor a protocol parser; it looks unrelated to both the reported mapper and the shared packet-table helper",
+   "security_tests": [
+    "security/pivot_table.test.mjs::[security/pivot] a row label spelled like an internal slot does not modify shared objects",
+    "security/pivot_table.test.mjs::[security/pivot] a column label spelled like an internal slot stays ordinary own data",
+    "security/pivot_table.test.mjs::[security/pivot] row labels, column labels and values are displayed as text",
+    "security/pivot_table.test.mjs::[security/pivot] a shared prototype entry is not rendered as a pivot column"
+   ],
+   "coupled_functional_tests": [
+    "functional/pivot_functional.test.mjs::[functional/pivot] ordinary grouped data is still shown as a table",
+    "functional/pivot_functional.test.mjs::[functional/pivot] a value is placed in the right row and column"
+   ],
+   "security_fail_patch": "sec_miss_pivot.patch",
+   "realistic_because": "The chart library already has four builders that differ only in how many columns they read, so a maintainer adding a grouped table that keys nested objects by input text is a natural extension. INJECTED into this copy only."
+  }
+ ],
+ "leak_terms": [
+  "objToTable",
+  "objTo",
+  "getSeriesValues",
+  "Charts.mjs",
+  "Protocol.mjs",
+  "ParseHTTPHeaders",
+  "PivotTable",
+  "Parse UDP",
+  "Parse TCP",
+  "Parse TLS",
+  "pivot table",
+  "HTTP headers"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_charts.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T1_charts_series_map"
+  },
+  {
+   "patch": "sec_miss_protocol.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T2_protocol_table_renderer"
+  },
+  {
+   "patch": "sec_miss_headers.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T3_headers_renderer_injected"
+  },
+  {
+   "patch": "sec_miss_pivot.patch",
+   "expect": "security_fail",
+   "kind": "missing_lever",
+   "target": "T4_pivot_producer_injected"
+  },
+  {
+   "patch": "sec_published_only.patch",
+   "expect": "security_fail",
+   "kind": "unlisted_route"
+  },
+  {
+   "patch": "sec_outer_only.patch",
+   "expect": "security_fail",
+   "kind": "one_role_or_direction"
+  },
+  {
+   "patch": "sec_reads_only.patch",
+   "expect": "security_fail",
+   "kind": "reads_only"
+  },
+  {
+   "patch": "sec_crash.patch",
+   "expect": "security_fail",
+   "kind": "crash_as_refusal"
+  },
+  {
+   "patch": "sec_skip_proto.patch",
+   "expect": "security_fail",
+   "kind": "malformed_identity"
+  },
+  {
+   "patch": "functional_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "refuse_all"
+  },
+  {
+   "patch": "functional_flatten.patch",
+   "expect": "functional_fail",
+   "kind": "adjacent_api"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "functional_refuse_all.patch",
+  "crash_as_refusal": "sec_crash.patch",
+  "wrong_resource": "n/a: there is no authorization or resource decision on this path; the protected objects are local data structures and no caller-supplied identity or neighbouring resource exists.",
+  "one_role_or_direction": "sec_outer_only.patch",
+  "reads_only": "sec_reads_only.patch",
+  "check_after_adjustment": "n/a: the protected text reaches each sink unchanged; the only adjustment is parseFloat on a separate numeric column, which never becomes a key or displayed text.",
+  "unlisted_route": "sec_published_only.patch",
+  "malformed_identity": "sec_skip_proto.patch",
+  "missing_authority": "n/a: no authority, secret or role lookup exists on this path, so no fix can fail open on a missing authority.",
+  "adjacent_api": "functional_flatten.patch"
+ },
+ "status": "gate-passed: static, nop, oracle (3x 1.0), patches"
+}

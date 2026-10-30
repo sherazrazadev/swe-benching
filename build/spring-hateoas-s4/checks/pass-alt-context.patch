@@ -1,0 +1,383 @@
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java b/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java
+index d47cee19..a9aa997c 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java
+@@ -25,6 +25,12 @@ import jakarta.validation.constraints.NotNull;
+ import jakarta.validation.constraints.Pattern;
+ import jakarta.validation.constraints.Size;
+ 
++import tools.jackson.databind.BeanDescription;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.ClassIntrospector;
++
+ import java.beans.PropertyDescriptor;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Field;
+@@ -121,6 +127,65 @@ public class PropertyUtils {
+ 		return obj;
+ 	}
+ 
++	/**
++	 * Creates an instance of the given type from the given property values, using the mapper's property metadata to
++	 * decide which supplied names may be written.
++	 */
++	@SuppressWarnings("unchecked")
++	public static <T> T createObjectFromProperties(DeserializationContext context, JavaType type,
++			Map<String, Object> properties) {
++
++		T instance = (T) BeanUtils.instantiateClass(type.getRawClass());
++
++		applyProperties(context, type, instance, properties);
++
++		return instance;
++	}
++
++	/**
++	 * Applies the given property values to an existing object, using the mapper's property metadata to decide which
++	 * supplied names may be written.
++	 */
++	public static void applyProperties(DeserializationContext context, JavaType type, Object target,
++			Map<String, Object> properties) {
++
++		BeanDescription description = describe(context, type);
++		Map<String, PropertyDescriptor> descriptors = new HashMap<>();
++
++		getPropertyDescriptors(type.getRawClass()).forEach(it -> descriptors.put(it.getName(), it));
++
++		description.findProperties().forEach(it -> {
++
++			PropertyDescriptor descriptor = descriptors.get(it.getInternalName());
++
++			if (descriptor == null) {
++				return;
++			}
++
++			Method writeMethod = descriptor.getWriteMethod();
++
++			if (writeMethod == null || !properties.containsKey(it.getName())) {
++				return;
++			}
++
++			ReflectionUtils.makeAccessible(writeMethod);
++
++			try {
++				writeMethod.invoke(target, properties.get(it.getName()));
++			} catch (IllegalAccessException | InvocationTargetException e) {
++				throw new RuntimeException(e);
++			}
++		});
++	}
++
++	private static BeanDescription describe(DeserializationContext context, JavaType type) {
++
++		ClassIntrospector introspector = context.getConfig().classIntrospectorInstance();
++		AnnotatedClass annotatedClass = introspector.introspectClassAnnotations(type);
++
++		return introspector.introspectForDeserialization(type, annotatedClass);
++	}
++
+ 	public static InputPayloadMetadata getExposedProperties(@Nullable Class<?> type) {
+ 		return getExposedProperties(type == null ? null : ResolvableType.forClass(type));
+ 	}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java
+index 16d5f11d..b724394a 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java
+@@ -15,6 +15,7 @@
+  */
+ package org.springframework.hateoas.mediatype.collectionjson;
+ 
++import tools.jackson.databind.DeserializationContext;
+ import tools.jackson.databind.JavaType;
+ 
+ import java.util.Collections;
+@@ -191,11 +192,11 @@ final class CollectionJsonItem<T> {
+ 	/**
+ 	 * Generate an object using the deserialized properties and the provided type from the deserializer.
+ 	 *
+-	 * @param javaType - type of the object to create
++	 * @param description must not be {@literal null}.
+ 	 * @return
+ 	 */
+ 	@Nullable
+-	Object toRawData(JavaType javaType) {
++	Object toRawData(DeserializationContext context, JavaType javaType) {
+ 
+ 		if (this.data.isEmpty()) {
+ 			return null;
+@@ -205,7 +206,7 @@ final class CollectionJsonItem<T> {
+ 			return this.data.get(0).getValue();
+ 		}
+ 
+-		return PropertyUtils.createObjectFromProperties(javaType.getRawClass(), //
++		return PropertyUtils.createObjectFromProperties(context, javaType, //
+ 				this.data.stream() //
+ 						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue)));
+ 	}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java
+index 67c8eebc..83f515ab 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java
+@@ -19,6 +19,7 @@ import tools.jackson.core.JacksonException;
+ import tools.jackson.core.JsonGenerator;
+ import tools.jackson.core.JsonParser;
+ import tools.jackson.core.Version;
++import tools.jackson.databind.BeanDescription;
+ import tools.jackson.databind.BeanProperty;
+ import tools.jackson.databind.DeserializationContext;
+ import tools.jackson.databind.JavaType;
+@@ -26,6 +27,8 @@ import tools.jackson.databind.SerializationContext;
+ import tools.jackson.databind.ValueDeserializer;
+ import tools.jackson.databind.ValueSerializer;
+ import tools.jackson.databind.deser.std.ContainerDeserializerBase;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.ClassIntrospector;
+ import tools.jackson.databind.jsontype.TypeSerializer;
+ import tools.jackson.databind.module.SimpleModule;
+ import tools.jackson.databind.ser.std.StdContainerSerializer;
+@@ -647,7 +650,7 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 								(left, right) -> right);
+ 
+ 				CollectionJsonItem<?> firstItem = items.get(0).withOwnSelfLink();
+-				RepresentationModel<?> resource = (RepresentationModel<?>) firstItem.toRawData(this.contentType);
++				RepresentationModel<?> resource = (RepresentationModel<?>) firstItem.toRawData(ctxt, this.contentType);
+ 
+ 				if (resource != null) {
+ 					resource.add(firstItem.getLinks().merge(merged));
+@@ -664,7 +667,7 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue));
+ 
+ 				RepresentationModel<?> resourceSupport = (RepresentationModel<?>) PropertyUtils
+-						.createObjectFromProperties(this.contentType.getRawClass(), properties);
++						.createObjectFromProperties(ctxt, this.contentType, properties);
+ 
+ 				return resourceSupport.add(withOwnSelfLink.getLinks());
+ 
+@@ -689,6 +692,14 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 		}
+ 	}
+ 
++	private static BeanDescription getDescription(DeserializationContext context, JavaType type) {
++
++		ClassIntrospector introspector = context.getConfig().classIntrospectorInstance();
++		AnnotatedClass annotatedClass = introspector.introspectClassAnnotations(type);
++
++		return introspector.introspectForDeserialization(type, annotatedClass);
++	}
++
+ 	static class CollectionJsonResourceDeserializer extends ContainerDeserializerBase<EntityModel<?>> {
+ 
+ 		private final JavaType contentType;
+@@ -731,12 +742,13 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 			Links links = collection.withOwnSelfLink().getLinks();
+ 			CollectionJsonTemplate template = collection.getTemplate();
+ 
++
+ 			if (items.isEmpty() && template != null) {
+ 
+ 				Map<String, Object> properties = template.getData().stream()
+ 						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue));
+ 
+-				Object obj = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++				Object obj = PropertyUtils.createObjectFromProperties(ctxt, rootType, properties);
+ 
+ 				return EntityModel.of(obj, links);
+ 
+@@ -750,7 +762,7 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 
+ 				CollectionJsonItem<?> firstItem = items.get(0).withOwnSelfLink();
+ 
+-				return EntityModel.of(firstItem.toRawData(rootType),
++				return EntityModel.of(firstItem.toRawData(ctxt, rootType),
+ 						merged.merge(MergeMode.REPLACE_BY_REL, firstItem.getLinks()));
+ 			}
+ 		}
+@@ -849,8 +861,8 @@ public class CollectionJsonJacksonModule extends SimpleModule {
+ 			return collection.getItems().stream() //
+ 					.map(CollectionJsonItem::withOwnSelfLink) //
+ 					.map(it -> isResource //
+-							? RepresentationModel.of(it.toRawData(rootType), it.getLinks()) //
+-							: it.toRawData(rootType)) //
++							? RepresentationModel.of(it.toRawData(ctxt, rootType), it.getLinks()) //
++							: it.toRawData(ctxt, rootType)) //
+ 					.collect(Collectors.collectingAndThen(Collectors.toList(), it -> finalizer.apply(it, links)));
+ 		}
+ 	}
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
+index 28713faf..a1f7c413 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
+@@ -33,6 +33,7 @@ import org.springframework.hateoas.EntityModel;
+ import org.springframework.hateoas.Links;
+ import org.springframework.hateoas.RepresentationModel;
+ import org.springframework.hateoas.mediatype.JacksonHelper;
++import org.springframework.hateoas.mediatype.PropertyUtils;
+ 
+ /**
+  * Reads a HAL-FORMS representation into an {@link EntityModel}, applying the values submitted through the templates
+@@ -79,12 +80,14 @@ final class HalFormsTemplateDataDeserializer extends ValueDeserializer<Represent
+ 		JsonNode templates = document.get(TEMPLATES);
+ 		Links links = readLinks(document, context);
+ 
++		ObjectNode contentNode = document.deepCopy().without(List.of(LINKS, TEMPLATES));
++
+ 		Object content = RepresentationModel.class.isAssignableFrom(rawType) //
+-				? context.readTreeAsValue(document.deepCopy().without(List.of(LINKS, TEMPLATES)), Object.class) //
+-				: context.readTreeAsValue(document.deepCopy().without(List.of(LINKS, TEMPLATES)), rootType);
++				? context.readTreeAsValue(contentNode, Object.class) //
++				: context.readTreeAsValue(contentNode, rootType);
+ 
+ 		if (templates != null) {
+-			HalFormsTemplateValues.applyTo(content, extractValues(templates, context));
++			PropertyUtils.applyProperties(context, rootType, content, extractValues(templates, context));
+ 		}
+ 
+ 		return EntityModel.of(content, links);
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
+index 29333657..3e59a40f 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
+@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
+ import java.util.Map;
+ 
+ import org.jspecify.annotations.Nullable;
++import org.springframework.hateoas.mediatype.PropertyUtils;
+ 
+ /**
+  * Deserializes an {@link Problem.ExtendedProblem} from an HTTP Problem Details document, materializing the additional
+@@ -78,7 +79,7 @@ final class ProblemPayloadDeserializer extends ValueDeserializer<Problem.Extende
+ 		Object payload = payloadClass == Object.class || Map.class.isAssignableFrom(payloadClass) //
+ 				|| payloadClass.isInterface() //
+ 						? document //
+-						: ProblemPayloadValues.create(payloadClass, document);
++						: PropertyUtils.createObjectFromProperties(context, payloadType, document);
+ 
+ 		return new Problem.ExtendedProblem<>(toUri(type), title == null ? null : title.toString(),
+ 				toInteger(status), detail == null ? null : detail.toString(), toUri(instance), payload);
+diff --git a/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java
+index f53aa96a..2daa42b6 100644
+--- a/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java
++++ b/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java
+@@ -21,6 +21,7 @@ import static org.springframework.hateoas.mediatype.uber.UberData.*;
+ import tools.jackson.core.JsonGenerator;
+ import tools.jackson.core.JsonParser;
+ import tools.jackson.core.Version;
++import tools.jackson.databind.BeanDescription;
+ import tools.jackson.databind.BeanProperty;
+ import tools.jackson.databind.DeserializationContext;
+ import tools.jackson.databind.JavaType;
+@@ -30,6 +31,8 @@ import tools.jackson.databind.ValueSerializer;
+ import tools.jackson.databind.annotation.JsonDeserialize;
+ import tools.jackson.databind.deser.std.ContainerDeserializerBase;
+ import tools.jackson.databind.deser.std.StdDeserializer;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.ClassIntrospector;
+ import tools.jackson.databind.jsontype.TypeSerializer;
+ import tools.jackson.databind.module.SimpleModule;
+ import tools.jackson.databind.ser.std.StdContainerSerializer;
+@@ -530,14 +533,15 @@ public class UberJacksonModule extends SimpleModule {
+ 			RepresentationModel<?> result = doc.getUber().getData().stream() //
+ 					.filter(uberData -> StringUtils.hasText(uberData.getName())) //
+ 					.findFirst() //
+-					.map(uberData -> convertToResourceSupport(uberData, links)) //
++					.map(uberData -> convertToResourceSupport(uberData, links, ctxt)) //
+ 					.orElse(null);
+ 
+ 			return result == null ? new RepresentationModel<>().add(links) : result;
+ 		}
+ 
+ 		@NotNull
+-		private RepresentationModel<?> convertToResourceSupport(UberData uberData, Links links) {
++		private RepresentationModel<?> convertToResourceSupport(UberData uberData, Links links,
++				DeserializationContext context) {
+ 
+ 			List<UberData> data = uberData.getData();
+ 			Map<String, Object> properties;
+@@ -549,8 +553,7 @@ public class UberJacksonModule extends SimpleModule {
+ 						.collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 			}
+ 
+-			RepresentationModel<?> resourceSupport = (RepresentationModel<?>) PropertyUtils
+-					.createObjectFromProperties(this.getContentType().getRawClass(), properties);
++			RepresentationModel<?> resourceSupport = (RepresentationModel<?>) PropertyUtils.createObjectFromProperties(context, contentType, properties);
+ 
+ 			return resourceSupport.add(links);
+ 		}
+@@ -587,6 +590,14 @@ public class UberJacksonModule extends SimpleModule {
+ 		}
+ 	}
+ 
++	private static BeanDescription getDescription(DeserializationContext context, JavaType type) {
++
++		ClassIntrospector introspector = context.getConfig().classIntrospectorInstance();
++		AnnotatedClass annotatedClass = introspector.introspectClassAnnotations(type);
++
++		return introspector.introspectForDeserialization(type, annotatedClass);
++	}
++
+ 	/**
+ 	 * Custom {@link StdDeserializer} to deserialize {@link EntityModel}.
+ 	 */
+@@ -618,12 +629,12 @@ public class UberJacksonModule extends SimpleModule {
+ 			return doc.getUber().getData().stream() //
+ 					.filter(uberData -> StringUtils.hasText(uberData.getName())) //
+ 					.findFirst() //
+-					.map(uberData -> convertToResource(uberData, links)) //
++					.map(uberData -> convertToResource(uberData, links, ctxt)) //
+ 					.orElseThrow(
+ 							() -> new IllegalStateException("No data entry containing a 'value' was found in this document!"));
+ 		}
+ 
+-		private RepresentationModel<?> convertToResource(UberData uberData, Links links) {
++		private RepresentationModel<?> convertToResource(UberData uberData, Links links, DeserializationContext context) {
+ 
+ 			// Primitive type
+ 			List<UberData> data = uberData.getData();
+@@ -645,7 +656,7 @@ public class UberJacksonModule extends SimpleModule {
+ 					: data.stream().collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 
+ 			JavaType rootType = JacksonHelper.findRootType(this.contentType);
+-			Object value = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++			Object value = PropertyUtils.createObjectFromProperties(context, rootType, properties);
+ 
+ 			return EntityModel.of(value, links);
+ 		}
+@@ -710,7 +721,7 @@ public class UberJacksonModule extends SimpleModule {
+ 			JavaType rootType = JacksonHelper.findRootType(this.contentType);
+ 			UberDocument doc = p.readValueAs(UberDocument.class);
+ 
+-			return extractResources(doc, rootType, this.contentType);
++			return extractResources(doc, rootType, this.contentType, ctxt);
+ 		}
+ 
+ 		/**
+@@ -773,7 +784,7 @@ public class UberJacksonModule extends SimpleModule {
+ 
+ 			UberDocument doc = p.readValueAs(UberDocument.class);
+ 
+-			CollectionModel<?> resources = extractResources(doc, rootType, this.contentType);
++			CollectionModel<?> resources = extractResources(doc, rootType, this.contentType, ctxt);
+ 			PageMetadata pageMetadata = extractPagingMetadata(doc);
+ 
+ 			return PagedModel.of(resources.getContent(), pageMetadata, resources.getLinks());
+@@ -818,7 +829,8 @@ public class UberJacksonModule extends SimpleModule {
+ 	 * @param contentType
+ 	 * @return
+ 	 */
+-	private static CollectionModel<?> extractResources(UberDocument doc, JavaType rootType, JavaType contentType) {
++	private static CollectionModel<?> extractResources(UberDocument doc, JavaType rootType, JavaType contentType,
++			DeserializationContext context) {
+ 
+ 		List<Object> content = new ArrayList<>();
+ 
+@@ -872,7 +884,7 @@ public class UberJacksonModule extends SimpleModule {
+ 								: itemData.stream() //
+ 										.collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 
+-						Object obj = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++						Object obj = PropertyUtils.createObjectFromProperties(context, rootType, properties);
+ 						resource = EntityModel.of(obj, uberData.getLinks());
+ 					}
+ 				}

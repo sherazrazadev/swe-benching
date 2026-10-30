@@ -1,0 +1,186 @@
+{
+ "slug": "rust-sdk-s4",
+ "candidate": "GHSA-33F5-2C5Q-WGWJ / CVE-2026-63127 - modelcontextprotocol/rust-sdk - OAuth protected-resource metadata resource identity not bound to the MCP server URL",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "pinned_commit": "eb435c6f51864df74926ef115befce55c16b01ba",
+  "fix_commit": "c1a8b29ff2cc45e7820b900dae42cbb4958089ec",
+  "entry_point": "public library API AuthorizationManager::discover_metadata (all discovery routes) and OAuthState::authenticate_client_credentials (token request); tests drive them with an in-process OAuthHttpClient stub",
+  "sites": [
+   "crates/rmcp/src/transport/auth.rs:1828 discover_oauth_server_via_resource_metadata (published site; validation inserted before the scope store)",
+   "crates/rmcp/src/transport/auth.rs:1963 fetch_resource_metadata_from_url (injected origin-wide merge at 1998)",
+   "crates/rmcp/src/transport/auth.rs:2015 canonical_authorization_servers (injected second metadata consumer)",
+   "crates/rmcp/src/transport/auth.rs:2322 exchange_client_credentials (caller-supplied resource forwarded to the token request)"
+  ],
+  "routes": [
+   "WWW-Authenticate resource_metadata URL -> protected-resource document -> authorization-server discovery",
+   "base URL probe and path-inserted well-known protected-resource discovery",
+   "origin-wide canonical protected-resource document merged into the authorization-server set (injected)",
+   "client-credentials token request carrying a caller-supplied resource identifier"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "cargo test -p rmcp --features auth --lib transport::auth::tests (106 passed at pinned+injected)",
+   "cargo test -p rmcp --features auth --test test_client_credentials (4 passed at pinned+injected; pristine copy is graded as functional)"
+  ],
+  "local_verification": "hidden security suite 0/8 pass on pinned+injected, 8/8 on the oracle; functional 5/5 and project 4/4 on both; nine check patches observed behaving as declared with cargo test locally",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS - security 0/8 (all 8 fail on vulnerable), functional 9/9 pass",
+   "oracle": "PASS - 3/3 identical trials, reward 1.0, security 8/8, functional 9/9",
+   "patches": "PASS - 9/9 checks behaved as declared"
+  }
+ },
+ "leak_terms": [
+  "ResourceServerMetadata",
+  "validate_resource_metadata_resource",
+  "resource_identifiers_match",
+  "is_root_resource_identifier",
+  "canonical_authorization_servers",
+  "fetch_resource_metadata_from_url",
+  "discover_oauth_server_via_resource_metadata",
+  "discover_metadata",
+  "exchange_client_credentials",
+  "authenticate_client_credentials",
+  "client_credentials",
+  "scopes_supported",
+  "authorization_servers",
+  "auth.rs",
+  "rmcp/src/transport"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_shape_path_slash.patch",
+   "expect": "security_fail",
+   "kind": "shape",
+   "why": "normalizes every trailing slash, so a different path identifier is accepted"
+  },
+  {
+   "patch": "sf_client_credentials.patch",
+   "expect": "security_fail",
+   "kind": "route",
+   "why": "fixes metadata discovery only; the client-credentials token request still carries a foreign resource"
+  },
+  {
+   "patch": "sf_merged_document.patch",
+   "expect": "security_fail",
+   "kind": "merged_route",
+   "why": "validates the requested document only; authorization servers folded in from the origin-wide document are still used"
+  },
+  {
+   "patch": "sf_scopes_side_effect.patch",
+   "expect": "security_fail",
+   "kind": "ordering",
+   "why": "refuses the document after its scopes have already been stored for later requests"
+  },
+  {
+   "patch": "ff_exact_identity.patch",
+   "expect": "functional_fail",
+   "kind": "over_strict",
+   "why": "plain equality rejects a bare-origin identifier written without the trailing slash"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "refuse_all",
+   "why": "refuses all discovery, including legitimate servers"
+  },
+  {
+   "patch": "ff_wrong_object.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_object",
+   "why": "compares the document with its own URL instead of the server address"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "why": "oracle plus validation at the fetch layer"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "why": "validates at the fetch layer and binds client-credentials requests to the server address by rewriting the value"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: a panicking guard is caught by libtest as a test failure, so the security tests already fail it; no separate patch is needed",
+  "wrong_resource": "ff_wrong_object.patch",
+  "one_role_or_direction": "n/a: the OAuth client has one role and one direction; there is no peer or role pair to fix separately",
+  "reads_only": "n/a: discovery and token acquisition are both outbound requests; there is no read/write verb pair on the protected path",
+  "check_after_adjustment": "sf_shape_path_slash.patch",
+  "unlisted_route": "sf_merged_document.patch",
+  "malformed_identity": "n/a: the guard compares two raw strings and the only malformed JSON form (non-string) never reaches it; the absent-value case is covered by the missing-resource security test",
+  "missing_authority": "n/a: no authority lookup exists; the guard is a local identifier comparison",
+  "adjacent_api": "n/a: no shared helper's stated behaviour changes; the hardening and alternative passes keep every public path working"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "resource identifier equivalence: an origin-only identifier may differ by one trailing slash, a path identifier may not",
+   "where": "crates/rmcp/src/transport/auth.rs:1840 and :1895",
+   "security_tests": [
+    "resource_metadata_with_path_trailing_slash_is_refused",
+    "resource_metadata_for_another_path_is_refused",
+    "resource_metadata_claiming_the_document_url_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "bare_origin_identifiers_still_match_with_or_without_trailing_slash",
+    "path_inserted_well_known_metadata_still_works"
+   ],
+   "security_fail_patch": "sf_shape_path_slash.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix must implement exactly this identity semantics"
+  },
+  {
+   "id": "T2",
+   "shape": "route where the protection never existed: the token audience comes from caller configuration instead of the server address",
+   "where": "crates/rmcp/src/transport/auth.rs:2322",
+   "security_tests": [
+    "client_credentials_must_bind_resource_to_server"
+   ],
+   "coupled_functional_tests": [
+    "client_credentials_with_server_resource_still_works"
+   ],
+   "security_fail_patch": "sf_client_credentials.patch",
+   "realistic_because": "real, unmodified upstream code: the authorization and code-exchange requests hardcode the server address while this branch forwards the caller's value"
+  },
+  {
+   "id": "T3",
+   "shape": "second metadata consumer: the origin-wide canonical document contributes authorization servers inside the fetch helper, off the path of the identity check",
+   "where": "crates/rmcp/src/transport/auth.rs:1998 and :2015 (injected)",
+   "security_tests": [
+    "canonical_metadata_for_another_resource_is_not_used"
+   ],
+   "coupled_functional_tests": [
+    "metadata_for_this_server_published_canonically_is_still_merged"
+   ],
+   "security_fail_patch": "sf_merged_document.patch",
+   "realistic_because": "injected: a compatibility merge a maintainer could add for deployments that publish only the origin-wide document; plausible and reachable through the real discovery entry point"
+  },
+  {
+   "id": "T4",
+   "shape": "ordering: document-derived scope state is stored before the identity check, so a refused document still affects later requests",
+   "where": "crates/rmcp/src/transport/auth.rs:1842",
+   "security_tests": [
+    "rejected_resource_metadata_must_not_change_requested_scopes"
+   ],
+   "coupled_functional_tests": [
+    "legitimate_canonical_discovery_still_works"
+   ],
+   "security_fail_patch": "sf_scopes_side_effect.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix inserts the check before the scope store, but any later insertion leaves the side effect"
+  }
+ ],
+ "status": "built and gate-green on 2026-10-30: static PASS; nop PASS (security 0/8 pass = all 8 fail on the pinned+injected tree, functional 9/9 pass); oracle PASS 3/3 identical trials at reward 1.0 (8/8 security, 9/9 functional); patches PASS 9/9 as declared (sf_shape_path_slash, sf_client_credentials, sf_merged_document, sf_scopes_side_effect each leave exactly their own security test failing with functional green; ff_exact_identity, ff_refuse_all, ff_wrong_object fail functional; pass_hardening and pass_alt score 1.0). The blind patch is declared and written downstream."
+}

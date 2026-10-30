@@ -1,0 +1,243 @@
+{
+ "slug": "mobile-security-framework-mobsf-s4",
+ "candidate": "screener-v2 entry 506: GHSA-3P54-567P-2WPR / CVE-2026-68923 / PYSEC-2026-3688 (MobSF/Mobile-Security-Framework-MobSF)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "c098134845a9f537a4feb64090883865cea5383e (parent of the published fix 62563ca429a75b3e5d47a13b958e1d2e7d5e2bbf). The fix commit adds no CSRF regression tests; the pinned commit contains none.",
+  "entry_points": [
+   "HTTP POST /delete_scan/ (form submission, session cookie)",
+   "HTTP POST /change_password/ (form submission, session cookie)",
+   "HTTP GET /generate_downloads/?hash=<md5>&file_type=java (load-triggered state change, real upstream)",
+   "HTTP POST /scan_note/ (shared handler also exposed to key clients)",
+   "HTTP GET /clear_reports/?checksum=<md5> (load-triggered maintenance action with a late token check)",
+   "HTTP POST /sso/acs/ (external identity provider callback, cross-origin by design)",
+   "HTTP GET /download/<file> (read-only download)",
+   "HTTP POST /api/v1/delete_scan and /api/v1/scan_note (key-authenticated clients)",
+   "HTTP GET / (token-bearing page used to obtain the anti-forgery token like a browser)"
+  ],
+  "sites": [
+   "mobsf/MobSF/settings.py:195-211 (published: dead MIDDLEWARE_CLASSES tuple, live MIDDLEWARE without CsrfViewMiddleware)",
+   "mobsf/MobSF/views/saml2.py:157-158 (coupled preservation: cross-origin POST callback)",
+   "mobsf/MobSF/views/home.py:499 (real upstream load-triggered state change)",
+   "mobsf/StaticAnalyzer/views/common/notes.py:26-30 (injected shared handler with a view-level exemption)",
+   "mobsf/StaticAnalyzer/views/common/artifacts.py:25-42 (injected maintenance route, token checked after removal)"
+  ],
+  "routes": [
+   "cross-site POST /delete_scan/ removed a scan row and its files at the pinned commit; refused with a client error and no change after the reference fix (confirmed by live-server tests)",
+   "cross-site POST /change_password/ changed the password at the pinned commit; refused after the fix (confirmed)",
+   "GET /generate_downloads/ created a zip at the pinned commit and still does after a middleware-only fix; refused with no archive after the reference fix (confirmed)",
+   "POST /scan_note/ without a token wrote note.txt at the pinned commit and after a middleware-only fix; refused after the reference fix (confirmed)",
+   "GET /clear_reports/ removed artifacts and then returned a server error at the pinned commit; refused with no removal after the reference fix (confirmed)",
+   "POST /sso/acs/ is refused by the origin protection unless the callback is exempted; the reference fix keeps it reachable (confirmed)",
+   "GET /download/<file> without a token keeps returning the file (confirmed)",
+   "POST /api/v1/delete_scan and /api/v1/scan_note with the API key and no anti-forgery token keep working (confirmed)"
+  ],
+  "services": [
+   "None. The Django test runner creates its own in-memory SQLite database; the application home is a writable directory under /var/tmp."
+  ],
+  "project_tests_run": [
+   "python manage.py check passes at the pinned+injection tree, at the reference fix, at the hardening patch and at the alternative fix.",
+   "The project's only test class (mobsf/StaticAnalyzer/tests.py::StaticAnalyzerAndAPI) drives the real analyzers over the test_files submodule and the downloaded analysis toolchain; it does not exercise the request pipeline and cannot run offline. No project test covers browser-origin protection, and the published fix adds none."
+  ],
+  "local_runs": "Gate: static PASS; nop PASS (security 0/8, functional 9/9); oracle PASS (3/3 reward 1.0, security 8/8 and functional 9/9 each, identical); patches PASS (sf-middleware-only 5 security failures; sf-generate 2; sf-scan-note 1; sf-clear-reports 2; sf-no-middleware 4; sf-crash 4; sf-failopen 3; sf-parser 4; ff-strict 2 functional; ff-api-exempt 1 functional; ff-saml 1 functional; pass-hardening 17/17; pass-alternative 17/17).",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS (security 0/8 on the vulnerable build, functional 9/9)",
+   "oracle": "PASS (3 runs, reward 1.0, identical security/functional results)",
+   "patches": "PASS (13 declared checks: 8 security_fail with functional intact, 3 functional_fail, 2 pass)",
+   "gate_report": "build/mobile-security-framework-mobsf-s4/gate_summary.json (all four stages; each was run separately with --only)"
+  }
+ },
+ "leak_terms": [
+  "settings.py",
+  "MIDDLEWARE",
+  "MIDDLEWARE_CLASSES",
+  "CsrfViewMiddleware",
+  "csrf_exempt",
+  "csrf_protect",
+  "csrfmiddlewaretoken",
+  "X-CSRFToken",
+  "Django",
+  "generate_download",
+  "generate_downloads",
+  "scan_note",
+  "save_scan_note",
+  "clear_reports",
+  "saml_acs",
+  "sso/acs",
+  "RecentScansDB",
+  "note.txt",
+  "SAML",
+  "CSRF",
+  "cross-site request forgery",
+  "Samesite",
+  "home.py",
+  "saml2.py",
+  "urls.py",
+  "artifacts.py",
+  "notes.py",
+  "security.py",
+  "api_static_analysis.py",
+  "api_middleware.py",
+  "android_binary_analysis.html"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-middleware-only.patch",
+   "expect": "security_fail",
+   "note": "the published pipeline restoration plus the identity-provider exemption only: the load-triggered action, the shared endpoint and the maintenance route stay open"
+  },
+  {
+   "patch": "sf-generate.patch",
+   "expect": "security_fail",
+   "note": "everything except the real upstream load-triggered state change (T1)"
+  },
+  {
+   "patch": "sf-scan-note.patch",
+   "expect": "security_fail",
+   "note": "everything except removing the view-level exemption from the shared handler (T2)"
+  },
+  {
+   "patch": "sf-clear-reports.patch",
+   "expect": "security_fail",
+   "note": "everything except moving the maintenance route's guard ahead of its file removal (T3)"
+  },
+  {
+   "patch": "sf-no-middleware.patch",
+   "expect": "security_fail",
+   "note": "the route fixes without the browser-origin protection in the pipeline: form submissions stay open"
+  },
+  {
+   "patch": "sf-crash.patch",
+   "expect": "security_fail",
+   "note": "the reference fix with a server error used as the refusal"
+  },
+  {
+   "patch": "sf-failopen.patch",
+   "expect": "security_fail",
+   "note": "a hand-written guard that skips verification when no token was submitted"
+  },
+  {
+   "patch": "sf-parser.patch",
+   "expect": "security_fail",
+   "note": "a hand-written guard that only parses the masked token shape and lets absent or malformed values through"
+  },
+  {
+   "patch": "ff-strict.patch",
+   "expect": "functional_fail",
+   "note": "an over-broad guard that demands a cookie on every page request, breaking read-only downloads"
+  },
+  {
+   "patch": "ff-api-exempt.patch",
+   "expect": "functional_fail",
+   "note": "the shared-endpoint fix that forgets the key-authenticated wrapper's exemption, breaking API clients"
+  },
+  {
+   "patch": "ff-saml.patch",
+   "expect": "functional_fail",
+   "note": "the reference fix without the identity-provider callback exemption, breaking sign-in"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "the reference fix plus defensive checksum validation on the model the security tests import and a resolved-path check before removing artifacts"
+  },
+  {
+   "patch": "pass-alternative.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "a custom middleware that carries the exemption centrally instead of decorating the callback"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-strict.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "n/a: the property decides on the request's method and origin, not on a per-resource authority; there is no neighbouring object an authority check could be made against",
+  "one_role_or_direction": "n/a: every session gets the same protection and there is no peer, role or direction variant in this task",
+  "reads_only": "sf-no-middleware.patch",
+  "check_after_adjustment": "sf-clear-reports.patch",
+  "unlisted_route": "sf-middleware-only.patch",
+  "malformed_identity": "sf-parser.patch",
+  "missing_authority": "sf-failopen.patch",
+  "adjacent_api": "ff-api-exempt.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "route where the protection never existed: a state change is performed by a request a browser sends when it merely loads a resource, so protecting unsafe methods leaves it open",
+   "where": "mobsf/MobSF/views/home.py:499",
+   "security_tests": [
+    "security/test_csrf.py::LoadTriggeredTests::test_cross_site_generate_download",
+    "security/test_csrf.py::LoadTriggeredTests::test_generate_download_rejects_a_load_even_with_a_token"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::LegitimateWrites::test_generate_download_with_token"
+   ],
+   "security_fail_patch": "sf-generate.patch",
+   "realistic_because": "real, unmodified upstream code: a GET helper reached by an anchor, with no method restriction"
+  },
+  {
+   "id": "T2",
+   "shape": "shared handler exempted at the view: the endpoint is written for key-authenticated clients but the same function is wired to a browser route, so the exemption covers the browser route too",
+   "where": "mobsf/StaticAnalyzer/views/common/notes.py:26",
+   "security_tests": [
+    "security/test_csrf.py::ScanNoteTests::test_cross_site_save_scan_note"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::LegitimateWrites::test_save_scan_note_with_token",
+    "functional/test_legit.py::ReadsAndProgrammaticClients::test_programmatic_note_client_keeps_working"
+   ],
+   "security_fail_patch": "sf-scan-note.patch",
+   "realistic_because": "code a maintainer could plausibly have left: the decorator belongs to the API client that posts without a token, and the function was later reused by a page"
+  },
+  {
+   "id": "T3",
+   "shape": "ineffective defence in the wrong order: the maintenance route validates the anti-forgery value only after it has already removed the files, so a refused request still changes state",
+   "where": "mobsf/StaticAnalyzer/views/common/artifacts.py:41",
+   "security_tests": [
+    "security/test_csrf.py::ArtifactMaintenanceTests::test_cross_site_clear_reports",
+    "security/test_csrf.py::ArtifactMaintenanceTests::test_clear_reports_rejects_a_load_even_with_a_token"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::LegitimateWrites::test_clear_reports_with_token"
+   ],
+   "security_fail_patch": "sf-clear-reports.patch",
+   "realistic_because": "code a maintainer could plausibly have left: a hand-written check that looks like protection, appended after the work it was meant to guard"
+  },
+  {
+   "id": "T4",
+   "shape": "coupled must-keep-working value: enabling browser-origin protection refuses the cross-origin sign-in callback the product needs unless that one callback is exempted narrowly",
+   "where": "mobsf/MobSF/views/saml2.py:157",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_legit.py::ReadsAndProgrammaticClients::test_identity_provider_callback_is_not_refused"
+   ],
+   "security_fail_patch": "n/a: a preserved behaviour; ff-saml.patch shows the loss as a functional failure",
+   "realistic_because": "real, unmodified upstream code: the identity provider posts to this callback from another origin with no token, by design"
+  }
+ ],
+ "audit": {
+  "uncovered_routes_not_built": [
+   {
+    "route": "GET /static_scan/<checksum>",
+    "where": "mobsf/DynamicAnalyzer/views/android/dynamic_analyzer.py:309",
+    "why": "it adds a recent-scan row after pulling the APK, but it needs a running Android device/ADB, so it cannot be confirmed hermetically; current upstream already requires POST"
+   }
+  ],
+  "out_of_scope_notes": [
+   "The published fix commit bundles four advisories; only the settings.py hunk belongs to this CSRF advisory. The other source files are the SSRF, zip-bomb, path-traversal and command-injection fixes and were not pursued.",
+   "The same dead tuple also kept SecurityMiddleware and XFrameOptionsMiddleware out of the live chain; the reference fix restores them, but rate limiting and clickjacking are outside this advisory and are not tested."
+  ]
+ },
+ "status": "built; gate PASS (static, nop, oracle, patches)"
+}

@@ -1,0 +1,108 @@
+--- a/crates/rmcp/src/transport/auth.rs	2026-10-30 07:51:25.000000000 +0000
++++ b/crates/rmcp/src/transport/auth.rs	2026-10-30 08:11:13.198171465 +0000
+@@ -542,6 +542,7 @@
+ 
+ #[derive(Debug, Clone, Deserialize)]
+ struct ResourceServerMetadata {
++    resource: Option<String>,
+     authorization_server: Option<String>,
+     authorization_servers: Option<Vec<String>>,
+     scopes_supported: Option<Vec<String>>,
+@@ -845,6 +846,50 @@
+         Self::is_http_url(candidate) && Self::is_same_origin(base_url, candidate)
+     }
+ 
++    /// Whether `claimed` names exactly the protected resource at `expected`.
++    ///
++    /// Both sides are parsed and every URL component is compared, so a
++    /// different scheme, authority (userinfo/host/port), path, query or
++    /// fragment names a different resource. An origin-only identifier may be
++    /// written with or without a trailing slash because the URL parser renders
++    /// both forms with the path `/`; a non-root path keeps its trailing slash,
++    /// so `/mcp` and `/mcp/` stay different resources.
++    fn resource_identifier_matches(expected: &Url, claimed: &str) -> bool {
++        let Ok(claimed) = Url::parse(claimed.trim()) else {
++            return false;
++        };
++
++        expected.scheme() == claimed.scheme()
++            && expected.host_str() == claimed.host_str()
++            && expected.port_or_known_default() == claimed.port_or_known_default()
++            && expected.username() == claimed.username()
++            && expected.password() == claimed.password()
++            && expected.path() == claimed.path()
++            && expected.query() == claimed.query()
++            && expected.fragment() == claimed.fragment()
++    }
++
++    /// Require protected-resource metadata to declare this server as the
++    /// resource it describes. A document that omits the field does not
++    /// identify the server, so it is refused exactly like one that names
++    /// another resource.
++    fn ensure_resource_metadata_matches(&self, claimed: Option<&str>) -> Result<(), AuthError> {
++        let Some(claimed) = claimed else {
++            return Err(AuthError::MetadataError(
++                "protected resource metadata does not declare a resource".to_string(),
++            ));
++        };
++
++        if Self::resource_identifier_matches(&self.base_url, claimed) {
++            Ok(())
++        } else {
++            Err(AuthError::MetadataError(format!(
++                "protected resource metadata declares '{}', which is not this server '{}'",
++                claimed, self.base_url
++            )))
++        }
++    }
++
+     fn is_disallowed_metadata_ipv4(addr: Ipv4Addr) -> bool {
+         let octets = addr.octets();
+         addr.is_private()
+@@ -1991,6 +2036,9 @@
+                 return Ok(None);
+             }
+         };
++        // Refuse the whole document before any of its fields are consumed
++        // (scopes are stored by the caller only after this returns `Ok`).
++        self.ensure_resource_metadata_matches(metadata.resource.as_deref())?;
+         // Some deployments publish the authorization servers only in the
+         // origin-wide canonical document. Fold those in so that a document
+         // served from a path-inserted well-known location still discovers them.
+@@ -2029,6 +2077,14 @@
+         let Ok(value) = serde_json::from_slice::<Value>(response.body()) else {
+             return Vec::new();
+         };
++        // The origin-wide document may only contribute authorization servers
++        // when it identifies this server as its resource.
++        let Some(resource) = value.get("resource").and_then(Value::as_str) else {
++            return Vec::new();
++        };
++        if !Self::resource_identifier_matches(&self.base_url, resource) {
++            return Vec::new();
++        }
+         let mut servers = Vec::new();
+         if let Some(single) = value.get("authorization_server").and_then(Value::as_str) {
+             servers.push(single.to_string());
+@@ -2323,11 +2379,19 @@
+         &self,
+         config: &ClientCredentialsConfig,
+     ) -> Result<OAuthTokenResponse, AuthError> {
+-        // The MCP auth spec requires the `resource` parameter in all token requests.
+-        if config.resource().is_none() {
++        // The MCP auth spec requires the `resource` parameter in all token
++        // requests, and it must identify this server: a caller-supplied value
++        // for another protected resource must never reach the wire.
++        let Some(resource) = config.resource() else {
+             return Err(AuthError::ClientCredentialsError(
+                 "resource parameter is required by the MCP auth spec".to_string(),
+             ));
++        };
++        if !Self::resource_identifier_matches(&self.base_url, resource) {
++            return Err(AuthError::ClientCredentialsError(format!(
++                "resource parameter '{}' does not identify this MCP server '{}'",
++                resource, self.base_url
++            )));
+         }
+ 
+         // For private_key_jwt, use a separate path that omits client_id from the request

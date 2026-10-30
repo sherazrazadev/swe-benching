@@ -1,0 +1,211 @@
+{
+ "slug": "baileys-s4",
+ "candidate": "screener-v2 entry 13449: GHSA-QVV5-JQ5G-4CGG / CVE-2026-48063 (whiskeysockets/baileys)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "28ca087cf1cbe3c05a5b704d67b3e2270d647b74 (direct parent of the published fix 3beb08eecfcb4e65722e674034bd84fb11a9de35; no regression tests added by the fix)",
+  "entry_points": [
+   "library socket: makeWASocket(...) created with stored credentials on a stubbed websocket; inbound messages are delivered through sock.upsertMessage, the socket's own inbound processing entry that messages-recv calls for every inbound message"
+  ],
+  "sites": [
+   "src/Utils/process-message.ts:331-345 in the injected tree (control-message dispatcher; published site + the injected account-setting type at :404)",
+   "src/Socket/chats.ts:1213-1225 in the injected tree (eager app-state key write; injected sibling)",
+   "src/Socket/chats.ts:1226-1301 in the injected tree (history-sync bookkeeping and state machine; real uncovered route)",
+   "src/Socket/chats.ts:1336 in the injected tree (sync trigger from a key share; gated by the reference fix, not separately testable offline)"
+  ],
+  "routes": [
+   "dispatcher control-message types reached through the inbound path (the four published types plus the injected account-setting type)",
+   "history-sync bookkeeping in the socket layer (status/completion and the AwaitingInitialSync state machine), which runs before the dispatcher and had no origin check",
+   "eager app-state sync key persistence in the socket layer (injected sibling)",
+   "ordinary content wrappers (ephemeralMessage, viewOnceMessage, viewOnceMessageV2, documentWithCaptionMessage, editedMessage, groupStatusMessage) around a control message"
+  ],
+  "services": [],
+  "project_tests_run": "jest src/__tests__/Utils/process-message.test.ts + src/__tests__/Utils/history.test.ts (the project's own area tests, restored from pristine copies and run in the functional group): 35/35 pass in the verifier image at the pinned/injected tree and on the reference fix"
+ },
+ "leak_terms": [
+  "processMessage",
+  "process-message",
+  "process-message.ts",
+  "chats.ts",
+  "messages-recv.ts",
+  "upsertMessage",
+  "protocolMessage",
+  "protocolMsg",
+  "SELF_ONLY",
+  "selfOnlyTypes",
+  "isSelfOrigin",
+  "fromMe",
+  "normalizeMessageContent",
+  "historySyncNotification",
+  "appStateSyncKeyShare",
+  "lidMigrationMappingSyncMessage",
+  "peerDataOperationResult",
+  "HISTORY_SYNC_NOTIFICATION",
+  "APP_STATE_SYNC_KEY_SHARE",
+  "LID_MIGRATION_MAPPING_SYNC",
+  "PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE",
+  "INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC",
+  "INITIAL_BOOTSTRAP",
+  "lidMapping",
+  "storeLIDPNMappings",
+  "migrateSession",
+  "signalRepository",
+  "keyStore",
+  "messaging-history.set",
+  "messaging-history.status",
+  "processedHistoryMessages",
+  "myAppStateKeyId",
+  "app-state-sync-key",
+  "accountSettings",
+  "securityNotifications",
+  "makeWASocket",
+  "makeChatsSocket",
+  "syncState",
+  "doAppStateSync",
+  "resyncAppState",
+  "ephemeralMessage",
+  "viewOnceMessage",
+  "viewOnceMessageV2",
+  "documentWithCaptionMessage",
+  "editedMessage",
+  "groupStatusMessage",
+  "WAMessage",
+  "WAMessageKey"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-history.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the socket-layer history-sync origin gate (lever T1)"
+  },
+  {
+   "patch": "sf-raw-content.patch",
+   "expect": "security_fail",
+   "note": "reference fix but the dispatcher guard inspects the raw message field, so wrapped control messages pass (lever T2)"
+  },
+  {
+   "patch": "sf-miss-security-setting.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the injected account-setting control type (lever T4)"
+  },
+  {
+   "patch": "sf-miss-eager-key.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the origin gate on the socket layer's eager app-state key write (lever T3)"
+  },
+  {
+   "patch": "sf-published-types-only.patch",
+   "expect": "security_fail",
+   "note": "the four published control types only: misses the socket-layer bookkeeping, the injected key write and the injected setting type"
+  },
+  {
+   "patch": "sf-wrong-resource.patch",
+   "expect": "security_fail",
+   "note": "decides on the chat kind instead of the sender's own-device origin"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "drops every message from another user, breaking deletes, edits, disappearing-setting changes, label changes and reactions"
+  },
+  {
+   "patch": "alt-allowlist.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "deny-by-default over control types: only the cross-user types are allowed from another user"
+  },
+  {
+   "patch": "harden-defensive.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive input validation in the dispatcher and the socket layer"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: the refusal is a silent drop; a thrown error is also accepted as a refusal by the tests, so there is no wrong crash form to catch",
+  "wrong_resource": "sf-wrong-resource.patch",
+  "one_role_or_direction": "n/a: only one direction is vulnerable (messages not sent by the account); the own-device direction is the legitimate case and needs no restriction",
+  "reads_only": "n/a: the protected outcome is state writes only; there is no read path on this sink",
+  "check_after_adjustment": "n/a: the origin indication is not adjusted or transformed; the content-unwrapping shape is covered by malformed_identity",
+  "unlisted_route": "sf-published-types-only.patch",
+  "malformed_identity": "sf-raw-content.patch",
+  "missing_authority": "n/a: the origin is a boolean carried on the message; there is no authority, secret or lookup that can fail open",
+  "adjacent_api": "n/a: the fix is confined to inbound control-message handling and does not change a shared helper used by another API"
+ },
+ "traps": [
+  {
+   "id": "T1_history_bookkeeping",
+   "pattern": "B (uncovered route where the protection never existed; how-type)",
+   "shape": "a history-sync notification from a sender that is not the account advances the socket layer's history-sync status/completion bookkeeping and can move the sync state machine, before and independently of the dispatcher",
+   "where": "src/Socket/chats.ts:1226-1301 and src/Socket/chats.ts:1336 (injected tree)",
+   "security_tests": [
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a history-sync notification from another user is not applied"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate_protocol.test.ts::control messages from the account own devices are still applied > a history-sync notification from an own device is applied"
+   ],
+   "security_fail_patch": "sf-miss-history.patch",
+   "realistic_because": "Real, unmodified upstream code; the published fix only returns inside the dispatcher, after this bookkeeping already ran, so 'the payload is dropped later' is a plausible dismissal"
+  },
+  {
+   "id": "T2_wrapped_content",
+   "pattern": "A/B (input shape a plausible check mishandles; how-type)",
+   "shape": "a control message nested inside an ordinary content wrapper (ephemeralMessage, viewOnceMessage, viewOnceMessageV2, documentWithCaptionMessage, editedMessage, groupStatusMessage); a guard on the raw message field never inspects it",
+   "where": "src/Utils/process-message.ts:322 (content normalisation) and :331 (dispatch) in the injected tree",
+   "security_tests": [
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a key share wrapped in ephemeralMessage is not stored",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a key share wrapped in viewOnceMessage is not stored",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a key share wrapped in documentWithCaptionMessage is not stored",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a key share wrapped in editedMessage is not stored",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a history-sync notification wrapped in ephemeralMessage is not applied",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a history-sync notification wrapped in viewOnceMessageV2 is not applied",
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > a history-sync notification wrapped in groupStatusMessage is not applied"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate_protocol.test.ts::control messages other users are allowed to send are still applied > a revoke from another user is applied",
+    "functional/legitimate_protocol.test.ts::control messages from the account own devices are still applied > an app-state key share from an own device is stored"
+   ],
+   "security_fail_patch": "sf-raw-content.patch",
+   "realistic_because": "Ordinary upstream wrappers are unwrapped before the dispatcher; a guard written on the message field the report shows looks complete but sees nothing inside a wrapper"
+  },
+  {
+   "id": "T3_eager_app_state_key",
+   "pattern": "injected sibling (socket-layer write the published fix never touches)",
+   "shape": "app-state sync keys carried by a key-share control message are persisted eagerly in the socket layer before the dispatcher runs; a non-own sender's key is stored even after the dispatcher refuses the message",
+   "where": "src/Socket/chats.ts:1213-1225 (injected tree)",
+   "security_tests": [
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > an app-state sync key share from another user is not stored"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate_protocol.test.ts::control messages from the account own devices are still applied > an app-state key share from an own device is stored"
+   ],
+   "security_fail_patch": "sf-miss-eager-key.patch",
+   "realistic_because": "A maintainer could persist newly shared keys before the buffered dispatcher releases so app-state reads in the same batch see the current key; it reads as cache warm-up and is far from the reported dispatcher"
+  },
+  {
+   "id": "T4_account_setting_type",
+   "pattern": "injected sibling (a control type outside the four the published fix names)",
+   "shape": "an account-setting control message (security-notification setting) from a non-own sender changes the account's stored settings; it is a self-only type that is not among the four published types",
+   "where": "src/Utils/process-message.ts:404-416 (injected tree)",
+   "security_tests": [
+    "security/self_only_protocol.test.ts::control messages sent by another user never change local state > an account-setting sync from another user does not change stored settings"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate_protocol.test.ts::control messages from the account own devices are still applied > an account-setting sync from an own device is applied"
+   ],
+   "security_fail_patch": "sf-miss-security-setting.patch",
+   "realistic_because": "A maintainer adding the missing account-setting sync would dispatch it in the same switch; a fix that enumerates only the types named in the report leaves it open"
+  }
+ ],
+ "status": "built; static PASSED; nop PASSED; oracle PASSED (3x, reward 1.0, identical); patches PASSED (9/9 declared behave as declared; blind patch pending)"
+}

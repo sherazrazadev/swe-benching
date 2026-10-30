@@ -1,0 +1,254 @@
+diff -ruN pristine/src/core/lib/Charts.mjs app/src/core/lib/Charts.mjs
+--- a/src/core/lib/Charts.mjs	2026-10-30 07:51:47.000000000 +0000
++++ b/src/core/lib/Charts.mjs	2026-10-30 08:07:01.604206179 +0000
+@@ -7,6 +7,7 @@
+ 
+ import OperationError from "../errors/OperationError.mjs";
+ import Utils from "../Utils.mjs";
++import {createRecord} from "./SafeRecords.mjs";
+ 
+ /**
+  * @constant
+@@ -153,7 +154,9 @@
+     );
+ 
+     let xValues = new Set();
+-    const series = {};
++    // Group with Maps so any input string is an ordinary key, then materialise
++    // each series as a prototype-free record for the chart code to read.
++    const grouped = new Map();
+ 
+     values.forEach(row => {
+         const serie = row[0],
+@@ -163,15 +166,20 @@
+         if (Number.isNaN(val)) throw new OperationError("Values must be numbers in base 10.");
+ 
+         xValues.add(xVal);
+-        if (typeof series[serie] === "undefined") series[serie] = {};
+-        series[serie][xVal] = val;
++        let points = grouped.get(serie);
++        if (typeof points === "undefined") {
++            points = new Map();
++            grouped.set(serie, points);
++        }
++        points.set(xVal, val);
+     });
+ 
+     xValues = new Array(...xValues);
+ 
+     const seriesList = [];
+-    for (const seriesName in series) {
+-        const serie = series[seriesName];
++    for (const [seriesName, points] of grouped) {
++        const serie = createRecord();
++        for (const [xVal, val] of points) serie[xVal] = val;
+         seriesList.push({name: seriesName, data: serie});
+     }
+ 
+diff -ruN pristine/src/core/lib/Protocol.mjs app/src/core/lib/Protocol.mjs
+--- a/src/core/lib/Protocol.mjs	2026-10-30 07:51:47.000000000 +0000
++++ b/src/core/lib/Protocol.mjs	2026-10-30 08:07:04.547235402 +0000
+@@ -8,6 +8,7 @@
+ 
+ import BigNumber from "bignumber.js";
+ import {toHexFast} from "../lib/Hex.mjs";
++import {ownKeys, escapeText} from "./SafeRecords.mjs";
+ 
+ /**
+  * Recursively displays a JSON object as an HTML table
+@@ -25,15 +26,16 @@
+             <th>Value</th>
+         </tr>`;
+ 
+-    for (const key in obj) {
+-        if (typeof obj[key] === "function")
++    for (const key of ownKeys(obj)) {
++        const value = obj[key];
++        if (typeof value === "function")
+             continue;
+ 
+-        html += `<tr><td style='word-wrap: break-word'>${key}</td>`;
+-        if (typeof obj[key] === "object")
+-            html += `<td style='padding: 0'>${objToTable(obj[key], true)}</td>`;
++        html += `<tr><td style='word-wrap: break-word'>${escapeText(key)}</td>`;
++        if (value !== null && typeof value === "object")
++            html += `<td style='padding: 0'>${objToTable(value, true)}</td>`;
+         else
+-            html += `<td>${obj[key]}</td>`;
++            html += `<td>${escapeText(value)}</td>`;
+         html += "</tr>";
+     }
+     html += "</table>";
+diff -ruN pristine/src/core/lib/SafeRecords.mjs app/src/core/lib/SafeRecords.mjs
+--- a/src/core/lib/SafeRecords.mjs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/lib/SafeRecords.mjs	2026-10-30 08:06:57.857173918 +0000
+@@ -0,0 +1,51 @@
++/**
++ * Helpers for handling data-derived text as ordinary values.
++ *
++ * Recipe input is untrusted and may contain strings such as `__proto__` or
++ * `constructor`. Assigning such a string as an object key can reach the
++ * prototype chain instead of creating an ordinary property, and rendering
++ * such a string without escaping can turn it into live markup. These helpers
++ * keep untrusted text as own properties and always render it as text.
++ *
++ * @copyright Crown Copyright 2026
++ * @license Apache-2.0
++ */
++
++import Utils from "../Utils.mjs";
++
++/**
++ * Creates a prototype-free lookup object.
++ *
++ * With no prototype in the chain, assigning any data-derived key - including
++ * `__proto__` - creates an ordinary own property instead of invoking an
++ * inherited setter or colliding with a built-in member.
++ *
++ * @returns {Object}
++ */
++export function createRecord() {
++    return Object.create(null);
++}
++
++/**
++ * Lists the own enumerable keys of a value.
++ *
++ * Inherited properties are never included, so a polluted prototype cannot
++ * leak extra fields into rendered output.
++ *
++ * @param {*} value
++ * @returns {string[]}
++ */
++export function ownKeys(value) {
++    if (value === null || typeof value !== "object") return [];
++    return Object.keys(value);
++}
++
++/**
++ * Renders a value as escaped text suitable for HTML output.
++ *
++ * @param {*} value
++ * @returns {string}
++ */
++export function escapeText(value) {
++    return Utils.escapeHtml(String(value));
++}
+diff -ruN pristine/src/core/operations/ParseHTTPHeaders.mjs app/src/core/operations/ParseHTTPHeaders.mjs
+--- a/src/core/operations/ParseHTTPHeaders.mjs	2026-10-30 07:51:50.000000000 +0000
++++ b/src/core/operations/ParseHTTPHeaders.mjs	2026-10-30 08:07:08.307270530 +0000
+@@ -5,6 +5,7 @@
+  */
+ 
+ import Operation from "../Operation.mjs";
++import {createRecord, ownKeys, escapeText} from "../lib/SafeRecords.mjs";
+ 
+ /**
+  * Parse HTTP Headers operation
+@@ -42,7 +43,7 @@
+      */
+     run(input, args) {
+         const recordDelimiter = args[0] === "CRLF" ? "\r\n" : "\n";
+-        const headers = {};
++        const headers = createRecord();
+ 
+         input.split(recordDelimiter).forEach(line => {
+             const separator = line.indexOf(":");
+@@ -67,9 +68,9 @@
+         let html = `<table class="table table-sm table-nonfluid table-bordered" style="table-layout: fixed;">
+             <tr><th>Field</th><th>Value</th></tr>`;
+ 
+-        for (const name in headers) {
+-            html += `<tr><td style="word-wrap: break-word">${name}</td>`;
+-            html += `<td>${headers[name]}</td></tr>`;
++        for (const name of ownKeys(headers)) {
++            html += `<tr><td style="word-wrap: break-word">${escapeText(name)}</td>`;
++            html += `<td>${escapeText(headers[name])}</td></tr>`;
+         }
+ 
+         html += "</table>";
+diff -ruN pristine/src/core/operations/PivotTable.mjs app/src/core/operations/PivotTable.mjs
+--- a/src/core/operations/PivotTable.mjs	2026-10-30 07:51:50.000000000 +0000
++++ b/src/core/operations/PivotTable.mjs	2026-10-30 08:07:12.803312554 +0000
+@@ -5,6 +5,7 @@
+  */
+ 
+ import Operation from "../Operation.mjs";
++import {createRecord, ownKeys, escapeText} from "../lib/SafeRecords.mjs";
+ 
+ /**
+  * Pivot table operation
+@@ -55,7 +56,7 @@
+             "Tab": "\t"
+         }[args[1]] || ",";
+ 
+-        const pivot = {};
++        const pivot = createRecord();
+ 
+         input.split(recordDelimiter).forEach(record => {
+             const cells = record.split(fieldDelimiter).map(cell => cell.trim());
+@@ -64,7 +65,7 @@
+             const [row, column, value] = cells;
+             if (!row || !column) return;
+ 
+-            if (typeof pivot[row] === "undefined") pivot[row] = {};
++            if (typeof pivot[row] === "undefined") pivot[row] = createRecord();
+             pivot[row][column] = value;
+         });
+ 
+@@ -79,11 +80,11 @@
+     present(pivot) {
+         const columns = [];
+ 
+-        for (const row in pivot) {
++        for (const row of ownKeys(pivot)) {
+             const cells = pivot[row];
+             if (cells === null || typeof cells !== "object") continue;
+ 
+-            for (const column in cells) {
++            for (const column of ownKeys(cells)) {
+                 if (!columns.includes(column)) columns.push(column);
+             }
+         }
+@@ -92,17 +93,17 @@
+             <tr><th></th>`;
+ 
+         columns.forEach(column => {
+-            html += `<th>${column}</th>`;
++            html += `<th>${escapeText(column)}</th>`;
+         });
+         html += "</tr>";
+ 
+-        for (const row in pivot) {
++        for (const row of ownKeys(pivot)) {
+             const cells = pivot[row];
+-            html += `<tr><th>${row}</th>`;
++            html += `<tr><th>${escapeText(row)}</th>`;
+ 
+             columns.forEach(column => {
+                 const value = cells[column];
+-                html += `<td>${typeof value === "undefined" ? "" : value}</td>`;
++                html += `<td>${typeof value === "undefined" ? "" : escapeText(value)}</td>`;
+             });
+             html += "</tr>";
+         }
+diff -ruN pristine/src/core/operations/SeriesChart.mjs app/src/core/operations/SeriesChart.mjs
+--- a/src/core/operations/SeriesChart.mjs	2026-10-30 07:51:47.000000000 +0000
++++ b/src/core/operations/SeriesChart.mjs	2026-10-30 08:07:19.311373763 +0000
+@@ -8,6 +8,7 @@
+ import * as d3temp from "d3";
+ import * as nodomtemp from "nodom";
+ import { getSeriesValues, RECORD_DELIMITER_OPTIONS, FIELD_DELIMITER_OPTIONS } from "../lib/Charts.mjs";
++import {createRecord} from "../lib/SafeRecords.mjs";
+ 
+ import Operation from "../Operation.mjs";
+ import Utils from "../Utils.mjs";
+@@ -127,7 +128,7 @@
+             .style("text-anchor", "middle")
+             .text(xLabel);
+ 
+-        const tooltipText = {},
++        const tooltipText = createRecord(),
+             tooltipAreaWidth = seriesWidth / xValues.length;
+ 
+         xValues.forEach(x => {

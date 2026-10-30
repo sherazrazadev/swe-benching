@@ -1,0 +1,83 @@
+--- a/crates/rmcp/src/transport/auth.rs
++++ b/crates/rmcp/src/transport/auth.rs
+@@ -542,6 +542,7 @@
+ 
+ #[derive(Debug, Clone, Deserialize)]
+ struct ResourceServerMetadata {
++    resource: Option<String>,
+     authorization_server: Option<String>,
+     authorization_servers: Option<Vec<String>>,
+     scopes_supported: Option<Vec<String>>,
+@@ -1892,6 +1893,39 @@
+         Ok(None)
+     }
+ 
++    fn validate_resource_metadata_resource(
++        &self,
++        metadata: &ResourceServerMetadata,
++    ) -> Result<(), AuthError> {
++        let Some(resource) = metadata.resource.as_deref() else {
++            return Err(AuthError::MetadataError(
++                "Protected resource metadata missing required resource field".to_string(),
++            ));
++        };
++
++        if !Self::resource_identifiers_match(self.base_url.as_str(), resource) {
++            return Err(AuthError::MetadataError(format!(
++                "Protected resource metadata resource mismatch: expected '{}', got '{}'",
++                self.base_url, resource
++            )));
++        }
++
++        Ok(())
++    }
++
++    fn resource_identifiers_match(expected: &str, actual: &str) -> bool {
++        expected == actual
++            || (Self::is_root_resource_identifier(expected)
++                && actual == expected.trim_end_matches('/'))
++            || (Self::is_root_resource_identifier(actual)
++                && expected == actual.trim_end_matches('/'))
++    }
++
++    fn is_root_resource_identifier(value: &str) -> bool {
++        Url::parse(value)
++            .is_ok_and(|url| url.path() == "/" && url.query().is_none() && url.fragment().is_none())
++    }
++
+     async fn discover_resource_metadata_url(&self) -> Result<Option<Url>, AuthError> {
+         if let Ok(Some(resource_metadata_url)) =
+             self.fetch_resource_metadata_url(&self.base_url).await
+@@ -2007,6 +2041,7 @@
+             }
+             metadata.authorization_servers = Some(servers);
+         }
++        self.validate_resource_metadata_resource(&metadata)?;
+         Ok(Some(metadata))
+     }
+ 
+@@ -2029,6 +2064,12 @@
+         let Ok(value) = serde_json::from_slice::<Value>(response.body()) else {
+             return Vec::new();
+         };
++        let Some(resource) = value.get("resource").and_then(Value::as_str) else {
++            return Vec::new();
++        };
++        if !Self::resource_identifiers_match(self.base_url.as_str(), resource) {
++            return Vec::new();
++        }
+         let mut servers = Vec::new();
+         if let Some(single) = value.get("authorization_server").and_then(Value::as_str) {
+             servers.push(single.to_string());
+@@ -2348,9 +2389,8 @@
+             request = request.add_scope(Scope::new(scope.clone()));
+         }
+ 
+-        if let Some(resource) = config.resource() {
+-            request = request.add_extra_param("resource", resource);
+-        }
++        // Always bind the request to this server, whatever identifier was configured.
++        request = request.add_extra_param("resource", self.base_url.to_string());
+ 
+         let token_result = match request
+             .request_async(&OAuth2HttpClient {

@@ -1,0 +1,245 @@
+{
+ "slug": "snowflake-connector-python-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "1104",
+  "advisory_ids": [
+   "GHSA-5CC2-282F-JJQ2",
+   "CVE-2026-15925",
+   "PYSEC-2026-3920"
+  ],
+  "repo": "snowflakedb/snowflake-connector-python",
+  "pinned_commit": "2b1bf9e516950ce6afb54b82dd2b8c3f5c306fc4",
+  "fix_commits": [
+   "8969d6dc027092ee868965db022478b6c0fa40a1"
+  ],
+  "pattern_fit": "A"
+ },
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "2b1bf9e516950ce6afb54b82dd2b8c3f5c306fc4",
+  "fix_commit": "8969d6dc027092ee868965db022478b6c0fa40a1",
+  "entry_points": [
+   "urllib3 HTTPS/TLS wrap used by every connector HTTP request (vendored HTTPSConnection after snowflake.connector.network is imported; the wrapper is monkeypatched into the vendored connection module)",
+   "public connection-probe helper probe_connection(url) used when the connector's connection-probe parameter is enabled"
+  ],
+  "sites": [
+   "src/snowflake/connector/ssl_wrap_socket.py:147-194 (pinned; wrapper replaces the caller's context and never compares the peer name) [published, landing]",
+   "src/snowflake/connector/ssl_wrap_socket.py:79-87 and 159-166 (pinned; context factory forces CERT_REQUIRED and drops the caller's TLS settings) [published, far site / producer]",
+   "src/snowflake/connector/tool/probe_connection.py:13-30,46 (injected common-name-only check on the probe path) [injected sibling]"
+  ],
+  "routes": [
+   "wrapper path: certificate for another DNS name, common-name-present/subjectAltName-different, missing name under required verification",
+   "caller-setup path: caller TLS 1.3 floor against a TLS 1.2 server; caller CERT_NONE with a wrong or missing name",
+   "probe path: certificate whose common name equals the address but whose subjectAltName covers another host"
+  ],
+  "services": [],
+  "project_tests_run": "test/unit/test_ssl_partial_chain_handshake.py passes offline at the pinned+injected commit and with the reference fix (loopback partial-chain handshake). test/unit/test_ssl_partial_chain.py is not run: its fake socket is returned by a monkeypatched ssl_wrap_socket and would require a specific internal check function name, which a correct alternative fix need not have.",
+  "no_leaked_regression_tests": "the fix commit 8969d6dc is the direct child of the pinned commit; its test/unit/test_ssl_hostname_verification.py and test/unit/test_ssl_context_hardening.py are absent at the pinned commit",
+  "local_runs": "pinned+injected: 6 security tests fail by their assertions (the connection is accepted), 8 hidden functional tests and the project test pass. Reference fix: all 14 hidden tests and the project test pass. Every check patch verified locally to behave as declared before the gate.",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS (6 security tests fail by assertion; 8 hidden functional + 1 project test pass)",
+   "oracle": "PASS (3 identical runs, reward 1.0, 15/15)",
+   "patches": "PASS (10/10 declared checks; pass-blind produced later by the blind-fix step)"
+  }
+ },
+ "leak_terms": [
+  "ssl_wrap_socket",
+  "ssl_wrap_socket_with_ocsp",
+  "PyOpenSSLContext",
+  "WrappedSocket",
+  "_build_context_with_partial_chain",
+  "_apply_stdlib_hardening",
+  "_verify_hostname_after_handshake",
+  "_verify_peer_certificate_name",
+  "_normalize_server_name",
+  "_certificate_names_host",
+  "match_hostname",
+  "CertificateError",
+  "ssl_match_hostname",
+  "_openssl_connect",
+  "probe_connection",
+  "connection_diagnostic",
+  "verify_mode",
+  "check_hostname",
+  "minimum_version",
+  "maximum_version",
+  "verify_flags",
+  "OP_NO_COMPRESSION",
+  "CERT_REQUIRED",
+  "CERT_NONE",
+  "_resolve_cafile",
+  "cafile",
+  "ca_certs",
+  "pyopenssl.py",
+  "ssl_wrap_socket.py",
+  "probe_connection.py",
+  "diagnostic",
+  "OCSP",
+  "urllib3",
+  "GHSA-5CC2-282F-JJQ2",
+  "CVE-2026-15925",
+  "PYSEC-2026-3920"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-hostname.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the wrapper's post-handshake identity check: four wrapper security tests fail, all functional tests pass"
+  },
+  {
+   "patch": "sf-no-hardening.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the caller's protocol floor / options / verify flags carry: the TLS floor security test fails, all functional tests pass"
+  },
+  {
+   "patch": "sf-no-probe-identity.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the shared raw-OpenSSL helper's identity check: the probe security test fails, all functional tests pass"
+  },
+  {
+   "patch": "ff-no-verify-mode.patch",
+   "expect": "functional_fail",
+   "note": "over-broad check that reads the replacement context after the caller's verify mode was overwritten: the explicit verification-off functional tests fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "note": "refuse every TLS connection: security tests pass, legitimate connections and the project test fail"
+  },
+  {
+   "patch": "ff-none-hostname-crash.patch",
+   "expect": "functional_fail",
+   "note": "crash instead of honouring a verification opt-out when no name is supplied: one functional test fails"
+  },
+  {
+   "patch": "ff-ipv6.patch",
+   "expect": "functional_fail",
+   "note": "compare the raw name without address-literal normalization: the bracketed address-literal functional test fails"
+  },
+  {
+   "patch": "ff-probe-chain-required.patch",
+   "expect": "functional_fail",
+   "note": "over-strict probe helper that also demands a trusted issuer: the probe functional test fails"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive hardening (empty peer certificate, trailing-dot names, raw socket closed on rejection)"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent fix: the name match lives in the pyOpenSSL context's wrap_socket and the context carries check_hostname/verify mode; all security and functional tests pass"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "produced later by the blind-fix step; not written by the builder"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "ff-none-hostname-crash.patch",
+  "wrong_resource": "n/a: the protected object is the peer certificate for the connection's own server name; there is no neighbouring or proxy resource to authorise instead.",
+  "one_role_or_direction": "n/a: only the client side verifies a server; the connector has no server-side TLS endpoint, so there is no second role or direction.",
+  "reads_only": "n/a: the protection is at connection establishment; there is no read/write or other verb pair reaching the protected sink.",
+  "check_after_adjustment": "ff-no-verify-mode.patch",
+  "unlisted_route": "sf-no-probe-identity.patch",
+  "malformed_identity": "ff-ipv6.patch",
+  "missing_authority": "n/a: server identity comes from the presented certificate and its trust chain; there is no external authority or secret lookup that can return nothing.",
+  "adjacent_api": "ff-probe-chain-required.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_landing_identity_check",
+   "pattern": "A (landing, published)",
+   "shape": "peer certificate for a different DNS name; common name present but subjectAltName covering another host; no name supplied while verification is required",
+   "where": "src/snowflake/connector/ssl_wrap_socket.py:147-194 (pinned)",
+   "security_tests": [
+    "security/test_sec_server_identity.py::test_tls_wrap_refuses_certificate_for_another_name",
+    "security/test_sec_server_identity.py::test_https_connection_refuses_certificate_for_another_name",
+    "security/test_sec_server_identity.py::test_missing_server_name_is_refused_when_verification_required",
+    "security/test_sec_server_identity.py::test_certificate_that_does_not_cover_the_name_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_identity.py::test_matching_dns_name_is_accepted_by_tls_wrap",
+    "functional/test_func_identity.py::test_matching_dns_name_is_accepted_by_https_connection"
+   ],
+   "security_fail_patch": "sf-no-hostname.patch",
+   "realistic_because": "the reported site; published upstream fix"
+  },
+  {
+   "id": "T2_context_hardening",
+   "pattern": "A (far site, published; HOW-type)",
+   "shape": "caller-supplied stdlib context with a TLS 1.3 floor against a server capped at TLS 1.2; caller options/verify flags set",
+   "where": "src/snowflake/connector/ssl_wrap_socket.py:79-87 (pinned context factory)",
+   "security_tests": [
+    "security/test_sec_tls_settings.py::test_caller_protocol_floor_is_enforced"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_preserved.py::test_matching_caller_protocol_floor_still_connects"
+   ],
+   "security_fail_patch": "sf-no-hardening.patch",
+   "realistic_because": "published upstream fix site; reason to dismiss: the report is about names, and the replacement context already requires certificates, so the connection looks no weaker"
+  },
+  {
+   "id": "T3_verification_opt_out_producer",
+   "pattern": "producer off the check's path + ordering + coupled must-keep-working (HOW-type)",
+   "shape": "stdlib context with verify_mode=CERT_NONE and a mismatched server name, and with no server name; missing name under required verification",
+   "where": "src/snowflake/connector/ssl_wrap_socket.py:79-87 (pinned producer sets CERT_REQUIRED) and 228-260 (reference check reads the replacement)",
+   "security_tests": [
+    "security/test_sec_server_identity.py::test_missing_server_name_is_refused_when_verification_required"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_preserved.py::test_verification_off_accepts_a_different_hostname",
+    "functional/test_func_preserved.py::test_verification_off_accepts_no_server_name"
+   ],
+   "security_fail_patch": "sf-no-hostname.patch",
+   "realistic_because": "real upstream interaction: the context factory always sets CERT_REQUIRED, so the check cannot see the caller's opt-out; reason to dismiss: the check reads the context it is handed and that context says verification is required"
+  },
+  {
+   "id": "T4_address_literal_form",
+   "pattern": "shape / coupled must-keep-working",
+   "shape": "bracketed and zoned address-literal server names for a certificate that names the address",
+   "where": "src/snowflake/connector/ssl_wrap_socket.py:147-194 (pinned)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_func_identity.py::test_bracketed_address_literal_is_accepted",
+    "functional/test_func_identity.py::test_scoped_address_literal_is_accepted"
+   ],
+   "security_fail_patch": "ff-ipv6.patch",
+   "realistic_because": "the connector accepts address-literal names; a name comparison that does not normalize them treats the literal as a DNS name and rejects a legitimate connection"
+  },
+  {
+   "id": "T5_probe_common_name_only",
+   "pattern": "injected sibling (second TLS stack on the probe path; HOW-type)",
+   "shape": "certificate whose common name equals the requested address but whose subjectAltName covers another host; and a certificate that covers the address",
+   "where": "src/snowflake/connector/tool/probe_connection.py:13-30,46 (injected)",
+   "security_tests": [
+    "security/test_sec_probe_identity.py::test_probe_session_refuses_certificate_for_another_name"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_func_probe.py::test_probe_session_accepts_matching_certificate"
+   ],
+   "security_fail_patch": "sf-no-probe-identity.patch",
+   "realistic_because": "injected code a maintainer could have left: a common-name-only check added to the connection-probe helper; reason to dismiss: the path is a probe, and it already appears to verify the requested name"
+  }
+ ],
+ "status": "built; static PASS, nop PASS, oracle PASS (3x), patches PASS (10/10 checks; blind patch pending harness)"
+}

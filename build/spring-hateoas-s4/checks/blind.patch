@@ -1,0 +1,562 @@
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/ConfiguredPropertyBinder.java b/src/main/java/org/springframework/hateoas/mediatype/ConfiguredPropertyBinder.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/ConfiguredPropertyBinder.java	1970-01-01 00:00:00.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/ConfiguredPropertyBinder.java	2026-10-30 09:27:05.651357660 +0000
+@@ -0,0 +1,139 @@
++/*
++ * Copyright 2017-2024 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.hateoas.mediatype;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import tools.jackson.databind.BeanDescription;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.BeanPropertyDefinition;
++import tools.jackson.databind.introspect.ClassIntrospector;
++
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++
++import org.springframework.beans.BeanUtils;
++import org.springframework.util.ReflectionUtils;
++
++/**
++ * Binds the name/value pairs a document supplies to a model object. Which names may be written is decided by the
++ * JSON binding configured on the mapper that performs the read, not by the JavaBeans shape of the model alone. That
++ * means annotations on the model, annotations contributed by mix-ins registered on the mapper, class-level property
++ * ignorals and configured external property names are all taken into account. Names the configuration does not
++ * expose for input are ignored, as are model properties the document does not mention.
++ */
++public final class ConfiguredPropertyBinder {
++
++	private final Class<?> targetType;
++
++	private final Map<String, Method> setters;
++
++	private ConfiguredPropertyBinder(Class<?> targetType, Map<String, Method> setters) {
++
++		this.targetType = targetType;
++		this.setters = setters;
++	}
++
++	/**
++	 * Creates a binder for reading a document of the given type with the given mapper context.
++	 *
++	 * @param context must not be {@literal null}.
++	 * @param type must not be {@literal null}.
++	 * @return
++	 */
++	public static ConfiguredPropertyBinder forRead(DeserializationContext context, JavaType type) {
++
++		ClassIntrospector introspector = context.getConfig().classIntrospectorInstance();
++		AnnotatedClass classInfo = introspector.introspectClassAnnotations(type);
++		BeanDescription description = introspector.introspectForDeserialization(type, classInfo);
++
++		JsonIgnoreProperties.Value ignorals = context.getConfig() //
++				.getDefaultPropertyIgnorals(description.getBeanClass(), classInfo);
++
++		Set<String> ignoredNames = ignorals == null //
++				? Collections.emptySet() //
++				: ignorals.findIgnoredForDeserialization();
++
++		Map<String, Method> setters = new LinkedHashMap<>();
++
++		for (BeanPropertyDefinition property : description.findProperties()) {
++
++			if (ignoredNames.contains(property.getName()) || !property.couldDeserialize() || !property.hasSetter()) {
++				continue;
++			}
++
++			Method setter = property.getSetter().getAnnotated();
++
++			if (setter == null || setter.getParameterCount() != 1) {
++				continue;
++			}
++
++			setters.putIfAbsent(property.getName(), setter);
++		}
++
++		return new ConfiguredPropertyBinder(description.getBeanClass(), setters);
++	}
++
++	/**
++	 * Creates a new instance of the bound type and writes the given values to it.
++	 *
++	 * @param values must not be {@literal null}.
++	 * @return
++	 */
++	@SuppressWarnings("unchecked")
++	public <T> T instantiate(Map<String, Object> values) {
++		return (T) apply(BeanUtils.instantiateClass(this.targetType), values);
++	}
++
++	/**
++	 * Writes the given values to the given object, ignoring names the configured binding does not expose and model
++	 * properties the given values do not mention.
++	 *
++	 * @param target can be {@literal null}.
++	 * @param values must not be {@literal null}.
++	 * @return
++	 */
++	public Object apply(Object target, Map<String, Object> values) {
++
++		if (target == null || !this.targetType.isInstance(target)) {
++			return target;
++		}
++
++		values.forEach((name, value) -> {
++
++			Method setter = this.setters.get(name);
++
++			if (setter == null) {
++				return;
++			}
++
++			ReflectionUtils.makeAccessible(setter);
++
++			try {
++				setter.invoke(target, value);
++			} catch (IllegalAccessException | InvocationTargetException e) {
++				throw new RuntimeException(e);
++			}
++		});
++
++		return target;
++	}
++}
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java b/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java	2026-10-30 08:18:35.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/PropertyUtils.java	2026-10-30 09:20:47.443707746 +0000
+@@ -98,29 +98,6 @@
+ 		return extractPropertyValues(object, true);
+ 	}
+ 
+-	public static <T> T createObjectFromProperties(Class<T> clazz, Map<String, Object> properties) {
+-
+-		T obj = BeanUtils.instantiateClass(clazz);
+-
+-		properties.forEach((key, value) -> {
+-			Optional.ofNullable(BeanUtils.getPropertyDescriptor(clazz, key)) //
+-					.ifPresent(property -> {
+-
+-						try {
+-
+-							Method writeMethod = property.getWriteMethod();
+-							ReflectionUtils.makeAccessible(writeMethod);
+-							writeMethod.invoke(obj, value);
+-
+-						} catch (IllegalAccessException | InvocationTargetException e) {
+-							throw new RuntimeException(e);
+-						}
+-					});
+-		});
+-
+-		return obj;
+-	}
+-
+ 	public static InputPayloadMetadata getExposedProperties(@Nullable Class<?> type) {
+ 		return getExposedProperties(type == null ? null : ResolvableType.forClass(type));
+ 	}
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java	2026-10-30 08:18:35.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonItem.java	2026-10-30 09:20:54.883722501 +0000
+@@ -28,6 +28,7 @@
+ import org.springframework.hateoas.Link;
+ import org.springframework.hateoas.Links;
+ import org.springframework.hateoas.Links.MergeMode;
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
+ import org.springframework.hateoas.mediatype.PropertyUtils;
+ 
+ import com.fasterxml.jackson.annotation.JsonCreator;
+@@ -189,13 +190,15 @@
+ 	}
+ 
+ 	/**
+-	 * Generate an object using the deserialized properties and the provided type from the deserializer.
++	 * Generate an object using the deserialized properties, the provided type and the binding configured on the
++	 * mapper that is performing the read.
+ 	 *
+ 	 * @param javaType - type of the object to create
++	 * @param binder - binder derived from the reading mapper's configuration
+ 	 * @return
+ 	 */
+ 	@Nullable
+-	Object toRawData(JavaType javaType) {
++	Object toRawData(JavaType javaType, ConfiguredPropertyBinder binder) {
+ 
+ 		if (this.data.isEmpty()) {
+ 			return null;
+@@ -205,9 +208,8 @@
+ 			return this.data.get(0).getValue();
+ 		}
+ 
+-		return PropertyUtils.createObjectFromProperties(javaType.getRawClass(), //
+-				this.data.stream() //
+-						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue)));
++		return binder.instantiate(this.data.stream() //
++				.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue)));
+ 	}
+ 
+ 	@Override
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java	2026-10-30 08:18:35.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/collectionjson/CollectionJsonJacksonModule.java	2026-10-30 09:21:19.871760642 +0000
+@@ -48,8 +48,8 @@
+ import org.springframework.hateoas.MediaTypes;
+ import org.springframework.hateoas.PagedModel;
+ import org.springframework.hateoas.RepresentationModel;
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
+ import org.springframework.hateoas.mediatype.JacksonHelper;
+-import org.springframework.hateoas.mediatype.PropertyUtils;
+ import org.springframework.http.HttpMethod;
+ import org.springframework.util.Assert;
+ 
+@@ -637,6 +637,7 @@
+ 			Links links = collection.getLinks();
+ 
+ 			CollectionJson<?> withOwnSelfLink = collection.withOwnSelfLink();
++			ConfiguredPropertyBinder binder = ConfiguredPropertyBinder.forRead(ctxt, this.contentType);
+ 
+ 			if (!items.isEmpty()) {
+ 
+@@ -647,7 +648,8 @@
+ 								(left, right) -> right);
+ 
+ 				CollectionJsonItem<?> firstItem = items.get(0).withOwnSelfLink();
+-				RepresentationModel<?> resource = (RepresentationModel<?>) firstItem.toRawData(this.contentType);
++				RepresentationModel<?> resource = (RepresentationModel<?>) firstItem.toRawData(this.contentType,
++						binder);
+ 
+ 				if (resource != null) {
+ 					resource.add(firstItem.getLinks().merge(merged));
+@@ -663,8 +665,7 @@
+ 				Map<String, Object> properties = template.getData().stream()
+ 						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue));
+ 
+-				RepresentationModel<?> resourceSupport = (RepresentationModel<?>) PropertyUtils
+-						.createObjectFromProperties(this.contentType.getRawClass(), properties);
++				RepresentationModel<?> resourceSupport = (RepresentationModel<?>) binder.instantiate(properties);
+ 
+ 				return resourceSupport.add(withOwnSelfLink.getLinks());
+ 
+@@ -730,13 +731,14 @@
+ 			List<? extends CollectionJsonItem<?>> items = collection.getItems();
+ 			Links links = collection.withOwnSelfLink().getLinks();
+ 			CollectionJsonTemplate template = collection.getTemplate();
++			ConfiguredPropertyBinder binder = ConfiguredPropertyBinder.forRead(ctxt, rootType);
+ 
+ 			if (items.isEmpty() && template != null) {
+ 
+ 				Map<String, Object> properties = template.getData().stream()
+ 						.collect(Collectors.toMap(CollectionJsonData::getName, CollectionJsonData::getValue));
+ 
+-				Object obj = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++				Object obj = binder.instantiate(properties);
+ 
+ 				return EntityModel.of(obj, links);
+ 
+@@ -750,7 +752,7 @@
+ 
+ 				CollectionJsonItem<?> firstItem = items.get(0).withOwnSelfLink();
+ 
+-				return EntityModel.of(firstItem.toRawData(rootType),
++				return EntityModel.of(firstItem.toRawData(rootType, binder),
+ 						merged.merge(MergeMode.REPLACE_BY_REL, firstItem.getLinks()));
+ 			}
+ 		}
+@@ -845,12 +847,13 @@
+ 			}
+ 
+ 			boolean isResource = contentType.hasGenericTypes() && contentType.containedType(0).hasRawClass(EntityModel.class);
++			ConfiguredPropertyBinder binder = ConfiguredPropertyBinder.forRead(ctxt, rootType);
+ 
+ 			return collection.getItems().stream() //
+ 					.map(CollectionJsonItem::withOwnSelfLink) //
+ 					.map(it -> isResource //
+-							? RepresentationModel.of(it.toRawData(rootType), it.getLinks()) //
+-							: it.toRawData(rootType)) //
++							? RepresentationModel.of(it.toRawData(rootType, binder), it.getLinks()) //
++							: it.toRawData(rootType, binder)) //
+ 					.collect(Collectors.collectingAndThen(Collectors.toList(), it -> finalizer.apply(it, links)));
+ 		}
+ 	}
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java	2026-10-30 08:18:37.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateDataDeserializer.java	2026-10-30 09:21:52.279820271 +0000
+@@ -32,6 +32,7 @@
+ import org.springframework.hateoas.EntityModel;
+ import org.springframework.hateoas.Links;
+ import org.springframework.hateoas.RepresentationModel;
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
+ import org.springframework.hateoas.mediatype.JacksonHelper;
+ 
+ /**
+@@ -84,7 +85,8 @@
+ 				: context.readTreeAsValue(document.deepCopy().without(List.of(LINKS, TEMPLATES)), rootType);
+ 
+ 		if (templates != null) {
+-			HalFormsTemplateValues.applyTo(content, extractValues(templates, context));
++			HalFormsTemplateValues.applyTo(content, extractValues(templates, context),
++					ConfiguredPropertyBinder.forRead(context, rootType));
+ 		}
+ 
+ 		return EntityModel.of(content, links);
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java	2026-10-30 08:18:37.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/hal/forms/HalFormsTemplateValues.java	2026-10-30 09:21:47.950814903 +0000
+@@ -15,15 +15,11 @@
+  */
+ package org.springframework.hateoas.mediatype.hal.forms;
+ 
+-import org.jspecify.annotations.Nullable;
+-import org.springframework.beans.BeanUtils;
+-import org.springframework.util.ReflectionUtils;
+-
+-import java.beans.PropertyDescriptor;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+ import java.util.Map;
+ 
++import org.jspecify.annotations.Nullable;
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
++
+ /**
+  * Applies the values submitted through a HAL-FORMS template to the object a document is read into.
+  *
+@@ -34,33 +30,14 @@
+ 	private HalFormsTemplateValues() {}
+ 
+ 	/**
+-	 * Applies the given values to the given target object.
++	 * Applies the given values to the given target object, restricted to the property binding configured on the mapper
++	 * that performs the read.
+ 	 *
+ 	 * @param target can be {@literal null}.
+ 	 * @param values must not be {@literal null}.
++	 * @param binder must not be {@literal null}.
+ 	 */
+-	static void applyTo(@Nullable Object target, Map<String, Object> values) {
+-
+-		if (target == null) {
+-			return;
+-		}
+-
+-		values.forEach((name, value) -> {
+-
+-			PropertyDescriptor descriptor = BeanUtils.getPropertyDescriptor(target.getClass(), name);
+-
+-			if (descriptor == null || descriptor.getWriteMethod() == null) {
+-				return;
+-			}
+-
+-			Method writeMethod = descriptor.getWriteMethod();
+-			ReflectionUtils.makeAccessible(writeMethod);
+-
+-			try {
+-				writeMethod.invoke(target, value);
+-			} catch (IllegalAccessException | InvocationTargetException e) {
+-				throw new RuntimeException(e);
+-			}
+-		});
++	static void applyTo(@Nullable Object target, Map<String, Object> values, ConfiguredPropertyBinder binder) {
++		binder.apply(target, values);
+ 	}
+ }
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java	2026-10-30 08:18:37.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadDeserializer.java	2026-10-30 09:21:57.109821632 +0000
+@@ -78,7 +78,7 @@
+ 		Object payload = payloadClass == Object.class || Map.class.isAssignableFrom(payloadClass) //
+ 				|| payloadClass.isInterface() //
+ 						? document //
+-						: ProblemPayloadValues.create(payloadClass, document);
++						: ProblemPayloadValues.create(context, payloadType, document);
+ 
+ 		return new Problem.ExtendedProblem<>(toUri(type), title == null ? null : title.toString(),
+ 				toInteger(status), detail == null ? null : detail.toString(), toUri(instance), payload);
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java	2026-10-30 08:18:37.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/problem/ProblemPayloadValues.java	2026-10-30 09:21:55.344822104 +0000
+@@ -15,14 +15,13 @@
+  */
+ package org.springframework.hateoas.mediatype.problem;
+ 
+-import org.springframework.beans.BeanUtils;
+-import org.springframework.util.ReflectionUtils;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
+ 
+-import java.beans.PropertyDescriptor;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+ import java.util.Map;
+ 
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
++
+ /**
+  * Creates the additional payload of an {@link Problem.ExtendedProblem} from the properties supplied by a document.
+  *
+@@ -33,35 +32,16 @@
+ 	private ProblemPayloadValues() {}
+ 
+ 	/**
+-	 * Creates an instance of the given type from the given property values.
++	 * Creates an instance of the given type from the given property values, honouring the property binding configured
++	 * on the mapper that performs the read.
+ 	 *
++	 * @param context must not be {@literal null}.
+ 	 * @param type must not be {@literal null}.
+ 	 * @param properties must not be {@literal null}.
+ 	 * @param <T>
+ 	 * @return
+ 	 */
+-	static <T> T create(Class<T> type, Map<String, Object> properties) {
+-
+-		T instance = BeanUtils.instantiateClass(type);
+-
+-		properties.forEach((name, value) -> {
+-
+-			PropertyDescriptor descriptor = BeanUtils.getPropertyDescriptor(type, name);
+-
+-			if (descriptor == null || descriptor.getWriteMethod() == null) {
+-				return;
+-			}
+-
+-			Method writeMethod = descriptor.getWriteMethod();
+-			ReflectionUtils.makeAccessible(writeMethod);
+-
+-			try {
+-				writeMethod.invoke(instance, value);
+-			} catch (IllegalAccessException | InvocationTargetException e) {
+-				throw new RuntimeException(e);
+-			}
+-		});
+-
+-		return instance;
++	static <T> T create(DeserializationContext context, JavaType type, Map<String, Object> properties) {
++		return ConfiguredPropertyBinder.forRead(context, type).instantiate(properties);
+ 	}
+ }
+diff -ruN a/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java b/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java
+--- a/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java	2026-10-30 08:18:35.000000000 +0000
++++ b/src/main/java/org/springframework/hateoas/mediatype/uber/UberJacksonModule.java	2026-10-30 09:21:45.279813228 +0000
+@@ -52,8 +52,8 @@
+ import org.springframework.hateoas.PagedModel;
+ import org.springframework.hateoas.PagedModel.PageMetadata;
+ import org.springframework.hateoas.RepresentationModel;
++import org.springframework.hateoas.mediatype.ConfiguredPropertyBinder;
+ import org.springframework.hateoas.mediatype.JacksonHelper;
+-import org.springframework.hateoas.mediatype.PropertyUtils;
+ import org.springframework.util.StringUtils;
+ 
+ /**
+@@ -530,14 +530,15 @@
+ 			RepresentationModel<?> result = doc.getUber().getData().stream() //
+ 					.filter(uberData -> StringUtils.hasText(uberData.getName())) //
+ 					.findFirst() //
+-					.map(uberData -> convertToResourceSupport(uberData, links)) //
++					.map(uberData -> convertToResourceSupport(uberData, links, ctxt)) //
+ 					.orElse(null);
+ 
+ 			return result == null ? new RepresentationModel<>().add(links) : result;
+ 		}
+ 
+ 		@NotNull
+-		private RepresentationModel<?> convertToResourceSupport(UberData uberData, Links links) {
++		private RepresentationModel<?> convertToResourceSupport(UberData uberData, Links links,
++				DeserializationContext context) {
+ 
+ 			List<UberData> data = uberData.getData();
+ 			Map<String, Object> properties;
+@@ -549,8 +550,8 @@
+ 						.collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 			}
+ 
+-			RepresentationModel<?> resourceSupport = (RepresentationModel<?>) PropertyUtils
+-					.createObjectFromProperties(this.getContentType().getRawClass(), properties);
++			RepresentationModel<?> resourceSupport = (RepresentationModel<?>) ConfiguredPropertyBinder
++					.forRead(context, this.getContentType()).instantiate(properties);
+ 
+ 			return resourceSupport.add(links);
+ 		}
+@@ -618,12 +619,12 @@
+ 			return doc.getUber().getData().stream() //
+ 					.filter(uberData -> StringUtils.hasText(uberData.getName())) //
+ 					.findFirst() //
+-					.map(uberData -> convertToResource(uberData, links)) //
++					.map(uberData -> convertToResource(uberData, links, ctxt)) //
+ 					.orElseThrow(
+ 							() -> new IllegalStateException("No data entry containing a 'value' was found in this document!"));
+ 		}
+ 
+-		private RepresentationModel<?> convertToResource(UberData uberData, Links links) {
++		private RepresentationModel<?> convertToResource(UberData uberData, Links links, DeserializationContext context) {
+ 
+ 			// Primitive type
+ 			List<UberData> data = uberData.getData();
+@@ -645,7 +646,7 @@
+ 					: data.stream().collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 
+ 			JavaType rootType = JacksonHelper.findRootType(this.contentType);
+-			Object value = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++			Object value = ConfiguredPropertyBinder.forRead(context, rootType).instantiate(properties);
+ 
+ 			return EntityModel.of(value, links);
+ 		}
+@@ -710,7 +711,7 @@
+ 			JavaType rootType = JacksonHelper.findRootType(this.contentType);
+ 			UberDocument doc = p.readValueAs(UberDocument.class);
+ 
+-			return extractResources(doc, rootType, this.contentType);
++			return extractResources(doc, rootType, this.contentType, ctxt);
+ 		}
+ 
+ 		/**
+@@ -773,7 +774,7 @@
+ 
+ 			UberDocument doc = p.readValueAs(UberDocument.class);
+ 
+-			CollectionModel<?> resources = extractResources(doc, rootType, this.contentType);
++			CollectionModel<?> resources = extractResources(doc, rootType, this.contentType, ctxt);
+ 			PageMetadata pageMetadata = extractPagingMetadata(doc);
+ 
+ 			return PagedModel.of(resources.getContent(), pageMetadata, resources.getLinks());
+@@ -818,9 +819,11 @@
+ 	 * @param contentType
+ 	 * @return
+ 	 */
+-	private static CollectionModel<?> extractResources(UberDocument doc, JavaType rootType, JavaType contentType) {
++	private static CollectionModel<?> extractResources(UberDocument doc, JavaType rootType, JavaType contentType,
++			DeserializationContext context) {
+ 
+ 		List<Object> content = new ArrayList<>();
++		ConfiguredPropertyBinder binder = ConfiguredPropertyBinder.forRead(context, rootType);
+ 
+ 		for (UberData uberData : doc.getUber().getData()) {
+ 
+@@ -872,7 +875,7 @@
+ 								: itemData.stream() //
+ 										.collect(Collectors.toMap(UberData::getName, UberData::getValue));
+ 
+-						Object obj = PropertyUtils.createObjectFromProperties(rootType.getRawClass(), properties);
++						Object obj = binder.instantiate(properties);
+ 						resource = EntityModel.of(obj, uberData.getLinks());
+ 					}
+ 				}

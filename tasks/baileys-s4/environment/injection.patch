@@ -1,0 +1,60 @@
+diff --git a/src/Socket/chats.ts b/src/Socket/chats.ts
+index 1af61b405e..2ca0dda2d9 100644
+--- a/src/Socket/chats.ts
++++ b/src/Socket/chats.ts
+@@ -1210,6 +1210,19 @@ export const makeChatsSocket = (config: SocketConfig) => {
+ 			}
+ 		}
+ 
++		// Persist app-state sync keys shared by our devices as soon as the stanza is handled,
++		// so app-state reads issued while the inbound buffer is still open use the current key
++		// rather than the previous one.
++		const sharedAppStateKeys = msg.message?.protocolMessage?.appStateSyncKeyShare?.keys
++		if (sharedAppStateKeys?.length) {
++			await authState.keys.transaction(async () => {
++				for (const { keyData, keyId } of sharedAppStateKeys) {
++					const strKeyId = Buffer.from(keyId!.keyId!).toString('base64')
++					await authState.keys.set({ 'app-state-sync-key': { [strKeyId]: keyData! } })
++				}
++			}, authState.creds.me!.id)
++		}
++
+ 		const historyMsg = getHistoryMsg(msg.message!)
+ 		const shouldProcessHistoryMsg = historyMsg
+ 			? shouldSyncHistoryMessage(historyMsg) &&
+diff --git a/src/Types/Auth.ts b/src/Types/Auth.ts
+index 40e34f0b1e..9a2b3e5c20 100644
+--- a/src/Types/Auth.ts
++++ b/src/Types/Auth.ts
+@@ -43,6 +43,8 @@ export type AccountSettings = {
+ 	unarchiveChats: boolean
+ 	/** the default mode to start new conversations with */
+ 	defaultDisappearingMode?: Pick<proto.IConversation, 'ephemeralExpiration' | 'ephemeralSettingTimestamp'>
++	/** show a security notification when a contact's identity key changes */
++	securityNotifications?: boolean
+ }
+ 
+ export type AuthenticationCreds = SignalCreds & {
+diff --git a/src/Utils/process-message.ts b/src/Utils/process-message.ts
+index 94f77158ac..c677244d01 100644
+--- a/src/Utils/process-message.ts
++++ b/src/Utils/process-message.ts
+@@ -400,6 +400,18 @@ const processMessage = async (
+ 					logger?.info({ protocolMsg }, 'recv app state sync with 0 keys')
+ 				}
+ 
++				break
++			case proto.Message.ProtocolMessage.Type.INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC:
++				const securityNotification = protocolMsg.initialSecurityNotificationSettingSync
++				if (securityNotification) {
++					ev.emit('creds.update', {
++						accountSettings: {
++							...creds.accountSettings,
++							securityNotifications: securityNotification.securityNotificationEnabled ?? true
++						}
++					})
++				}
++
+ 				break
+ 			case proto.Message.ProtocolMessage.Type.REVOKE:
+ 				ev.emit('messages.update', [

@@ -1,0 +1,106 @@
+--- a/mobsf/MobSF/settings.py
++++ b/mobsf/MobSF/settings.py
+@@ -192,23 +192,14 @@
+     'mobsf.MobSF',
+     'mobsf.MalwareAnalyzer',
+ )
+-MIDDLEWARE_CLASSES = (
+-    'django.middleware.security.SecurityMiddleware',
+-    'whitenoise.middleware.WhiteNoiseMiddleware',
+-    'django.middleware.common.CommonMiddleware',
+-    'django.middleware.csrf.CsrfViewMiddleware',
+-    'django.contrib.auth.middleware.AuthenticationMiddleware',
+-    'django.contrib.auth.middleware.SessionAuthenticationMiddleware',
+-    'django.contrib.messages.middleware.MessageMiddleware',
+-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+-    'django_ratelimit.middleware.RatelimitMiddleware',
+-)
+ MIDDLEWARE = (
++    'django.middleware.security.SecurityMiddleware',
+     'mobsf.MobSF.views.api.api_middleware.RestApiAuthMiddleware',
+     'django.contrib.sessions.middleware.SessionMiddleware',
++    'django.middleware.csrf.CsrfViewMiddleware',
+     'django.contrib.auth.middleware.AuthenticationMiddleware',
+     'django.contrib.messages.middleware.MessageMiddleware',
+-
++    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+ )
+ ROOT_URLCONF = 'mobsf.MobSF.urls'
+ WSGI_APPLICATION = 'mobsf.MobSF.wsgi.application'
+--- a/mobsf/MobSF/views/home.py
++++ b/mobsf/MobSF/views/home.py
+@@ -496,6 +496,7 @@
+ 
+ 
+ @login_required
++@require_http_methods(['POST'])
+ def generate_download(request):
+     """Generate downloads for smali/java zip."""
+     try:
+--- a/mobsf/MobSF/views/saml2.py
++++ b/mobsf/MobSF/views/saml2.py
+@@ -18,6 +18,7 @@
+ from django.urls import reverse
+ from django.shortcuts import redirect
+ from django.views.decorators.http import require_http_methods
++from django.views.decorators.csrf import csrf_exempt
+ 
+ from mobsf.MobSF.views.authorization import (
+     MAINTAINER_GROUP,
+@@ -154,6 +155,7 @@
+             False)
+ 
+ 
++@csrf_exempt
+ @require_http_methods(['POST'])
+ def saml_acs(request):
+     """Handle SSO Assertion Consumer Service."""
+--- a/mobsf/StaticAnalyzer/views/common/artifacts.py
++++ b/mobsf/StaticAnalyzer/views/common/artifacts.py
+@@ -4,8 +4,8 @@
+ from pathlib import Path
+ 
+ from django.conf import settings
+-from django.middleware.csrf import _does_token_match
+ from django.http import HttpResponse
++from django.views.decorators.http import require_http_methods
+ 
+ from mobsf.MobSF.utils import (
+     is_md5,
+@@ -22,9 +22,10 @@
+ 
+ @login_required
+ @permission_required(Permissions.DELETE)
++@require_http_methods(['POST'])
+ def clear_reports(request):
+     """Remove the generated report artifacts of a scan."""
+-    checksum = request.GET.get('checksum', '')
++    checksum = request.POST.get('checksum') or request.GET.get('checksum', '')
+     if not is_md5(checksum):
+         return print_n_send_error_response(request, 'Invalid checksum')
+     removed = 0
+@@ -36,10 +37,6 @@
+                 removed += 1
+     except OSError:
+         logger.exception('Cannot remove report artifacts')
+-    token = request.GET.get('csrfmiddlewaretoken', '')
+-    secret = request.COOKIES.get('csrftoken', '')
+-    if not token or not secret or not _does_token_match(token, secret):
+-        return print_n_send_error_response(request, 'Invalid request')
+     return HttpResponse(
+         '{"cleared": %d}' % removed,
+         content_type='application/json')
+--- a/mobsf/templates/static_analysis/android_binary_analysis.html
++++ b/mobsf/templates/static_analysis/android_binary_analysis.html
+@@ -655,9 +655,9 @@
+                     {% endif %}
+                     </p>
+                     <p>
+-                    <a href="{% url 'generate_downloads' %}?hash={{ md5 }}&amp;file_type=java" class="btn btn-warning" role="button"> <i class="fa fa-download"></i> Download Java Code</a>
++                    <form action="{% url 'generate_downloads' %}?hash={{ md5 }}&amp;file_type=java" method="post" style="display:inline">{% csrf_token %}<button type="submit" class="btn btn-warning"><i class="fa fa-download"></i> Download Java Code</button></form>
+                     {% if app_type not in 'jar,aar' %}
+-                    <a href="{% url 'generate_downloads' %}?hash={{ md5 }}&amp;file_type=smali" class="btn btn-warning"> <i class="fa fa-download"></i> Download Smali Code</a>
++                    <form action="{% url 'generate_downloads' %}?hash={{ md5 }}&amp;file_type=smali" method="post" style="display:inline">{% csrf_token %}<button type="submit" class="btn btn-warning"><i class="fa fa-download"></i> Download Smali Code</button></form>
+                     {% endif %}
+                     <a href="{% url "download_binary" checksum=md5 %}" class="btn btn-warning"> <i class="fa fa-download"></i> Download {{ app_type | upper}}</a>
+                     
