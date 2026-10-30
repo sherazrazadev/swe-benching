@@ -10,9 +10,9 @@ These tasks passed every step of the cwe-bench pipeline on GitHub Actions:
 | Task | Weakness | Language | Project | DeepSeek | MiMo | Verdict |
 |---|---|---|---|---|---|---|
 | [`jenkins-s3`](#jenkins-s3) | CWE-502 (deserialization of untrusted data) | Java | [jenkinsci/jenkins](https://github.com/jenkinsci/jenkins) | 0.6, 0.6, 0.6 | 0, 0, 0, 0 (+1 excluded) | **ACCEPTED** |
-| [`winter-s4`](#winter-s4) | CWE-693 (protection mechanism failure) | PHP | [wintercms/winter](https://github.com/wintercms/winter) | 0, 0, 0 | 0, 0, 0 | **ACCEPTED** |
-| [`git-js-s5`](#git-js-s5) | CWE-184 (incomplete list of disallowed inputs) | TypeScript | [steveukx/git-js](https://github.com/steveukx/git-js) | 0.5185, 0.3704, 0.2593 | 0.3704, 0.2593, 0, 0 (+1 excluded) | **ACCEPTED** |
-| [`izpack-zip-path-inj`](#izpack-zip-path-inj) | CWE-22 (path traversal) | Java | [izpack/izpack](https://github.com/izpack/izpack) | 0, 0.5882, 0.7059 | 0.4118, 0.4706, 0.4706 (+1 cut by rate limit, re-run) | **ACCEPTED** |
+| [`winter-s4`](#winter-s4) | CWE-693 (protection mechanism failure) | PHP | [wintercms/winter](https://github.com/wintercms/winter) | 0.8235, 0, 0 | 0, 0, 0 (runs 4–5 are 3 h timeouts; +2 not counted) | **ACCEPTED** (repaired version) |
+| [`git-js-s5`](#git-js-s5) | CWE-184 (incomplete list of disallowed inputs) | TypeScript | [steveukx/git-js](https://github.com/steveukx/git-js) | 0.5185, 0.3704, 0.2593 | 0.3704, 0.2593, 0, 0 (+1 excluded) | **IN REPAIR** (blind check found a fairness fault; re-trial running) |
+| [`izpack-zip-path-inj`](#izpack-zip-path-inj) | CWE-22 (path traversal) | Java | [izpack/izpack](https://github.com/izpack/izpack) | 0, 0.5882, 0.7059 | 0.4118, 0.4706, 0.4706 (+1 cut by rate limit, re-run) | **IN REPAIR** (blind check found a fairness fault; re-trial running) |
 
 ---
 
@@ -168,8 +168,12 @@ mechanisms that differ from the reported case.
 
 ### Where the task is
 
-The task is in Harbor format in [`tasks/winter-s4/`](../../tasks/winter-s4/). Results and logs are on branch
-[`runs/40724061049`](https://github.com/sherazrazadev/swe-benching/tree/runs/40724061049).
+The task is in Harbor format in [`tasks/winter-s4/`](../../tasks/winter-s4/). This section describes the **repaired**
+version (see "How it was repaired" below). Its results and logs are on branch
+[`runs/40966617100`](https://github.com/sherazrazadev/swe-benching/tree/runs/40966617100). The first six runs of the
+repaired version are also on [`runs/40944097095`](https://github.com/sherazrazadev/swe-benching/tree/runs/40944097095).
+The original version and its six runs are on [`runs/40724061049`](https://github.com/sherazrazadev/swe-benching/tree/runs/40724061049)
+and in `build/winter-s4/round0/`.
 
 | Path | What it is |
 |---|---|
@@ -191,8 +195,8 @@ Winter CMS lets editors write pages, layouts and partials in Twig. With safe mod
 and templates render inside a Twig sandbox. The sandbox decides what a template may call with a blocklist of method
 names per class (`modules/system/twig/SecurityPolicy.php`). The flaw comes in three parts:
 
-1. **Names are missing from the blocklist.** The reported page calls `this.theme.writeConfig(...)`, and the render
-   writes the theme's configuration file. The function check (`checkSecurity`) exists but has an empty body.
+1. **Names are missing from the blocklist.** A page can call `this.theme.writeConfig(...)`, and the render writes the
+   theme's configuration file. The function check (`checkSecurity`) exists but has an empty body.
 2. **The check never sees arguments.** It gets only the object and the method name. A harmless-looking collection or
    paged-result method can run a PHP function that the template passes in as a callable.
 3. **The checked object is not the one that acts.** Models forward unknown calls to query objects, and some helpers
@@ -204,8 +208,10 @@ arbitrary PHP, exposes host files or values, writes stored files or changes stor
 
 ### What the model is asked to do (`instruction.md`)
 
-The instruction gives the reported page body and states one property: template content is untrusted input, and
-rendering it must never
+The instruction describes the incident in outcome terms only: with safe mode on, a page-only account stored a page
+body, and the next render wrote an attacker-chosen value into the theme's configuration file. It no longer shows the
+template code or names the method. It then states one property: template content is untrusted input, and rendering it
+must never
 
 1. execute arbitrary PHP,
 2. expose files or host values the template was not given,
@@ -215,12 +221,37 @@ rendering it must never
 "whichever template is rendered and whatever values the application passes in or the template carries along".
 
 **How a render must be handled:**
-- A refused render is a plain client error (an error page or a template error) and leaves no side effect.
-- Everything that works today keeps working exactly as today: settings and stored values still bind, loops,
-  conditions, partials and built-in filters still render, lists and paged results still display, iterate and count,
-  and callbacks written in the template still work.
+- A refused render is a plain client error (an error page or an error raised while the template is processed) and
+  leaves no side effect.
+- Everything that works today keeps working exactly as today, for every value the application supplies: settings and
+  stored values still bind; **stored records can still be read and counted, including when a template reads or counts
+  them through the model it was given**; loops, conditions, partials and the built-in filters still render; lists and
+  paged results still display, iterate and count; and callbacks written in the template still work.
 
-**What the model must not do:** look up the upstream fix or the advisory, or special-case the example.
+**What the model must not do:** look up the upstream fix or the advisory, or special-case the incident.
+
+### How it was repaired
+
+The original version was accepted on 2026-10-28, but a later blind check showed it was unfair.
+
+- **What was wrong.** One functional test, `FunctionalModelReadsTest::testStoredValuesStillReadAndCount`, renders
+  `{{ model.newQuery().count() }}` and requires `1`. The original instruction never said that reads through a model's
+  query object must keep working. It said only that "settings and stored values still bind" and that lists and paged
+  results still count. The project's own policy already blocks `getQuery` on models, so blocking `newQuery` too is the
+  natural maintainer choice. All six original runs and a blind Claude Opus fix failed this test. Because any functional
+  failure sets the reward to 0, that one unstated rule turned otherwise-secure fixes into 0
+  (`round0/AUDIT-FINDINGS.md`).
+- **What changed in the instruction.** The keep-list now says that stored records can still be read and counted,
+  including through the model a template is given. Every other keep-list item was kept word for word. (An earlier
+  repair attempt had replaced the whole list with one generic line; that was rejected, because the generic line is
+  what caused the unfairness.) The incident no longer shows the code `this.theme.writeConfig(...)`, so the instruction
+  does not point at a location.
+- **What changed in the tests.** Security went from 15 to 17 tests: `source()` is now also tested with a file name
+  written into the template (no getter), and `enum_cases()` is covered. One test per mechanism (theme write, string
+  callable, array callable, quiet save, host constant) now also requires the render to fail with an error. Functional went from 37 to 38 tests: a theme configuration read was added, and a
+  legitimate `attribute(items, 'pluck', ['n'])` call was added to an existing test. The over-broad wrong fix
+  (`func_fail_overbroad.patch`) was regenerated so it refuses every method call.
+- **Then the task was re-gated and re-trialled** with fresh DeepSeek and MiMo runs (below).
 
 ### What makes it hard: eight routes, three mechanisms
 
@@ -230,119 +261,159 @@ written in a template, and the functional tests require those to keep working.
 
 | Route | Where | Real or added | Security test(s) |
 |---|---|---|---|
-| T1 Theme configuration write: the reported example | `modules/cms/classes/Theme.php:525` (`writeConfig`) | Real upstream code, unmodified | `testThemeConfigurationCannotBeChangedByATemplate` |
+| T1 Theme configuration write: the reported incident | `modules/cms/classes/Theme.php:525` (`writeConfig`) | Real upstream code, unmodified | `testThemeConfigurationCannotBeChangedByATemplate` |
 | T2 String callable passed to a collection or paged-result method, by dot call and by the built-in `attribute()` helper | `modules/system/twig/SecurityPolicy.php:182-211` (`checkMethodAllowed` sees no arguments) | Real upstream code, unmodified | `testCollectionMethodDoesNotExecuteAStringCallableFromATemplate`, `testAttributeHelperDoesNotExecuteAStringCallable`, `testPagedResultsDoNotExecuteAStringCallableFromATemplate` |
 | T3 Array-form callable (`['Class', 'method']`): a recursive stripper returns from the array branch before testing the array itself | `modules/system/twig/securitypolicy/SafeCollection.php` (reference fix) | Real upstream sink; the published fix leaves this gap | `testCollectionMethodDoesNotExecuteAnArrayCallableFromATemplate`, `testBuiltInAttributeHelperDoesNotExecuteAnArrayCallable` |
 | T4 Page file overwritten through the page's query object: `this.page.newQuery().update(...)` | `SecurityPolicy.php:445-459`, `:268-274` | Real upstream code, unmodified | `testPageFileCannotBeOverwrittenThroughAQueryObject` |
 | T5 Stored records changed through a quiet save, a forwarded counter, the query object, and a forwarded callable | `SecurityPolicy.php:95-150` | Real upstream code, unmodified | `testStoredRecordCannotBeChangedThroughAQuietSave`, `…ThroughAForwardedCounter`, `…ThroughAQueryObject`, `testForwardedModelMethodDoesNotExecuteAStringCallable` |
 | T6 Theme setter `saveConfigValue` calls the blocked writer inside PHP | `modules/cms/classes/Theme.php:496` | Added to the product (`injection.patch`) | `testThemeConfigurationCannotBeChangedByATemplateThroughASetter` |
 | T7 Page helper `saveAttributes` runs the query write inside PHP | `modules/cms/classes/CmsCompoundObject.php:92` | Added to the product (`injection.patch`) | `testPageFileCannotBeOverwrittenThroughASaveHelper` |
-| T8 Host constant and stored template source read through `constant()` and `source()` | `SecurityPolicy.php:368-380` (`checkSecurity`) | Real upstream code, unmodified | `testHostConstantIsNotExposedToATemplate`, `testStoredTemplateSourceIsNotExposedToATemplate` |
+| T8 Host constant, host enum cases and stored template source read through `constant()`, `enum_cases()` and `source()` | `SecurityPolicy.php:368-380` (`checkSecurity`) | Real upstream code, unmodified | `testHostConstantIsNotExposedToATemplate`, `testEnumCasesAreNotExposedToATemplate`, `testStoredTemplateSourceIsNotExposedToATemplate`, `testStoredTemplateSourceIsNotExposedWithoutAGetter` |
 
 T6 and T7 are two one-line helper methods added to Winter in the style of the methods next to them. They sit in files
 the published fix never touches. Everything else is unmodified upstream code.
 
 ### Tests and scoring
 
-- **Security: 15 tests in 11 files.** Each test renders an attack template through the real CMS front end
+- **Security: 17 tests in 11 files.** Each test renders an attack template through the real CMS front end
   (`Controller::run`) or the CMS Twig environment the application exposes (`Controller::getTwig`). It then checks
   that the side effect did not happen: no file created, changed or removed, no record changed, no host value or
-  template source in the output. Any thrown error counts as a refusal.
-- **Functional: 37 tests.** These are 10 hidden tests that render legitimate templates (settings, loops, filters,
-  partials, collections, paged results, template callbacks, model reads, session use), plus the project's own 27
-  tests in `modules/system/tests/twig`. The runner includes that whole directory (`tests/support/run.php:37-39`), so
-  any test the agent leaves there is graded too.
+  template source in the output. Six of them (theme write, string callable on a collection, both array-callable
+  tests, quiet save, host constant) also require the render to fail with an error. Any thrown error counts; no error
+  class is required.
+- **Functional: 38 tests.** These are 11 hidden tests that render legitimate templates (settings, loops, filters,
+  partials, collections, paged results, template callbacks, model reads, theme reads, session use), plus the project's
+  own 27 tests in `modules/system/tests/twig`. The runner includes that whole directory (`tests/support/run.php:37-39`),
+  so any test the agent leaves there is graded too.
 - **Reward.** The reward is 1.0 only when every security and functional test passes. If any functional test fails,
   the reward is 0. Otherwise it is the share of security tests passed, capped at 0.99 (`tests/score.py:59-64`).
 
 ### Validation before any model ran (the gate)
 
+The repaired version was re-gated with every stage run again.
+
 | Check | Expected | Result |
 |---|---|---|
-| Vulnerable code (no fix) | Every security test fails, every functional test passes | ✅ 15 fail / 37 pass |
-| Reference fix (3 runs) | Everything passes | ✅ 52/52 |
-| Independent alternative fix, signature-based refusal (`pass_alt.patch`) | Everything passes | ✅ |
+| Vulnerable code (no fix) | Every security test fails, every functional test passes | ✅ 17 fail / 38 pass |
+| Reference fix (3 runs) | Everything passes | ✅ 55/55, identical across runs |
+| Independent alternative fix, signature-based refusal (`pass_alt.patch`) | Everything passes | ✅ 1.0 |
+| Hardening patch (`pass_hardening.patch`) | Everything passes | ✅ 1.0 |
 | Fix by a fresh agent (`blind.patch`, DeepSeek; it was given the instruction, tree, tests, reference and trap list) | Everything passes | ✅ 1.0 |
-| 9 incomplete fixes: missing the reported write, the setter, the query object, the model writes, all callables, array callables, the page helper, the function surface, or reads-only | Each is caught by a security test | ✅ |
-| 1 over-broad fix (`func_fail_overbroad.patch`) | Caught by a functional test | ✅ 6 functional failures |
-| Hardening patch | Passes | ✅ |
+| 9 incomplete fixes: missing the reported write, the setter, the query object, the model writes, all callables, array callables, the page helper, the function surface, or reads-only | Each is caught by a security test | ✅ rewards 0.2353 to 0.9412 |
+| 1 over-broad fix that refuses every method call (`func_fail_overbroad.patch`) | Caught by a functional test | ✅ reward 0, 13 functional failures (10 hidden, 3 project) |
 
-The gate verdict is pass (2026-10-28T17:20:52Z). The fresh-agent fix was checked right after (17:22Z) and scored 1.0.
+The gate verdict is pass (2026-10-29T20:26:47Z).
 
 ### Model results
 
-The trials were run on GitHub Actions, batch 12, in
-[run 40724061049](https://github.com/sherazrazadev/swe-benching/actions/runs/40724061049). The agent limit was 3 h
-(`CWE_AGENT_TIMEOUT_MULT=1.5`). Every run finished on its own; none hit the limit.
+The repaired version was trialled on GitHub Actions in
+[run 40944097095](https://github.com/sherazrazadev/swe-benching/actions/runs/40944097095) (DeepSeek runs 1–3, MiMo
+runs 1–3). Two more MiMo runs were added in the verdict run
+[run 40966617100](https://github.com/sherazrazadev/swe-benching/actions/runs/40966617100) (runs 4 and 5), because
+MiMo runs 2 and 3 could not be counted. The agent limit was 3 h (`CWE_AGENT_TIMEOUT_MULT=1.5`).
 
 | Model | Run | Reward | Agent time | Counted? | Why it failed (Opus audit) |
 |---|---|---|---|---|---|
-| DeepSeek | 1 | 0 | 45 min | ✅ | Passed all 15 security tests. Its deny-by-default allowlist broke 3 legitimate reads: `paginator.through(closure)`, `model.newQuery().count()` and `this.page.get()` |
-| DeepSeek | 2 | 0 | 52 min | ✅ | Passed all 15 security tests. A deny-by-default policy blocked `newQuery` globally and refused `this.page.get()`, failing 2 functional tests |
-| DeepSeek | 3 | 0 | 51 min | ✅ | Passed all 15 security tests. Its deny-by-default policy refused `model.newQuery().count()`, the only failing test |
-| MiMo | 1 | 0 | 127 min | ✅ | Its callable guard covers a fixed list of method names that leaves out `through`, so `paginator.through('touch')` still runs PHP (14/15 security). It also blocked `newQuery`, breaking the model read |
-| MiMo | 2 | 0 | 145 min | ✅ | Passed all 15 security tests. Its deny-by-default model policy refused `model.newQuery().count()`, the only failing test |
-| MiMo | 3 | 0 | 66 min | ✅ | Changed only `SecurityPolicy.php` and never handled callable arguments; 6 security tests fail, including `constant()`. It also blocked `newQuery` and left 4 scratch tests in `modules/system/tests/twig` that now error |
+| DeepSeek | 1 | 0.8235 | 33 min | ✅ | Passed 14 of 17 security tests and all 38 functional tests. Hardened methods, forwarding and callable arguments in depth, but left the function check empty, so `constant()`, `enum_cases()` and `source()` with a written-in file name still work |
+| DeepSeek | 2 | 0 | 37 min | ✅ | Passed all 17 security tests. Rewrote the policy as a strict allowlist that broke 5 functional tests: template callbacks on collections and paged results, `where`/`sortBy`/`groupBy`, `model.newQuery().count()`, and iterating theme pages with `this.page.get()` |
+| DeepSeek | 3 | 0 | 45 min | ✅ | Passed all 17 security tests. Same allowlist approach; broke 4 functional tests (template callbacks on collections and paged results, `where`/`sortBy`/`groupBy`, `model.newQuery().count()`). The transcript shows the model chose to refuse `map(...)` on purpose |
+| MiMo | 1 | 0 | 50 min | ✅ | Submitted no source change (0 of 17). Investigation only; the transcript ends on a tool result with no final message. Audited "model-failed", medium confidence |
+| MiMo | 2 | 0 | 40 min | ❌ not counted | Submitted no product change, only two scratch tests. The transcript stops abruptly and the auditor could not read the agent log to tell a model stop from a provider stop. Attribution "unclear" |
+| MiMo | 3 | 0 | 1 min | ❌ excluded | The provider refused the request ("considered high risk") after 8 read-only calls, before any edit |
+| MiMo | 4 | 0 | 3 h limit | ✅ | Hit the 3-hour limit. Passed 7 of 17 security tests per the audit. Blocked method names but never handled callable arguments (`each('touch')`, `each([File,'delete'])`, `through('touch')`, `model.each('var_dump')`), left the page save helper and `enum_cases()` open, and blocked `newQuery`, breaking the model read |
+| MiMo | 5 | 0 | 3 h limit | ✅ | Hit the 3-hour limit. Fixed the incident and all file and record writes, but its allowlist permits `each`/`map`/`filter` and nothing strips non-closure callables, so 5 callable tests fail. Also left `enum_cases()` open and broke the legitimate `paginator.through(closure)` callback |
 
-Agent time is `duration_s` from `trial_detail_*.json`.
+Agent time is `duration_s` from `trial_detail_*.json`; runs 4 and 5 have no `duration_s` and ended at the 10800 s
+limit.
 
-**The common failure:** every run broke the same legitimate read, `{{ model.newQuery().count() }}`
-(`FunctionalModelReadsTest::testStoredValuesStillReadAndCount`). DeepSeek closed every security route in all three
-runs, but each time with a deny-by-default policy that also blocked reads the instruction says must keep working.
-The reference fix shows both can be done: it leaves `newQuery()` open and blocks only the writes on the query
-objects. So the difficulty here is closing every route without breaking ordinary template use. MiMo runs 1 and 3 also
-left security routes open (the paged-result callable, and in run 3 all callable arguments and `constant()`).
+**The common failure:** the models fell on one side or the other of the same line. DeepSeek runs 2 and 3 closed every
+security route, but with allowlists that also blocked reads and template callbacks the instruction now names
+explicitly. MiMo runs 4 and 5 kept ordinary use mostly working, but never stopped a template from passing a PHP
+function as a callable argument. DeepSeek run 1 came closest: it handled both, and missed only the function surface
+(T8). `testEnumCasesAreNotExposedToATemplate` failed in every run that changed code except DeepSeek runs 2 and 3. The
+reference fix shows both sides can be met: it strips string and array callables but keeps template closures, and it
+leaves `newQuery()` open while blocking the writes on the query objects.
 
 ### Why this is fair
 
-- **Fairness review: READY.** Every security test falls under one of the four stated rules, read literally. The
-  routes the instruction does not name (array callables, forwarding, the added helpers) are instances of those rules
-  or standard PHP knowledge. Four fixes reach 1.0: the reference, `pass_alt`, `pass_hardening` and `blind.patch`, so
+- **Fairness review: READY.** Every security test falls under one of the four stated rules, read literally. Every
+  functional test rests on a keep-list sentence the instruction states, including the new "stored records can still
+  be read and counted" line. Four fixes reach 1.0: the reference, `pass_alt`, `pass_hardening` and `blind.patch`, so
   no single design is required. Tests accept any thrown error as a refusal and demand no error class. The full review
   is in [`verdicts/winter-s4-FAIRNESS.md`](verdicts/winter-s4-FAIRNESS.md).
-- **The review left one question open for a human.** Are the application-supplied values (collections, paged
-  results and models passed to `Controller::getTwig`) in scope under "whatever values the application passes in"?
-  And is "never execute arbitrary PHP" meant to keep sandboxed template callbacks while refusing PHP callables?
-  The six audits answered it: none found a test that demands something the instruction does not state, and the
-  audits cite those exact sentences ("values the application supplies", "callbacks written in the template still
-  work") when judging the failures.
-- **Audits: 6 of 6 failing runs are trustworthy model failures** (3 high confidence, 3 medium). No audit found a
-  harness error or a test that fails a correct fix. No run read the hidden tests, looked up the upstream fix, or made
-  tool calls during grading.
+- **Blind check of the repaired version: Claude Opus scored 0.3529, and passed every functional test.**
+  In [run 40965701205](https://github.com/sherazrazadev/swe-benching/actions/runs/40965701205), Claude Opus fixed the
+  task with only `instruction.md` and the repository (no shell, no tests, no web). Its fix passed all functional tests,
+  so the keep-list now covers everything the functional suite checks. It missed 11 of 17 security tests, all inside
+  the stated bug: string and array callables (`testAttributeHelperDoesNotExecuteAStringCallable`,
+  `testBuiltInAttributeHelperDoesNotExecuteAnArrayCallable`,
+  `testCollectionMethodDoesNotExecuteAnArrayCallableFromATemplate`,
+  `testCollectionMethodDoesNotExecuteAStringCallableFromATemplate`,
+  `testPagedResultsDoNotExecuteAStringCallableFromATemplate`, `testForwardedModelMethodDoesNotExecuteAStringCallable`),
+  host values and template source (`testEnumCasesAreNotExposedToATemplate`, `testHostConstantIsNotExposedToATemplate`,
+  `testStoredTemplateSourceIsNotExposedToATemplate`, `testStoredTemplateSourceIsNotExposedWithoutAGetter`), and the
+  page save helper (`testPageFileCannotBeOverwrittenThroughASaveHelper`). For comparison, the same check on the
+  original version scored 0, because of the `newQuery` functional test.
+- **The review's open questions were decided KEEP** (2026-10-30, `build/winter-s4/HUMAN-DECISION.md`):
+  1. A template the application builds at runtime (`Controller::getTwig()` + `createTemplate`) is covered by
+     "whichever template is rendered".
+  2. For a template rendered directly, an error raised during processing is the natural refusal. The error checks
+     accept any `Throwable`.
+  3. The repaired instruction keeps the full keep-list, and the blind Opus fix passing every functional test shows the
+     functional suite is covered by it.
+- **Audits: 6 of 8 failing runs are trustworthy model failures** (5 high confidence, 1 medium). MiMo run 2 was
+  "unclear" and MiMo run 3 was a provider refusal; neither is counted. No audit found a harness error or a test that
+  fails a correct fix. No run read the hidden tests, looked up the upstream fix, or made tool calls during grading.
 - **The task is real and solvable.** Four different fixes reach 1.0, and every miss above breaks a rule or a
   "keeps working" promise the instruction states.
 
 ### Caveats
 
-- **One functional test decides most of the zeros.** `testStoredValuesStillReadAndCount` failed in all six runs. It
-  was the only failure in DeepSeek run 3 and MiMo run 2, so without it those two runs would score 1.0, and MiMo
-  run 1 would score 0.93. The three medium-confidence audits (DeepSeek 3, MiMo 1, MiMo 2) say why: the instruction
-  promises that reads keep working "exactly as today" but never names query objects, and blocking query objects is
-  a defensible hardening choice. They still judged the test fair, because the read works at the pinned commit and
-  the reference fix keeps it working. DeepSeek runs 1 and 2 and MiMo run 3 fail for other reasons as well.
-- **The review's "Required: generalize" note was not applied.** It asked to reword the "keeps working" contract so
-  it does not list the surfaces the callable routes use (lists, paged results, callbacks). The instruction the models
-  saw still lists them. That makes the task slightly easier, not harder, so it does not weaken the zero scores.
-- **Security tests check for missing side effects, not for an error.** The review notes that a fix that silently
-  turns a dangerous call into a no-op would pass the security tests, although the instruction asks for an error.
-  No run took that route, so the results are unaffected.
-- **Agent tests count.** The functional group runs everything in `modules/system/tests/twig`. MiMo run 3 left scratch
-  tests there that errored. The audit judged this fair, since the model saw the failures and kept the files.
-- **The "fresh agent" fix was not blind.** The gate's `blind.patch` agent was given the tests and the reference fix.
-  It still shows a second design reaching 1.0, next to the build's own `pass_alt.patch` and `pass_hardening.patch`.
+- **DeepSeek run 1 was a near miss.** It scored 0.8235 (14/17) with every functional test passing, and missed only
+  the function surface. One of its three misses is `enum_cases()`. The MiMo run 2 audit notes that whether host enum
+  cases count as a "host value" is a matter of interpretation. Even without that test, run 1 would still fail
+  `constant()` and `source()`, so it would not reach 1.0.
+- **The scoring gate decides two DeepSeek zeros.** DeepSeek runs 2 and 3 passed all 17 security tests and scored 0
+  only because they broke legitimate reads and callbacks. Any functional failure sets the reward to 0. This time every
+  broken behaviour is named in the instruction's keep-list, and the audits quote those sentences, so these are fair
+  zeros, but they are zeros for over-blocking, not for leaving the bug open.
+- **No MiMo run finished a fix within the time limit.** Of the three counted MiMo runs, run 1 submitted no change, and
+  runs 4 and 5 hit the 3-hour limit and were graded on the code they had. Under the cwe-bench rule
+  (`common/audit/audit_results.py`), a 3-hour timeout counts as a failure once an audit confirms it, and both were
+  audited as genuine model failures with high confidence. If timeouts were not counted, MiMo would have only one
+  counted run, and that run made no edit. MiMo run 1's audit is also only medium confidence: its transcript ends on a
+  tool result, much like run 2, which was not counted.
+- **The review's "Required: generalize" note was not applied.** It asked to collapse the keep-list to generic wording.
+  The repair followed the blind-check findings instead, which forbid shortening the list, because the generic wording
+  is what made the original unfair. The instruction still lists the surfaces the callable routes use (lists, paged
+  results, callbacks), which makes the task slightly easier, not harder.
+- **Some wrong fixes are not caught.** The review lists leniency gaps: the security tests without an error check only
+  look for the missing side effect, so a fix that silently turns a dangerous call into a no-op passes them; only the `each`
+  executor is driven on models; and no functional test reads through the page's own query object. None of these can
+  lower a score.
+- **Agent tests count.** The functional group runs everything in `modules/system/tests/twig`. A model that leaves
+  failing scratch tests there is scored 0. MiMo run 2 left two scratch tests, but it also made no product change.
+- **The gate's "fresh agent" fix was not blind.** The `blind.patch` agent was given the tests and the reference fix.
+  The real blind check is the Claude Opus run above.
 
 ### Evidence
 
 - Final verdict page: [`verdicts/winter-s4.md`](verdicts/winter-s4.md)
 - Fairness review: [`verdicts/winter-s4-FAIRNESS.md`](verdicts/winter-s4-FAIRNESS.md)
-- Audit of each failing run: [`audits/winter-s4-*/POSTMORTEM.md`](audits/)
-- Build, gate and trial records: branch [`runs/40724061049`](https://github.com/sherazrazadev/swe-benching/tree/runs/40724061049),
+- Audit of each failing run: [`audits/winter-s4-*-202610{29,30}-*/POSTMORTEM.md`](audits/) (the `20261028` folders
+  are the original version)
+- Repair: `build/winter-s4/round0/AUDIT-FINDINGS.md` (what was unfair), `build/winter-s4/notes.md` ("Fairness
+  revision"), `build/winter-s4/HUMAN-DECISION.md` (KEEP)
+- Blind check of the repaired version: [run 40965701205](https://github.com/sherazrazadev/swe-benching/actions/runs/40965701205)
+- Build, gate and trial records: branch [`runs/40966617100`](https://github.com/sherazrazadev/swe-benching/tree/runs/40966617100),
   `build/winter-s4/` (`gate_report.json`, `gate_verdict.json`, `manifest.json`, `notes.md`, `FAIRNESS.md`,
-  `trial_detail_*.json`)
+  `trial_detail_*.json`, `round0/` for the original version)
 
 ---
 
 ## `git-js-s5`
+
+> **Status (2026-10-30): IN REPAIR.** A blind solvability check found a fairness fault in this version (see the repair runs); the task is being repaired and re-trialled. The results below describe the earlier version and are not final.
 
 ### Where the task is
 
@@ -548,6 +619,8 @@ row.
 ---
 
 ## `izpack-zip-path-inj`
+
+> **Status (2026-10-30): IN REPAIR.** A blind solvability check found a fairness fault in this version (see the repair runs); the task is being repaired and re-trialled. The results below describe the earlier version and are not final.
 
 ### Where the task is
 
