@@ -4,7 +4,7 @@ Started 2026-10-30T05:11Z. [run 41007009474](https://github.com/sherazrazadev/sw
 
 | Task | Gate | DeepSeek rewards | MiMo rewards | Outcome |
 |---|---|---|---|---|
-| `camel-s4` | sound | 0 0 0 | 0 0 0 | **in final checks** |
+| `camel-s4` | sound | 1 | 1 | **REJECTED** |
 | `pip-s4` | sound | 1 | 0.8571 | **REJECTED** |
 | `transformers-s4` | sound | 1 | 1 | **REJECTED** |
 | `http-server-s4` | sound | 1 | 1 | **REJECTED** |
