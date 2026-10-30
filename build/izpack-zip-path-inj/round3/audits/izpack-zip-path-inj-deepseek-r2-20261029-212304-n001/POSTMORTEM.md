@@ -1,0 +1,26 @@
+# Post-run audit: izpack-zip-path-inj__MGXzJxG
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.9.
+
+**Trustworthy:** True  **Attribution:** model-failed  **Confidence:** medium
+
+Reward 0.9 = 18/20 security tests and 36/36 functional tests passing (score.py threshold rule). The only failures are both cases in FileEntryApiSecurityTest. They build a PackFile, the file entry used while compiling a description, with a target of 'sub/../escape.txt' or 'sub\\..\\escape.txt' and expect any Exception. The model put extensive install-time checks into UnpackerBase, the unpackers, config tasks, uninstaller data/log, ScriptParser, LogUtils and others, but it never changed PackFile or the compiler path. It read PackFile.java (transcript.md:50) and looked through CompilerConfig target handling (transcript.md:44-55), then validated only when locations are used. The instruction says no '..' location 'however it enters the toolkit, may be retained', and it says the toolkit consumes the description to produce the installer. So refusing at entry construction is a stated requirement. The test accepts any exception type, so a reasonable fix would pass, and the reference fix does exactly this (PackFile.validateTargetPath). Some ambiguity remains, because most of the instruction is phrased around what the installer does at install time, so confidence is medium, not high. The passing security tests check real side effects (no file outside the install directory, a later legitimate entry still installs, getResult()==false, nothing recorded as installed), so they are not lenient. No infra problems: results.json is complete, there were no tool calls during the grading window, and exception_info is null. The stdout tail is empty, but per-test results exist. No sign of hidden-test access or upstream lookup.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| com.izforge.izpack.installer.bench.security.FileEntryApiSecurityTest::refusesForwardSlashTraversal | fail | genuine-fail | True | True |
+| com.izforge.izpack.installer.bench.security.FileEntryApiSecurityTest::refusesBackslashTraversal | fail | genuine-fail | True | True |
+
+**Lookup or leak:** None found. The transcript has no WebFetch/WebSearch/curl/wget calls and no access to /tests, /logs, the solution, or the bench test sources. The agent worked from the repository source only.
+
+**Evidence:**
+- evidence/grading/results.json:9-10 — the two FileEntryApiSecurityTest cases fail; every other security and functional test passes
+- evidence/tests/security/.../FileEntryApiSecurityTest.java:19-24,38-48 — constructs PackFile with a traversing target and expects any Exception
+- evidence/instruction.md:22-27 — 'No location value the toolkit accepts, however it enters the toolkit, may be retained or used ... if it contains a parent-directory segment'
+- evidence/final-code/changes.patch — no hunk touches izpack-api/.../PackFile.java or izpack-compiler (the only new izpack-api file is InvalidPathException.java)
+- evidence/solution/fix.patch:27,35-60 — the reference adds PackFile.validateTargetPath, which throws IOException on a '..' segment with either separator
+- evidence/transcript.md:50 — the model read PackFile.java but did not change it
+- evidence/run.json timing — tool_calls_during_grading: [], agent_events_after_end: 0
+- evidence/tests/score.py:59-64 — reward = sec_ok/len(sec) = 18/20 = 0.9 when all functional tests pass
+
+**Recommended action:** Accept the 0.9 as a fair measure: the model missed the compile-time/entry-construction layer. Optionally make the instruction say explicitly that the description-side file-entry API must refuse traversing targets, which would remove the remaining ambiguity.
