@@ -10,3 +10,6 @@ Keep both tests. Re-gate; oracle and pass_alt must still reach 1.0.
 
 ## Owner rule (instruction tone)
 instruction.md reads as an issue report: in this codebase, this is the exact bug and its impact, please fix it. Keep every sentence that states WHAT the bug is and WHAT must keep working, word for word. Remove only WHERE: file, path, module, class, function, method, variable, test names, line numbers.
+
+## HARD RULE for this repair: only the three instruction edits above, nothing else
+Make exactly the three changes listed (contract wording, the added self-issued property sentences, the added observed-impact clause). Every other line of instruction.md must stay byte-for-byte unchanged — in particular keep "- A wildcard still matches exactly one label when names are compared." (a previous attempt deleted it, which drops a stated must-keep-working behaviour), and keep the Constraints/closing lines as they are. Do not edit tests.
