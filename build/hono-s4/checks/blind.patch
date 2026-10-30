@@ -1,0 +1,162 @@
+diff -ruN a/src/helper/ssg/manifest.ts b/src/helper/ssg/manifest.ts
+--- a/src/helper/ssg/manifest.ts	2026-10-30 05:30:34.000000000 +0000
++++ b/src/helper/ssg/manifest.ts	2026-10-30 05:46:34.399420551 +0000
+@@ -1,5 +1,5 @@
+ import type { FileSystemModule } from './ssg'
+-import { dirname, joinPaths } from './utils'
++import { dirname, joinPathsWithinOutDir } from './utils'
+ 
+ export const DEFAULT_MANIFEST_NAME = 'manifest.json'
+ 
+@@ -18,7 +18,8 @@
+   manifest: boolean | string
+ ): Promise<string> => {
+   const name = typeof manifest === 'string' ? manifest : DEFAULT_MANIFEST_NAME
+-  const manifestPath = joinPaths(outDir, name)
++  // The manifest name is caller configuration, but it still may not escape.
++  const manifestPath = joinPathsWithinOutDir(outDir, name)
+   const dirPath = dirname(manifestPath)
+   if (dirPath !== '') {
+     await fsModule.mkdir(dirPath, { recursive: true })
+diff -ruN a/src/helper/ssg/redirects.ts b/src/helper/ssg/redirects.ts
+--- a/src/helper/ssg/redirects.ts	2026-10-30 05:30:34.000000000 +0000
++++ b/src/helper/ssg/redirects.ts	2026-10-30 05:46:35.145413581 +0000
+@@ -1,5 +1,5 @@
+ import type { FileSystemModule } from './ssg'
+-import { dirname, joinPaths } from './utils'
++import { dirname, joinPathsWithinOutDir } from './utils'
+ 
+ export const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308])
+ 
+@@ -18,7 +18,8 @@
+   outDir: string,
+   location: string
+ ): Promise<string> => {
+-  const filePath = joinPaths(outDir, location, 'index.html')
++  // The target comes from the response, so confine it like any page address.
++  const filePath = joinPathsWithinOutDir(outDir, location, 'index.html')
+   const dirPath = dirname(filePath)
+   if (dirPath !== '') {
+     await fsModule.mkdir(dirPath, { recursive: true })
+diff -ruN a/src/helper/ssg/ssg.ts b/src/helper/ssg/ssg.ts
+--- a/src/helper/ssg/ssg.ts	2026-10-30 05:30:34.000000000 +0000
++++ b/src/helper/ssg/ssg.ts	2026-10-30 05:46:31.006451502 +0000
+@@ -18,6 +18,7 @@
+   filterStaticGenerateRoutes,
+   isDynamicRoute,
+   joinPaths,
++  joinPathsWithinOutDir,
+ } from './utils'
+ 
+ const DEFAULT_CONCURRENCY = 2 // default concurrency for ssg
+@@ -376,8 +377,9 @@
+   }
+   let filePath = generateFilePath(routePath, outDir, mimeType, extensionMap)
+   if (outputName) {
+-    // A response can choose the file it is written to.
+-    filePath = joinPaths(outDir, outputName)
++    // A response can choose the file it is written to, so the chosen name is
++    // joined and confined here rather than trusting the earlier page check.
++    filePath = joinPathsWithinOutDir(outDir, outputName)
+   }
+   const dirPath = dirname(filePath)
+ 
+diff -ruN a/src/helper/ssg/utils.ts b/src/helper/ssg/utils.ts
+--- a/src/helper/ssg/utils.ts	2026-10-30 05:30:32.000000000 +0000
++++ b/src/helper/ssg/utils.ts	2026-10-30 05:46:26.609492198 +0000
+@@ -74,14 +74,89 @@
+   return path.split('/').some((segment) => segment.startsWith(':') || segment.includes('*'))
+ }
+ 
++interface ResolvedPath {
++  /** Which filesystem root the path belongs to; two paths only compare when these match. */
++  root: string
++  /** Segments with every `.` and `..` already applied. */
++  segments: string[]
++}
++
++const DRIVE_PREFIX = /^([A-Za-z]):/
++
++/**
++ * Resolve `path` into a root kind and the segments the operating system would
++ * walk. Parent segments are applied here rather than compared as text, so a
++ * joined path such as `static/a/../../pwned` is seen to climb out of `static`.
++ * `..` cannot climb above an absolute root, but is kept for relative paths.
++ */
++const resolvePath = (path: string): ResolvedPath => {
++  const normalized = path.replace(/\\/g, '/')
++  const drive = DRIVE_PREFIX.exec(normalized)
++
++  let root = 'relative'
++  let remainder = normalized
++  if (drive) {
++    root =
++      normalized[drive[0].length] === '/'
++        ? `drive-absolute:${drive[1].toLowerCase()}`
++        : `drive-relative:${drive[1].toLowerCase()}`
++    remainder = normalized.slice(drive[0].length)
++  } else if (normalized.startsWith('/')) {
++    root = 'absolute'
++    remainder = normalized.replace(/^\/+/, '')
++  }
++
++  const canClimbAboveRoot = root.startsWith('absolute') || root.startsWith('drive-absolute:')
++
++  const segments: string[] = []
++  for (const segment of remainder.split('/')) {
++    if (segment === '' || segment === '.') {
++      continue
++    }
++    if (segment !== '..') {
++      segments.push(segment)
++      continue
++    }
++    const last = segments[segments.length - 1]
++    if (last !== undefined && last !== '..') {
++      segments.pop()
++    } else if (!canClimbAboveRoot) {
++      segments.push('..')
++    }
++  }
++
++  return { root, segments }
++}
++
++/**
++ * Throw unless `filePath`, once resolved, is `outDir` itself or lies below it.
++ * The comparison is segment-wise after resolution, so only the directory the
++ * caller chose defines the boundary and no text prefix can stand in for it.
++ */
+ export const ensureWithinOutDir = (outDir: string, filePath: string): void => {
+-  const normalizedOutDir = joinPaths('/', outDir)
+-  const normalizedFilePath = joinPaths('/', filePath)
++  const target = resolvePath(outDir)
++  const candidate = resolvePath(filePath)
+ 
+-  if (
+-    normalizedFilePath !== normalizedOutDir &&
+-    !normalizedFilePath.startsWith(`${normalizedOutDir}/`)
+-  ) {
++  const sameRoot = target.root === candidate.root
++  const longEnough = candidate.segments.length >= target.segments.length
++  const startsWithOutDir = target.segments.every(
++    (segment, index) => candidate.segments[index] === segment
++  )
++  // Once the outDir segments are consumed, a remaining `..` climbs above it.
++  const climbsAboveOutDir = candidate.segments[target.segments.length] === '..'
++
++  if (!sameRoot || !longEnough || !startsWithOutDir || climbsAboveOutDir) {
+     throw new Error(`Path traversal detected: "${filePath}" is outside the output directory`)
+   }
+ }
++
++/**
++ * Join `parts` onto `outDir` and return the result only when it resolves inside
++ * `outDir`. Every writer goes through this so no produced path reaches the
++ * filesystem unchecked.
++ */
++export const joinPathsWithinOutDir = (outDir: string, ...parts: string[]): string => {
++  const filePath = joinPaths(outDir, ...parts)
++  ensureWithinOutDir(outDir, filePath)
++  return filePath
++}

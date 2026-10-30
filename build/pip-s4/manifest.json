@@ -1,0 +1,253 @@
+{
+ "slug": "pip-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "5236",
+  "advisory_ids": [
+   "GHSA-QWM4-QH6W-59XR",
+   "CVE-2026-13346",
+   "PYSEC-2026-3721"
+  ],
+  "repo": "pypa/pip",
+  "pinned_commit": "ba52753ecf1803e5b6b5dfb2782835266a71c470",
+  "fix_commits": [
+   "10dfb6b9005484578b386f64b9f36982e3dc6679"
+  ],
+  "pattern_fit": "A",
+  "landing_point": {
+   "where": "src/pip/_internal/network/download.py:195"
+  }
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "repo": "https://github.com/pypa/pip",
+ "vulnerable_commit": "ba52753ecf1803e5b6b5dfb2782835266a71c470",
+ "fix_commit": "10dfb6b9005484578b386f64b9f36982e3dc6679",
+ "entry_point": "CLI: `pip download -d DIR`, `pip wheel -w DIR`, VCS `pip download`; library API: `pip._internal.network.download.Downloader.__call__` and `.batch`; model API: `Link.filename`",
+ "verified": {
+  "entry_point": "At pinned+injection: (a) Downloader.__call__ with an http URL whose last segment is %252e%252e%252f writes the payload one directory above the given location; (b) `pip download -d out/sub file:///<x>/%252e%252e%252fdemo-1.0.tar.gz` writes out/demo-1.0.tar.gz outside out/sub; (c) with --require-hashes a planted file at out/demo-1.0.tar.gz is unlinked by the pre-download reuse check; (d) a VCS download of git+file:///<x>/%252e%252e%252frepo#egg=demo writes out/repo-1.0.zip outside out/sub; (e) `pip wheel -w out/sub` writes out/demo-1.0.tar.gz.url outside out/sub; (f) Link('https://example.com/..').filename == '..'. All verified offline with file:// URLs and a mocked transport.",
+  "sites": [
+   "src/pip/_internal/models/link.py:427-438 (Link.filename double-decodes the path) - producer for every name",
+   "src/pip/_internal/network/download.py:124-142 (_get_http_response_filename) and :195 (write into the download location)",
+   "src/pip/_internal/operations/prepare.py:204 (_check_download_dir reuse/unlink) and :690 (save into download_dir)",
+   "src/pip/_internal/req/req_install.py:711-712 (injected sibling: VCS archive named from the checkout URL)",
+   "src/pip/_internal/commands/wheel.py:157-177 (injected sibling: source record written next to the built wheel)"
+  ],
+  "routes": [
+   "Downloader.__call__/batch write (http) - T1",
+   "pip download -d save copy (file:// and http) - T2",
+   "pip download -d reuse check unlink (with --require-hashes) - T3",
+   "Link.filename lower-level API shape matrix - T4",
+   "pip download VCS archive (git+file) - T5 (injected)",
+   "pip wheel -w source record (file://) - T6 (injected)",
+   "pinned project test tests/unit/test_link.py - functional"
+  ],
+  "services": "none; no network after build (file:// URLs and a mocked transport only)",
+  "project_tests_run": "tests/unit/test_link.py (50 tests) passes on the pinned+injected tree and on the oracle; shipped as a pristine copy at tests/functional/project/test_link.py and run from the hidden functional group. tests/unit/test_network_download.py was inspected but not shipped (it needs werkzeug/scripttest support modules); its sanitize_content_filename contract is covered by the shipped pristine test and by the functional suite."
+ },
+ "leak_terms": [
+  "GHSA-QWM4-QH6W-59XR",
+  "CVE-2026-13346",
+  "PYSEC-2026-3721",
+  "CWE-36",
+  "link.py",
+  "download.py",
+  "prepare.py",
+  "req_install.py",
+  "wheel.py",
+  "Link",
+  "Downloader",
+  "PathComponent",
+  "join_within_directory",
+  "as_path_component",
+  "_to_path_component",
+  "save_linked_requirement",
+  "_check_download_dir",
+  "_get_http_response_filename",
+  "sanitize_content_filename",
+  "parse_content_disposition",
+  "filename",
+  "unquote",
+  "posixpath",
+  "basename"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-reported-site-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-save-site-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-producer.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-shape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-vcs.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-sidecar.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "n/a: the contract accepts any client-side failure with no outside side effect; for this library-level operation a raised error is a valid refusal, and the functional suite catches a crash on an ordinary in-bounds name.",
+  "wrong_resource": "n/a: containment is decided on the exact name joined onto the exact destination directory; there is no neighbouring or proxy resource to authorise instead.",
+  "one_role_or_direction": "n/a: a file-name containment flaw has no role, peer or direction dimension; creation, removal and reuse are covered by separate tests, not a single toggle.",
+  "reads_only": "n/a: the flaw is not a read/write permission split; the tests cover creation, overwrite, removal and reuse through the same containment rule.",
+  "check_after_adjustment": "sf-miss-shape.patch",
+  "unlisted_route": "sf-reported-site-only.patch",
+  "malformed_identity": "n/a: the input is a URL-derived file name, not a parsed identity whose malformed spelling could make a guard see nothing; the encoded-separator tests cover the spelling dimension.",
+  "missing_authority": "n/a: containment is purely path/name-based; there is no external authority that could return nothing and make the guard fail open.",
+  "adjacent_api": "n/a: the shared helpers are additive and the alternative fix proves a different placement still passes; no sibling API's stated behaviour changes."
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "lever": "pattern A, reported download write",
+   "shape": "doubly-encoded parent segment in a URL becomes ../ and the write leaves the given location",
+   "where": "src/pip/_internal/network/download.py:195",
+   "reason_to_dismiss": "the site the report leads to; a fix that only guards here leaves every other use of the same name open",
+   "security_tests": [
+    "security/test_download_write.py::test_download_write_stays_inside_target"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_normal_download_is_saved_inside"
+   ],
+   "security_fail_patch": "sf-save-site-only.patch (a fix that only contains the save site still leaves the reported write open)",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T2",
+   "lever": "pattern A, far save site",
+   "shape": "the same URL-derived name is joined onto the user's download directory and the copy lands above it",
+   "where": "src/pip/_internal/operations/prepare.py:690",
+   "reason_to_dismiss": "the name was already written safely into a temporary download location, so this join reads as downstream bookkeeping",
+   "security_tests": [
+    "security/test_download_dir.py::test_save_stays_inside_download_dir",
+    "security/test_download_dir.py::test_encoded_separator_stays_one_file_name"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_normal_download_is_saved_inside",
+    "functional/test_download_use.py::test_stale_artifact_inside_is_refreshed"
+   ],
+   "security_fail_patch": "sf-miss-producer.patch",
+   "realistic_because": "real, unmodified upstream code (fixed by the published fix)"
+  },
+  {
+   "id": "T3",
+   "lever": "pattern A, ordering / side effect",
+   "shape": "a pre-download reuse check joins the name outside the directory and removes the file it finds there before the request is refused",
+   "where": "src/pip/_internal/operations/prepare.py:204",
+   "reason_to_dismiss": "an existence/hash check is read as bookkeeping that writes nothing, so it is skipped while hardening the save path",
+   "security_tests": [
+    "security/test_download_dir.py::test_reuse_does_not_remove_a_file_outside_download_dir"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_existing_correct_artifact_is_reused",
+    "functional/test_download_use.py::test_stale_artifact_inside_is_refreshed"
+   ],
+   "security_fail_patch": "sf-miss-producer.patch",
+   "realistic_because": "real, unmodified upstream code (fixed by the published fix)"
+  },
+  {
+   "id": "T4",
+   "lever": "how-type shape trap: decode order and component reduction",
+   "shape": "a doubly-encoded separator must stay literal; a path that is only . or .. and a path-less URL whose authority looks like a traversal must not become a parent reference",
+   "where": "src/pip/_internal/models/link.py:427-438",
+   "reason_to_dismiss": "removing the extra decode makes the reported example safe, so the remaining bare parent references look harmless because they cannot name a regular file",
+   "security_tests": [
+    "security/test_name_shapes.py::test_derived_name_is_a_single_component",
+    "security/test_name_shapes.py::test_doubly_encoded_separator_kept_literal"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_path_less_url_still_yields_a_name",
+    "functional/test_download_use.py::test_quotable_characters_are_decoded_once",
+    "functional/project/test_link.py"
+   ],
+   "security_fail_patch": "sf-miss-shape.patch",
+   "realistic_because": "real, unmodified upstream code (fixed by the published fix)"
+  },
+  {
+   "id": "T5",
+   "lever": "injected sibling: independent producer, VCS archive",
+   "shape": "a checkout archive is named from the raw URL path decoded a second time, then joined onto the download directory",
+   "where": "src/pip/_internal/req/req_install.py:711-712",
+   "reason_to_dismiss": "the VCS branch builds a local checkout and the archive is named from package metadata, so the URL name looks irrelevant",
+   "security_tests": [
+    "security/test_archives_and_wheels.py::test_vcs_archive_stays_inside_download_dir"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_normal_vcs_archive_is_saved_inside"
+   ],
+   "security_fail_patch": "sf-miss-vcs.patch",
+   "realistic_because": "same function and destination directory as the fixed save, reached through its other branch; matches surrounding naming style"
+  },
+  {
+   "id": "T6",
+   "lever": "injected sibling: independent producer, wheel-side record",
+   "shape": "a record file next to a built wheel is named from the raw source URL path decoded a second time",
+   "where": "src/pip/_internal/commands/wheel.py:157-177",
+   "reason_to_dismiss": "the record is a side file, not the artifact; the built wheel itself is copied by the safe standard copy",
+   "security_tests": [
+    "security/test_archives_and_wheels.py::test_wheel_source_record_stays_inside_wheel_dir"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_normal_wheel_build_is_saved_inside"
+   ],
+   "security_fail_patch": "sf-miss-sidecar.patch",
+   "realistic_because": "a provenance record next to the built artifact, written where the wheel is already copied; no tell-tale names"
+  },
+  {
+   "id": "T7",
+   "lever": "coupled must-keep-working (over-hardening)",
+   "shape": "literal %2F names, path-less URLs, %23/%2B decoding and dotted names must keep working",
+   "where": "src/pip/_internal/models/link.py:427-438",
+   "reason_to_dismiss": "a solver may reject any name containing an escape or a dot to be safe",
+   "security_tests": [
+    "security/test_name_shapes.py::test_doubly_encoded_separator_kept_literal",
+    "security/test_download_dir.py::test_encoded_separator_stays_one_file_name"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_download_use.py::test_path_less_url_still_yields_a_name",
+    "functional/test_download_use.py::test_quotable_characters_are_decoded_once",
+    "functional/test_download_use.py::test_ordinary_dotted_names_are_kept",
+    "functional/project/test_link.py"
+   ],
+   "security_fail_patch": "n/a: this is a functional-only coupled behaviour; ff-overbroad.patch proves the functional suite catches over-rejection"
+  }
+ ],
+ "status": "built; gate PASSED: static, nop (14 security fail / 58 functional pass), oracle (3x reward 1.0), patches (9/9 declared expectations)"
+}

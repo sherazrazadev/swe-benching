@@ -1,0 +1,95 @@
+diff --git a/pkg/packet/bgp/bgp.go b/pkg/packet/bgp/bgp.go
+index c7276d3e..2bc53258 100644
+--- a/pkg/packet/bgp/bgp.go
++++ b/pkg/packet/bgp/bgp.go
+@@ -371,6 +371,7 @@ type BGPCapabilityCode uint8
+ const (
+ 	BGP_CAP_MULTIPROTOCOL               BGPCapabilityCode = 1
+ 	BGP_CAP_ROUTE_REFRESH               BGPCapabilityCode = 2
++	BGP_CAP_ORF                         BGPCapabilityCode = 3
+ 	BGP_CAP_CARRYING_LABEL_INFO         BGPCapabilityCode = 4
+ 	BGP_CAP_EXTENDED_NEXTHOP            BGPCapabilityCode = 5
+ 	BGP_CAP_GRACEFUL_RESTART            BGPCapabilityCode = 64
+@@ -386,6 +387,7 @@ const (
+ var CapNameMap = map[BGPCapabilityCode]string{
+ 	BGP_CAP_MULTIPROTOCOL:               "multiprotocol",
+ 	BGP_CAP_ROUTE_REFRESH:               "route-refresh",
++	BGP_CAP_ORF:                         "orf",
+ 	BGP_CAP_CARRYING_LABEL_INFO:         "carrying-label-info",
+ 	BGP_CAP_GRACEFUL_RESTART:            "graceful-restart",
+ 	BGP_CAP_EXTENDED_NEXTHOP:            "extended-nexthop",
+@@ -1185,6 +1187,8 @@ func DecodeCapability(data []byte) (ParameterCapabilityInterface, error) {
+ 		c = &CapMultiProtocol{}
+ 	case BGP_CAP_ROUTE_REFRESH:
+ 		c = &CapRouteRefresh{}
++	case BGP_CAP_ORF:
++		c = &CapORF{}
+ 	case BGP_CAP_CARRYING_LABEL_INFO:
+ 		c = &CapCarryingLabelInfo{}
+ 	case BGP_CAP_EXTENDED_NEXTHOP:
+diff --git a/pkg/packet/bgp/capability_orf.go b/pkg/packet/bgp/capability_orf.go
+new file mode 100644
+index 00000000..edb68c2f
+--- /dev/null
++++ b/pkg/packet/bgp/capability_orf.go
+@@ -0,0 +1,60 @@
++package bgp
++
++import (
++	"encoding/binary"
++)
++
++// CapORFTuple is one address-family entry of an Outbound Route Filtering
++// capability (RFC 5291).
++type CapORFTuple struct {
++	AFI   uint16
++	SAFI  uint8
++	Types []uint8
++}
++
++type CapORF struct {
++	DefaultParameterCapability
++	Tuples []*CapORFTuple
++}
++
++func (c *CapORF) DecodeFromBytes(data []byte) error {
++	if err := c.DefaultParameterCapability.DecodeFromBytes(data); err != nil {
++		return err
++	}
++	data = data[2:]
++
++	for len(data) >= 4 {
++		num := int(data[3])
++		if len(data) < 4+num {
++			return NewMessageError(BGP_ERROR_OPEN_MESSAGE_ERROR, BGP_ERROR_SUB_UNSUPPORTED_CAPABILITY, nil, "Not all CapabilityORF bytes available")
++		}
++		t := &CapORFTuple{
++			AFI:   binary.BigEndian.Uint16(data[:2]),
++			SAFI:  data[2],
++			Types: make([]uint8, num),
++		}
++		copy(t.Types, data[4:4+num])
++		c.Tuples = append(c.Tuples, t)
++		data = data[4+num:]
++	}
++	return nil
++}
++
++func (c *CapORF) Serialize() ([]byte, error) {
++	buf := make([]byte, 0, 5*len(c.Tuples))
++	for _, t := range c.Tuples {
++		buf = append(buf, byte(t.AFI>>8), byte(t.AFI), t.SAFI, uint8(len(t.Types)))
++		buf = append(buf, t.Types...)
++	}
++	c.DefaultParameterCapability.CapValue = buf
++	return c.DefaultParameterCapability.Serialize()
++}
++
++func NewCapORF(tuples []*CapORFTuple) *CapORF {
++	return &CapORF{
++		DefaultParameterCapability: DefaultParameterCapability{
++			CapCode: BGP_CAP_ORF,
++		},
++		Tuples: tuples,
++	}
++}

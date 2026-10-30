@@ -1,0 +1,260 @@
+diff -ruN a/src/pip/_internal/commands/wheel.py b/src/pip/_internal/commands/wheel.py
+--- a/src/pip/_internal/commands/wheel.py	2026-10-30 05:31:12.000000000 +0000
++++ b/src/pip/_internal/commands/wheel.py	2026-10-30 05:52:22.511167890 +0000
+@@ -2,7 +2,6 @@
+ import os
+ import posixpath
+ import shutil
+-import urllib.parse
+ from optparse import Values
+ 
+ from pip._internal.cache import WheelCache
+@@ -15,6 +14,7 @@
+     InstallRequirement,
+ )
+ from pip._internal.utils.misc import ensure_dir, normalize_path
++from pip._internal.utils.path_safety import join_inside, safe_component
+ from pip._internal.utils.temp_dir import TempDirectory
+ from pip._internal.wheel_builder import build
+ 
+@@ -169,14 +169,20 @@
+                 )
+                 build_failures.append(req)
+                 continue
+-            # Record the source URL next to the built wheel.
++            # Record the source URL next to the built wheel.  The name comes
++            # from the source and is already decoded once; it is reduced to a
++            # single component and joined without being able to leave the
++            # wheel directory.
+             if req.original_link is not None:
+-                published = urllib.parse.unquote(
+-                    posixpath.basename(req.original_link.path.rstrip("/"))
++                published = (
++                    safe_component(
++                        posixpath.basename(req.original_link.path.rstrip("/"))
++                    )
++                    or ""
+                 )
+                 if published:
+                     with open(
+-                        os.path.join(options.wheel_dir, published + ".url"), "w"
++                        join_inside(options.wheel_dir, published + ".url"), "w"
+                     ) as url_file:
+                         url_file.write(req.original_link.url)
+         if len(build_failures) != 0:
+diff -ruN a/src/pip/_internal/models/link.py b/src/pip/_internal/models/link.py
+--- a/src/pip/_internal/models/link.py	2026-10-30 05:31:09.000000000 +0000
++++ b/src/pip/_internal/models/link.py	2026-10-30 05:51:44.088998875 +0000
+@@ -25,6 +25,7 @@
+     split_auth_from_netloc,
+     splitext,
+ )
++from pip._internal.utils.path_safety import safe_component
+ from pip._internal.utils.urls import path_to_url, url_to_path
+ 
+ logger = logging.getLogger(__name__)
+@@ -425,17 +426,19 @@
+ 
+     @property
+     def filename(self) -> str:
+-        path = self.path.rstrip("/")
+-        name = posixpath.basename(path)
+-        if not name:
+-            # Make sure we don't leak auth information if the netloc
+-            # includes a username and password.
+-            netloc, user_pass = split_auth_from_netloc(self.netloc)
+-            return netloc
+-
+-        name = urllib.parse.unquote(name)
+-        assert name, f"URL {self._url!r} produced no filename"
+-        return name
++        # ``self._path`` has already been percent-decoded exactly once when the
++        # link was parsed.  Decoding it again would turn a doubly-encoded
++        # separator (``%252F`` -> ``%2F`` -> ``/``) into a real path separator,
++        # so the raw path component is used as-is and only reduced to a single
++        # component here.
++        name = safe_component(posixpath.basename(self.path.rstrip("/")))
++        if name is not None:
++            return name
++
++        # The path had no usable component.  Fall back to the host name,
++        # dropping any credentials so they are not leaked into a file name.
++        netloc, _user_pass = split_auth_from_netloc(self.netloc)
++        return safe_component(netloc) or ""
+ 
+     @property
+     def file_path(self) -> str:
+diff -ruN a/src/pip/_internal/network/download.py b/src/pip/_internal/network/download.py
+--- a/src/pip/_internal/network/download.py	2026-10-30 05:31:09.000000000 +0000
++++ b/src/pip/_internal/network/download.py	2026-10-30 05:53:15.777039169 +0000
+@@ -24,6 +24,7 @@
+ from pip._internal.network.session import CacheControlAdapter, PipSession
+ from pip._internal.network.utils import HEADERS, raise_for_status, response_chunks
+ from pip._internal.utils.misc import format_size, redact_auth_from_url, splitext
++from pip._internal.utils.path_safety import join_inside, require_component
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -124,6 +125,9 @@
+ def _get_http_response_filename(resp: Response, link: Link) -> str:
+     """Get an ideal filename from the given HTTP response, falling back to
+     the link filename if not provided.
++
++    The result is validated as a single path component: callers may join it
++    onto a download directory without the name being able to leave it.
+     """
+     filename = link.filename  # fallback
+     # Have a look at the Content-Disposition header for a better guess
+@@ -139,7 +143,7 @@
+         ext = os.path.splitext(resp.url)[1]
+         if ext:
+             filename += ext
+-    return filename
++    return require_component(filename)
+ 
+ 
+ @dataclass
+@@ -192,7 +196,7 @@
+         resp = self._http_get(link)
+         download_size = _get_http_response_size(resp)
+ 
+-        filepath = os.path.join(location, _get_http_response_filename(resp, link))
++        filepath = join_inside(location, _get_http_response_filename(resp, link))
+         with open(filepath, "wb") as content_file:
+             download = _FileDownload(link, content_file, download_size)
+             self._process_response(download, resp)
+diff -ruN a/src/pip/_internal/operations/prepare.py b/src/pip/_internal/operations/prepare.py
+--- a/src/pip/_internal/operations/prepare.py	2026-10-30 05:31:09.000000000 +0000
++++ b/src/pip/_internal/operations/prepare.py	2026-10-30 05:52:00.520183576 +0000
+@@ -52,6 +52,7 @@
+     hide_url,
+     redact_auth_from_requirement,
+ )
++from pip._internal.utils.path_safety import join_inside
+ from pip._internal.utils.temp_dir import TempDirectory
+ from pip._internal.utils.unpacking import unpack_file
+ from pip._internal.vcs import vcs
+@@ -201,7 +202,7 @@
+     """Check download_dir for previously downloaded file with correct hash
+     If a correct file is found return its path else None
+     """
+-    download_path = os.path.join(download_dir, link.filename)
++    download_path = join_inside(download_dir, link.filename)
+ 
+     if not os.path.exists(download_path):
+         return None
+@@ -687,7 +688,7 @@
+             # No distribution was downloaded for this requirement.
+             return
+ 
+-        download_location = os.path.join(self.download_dir, link.filename)
++        download_location = join_inside(self.download_dir, link.filename)
+         if not os.path.exists(download_location):
+             shutil.copy(req.local_file_path, download_location)
+             download_path = display_path(download_location)
+diff -ruN a/src/pip/_internal/req/req_install.py b/src/pip/_internal/req/req_install.py
+--- a/src/pip/_internal/req/req_install.py	2026-10-30 05:31:12.000000000 +0000
++++ b/src/pip/_internal/req/req_install.py	2026-10-30 05:52:22.535811566 +0000
+@@ -6,7 +6,6 @@
+ import posixpath
+ import shutil
+ import sys
+-import urllib.parse
+ import uuid
+ import zipfile
+ from collections.abc import Collection, Iterable
+@@ -51,6 +50,7 @@
+     redact_auth_from_url,
+ )
+ from pip._internal.utils.packaging import get_requirement
++from pip._internal.utils.path_safety import join_inside, safe_component
+ from pip._internal.utils.subprocess import runner_with_spinner_message
+ from pip._internal.utils.temp_dir import TempDirectory, tempdir_kinds
+ from pip._internal.utils.unpacking import unpack_file
+@@ -711,17 +711,19 @@
+ 
+         create_archive = True
+         # Keep the source name in the archive so that a download directory
+-        # shows which checkout each archive was built from.
++        # shows which checkout each archive was built from.  ``link.path`` is
++        # already decoded once; decoding it again would turn a doubly-encoded
++        # separator into a real one, and the result must be a single component.
+         if self.link is not None:
+-            source_name = urllib.parse.unquote(
+-                posixpath.basename(self.link.path.rstrip("/"))
++            source_name = (
++                safe_component(posixpath.basename(self.link.path.rstrip("/"))) or ""
+             )
+         else:
+             source_name = ""
+         archive_name = "{}-{}.zip".format(
+             source_name or self.name, self.metadata["version"]
+         )
+-        archive_path = os.path.join(build_dir, archive_name)
++        archive_path = join_inside(build_dir, archive_name)
+ 
+         if os.path.exists(archive_path):
+             response = ask_path_exists(
+diff -ruN a/src/pip/_internal/utils/path_safety.py b/src/pip/_internal/utils/path_safety.py
+--- a/src/pip/_internal/utils/path_safety.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/pip/_internal/utils/path_safety.py	2026-10-30 05:51:40.671960852 +0000
+@@ -0,0 +1,59 @@
++"""Reduce untrusted, source-supplied strings to safe path components.
++
++Names handled here come from package indexes, requirement URLs and response
++headers -- all of them are chosen by whoever publishes the package, not by the
++user.  A value that is going to be joined onto a directory chosen by the user
++must first be reduced to a *single* component: no directory part, no separator,
++and never ``.`` or ``..``.
++"""
++from __future__ import annotations
++
++import os
++
++
++def safe_component(name: str) -> str | None:
++    """Return ``name`` reduced to a single, safe path component.
++
++    ``None`` is returned when nothing usable is left (an empty name, a bare
++    separator, or a ``.``/``..`` reference).  The result never contains a path
++    separator on the running platform, so joining it onto a directory cannot
++    leave that directory.
++    """
++    if not name:
++        return None
++
++    # Strip trailing separators first: ``basename("pkg/")`` is empty, while
++    # ``basename("pkg")`` is the name we want to keep.
++    trimmed = name.rstrip("/\\")
++    component = os.path.basename(trimmed)
++    if not component or component in (os.curdir, os.pardir):
++        return None
++
++    return component
++
++
++def require_component(name: str) -> str:
++    """Like :func:`safe_component`, but an unsafe name is a hard error.
++
++    Use this immediately before something is written: if the source did not
++    supply a usable name, the operation must fail instead of writing into the
++    directory that was supposed to hold the file.
++    """
++    component = safe_component(name)
++    if component is None:
++        raise ValueError(f"Unsafe file name derived from package source: {name!r}")
++
++    return component
++
++
++def join_inside(directory: str, name: str) -> str:
++    """Join the untrusted ``name`` onto ``directory``, staying inside it."""
++    component = require_component(name)
++    joined = os.path.join(directory, component)
++
++    # Defence in depth: whatever ``basename`` did, the result has to be a
++    # direct child of the directory the operation targets.
++    if os.path.dirname(os.path.abspath(joined)) != os.path.abspath(directory):
++        raise ValueError(f"Unsafe file name derived from package source: {name!r}")
++
++    return joined

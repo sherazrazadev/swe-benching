@@ -1,0 +1,365 @@
+diff --git a/src/router/brisk.ts b/src/router/brisk.ts
+index ff88888..af5e456 100644
+--- a/src/router/brisk.ts
++++ b/src/router/brisk.ts
+@@ -11,7 +11,9 @@ import Macroable from '@poppinss/macroable'
+ import type { Application } from '@adonisjs/application'
+ 
+ import { Route } from './route.ts'
++import { parseRoute } from '../helpers.ts'
+ import type { HttpContext } from '../http_context/main.ts'
++import { type ClientRouteMatchItTokens } from '../client/types.ts'
+ import type { RouteFn, RouteMatchers } from '../types/route.ts'
+ import type { ParsedGlobalMiddleware } from '../types/middleware.ts'
+ import type {
+@@ -22,6 +24,57 @@ import type {
+   RouteBuilderArguments,
+ } from '../types/url_builder.ts'
+ 
++/**
++ * Makes the path for a route pattern using the given params.
++ */
++function makePatternPath(
++  pattern: string,
++  tokens: Pick<ClientRouteMatchItTokens, 'val' | 'type' | 'end'>[],
++  params?: any[] | Record<string, any>
++): string {
++  const uriSegments: string[] = []
++  const paramsArray = Array.isArray(params) ? params : null
++  const paramsObject = !Array.isArray(params) ? (params ?? {}) : {}
++
++  let paramsIndex = 0
++  for (const token of tokens) {
++    if (token.type === 0) {
++      uriSegments.push(token.val === '/' ? '' : `${token.val}${token.end}`)
++      continue
++    }
++
++    if (token.type === 2) {
++      const values = paramsArray ? paramsArray.slice(paramsIndex) : paramsObject['*']
++      if (!Array.isArray(values) || !values.length) {
++        throw new Error(
++          `Cannot make URL for "${pattern}". Invalid value provided for the wildcard param`
++        )
++      }
++
++      uriSegments.push(`${values.join('/')}${token.end}`)
++      break
++    }
++
++    const paramName = token.val
++    const value = paramsArray ? paramsArray[paramsIndex] : paramsObject[paramName]
++    const isDefined = value !== undefined && value !== null
++
++    if (token.type === 1 && !isDefined) {
++      throw new Error(
++        `Cannot make URL for "${pattern}". Missing value for the "${paramName}" param`
++      )
++    }
++
++    if (isDefined) {
++      uriSegments.push(`${value}${token.end}`)
++    }
++
++    paramsIndex++
++  }
++
++  return `/${uriSegments.join('/')}`
++}
++
+ /**
+  * Options for declarative route redirects
+  */
+@@ -134,6 +187,34 @@ export class BriskRoute extends Macroable {
+     return this.setHandler(redirectsToRoute)
+   }
+ 
++  /**
++   * Redirects to a given route pattern. Params from the original request will
++   * be used when no custom params are defined.
++   * @param pattern - The route pattern to redirect to
++   * @param params - Optional params for the route pattern
++   * @param options - Optional redirect options including HTTP status code and query string forwarding
++   * @returns The created route instance
++   */
++  redirectToPattern(
++    pattern: string,
++    params?: any[] | Record<string, any>,
++    options?: RedirectResponseOptions
++  ): Route {
++    function redirectsToPattern(ctx: HttpContext) {
++      const redirector = ctx.response.redirect()
++      if (options?.status) {
++        redirector.status(options.status)
++      }
++      if (options?.forwardQueryString !== undefined) {
++        redirector.withQs(options.forwardQueryString)
++      }
++      return redirector.toPath(makePatternPath(pattern, parseRoute(pattern), params || ctx.params))
++    }
++
++    Object.defineProperty(redirectsToPattern, 'listArgs', { value: pattern, writable: false })
++    return this.setHandler(redirectsToPattern)
++  }
++
+   /**
+    * Redirect request to a fixed URL
+    * @param url - The URL to redirect to
+diff --git a/src/router/legacy/pattern_url.ts b/src/router/legacy/pattern_url.ts
+new file mode 100644
+index 0000000..8a71c10
+--- /dev/null
++++ b/src/router/legacy/pattern_url.ts
+@@ -0,0 +1,99 @@
++/*
++ * @adonisjs/http-server
++ *
++ * (c) AdonisJS
++ *
++ * For the full copyright and license information, please view the LICENSE
++ * file that was distributed with this source code.
++ */
++
++import { type ClientRouteMatchItTokens, type URLOptions } from '../../client/types.ts'
++
++/**
++ * Makes a URL for a route pattern using its parsed tokens. Unlike the
++ * route store based builder, the pattern is used as given and no route
++ * lookup is performed.
++ *
++ * @param pattern - The route pattern
++ * @param tokens - Array of parsed route tokens
++ * @param searchParamsStringifier - Function to stringify query parameters
++ * @param params - Route parameters as array or object
++ * @param options - URL options
++ * @returns {string} The generated URL
++ */
++export function makePatternUrl(
++  pattern: string,
++  tokens: Pick<ClientRouteMatchItTokens, 'val' | 'type' | 'end'>[],
++  searchParamsStringifier: (qs: Record<string, any>) => string,
++  params?: any[] | { [param: string]: any },
++  options?: URLOptions
++): string {
++  const uriSegments: string[] = []
++  const paramsArray = Array.isArray(params) ? params : null
++  const paramsObject = !Array.isArray(params) ? (params ?? {}) : {}
++
++  let paramsIndex = 0
++  for (const token of tokens) {
++    /**
++     * Static param
++     */
++    if (token.type === 0) {
++      uriSegments.push(token.val === '/' ? '' : `${token.val}${token.end}`)
++      continue
++    }
++
++    /**
++     * Wildcard param. It will always be the last param, hence we will
++     * provide it all the remaining values
++     */
++    if (token.type === 2) {
++      const values = paramsArray ? paramsArray.slice(paramsIndex) : paramsObject['*']
++      if (!Array.isArray(values) || !values.length) {
++        throw new Error(
++          `Cannot make URL for "${pattern}". Invalid value provided for the wildcard param`
++        )
++      }
++
++      uriSegments.push(`${values.join('/')}${token.end}`)
++      break
++    }
++
++    const paramName = token.val
++    const value = paramsArray ? paramsArray[paramsIndex] : paramsObject[paramName]
++    const isDefined = value !== undefined && value !== null
++
++    /**
++     * Required param
++     */
++    if (token.type === 1 && !isDefined) {
++      throw new Error(
++        `Cannot make URL for "${pattern}". Missing value for the "${paramName}" param`
++      )
++    }
++
++    if (isDefined) {
++      uriSegments.push(`${value}${token.end}`)
++    }
++
++    paramsIndex++
++  }
++
++  let URI = `/${uriSegments.join('/')}`
++
++  /**
++   * Prefix base URL
++   */
++  if (options?.prefixUrl) {
++    URI = `${options?.prefixUrl.replace(/\/$/, '')}${URI}`
++  }
++
++  /**
++   * Append query string
++   */
++  if (options?.qs) {
++    const queryString = searchParamsStringifier(options?.qs)
++    URI = queryString ? `${URI}?${queryString}` : URI
++  }
++
++  return URI
++}
+diff --git a/src/router/main.ts b/src/router/main.ts
+index 612b485..3d7afbd 100644
+--- a/src/router/main.ts
++++ b/src/router/main.ts
+@@ -25,6 +25,7 @@ import { toRoutesJSON } from '../utils.ts'
+ import { RouteResource } from './resource.ts'
+ import { findRoute } from '../client/helpers.ts'
+ import { UrlBuilder } from './legacy/url_builder.ts'
++import { makePatternUrl } from './legacy/pattern_url.ts'
+ import { RouteMatchers as Matchers } from './matchers.ts'
+ import { createUrlBuilder } from '../client/url_builder.ts'
+ import { defineNamedMiddleware } from '../define_middleware.ts'
+@@ -751,7 +752,7 @@ export class Router extends Macroable {
+     const normalizedOptions = Object.assign({}, options)
+ 
+     if (options?.disableRouteLookup) {
+-      return createURL(
++      return makePatternUrl(
+         routeIdentifier,
+         parseRoute(routeIdentifier),
+         this.qs.stringify,
+diff --git a/src/router/signed_url_builder.ts b/src/router/signed_url_builder.ts
+index d59f7ea..9d9d64c 100644
+--- a/src/router/signed_url_builder.ts
++++ b/src/router/signed_url_builder.ts
+@@ -11,8 +11,74 @@ import type { Encryption } from '@boringnode/encryption'
+ 
+ import { type Router } from './main.ts'
+ import { createSignedURL, parseRoute } from '../helpers.ts'
++import { type ClientRouteMatchItTokens, type URLOptions } from '../client/types.ts'
+ import { type LookupList, type SignedURLOptions, type SignedUrlFor } from '../types/url_builder.ts'
+ 
++/**
++ * Makes the path for a route pattern. The pattern is used as given and
++ * no route lookup is performed.
++ */
++function makePatternPath(
++  pattern: string,
++  tokens: Pick<ClientRouteMatchItTokens, 'val' | 'type' | 'end'>[],
++  searchParamsStringifier: (qs: Record<string, any>) => string,
++  params?: any[] | { [param: string]: any },
++  options?: URLOptions
++): string {
++  const uriSegments: string[] = []
++  const paramsArray = Array.isArray(params) ? params : null
++  const paramsObject = !Array.isArray(params) ? (params ?? {}) : {}
++
++  let paramsIndex = 0
++  for (const token of tokens) {
++    if (token.type === 0) {
++      uriSegments.push(token.val === '/' ? '' : `${token.val}${token.end}`)
++      continue
++    }
++
++    if (token.type === 2) {
++      const values = paramsArray ? paramsArray.slice(paramsIndex) : paramsObject['*']
++      if (!Array.isArray(values) || !values.length) {
++        throw new Error(
++          `Cannot make URL for "${pattern}". Invalid value provided for the wildcard param`
++        )
++      }
++
++      uriSegments.push(`${values.join('/')}${token.end}`)
++      break
++    }
++
++    const paramName = token.val
++    const value = paramsArray ? paramsArray[paramsIndex] : paramsObject[paramName]
++    const isDefined = value !== undefined && value !== null
++
++    if (token.type === 1 && !isDefined) {
++      throw new Error(
++        `Cannot make URL for "${pattern}". Missing value for the "${paramName}" param`
++      )
++    }
++
++    if (isDefined) {
++      uriSegments.push(`${value}${token.end}`)
++    }
++
++    paramsIndex++
++  }
++
++  let URI = `/${uriSegments.join('/')}`
++
++  if (options?.prefixUrl) {
++    URI = `${options?.prefixUrl.replace(/\/$/, '')}${URI}`
++  }
++
++  if (options?.qs) {
++    const queryString = searchParamsStringifier(options.qs)
++    URI = queryString ? `${URI}?${queryString}` : URI
++  }
++
++  return URI
++}
++
+ /**
+  * Creates the URLBuilder helper for making signed URLs
+  * @param router - The router instance
+@@ -32,14 +98,21 @@ export function createSignedUrlBuilder<Routes extends LookupList>(
+     params: any,
+     options?: SignedURLOptions
+   ) {
+-    return createSignedURL(
+-      identifier,
+-      parseRoute(identifier),
+-      searchParamsStringifier,
+-      encryption,
+-      params,
+-      options
+-    )
++    /**
++     * Build the path once, sign it and then add the signature to the query
++     * string. The "prefixUrl" is not part of the signed payload, since it
++     * only makes the signature bigger.
++     */
++    const tokens = parseRoute(identifier)
++    const path = makePatternPath(identifier, tokens, searchParamsStringifier, params)
++    const signedQuery = searchParamsStringifier(options?.qs ?? {})
++    const signature = encryption
++      .getMessageVerifier()
++      .sign(signedQuery ? `${path}?${signedQuery}` : path, options?.expiresIn, options?.purpose)
++    const queryString = searchParamsStringifier({ ...options?.qs, signature })
++    const url = queryString ? `${path}?${queryString}` : path
++
++    return options?.prefixUrl ? `${options.prefixUrl.replace(/\/$/, '')}${url}` : url
+   }
+ 
+   function createSignedUrlForRoute(
+diff --git a/tests/router/brisk.spec.ts b/tests/router/brisk.spec.ts
+index 04ac848..e735e65 100644
+--- a/tests/router/brisk.spec.ts
++++ b/tests/router/brisk.spec.ts
+@@ -62,4 +62,18 @@ test.group('Brisk Route', () => {
+     assert.isFunction(route.handler)
+     assert.equal('listArgs' in route.handler && route.handler.listArgs, '/home')
+   })
++
++  test('define handler via the redirectToPattern method', ({ assert }) => {
++    const app = new AppFactory().create(BASE_URL, () => {})
++
++    const brisk = new BriskRoute(app, [], {
++      pattern: '/',
++      globalMatchers: {},
++    })
++
++    const route = brisk.redirectToPattern('/:page', { page: 'home' }).toJSON()
++
++    assert.isFunction(route.handler)
++    assert.equal('listArgs' in route.handler && route.handler.listArgs, '/:page')
++  })
+ })

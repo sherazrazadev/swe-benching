@@ -1,0 +1,288 @@
+diff --git a/src/helper/ssg/index.ts b/src/helper/ssg/index.ts
+index 2a63575..6a7d6c5 100644
+--- a/src/helper/ssg/index.ts
++++ b/src/helper/ssg/index.ts
+@@ -6,6 +6,7 @@
+ export * from './ssg'
+ export {
+   X_HONO_DISABLE_SSG_HEADER_KEY,
++  X_HONO_SSG_FILENAME_HEADER_KEY,
+   ssgParams,
+   isSSGContext,
+   disableSSG,
+diff --git a/src/helper/ssg/manifest.ts b/src/helper/ssg/manifest.ts
+new file mode 100644
+index 0000000..4962726
+--- /dev/null
++++ b/src/helper/ssg/manifest.ts
+@@ -0,0 +1,28 @@
++import type { FileSystemModule } from './ssg'
++import { dirname, joinPaths } from './utils'
++
++export const DEFAULT_MANIFEST_NAME = 'manifest.json'
++
++/**
++ * Write the list of generated files next to the generated site, so a deploy step
++ * can pick up exactly the pages that were produced.
++ *
++ * @experimental
++ * `writeOutputManifest` is an experimental feature.
++ * The API might be changed.
++ */
++export const writeOutputManifest = async (
++  fsModule: FileSystemModule,
++  outDir: string,
++  files: string[],
++  manifest: boolean | string
++): Promise<string> => {
++  const name = typeof manifest === 'string' ? manifest : DEFAULT_MANIFEST_NAME
++  const manifestPath = joinPaths(outDir, name)
++  const dirPath = dirname(manifestPath)
++  if (dirPath !== '') {
++    await fsModule.mkdir(dirPath, { recursive: true })
++  }
++  await fsModule.writeFile(manifestPath, JSON.stringify({ files }, null, 2))
++  return manifestPath
++}
+diff --git a/src/helper/ssg/middleware.ts b/src/helper/ssg/middleware.ts
+index e9684cb..4b5f38a 100644
+--- a/src/helper/ssg/middleware.ts
++++ b/src/helper/ssg/middleware.ts
+@@ -5,6 +5,12 @@ import { isDynamicRoute } from './utils'
+ export const SSG_CONTEXT = 'HONO_SSG_CONTEXT'
+ export const X_HONO_DISABLE_SSG_HEADER_KEY = 'x-hono-disable-ssg'
+ 
++/**
++ * @experimental
++ * A response may set this header to choose the file it is written to.
++ */
++export const X_HONO_SSG_FILENAME_HEADER_KEY = 'x-hono-ssg-filename'
++
+ /**
+  * @deprecated
+  * Use `X_HONO_DISABLE_SSG_HEADER_KEY` instead.
+diff --git a/src/helper/ssg/plugins.ts b/src/helper/ssg/plugins.ts
+index a25179a..e0ba2eb 100644
+--- a/src/helper/ssg/plugins.ts
++++ b/src/helper/ssg/plugins.ts
+@@ -1,4 +1,5 @@
+ import { html } from '../html'
++import { REDIRECT_STATUS_CODES } from './redirects'
+ import type { SSGPlugin } from './ssg'
+ 
+ /**
+@@ -19,8 +20,6 @@ export const defaultPlugin = (): SSGPlugin => {
+   }
+ }
+ 
+-const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308])
+-
+ const generateRedirectHtml = (location: string) => {
+   // prettier-ignore
+   const content = html`<!DOCTYPE html>
+diff --git a/src/helper/ssg/redirects.ts b/src/helper/ssg/redirects.ts
+new file mode 100644
+index 0000000..89cf980
+--- /dev/null
++++ b/src/helper/ssg/redirects.ts
+@@ -0,0 +1,28 @@
++import type { FileSystemModule } from './ssg'
++import { dirname, joinPaths } from './utils'
++
++export const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308])
++
++const REDIRECT_STUB =
++  '<!DOCTYPE html><meta http-equiv="refresh" content="0"><title>Redirecting</title>'
++
++/**
++ * Write the small page a static host serves for a redirected route.
++ *
++ * @experimental
++ * `writeRedirectFile` is an experimental feature.
++ * The API might be changed.
++ */
++export const writeRedirectFile = async (
++  fsModule: FileSystemModule,
++  outDir: string,
++  location: string
++): Promise<string> => {
++  const filePath = joinPaths(outDir, location, 'index.html')
++  const dirPath = dirname(filePath)
++  if (dirPath !== '') {
++    await fsModule.mkdir(dirPath, { recursive: true })
++  }
++  await fsModule.writeFile(filePath, REDIRECT_STUB)
++  return filePath
++}
+diff --git a/src/helper/ssg/ssg.ts b/src/helper/ssg/ssg.ts
+index c0569de..5b6d5e3 100644
+--- a/src/helper/ssg/ssg.ts
++++ b/src/helper/ssg/ssg.ts
+@@ -3,9 +3,15 @@ import type { Hono } from '../../hono'
+ import type { Env, Schema } from '../../types'
+ import { createPool } from '../../utils/concurrent'
+ import { getExtension } from '../../utils/mime'
++import { writeOutputManifest } from './manifest'
+ import type { AddedSSGDataRequest, SSGParams } from './middleware'
+-import { SSG_CONTEXT, X_HONO_DISABLE_SSG_HEADER_KEY } from './middleware'
++import {
++  SSG_CONTEXT,
++  X_HONO_DISABLE_SSG_HEADER_KEY,
++  X_HONO_SSG_FILENAME_HEADER_KEY,
++} from './middleware'
+ import { defaultPlugin } from './plugins'
++import { REDIRECT_STATUS_CODES, writeRedirectFile } from './redirects'
+ import {
+   dirname,
+   ensureWithinOutDir,
+@@ -195,6 +201,14 @@ export interface ToSSGOptions {
+   concurrency?: number
+   extensionMap?: Record<string, string>
+   plugins?: SSGPlugin[]
++  /**
++   * Write a JSON list of the generated files. A string sets the name of that file.
++   */
++  manifest?: boolean | string
++  /**
++   * Write a small page for each route that responds with a redirect.
++   */
++  redirectFiles?: boolean
+ }
+ 
+ /**
+@@ -210,11 +224,22 @@ export const fetchRoutesContent = function* <
+   app: Hono<E, S, BasePath>,
+   beforeRequestHook?: BeforeRequestHook,
+   afterResponseHook?: AfterResponseHook,
+-  concurrency?: number
++  concurrency?: number,
++  redirectFiles?: boolean
+ ): Generator<
+   Promise<
+     | Generator<
+-        Promise<{ routePath: string; mimeType: string; content: string | ArrayBuffer } | undefined>
++        Promise<
++          | {
++              routePath: string
++              mimeType: string
++              content: string | ArrayBuffer
++              outputName?: string
++              redirectLocation?: string
++              redirectOnly?: boolean
++            }
++          | undefined
++        >
+       >
+     | undefined
+   >
+@@ -267,6 +292,10 @@ export const fetchRoutesContent = function* <
+                       [SSG_CONTEXT]: true,
+                     })
+                   )
++                  const redirectLocation =
++                    redirectFiles && REDIRECT_STATUS_CODES.has(response.status)
++                      ? (response.headers.get('Location') ?? undefined)
++                      : undefined
+                   if (response.headers.get(X_HONO_DISABLE_SSG_HEADER_KEY)) {
+                     resolveReq(undefined)
+                     return
+@@ -274,11 +303,23 @@ export const fetchRoutesContent = function* <
+                   if (afterResponseHook) {
+                     const maybeResponse = await afterResponseHook(response)
+                     if (!maybeResponse) {
++                      if (redirectLocation) {
++                        resolveReq({
++                          routePath: replacedUrlParam,
++                          mimeType: DEFAULT_CONTENT_TYPE,
++                          content: '',
++                          redirectLocation,
++                          redirectOnly: true,
++                        })
++                        return
++                      }
+                       resolveReq(undefined)
+                       return
+                     }
+                     response = maybeResponse
+                   }
++                  const outputName =
++                    response.headers.get(X_HONO_SSG_FILENAME_HEADER_KEY) ?? undefined
+                   const mimeType =
+                     response.headers.get('Content-Type')?.split(';')[0] || DEFAULT_CONTENT_TYPE
+                   const content = await parseResponseContent(response)
+@@ -286,6 +327,8 @@ export const fetchRoutesContent = function* <
+                     routePath: replacedUrlParam,
+                     mimeType,
+                     content,
++                    outputName,
++                    redirectLocation,
+                   })
+                 } catch (error) {
+                   rejectReq(error)
+@@ -308,7 +351,17 @@ export const fetchRoutesContent = function* <
+  */
+ const createdDirs: Set<string> = new Set()
+ export const saveContentToFile = async (
+-  data: Promise<{ routePath: string; content: string | ArrayBuffer; mimeType: string } | undefined>,
++  data: Promise<
++    | {
++        routePath: string
++        content: string | ArrayBuffer
++        mimeType: string
++        outputName?: string
++        redirectLocation?: string
++        redirectOnly?: boolean
++      }
++    | undefined
++  >,
+   fsModule: FileSystemModule,
+   outDir: string,
+   extensionMap?: Record<string, string>
+@@ -317,8 +370,15 @@ export const saveContentToFile = async (
+   if (!awaitedData) {
+     return
+   }
+-  const { routePath, content, mimeType } = awaitedData
+-  const filePath = generateFilePath(routePath, outDir, mimeType, extensionMap)
++  const { routePath, content, mimeType, outputName, redirectLocation, redirectOnly } = awaitedData
++  if (redirectOnly && redirectLocation) {
++    return writeRedirectFile(fsModule, outDir, redirectLocation)
++  }
++  let filePath = generateFilePath(routePath, outDir, mimeType, extensionMap)
++  if (outputName) {
++    // A response can choose the file it is written to.
++    filePath = joinPaths(outDir, outputName)
++  }
+   const dirPath = dirname(filePath)
+ 
+   if (!createdDirs.has(dirPath)) {
+@@ -330,6 +390,9 @@ export const saveContentToFile = async (
+   } else if (content instanceof ArrayBuffer) {
+     await fsModule.writeFile(filePath, new Uint8Array(content))
+   }
++  if (redirectLocation) {
++    await writeRedirectFile(fsModule, outDir, redirectLocation)
++  }
+   return filePath
+ }
+ 
+@@ -431,7 +494,8 @@ export const toSSG: ToSSGInterface = async (app, fs, options) => {
+       app,
+       combinedBeforeRequestHook,
+       combinedAfterResponseHook,
+-      concurrency
++      concurrency,
++      options?.redirectFiles
+     )
+     for (const getInfo of getInfoGen) {
+       getInfoPromises.push(
+@@ -457,6 +521,9 @@ export const toSSG: ToSSGInterface = async (app, fs, options) => {
+         throw fileOrError
+       }
+     }
++    if (options?.manifest) {
++      files.push(await writeOutputManifest(fs, outputDir, files, options.manifest))
++    }
+     result = { success: true, files }
+   } catch (error) {
+     const errorObj = error instanceof Error ? error : new Error(String(error))

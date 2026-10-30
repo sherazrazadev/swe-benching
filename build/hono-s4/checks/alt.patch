@@ -1,0 +1,103 @@
+diff --git a/src/helper/ssg/manifest.ts b/src/helper/ssg/manifest.ts
+index 4962726..b99615b 100644
+--- a/src/helper/ssg/manifest.ts
++++ b/src/helper/ssg/manifest.ts
+@@ -1,5 +1,5 @@
+ import type { FileSystemModule } from './ssg'
+-import { dirname, joinPaths } from './utils'
++import { dirname, ensureWithinOutDir, joinPaths } from './utils'
+ 
+ export const DEFAULT_MANIFEST_NAME = 'manifest.json'
+ 
+@@ -19,6 +19,7 @@ export const writeOutputManifest = async (
+ ): Promise<string> => {
+   const name = typeof manifest === 'string' ? manifest : DEFAULT_MANIFEST_NAME
+   const manifestPath = joinPaths(outDir, name)
++  ensureWithinOutDir(outDir, manifestPath)
+   const dirPath = dirname(manifestPath)
+   if (dirPath !== '') {
+     await fsModule.mkdir(dirPath, { recursive: true })
+diff --git a/src/helper/ssg/redirects.ts b/src/helper/ssg/redirects.ts
+index 89cf980..af2ac34 100644
+--- a/src/helper/ssg/redirects.ts
++++ b/src/helper/ssg/redirects.ts
+@@ -1,5 +1,5 @@
+ import type { FileSystemModule } from './ssg'
+-import { dirname, joinPaths } from './utils'
++import { dirname, ensureWithinOutDir, joinPaths } from './utils'
+ 
+ export const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308])
+ 
+@@ -19,6 +19,7 @@ export const writeRedirectFile = async (
+   location: string
+ ): Promise<string> => {
+   const filePath = joinPaths(outDir, location, 'index.html')
++  ensureWithinOutDir(outDir, filePath)
+   const dirPath = dirname(filePath)
+   if (dirPath !== '') {
+     await fsModule.mkdir(dirPath, { recursive: true })
+diff --git a/src/helper/ssg/ssg.ts b/src/helper/ssg/ssg.ts
+index 5b6d5e3..f0c22e4 100644
+--- a/src/helper/ssg/ssg.ts
++++ b/src/helper/ssg/ssg.ts
+@@ -378,10 +378,12 @@ export const saveContentToFile = async (
+   if (outputName) {
+     // A response can choose the file it is written to.
+     filePath = joinPaths(outDir, outputName)
++    ensureWithinOutDir(outDir, filePath)
+   }
+   const dirPath = dirname(filePath)
+ 
+-  if (!createdDirs.has(dirPath)) {
++  // `dirPath` is empty when outDir itself is the current directory
++  if (dirPath !== '' && !createdDirs.has(dirPath)) {
+     await fsModule.mkdir(dirPath, { recursive: true })
+     createdDirs.add(dirPath)
+   }
+diff --git a/src/helper/ssg/utils.ts b/src/helper/ssg/utils.ts
+index 5341630..b775b24 100644
+--- a/src/helper/ssg/utils.ts
++++ b/src/helper/ssg/utils.ts
+@@ -74,14 +74,35 @@ export const isDynamicRoute = (path: string): boolean => {
+   return path.split('/').some((segment) => segment.startsWith(':') || segment.includes('*'))
+ }
+ 
+-export const ensureWithinOutDir = (outDir: string, filePath: string): void => {
+-  const normalizedOutDir = joinPaths('/', outDir)
+-  const normalizedFilePath = joinPaths('/', filePath)
++const resolveSegments = (path: string): { absolute: boolean; segments: string[] } => {
++  const normalized = path.replace(/\\/g, '/')
++  const absolute = normalized.startsWith('/')
++  const segments: string[] = []
++  for (const segment of normalized.split('/')) {
++    if (segment === '' || segment === '.') {
++      continue
++    }
++    if (segment === '..') {
++      if (segments.length > 0 && segments[segments.length - 1] !== '..') {
++        segments.pop()
++      } else if (!absolute) {
++        segments.push('..')
++      }
++      continue
++    }
++    segments.push(segment)
++  }
++  return { absolute, segments }
++}
+ 
+-  if (
+-    normalizedFilePath !== normalizedOutDir &&
+-    !normalizedFilePath.startsWith(`${normalizedOutDir}/`)
+-  ) {
++export const ensureWithinOutDir = (outDir: string, filePath: string): void => {
++  const out = resolveSegments(outDir)
++  const file = resolveSegments(filePath)
++  const contained =
++    out.absolute === file.absolute &&
++    file.segments.length >= out.segments.length &&
++    out.segments.every((segment, i) => segment === file.segments[i])
++  if (!contained) {
+     throw new Error(`Path traversal detected: "${filePath}" is outside the output directory`)
+   }
+ }

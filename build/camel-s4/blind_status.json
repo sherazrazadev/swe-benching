@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/camel-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/camel-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 52,
+ "duration_ms": 319205,
+ "total_cost_usd": 1.3290904,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "cde9b26f-7df5-4011-8d46-c110cf6a632e",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 67625,
+   "outputTokens": 31606,
+   "cacheReadInputTokens": 2132352,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 1.3290904,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "Done. The fix is implemented, compiled, behaviorally probed against the real compiled decoder classes, and the patch applies cleanly to a fresh pristine tree.\n\n**Patch:** `/home/runner/.tb-graders/cwe/blind/camel-s4/blind.patch`\n**Mechanisms:** `/home/runner/.tb-graders/cwe/blind/camel-s4/mechanisms.md`\n\n**Fix summary (5 lines)**\n1. Added one shared rule in a new package-private helper, `CloudEventExtensionHeaders`: any field name beginning with `camel` compared case-insensitively is reserved and is never mapped to a message header.\n2. Binary mode: `ce-<name>` extensions are mapped through that helper, so `ce-CamelFileName` / `ce-CAMELFILENAME` / `ce-CamelCloudEventID` are dropped after the `ce-` strip while ordinary extensions and request headers survive.\n3. Structured mode: the \"remaining fields are extensions\" loop in all three decoders (1.0, 1.0.1, 1.0.2) now maps through the same helper, covering exact, lower- and upper-case reserved names.\n4. Standard attribute and `datacontenttype`\u2192`Content-Type` writers are untouched, so `CamelCloudEvent*` headers still populate and a reserved extension can no longer case-insensitively overwrite them.\n5. No `DefaultHeaderFilterStrategy` is used, so the empty in-bound filter trap cannot no-op the guard; nothing is refused and only the reserved field is discarded.\n\n**Mechanisms list** (also in `mechanisms.md`)\n- `CloudEventExtensionHeaders` (new): single reserved-name definition (`regionMatches(true,0,\"camel\",0,5)`) plus shared `mapExtension`; avoids the bare-strategy no-op trap.\n- `AbstractCloudEventProcessor.consumer` binary branch (T1): `ce-` extensions go through `mapExtension`.\n- `CloudEventProcessors.v1_0.decodeStructuredContent` (T2/T3/T4): remaining JSON fields go through `mapExtension`.\n- `CloudEventProcessors.v1_0_1.decodeStructuredContent` (T2): same change.\n- `CloudEventProcessors.v1_0_2.decodeStructuredContent` (T2): same change.\n- Structured standard-attribute/content-type writers (T5): untouched; filtering is extension-only.\n- Binary standard-attribute mapping (T5): untouched; attributes are mapped before the extension loop.\n\n**Verification**\n- Changed sources compile with `javac` against the tree's own compiled classes.\n- Probe (`WORK/probe`) exercises the real compiled decoders via proxy `Exchange`/`Message`: **69/69 pass** post-fix; the same probe against pristine classes fails exactly the **16** reserved-header assertions (all three spec versions + binary) while every functional assertion passes, confirming both coverage and that legitimate use is unchanged.\n- `patch -p1 --dry-run` on pristine: clean; real apply to a fresh pristine copy reproduces the edited tree byte-for-byte.",
+ "status": "ok"
+}

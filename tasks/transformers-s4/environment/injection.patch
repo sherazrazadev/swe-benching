@@ -1,0 +1,57 @@
+diff --git a/src/transformers/models/superglue/configuration_superglue.py b/src/transformers/models/superglue/configuration_superglue.py
+index 0322d2be22..b78ae49ebd 100644
+--- a/src/transformers/models/superglue/configuration_superglue.py
++++ b/src/transformers/models/superglue/configuration_superglue.py
+@@ -33,6 +33,8 @@ class SuperGlueConfig(PreTrainedConfig):
+         The number of Sinkhorn iterations.
+     matching_threshold (`float`, *optional*, defaults to 0.0):
+         The matching threshold.
++    trust_remote_code (`bool`, *optional*, defaults to `False`):
++        Whether to trust remote code when using other models than SuperPoint as keypoint detector.
+ 
+     Examples:
+         ```python
+@@ -62,6 +64,9 @@ class SuperGlueConfig(PreTrainedConfig):
+     initializer_range: float = 0.02
+     is_decoder: bool = False
+     attention_probs_dropout_prob: int | float = 0.0
++    # SuperGlue can be combined with detector implementations that are shipped with a checkpoint
++    # rather than being part of CONFIG_MAPPING; this flag lets such a detector be resolved.
++    trust_remote_code: bool = False
+ 
+     def __post_init__(self, **kwargs):
+         self.gnn_layers_types = self.gnn_layers_types if self.gnn_layers_types is not None else ["self", "cross"] * 9
+@@ -71,9 +76,15 @@ class SuperGlueConfig(PreTrainedConfig):
+ 
+         if isinstance(self.keypoint_detector_config, dict):
+             self.keypoint_detector_config["model_type"] = self.keypoint_detector_config.get("model_type", "superpoint")
+-            self.keypoint_detector_config = CONFIG_MAPPING[self.keypoint_detector_config["model_type"]](
+-                **self.keypoint_detector_config
+-            )
++            if self.keypoint_detector_config["model_type"] not in CONFIG_MAPPING:
++                self.keypoint_detector_config = AutoConfig.from_pretrained(
++                    self.keypoint_detector_config["_name_or_path"],
++                    trust_remote_code=self.trust_remote_code,
++                )
++            else:
++                self.keypoint_detector_config = CONFIG_MAPPING[self.keypoint_detector_config["model_type"]](
++                    **self.keypoint_detector_config
++                )
+         elif self.keypoint_detector_config is None:
+             self.keypoint_detector_config = CONFIG_MAPPING["superpoint"]()
+ 
+diff --git a/src/transformers/models/superglue/modeling_superglue.py b/src/transformers/models/superglue/modeling_superglue.py
+index 4e9abde9b5..be0aa9d68f 100644
+--- a/src/transformers/models/superglue/modeling_superglue.py
++++ b/src/transformers/models/superglue/modeling_superglue.py
+@@ -503,7 +503,9 @@ class SuperGlueForKeypointMatching(SuperGluePreTrainedModel):
+     def __init__(self, config: SuperGlueConfig) -> None:
+         super().__init__(config)
+ 
+-        self.keypoint_detector = AutoModelForKeypointDetection.from_config(config.keypoint_detector_config)
++        self.keypoint_detector = AutoModelForKeypointDetection.from_config(
++            config.keypoint_detector_config, trust_remote_code=config.trust_remote_code
++        )
+ 
+         self.keypoint_encoder = SuperGlueKeypointEncoder(config)
+         self.gnn = SuperGlueAttentionalGNN(config)

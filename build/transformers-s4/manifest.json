@@ -1,0 +1,194 @@
+{
+ "slug": "transformers-s4",
+ "candidate": "3171",
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-FGCW-684Q-JJ6R",
+  "CVE-2026-5241",
+  "PYSEC-2026-2290"
+ ],
+ "repo": "https://github.com/huggingface/transformers",
+ "vulnerable_commit": "09a0bbb21ac50eae76bec1c600ff711f135a4f91",
+ "fix_commit": "676559d5022b74aaa0cee1cee0842b7f27c5320e",
+ "track": "injected",
+ "entry_point": "library API: transformers.AutoConfig.from_pretrained(checkpoint dir) and the configuration class's own from_pretrained; then model construction through AutoModelForKeypointMatching.from_config, LightGlueForKeypointMatching(config) or SuperGlueForKeypointMatching(config)",
+ "verified": {
+  "entry_point": "Confirmed offline at the pinned commit (scratch venv, Python 3.12, torch 2.9.1+cpu, HF_HUB_OFFLINE=1, 2026-10-30). A local checkpoint whose config.json carries a custom-code value and a nested detector dict with an unregistered model_type and _name_or_path imports a probe module from that path at the configuration sink (marker written) before the outer strict dataclass validation raises. A local checkpoint whose nested detector dict uses the built-in superpoint model_type and also carries auto_map imports the probe detector class at AutoModelForKeypointDetection.from_config during model construction and returns a model. The same two routes execute on the injected SuperGlue sibling. Applying the reference fix writes no marker on any of the four routes; the configuration route refuses with KeyError and the model route falls back to the built-in detector model. LightGlue and SuperGlue model construction and a tiny forward pass still work.",
+  "sites": [
+   "src/transformers/models/lightglue/configuration_lightglue.py:87-98 - nested detector dict with an unregistered model_type and _name_or_path reaches AutoConfig.from_pretrained with the checkpoint's own custom-code value (published fix site; landing point)",
+   "src/transformers/models/lightglue/modeling_lightglue.py:505-507 - forwards the checkpoint's custom-code value into AutoModelForKeypointDetection.from_config (published fix site; main lever sink)",
+   "src/transformers/models/lightglue/modular_lightglue.py:89-105 and 521-525 - the modular source of the two sites (published fix site; second implementation, not imported at run time)",
+   "src/transformers/models/superglue/configuration_superglue.py:77-86 - injected: the identical nested-detector fallback with a declared custom-code value",
+   "src/transformers/models/superglue/modeling_superglue.py:506-508 - injected: forwards the same value into AutoModelForKeypointDetection.from_config",
+   "utils/mlinter/trf014.py and utils/mlinter/rules.toml - published-fix static lint rule; not a run-time sink and not graded"
+  ],
+  "routes": [
+   "configuration auto-class on a checkpoint with an unregistered nested detector and _name_or_path -> probe module imported (verified, marker written at pinned)",
+   "configuration class from_pretrained on the same checkpoint -> probe module imported (verified)",
+   "model auto-class from_config on a checkpoint whose built-in nested detector also carries auto_map -> probe detector imported (verified)",
+   "direct model construction from the same loaded configuration -> probe detector imported (verified)",
+   "injected SuperGlue configuration route with the same shapes (verified)",
+   "injected SuperGlue model route with the same shapes (verified)",
+   "reference fix: all six security tests pass and all eight functional tests pass",
+   "ordinary nested detector dicts with no model_type, with built-in values, with harmless _name_or_path metadata, and a checkpoint carrying the custom-code value but only built-in components: all verified to keep loading and binding"
+  ],
+  "services": "none; every test uses a local checkpoint directory under a pytest tmp_path and runs offline (HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1). No network, GPU, kernel or GUI at test time.",
+  "project_tests_run": "At the pinned commit in the scratch environment: `python -m pytest -q -p no:cacheprovider tests/models/lightglue/test_modeling_lightglue.py -k 'test_config or test_model'` -> 91 passed, 64 skipped, 958 subtests passed in 49.19s, offline. The environment image build runs the same command as a build-time check, so the affected-area project tests must pass in the image.",
+  "injected_siblings": [
+   "src/transformers/models/superglue/configuration_superglue.py:77-86 - declared custom-code value plus AutoConfig fallback for an unregistered detector (the published fix never edits this package)",
+   "src/transformers/models/superglue/modeling_superglue.py:506-508 - forwards the same value at model construction (the published fix never edits this package)"
+  ]
+ },
+ "leak_terms": [
+  "trust_remote_code",
+  "auto_map",
+  "keypoint_detector_config",
+  "LightGlue",
+  "SuperGlue",
+  "LightGlueConfig",
+  "SuperGlueConfig",
+  "LightGlueForKeypointMatching",
+  "SuperGlueForKeypointMatching",
+  "AutoModelForKeypointDetection",
+  "AutoModelForKeypointMatching",
+  "configuration_lightglue",
+  "modeling_lightglue",
+  "modular_lightglue",
+  "configuration_superglue",
+  "modeling_superglue",
+  "trf014",
+  "mlinter",
+  "GHSA-FGCW-684Q-JJ6R",
+  "CVE-2026-5241",
+  "PYSEC-2026-2290",
+  "CWE-829"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-config-stage-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-lightglue-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-modular-only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-metadata.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-overbroad.patch",
+  "crash_as_refusal": "n/a: the library has no status channel to test; every security test accepts any exception as a refusal as long as no checkpoint-named code ran, and an unconditional crash is rejected by the positive-control functional tests that build configurations and models",
+  "wrong_resource": "n/a: there is no authorization decision or neighbouring/proxy resource; the protected outcome is whether code named by the checkpoint runs during setup",
+  "one_role_or_direction": "n/a: there are no roles, peers or directions; the configuration-stage and model-stage sinks are separate tests, not two directions of one toggle",
+  "reads_only": "n/a: there is no read/write split; every route is a setup path and the tests drive the public entry points that build a configuration or a model",
+  "check_after_adjustment": "n/a: no normalising or adjusting step turns the checkpoint value into a different one before the sink; the value is consumed where it is read",
+  "unlisted_route": "sf-config-stage-only.patch",
+  "malformed_identity": "n/a: no identity or path parsing decision; a malformed value produces an ordinary load error, which the security group accepts only because no code ran",
+  "missing_authority": "n/a: there is no authority, secret or role lookup that could fail open; the only decision is whether the person loading explicitly asked for custom code",
+  "adjacent_api": "n/a: the reference fix changes no shared helper or sibling API contract; the sibling integration is a separate safety gap with its own tests (sf-lightglue-only.patch), not a shared-helper regression"
+ },
+ "traps": [
+  {
+   "id": "nested_detector_remote_mapping_at_model_init",
+   "shape": "input shape a plausible check mishandles plus a far sink: a nested detector whose built-in model_type hides a remote model mapping that is resolved at model construction, while the reported configuration-stage fallback never runs",
+   "where": "src/transformers/models/lightglue/modeling_lightglue.py:505-507 with src/transformers/models/lightglue/configuration_lightglue.py:87-98",
+   "security_tests": [
+    "test_model_auto_class_does_not_run_checkpoint_code",
+    "test_direct_model_construction_does_not_run_checkpoint_code"
+   ],
+   "coupled_functional_tests": [
+    "test_nested_detector_dict_binds_supplied_values",
+    "test_nested_detector_with_harmless_origin_metadata_still_binds",
+    "test_model_builds_and_runs_from_a_builtin_detector_configuration"
+   ],
+   "security_fail_patch": "sf-config-stage-only.patch",
+   "realistic_because": "real, unmodified upstream code at the pinned commit; the published fix removes the forwarded value at this sink, but the reported symptom is the configuration-stage fallback"
+  },
+  {
+   "id": "modular_source_versus_generated_modules",
+   "shape": "second implementation: the modular source is the documented source of truth while the generated modules are what the interpreter imports",
+   "where": "src/transformers/models/lightglue/modular_lightglue.py:89-105 and 521-525 against src/transformers/models/lightglue/configuration_lightglue.py and modeling_lightglue.py",
+   "security_tests": [
+    "test_configuration_auto_class_does_not_run_checkpoint_code",
+    "test_configuration_class_does_not_run_checkpoint_code",
+    "test_model_auto_class_does_not_run_checkpoint_code",
+    "test_direct_model_construction_does_not_run_checkpoint_code"
+   ],
+   "coupled_functional_tests": [
+    "test_nested_detector_dict_binds_supplied_values",
+    "test_configuration_save_and_reload_round_trip",
+    "test_model_builds_and_runs_from_a_builtin_detector_configuration"
+   ],
+   "security_fail_patch": "sf-modular-only.patch",
+   "realistic_because": "real, unmodified upstream structure; the generated file's header forbids editing it, so a solver can edit only the modular source and leave the executed copy vulnerable"
+  },
+  {
+   "id": "sibling_keypoint_matching_integration",
+   "shape": "injected second integration: the sibling keypoint-matching model carries the same nested-detector fallback and the same model-stage forwarding",
+   "where": "src/transformers/models/superglue/configuration_superglue.py:77-86 and src/transformers/models/superglue/modeling_superglue.py:506-508 (injected)",
+   "security_tests": [
+    "test_superglue_configuration_does_not_run_checkpoint_code",
+    "test_superglue_model_does_not_run_checkpoint_code"
+   ],
+   "coupled_functional_tests": [
+    "test_superglue_configuration_and_model_build",
+    "test_superglue_checkpoint_with_nested_detector_loads"
+   ],
+   "security_fail_patch": "sf-lightglue-only.patch",
+   "realistic_because": "injected: a maintainer adding third-party detector support to the sibling keypoint-matching integration copied the pattern; the published fix never touches this package"
+  },
+  {
+   "id": "ordinary_nested_detector_configurations",
+   "shape": "coupled must-keep-working value: ordinary nested detector configurations, including ones carrying harmless origin metadata, must keep loading and binding their values, and models built from them must keep running",
+   "where": "src/transformers/models/lightglue/configuration_lightglue.py:87-98 and src/transformers/models/superglue/configuration_superglue.py:77-86",
+   "security_tests": [
+    "test_model_auto_class_does_not_run_checkpoint_code",
+    "test_superglue_model_does_not_run_checkpoint_code"
+   ],
+   "coupled_functional_tests": [
+    "test_nested_detector_dict_binds_supplied_values",
+    "test_nested_detector_with_harmless_origin_metadata_still_binds",
+    "test_checkpoint_with_unused_custom_code_value_still_loads_and_builds",
+    "test_superglue_configuration_and_model_build",
+    "test_superglue_checkpoint_with_nested_detector_loads"
+   ],
+   "security_fail_patch": "ff-metadata.patch (functional_fail: an over-broad rejection of nested configurations that carry harmless metadata is caught by the coupled functional tests; ff-overbroad.patch rejects all nested detector configurations)",
+   "realistic_because": "real, unmodified upstream behaviour; every project test for the area builds its configuration with a nested detector dict"
+  }
+ ],
+ "status": "built; gate green (static, nop, oracle x3, patches)",
+ "gate": {
+  "static": "pass",
+  "nop": "pass (0/6 security tests pass on vulnerable code; 8/8 functional pass)",
+  "oracle": "pass (3 runs, reward 1.0 each, identical results)",
+  "patches": "pass (3 security_fail, 2 functional_fail, hardening and alternative pass patches all as declared)"
+ }
+}

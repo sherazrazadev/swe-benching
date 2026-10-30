@@ -1,0 +1,256 @@
+diff -ruN a/src/transformers/models/lightglue/configuration_lightglue.py b/src/transformers/models/lightglue/configuration_lightglue.py
+--- a/src/transformers/models/lightglue/configuration_lightglue.py	2026-10-30 05:31:27.000000000 +0000
++++ b/src/transformers/models/lightglue/configuration_lightglue.py	2026-10-30 05:57:54.394182611 +0000
+@@ -26,6 +26,26 @@
+ from ..superpoint import SuperPointConfig
+ 
+ 
++def _builtin_detector_config(detector_config: dict, **extra) -> PreTrainedConfig:
++    """Build a keypoint detector configuration from checkpoint-provided data.
++
++    The dictionary is data only. A ``model_type`` registered in the library selects a built-in
++    configuration class; anything else is refused instead of being resolved from a location the
++    checkpoint names. Extra keys (for example ``_name_or_path`` or ``auto_map``) are left on the
++    resulting configuration as inert metadata and never cause code to be fetched or executed.
++    """
++    values = dict(detector_config)
++    values.setdefault("model_type", "superpoint")
++    model_type = values["model_type"]
++    if model_type not in CONFIG_MAPPING:
++        raise ValueError(
++            f"Unsupported keypoint detector `model_type={model_type!r}`: only detector "
++            "configurations built into the library can be loaded from a checkpoint. Custom code "
++            "named by a checkpoint is never fetched or executed."
++        )
++    return CONFIG_MAPPING[model_type](**values, **extra)
++
++
+ @auto_docstring(checkpoint="ETH-CVG/lightglue_superpoint")
+ @strict
+ class LightGlueConfig(PreTrainedConfig):
+@@ -41,7 +61,9 @@
+     filter_threshold (`float`, *optional*, defaults to 0.1):
+         The confidence threshold used to filter matches
+     trust_remote_code (`bool`, *optional*, defaults to `False`):
+-        Whether to trust remote code when using other models than SuperPoint as keypoint detector.
++        Kept as an ordinary (inert) configuration value for backward compatibility. It is never
++        used to grant permission to load custom code: a checkpoint's own values cannot enable
++        remote code execution.
+ 
+     Examples:
+         ```python
+@@ -73,9 +95,8 @@
+     hidden_act: str = "gelu"
+     attention_dropout: float | int = 0.0
+     attention_bias: bool = True
+-    # LightGlue can be used with other models than SuperPoint as keypoint detector
+-    # We provide the trust_remote_code argument to allow the use of other models
+-    # that are not registered in the CONFIG_MAPPING dictionary (for example DISK)
++    # Retained as plain data for backward compatibility. A checkpoint value must never be read
++    # as permission to load code from a location it names, so this field is not consulted anywhere.
+     trust_remote_code: bool = False
+ 
+     def __post_init__(self, **kwargs):
+@@ -85,15 +106,9 @@
+         # Keypoint Detector is forced into eager attention mode because SuperPoint does not have Attention
+         # See https://github.com/huggingface/transformers/pull/31718#discussion_r2109733153
+         if isinstance(self.keypoint_detector_config, dict):
+-            self.keypoint_detector_config["model_type"] = self.keypoint_detector_config.get("model_type", "superpoint")
+-            if self.keypoint_detector_config["model_type"] not in CONFIG_MAPPING:
+-                self.keypoint_detector_config = AutoConfig.from_pretrained(
+-                    self.keypoint_detector_config["_name_or_path"], trust_remote_code=self.trust_remote_code
+-                )
+-            else:
+-                self.keypoint_detector_config = CONFIG_MAPPING[self.keypoint_detector_config["model_type"]](
+-                    **self.keypoint_detector_config, attn_implementation="eager"
+-                )
++            self.keypoint_detector_config = _builtin_detector_config(
++                self.keypoint_detector_config, attn_implementation="eager"
++            )
+         elif self.keypoint_detector_config is None:
+             self.keypoint_detector_config = CONFIG_MAPPING["superpoint"](attn_implementation="eager")
+ 
+diff -ruN a/src/transformers/models/lightglue/modeling_lightglue.py b/src/transformers/models/lightglue/modeling_lightglue.py
+--- a/src/transformers/models/lightglue/modeling_lightglue.py	2026-10-30 05:31:27.000000000 +0000
++++ b/src/transformers/models/lightglue/modeling_lightglue.py	2026-10-30 05:57:58.294186929 +0000
+@@ -502,8 +502,10 @@
+ 
+     def __init__(self, config: LightGlueConfig):
+         super().__init__(config)
++        # The detector configuration comes from the checkpoint and is data only. Never let it
++        # vouch for custom code: resolve the detector with the built-in classes exclusively.
+         self.keypoint_detector = AutoModelForKeypointDetection.from_config(
+-            config.keypoint_detector_config, trust_remote_code=config.trust_remote_code
++            config.keypoint_detector_config, trust_remote_code=False
+         )
+ 
+         self.keypoint_detector_descriptor_dim = config.keypoint_detector_config.descriptor_decoder_dim
+diff -ruN a/src/transformers/models/lightglue/modular_lightglue.py b/src/transformers/models/lightglue/modular_lightglue.py
+--- a/src/transformers/models/lightglue/modular_lightglue.py	2026-10-30 05:31:27.000000000 +0000
++++ b/src/transformers/models/lightglue/modular_lightglue.py	2026-10-30 05:58:20.270211382 +0000
+@@ -36,6 +36,26 @@
+ from ..superpoint import SuperPointConfig
+ 
+ 
++def _builtin_detector_config(detector_config: dict, **extra) -> PreTrainedConfig:
++    """Build a keypoint detector configuration from checkpoint-provided data.
++
++    The dictionary is data only. A ``model_type`` registered in the library selects a built-in
++    configuration class; anything else is refused instead of being resolved from a location the
++    checkpoint names. Extra keys (for example ``_name_or_path`` or ``auto_map``) are left on the
++    resulting configuration as inert metadata and never cause code to be fetched or executed.
++    """
++    values = dict(detector_config)
++    values.setdefault("model_type", "superpoint")
++    model_type = values["model_type"]
++    if model_type not in CONFIG_MAPPING:
++        raise ValueError(
++            f"Unsupported keypoint detector `model_type={model_type!r}`: only detector "
++            "configurations built into the library can be loaded from a checkpoint. Custom code "
++            "named by a checkpoint is never fetched or executed."
++        )
++    return CONFIG_MAPPING[model_type](**values, **extra)
++
++
+ logger = logging.get_logger(__name__)
+ 
+ 
+@@ -54,7 +74,9 @@
+     filter_threshold (`float`, *optional*, defaults to 0.1):
+         The confidence threshold used to filter matches
+     trust_remote_code (`bool`, *optional*, defaults to `False`):
+-        Whether to trust remote code when using other models than SuperPoint as keypoint detector.
++        Kept as an ordinary (inert) configuration value for backward compatibility. It is never
++        used to grant permission to load custom code: a checkpoint's own values cannot enable
++        remote code execution.
+ 
+     Examples:
+         ```python
+@@ -86,9 +108,8 @@
+     hidden_act: str = "gelu"
+     attention_dropout: float | int = 0.0
+     attention_bias: bool = True
+-    # LightGlue can be used with other models than SuperPoint as keypoint detector
+-    # We provide the trust_remote_code argument to allow the use of other models
+-    # that are not registered in the CONFIG_MAPPING dictionary (for example DISK)
++    # Retained as plain data for backward compatibility. A checkpoint value must never be read
++    # as permission to load code from a location it names, so this field is not consulted anywhere.
+     trust_remote_code: bool = False
+ 
+     def __post_init__(self, **kwargs):
+@@ -98,15 +119,9 @@
+         # Keypoint Detector is forced into eager attention mode because SuperPoint does not have Attention
+         # See https://github.com/huggingface/transformers/pull/31718#discussion_r2109733153
+         if isinstance(self.keypoint_detector_config, dict):
+-            self.keypoint_detector_config["model_type"] = self.keypoint_detector_config.get("model_type", "superpoint")
+-            if self.keypoint_detector_config["model_type"] not in CONFIG_MAPPING:
+-                self.keypoint_detector_config = AutoConfig.from_pretrained(
+-                    self.keypoint_detector_config["_name_or_path"], trust_remote_code=self.trust_remote_code
+-                )
+-            else:
+-                self.keypoint_detector_config = CONFIG_MAPPING[self.keypoint_detector_config["model_type"]](
+-                    **self.keypoint_detector_config, attn_implementation="eager"
+-                )
++            self.keypoint_detector_config = _builtin_detector_config(
++                self.keypoint_detector_config, attn_implementation="eager"
++            )
+         elif self.keypoint_detector_config is None:
+             self.keypoint_detector_config = CONFIG_MAPPING["superpoint"](attn_implementation="eager")
+ 
+@@ -520,8 +535,10 @@
+ 
+     def __init__(self, config: LightGlueConfig):
+         super().__init__(config)
++        # The detector configuration comes from the checkpoint and is data only. Never let it
++        # vouch for custom code: resolve the detector with the built-in classes exclusively.
+         self.keypoint_detector = AutoModelForKeypointDetection.from_config(
+-            config.keypoint_detector_config, trust_remote_code=config.trust_remote_code
++            config.keypoint_detector_config, trust_remote_code=False
+         )
+ 
+         self.keypoint_detector_descriptor_dim = config.keypoint_detector_config.descriptor_decoder_dim
+diff -ruN a/src/transformers/models/superglue/configuration_superglue.py b/src/transformers/models/superglue/configuration_superglue.py
+--- a/src/transformers/models/superglue/configuration_superglue.py	2026-10-30 05:37:09.000000000 +0000
++++ b/src/transformers/models/superglue/configuration_superglue.py	2026-10-30 05:58:09.279199279 +0000
+@@ -19,6 +19,26 @@
+ from ..auto import CONFIG_MAPPING, AutoConfig
+ 
+ 
++def _builtin_detector_config(detector_config: dict, **extra) -> PreTrainedConfig:
++    """Build a keypoint detector configuration from checkpoint-provided data.
++
++    The dictionary is data only. A ``model_type`` registered in the library selects a built-in
++    configuration class; anything else is refused instead of being resolved from a location the
++    checkpoint names. Extra keys (for example ``_name_or_path`` or ``auto_map``) are left on the
++    resulting configuration as inert metadata and never cause code to be fetched or executed.
++    """
++    values = dict(detector_config)
++    values.setdefault("model_type", "superpoint")
++    model_type = values["model_type"]
++    if model_type not in CONFIG_MAPPING:
++        raise ValueError(
++            f"Unsupported keypoint detector `model_type={model_type!r}`: only detector "
++            "configurations built into the library can be loaded from a checkpoint. Custom code "
++            "named by a checkpoint is never fetched or executed."
++        )
++    return CONFIG_MAPPING[model_type](**values, **extra)
++
++
+ @auto_docstring(checkpoint="magic-leap-community/superglue_indoor")
+ @strict
+ class SuperGlueConfig(PreTrainedConfig):
+@@ -34,7 +54,9 @@
+     matching_threshold (`float`, *optional*, defaults to 0.0):
+         The matching threshold.
+     trust_remote_code (`bool`, *optional*, defaults to `False`):
+-        Whether to trust remote code when using other models than SuperPoint as keypoint detector.
++        Kept as an ordinary (inert) configuration value for backward compatibility. It is never
++        used to grant permission to load custom code: a checkpoint's own values cannot enable
++        remote code execution.
+ 
+     Examples:
+         ```python
+@@ -64,8 +86,8 @@
+     initializer_range: float = 0.02
+     is_decoder: bool = False
+     attention_probs_dropout_prob: int | float = 0.0
+-    # SuperGlue can be combined with detector implementations that are shipped with a checkpoint
+-    # rather than being part of CONFIG_MAPPING; this flag lets such a detector be resolved.
++    # Retained as plain data for backward compatibility. A checkpoint value must never be read
++    # as permission to load code from a location it names, so this field is not consulted anywhere.
+     trust_remote_code: bool = False
+ 
+     def __post_init__(self, **kwargs):
+@@ -75,16 +97,7 @@
+         )
+ 
+         if isinstance(self.keypoint_detector_config, dict):
+-            self.keypoint_detector_config["model_type"] = self.keypoint_detector_config.get("model_type", "superpoint")
+-            if self.keypoint_detector_config["model_type"] not in CONFIG_MAPPING:
+-                self.keypoint_detector_config = AutoConfig.from_pretrained(
+-                    self.keypoint_detector_config["_name_or_path"],
+-                    trust_remote_code=self.trust_remote_code,
+-                )
+-            else:
+-                self.keypoint_detector_config = CONFIG_MAPPING[self.keypoint_detector_config["model_type"]](
+-                    **self.keypoint_detector_config
+-                )
++            self.keypoint_detector_config = _builtin_detector_config(self.keypoint_detector_config)
+         elif self.keypoint_detector_config is None:
+             self.keypoint_detector_config = CONFIG_MAPPING["superpoint"]()
+ 
+diff -ruN a/src/transformers/models/superglue/modeling_superglue.py b/src/transformers/models/superglue/modeling_superglue.py
+--- a/src/transformers/models/superglue/modeling_superglue.py	2026-10-30 05:37:09.000000000 +0000
++++ b/src/transformers/models/superglue/modeling_superglue.py	2026-10-30 05:57:58.875187573 +0000
+@@ -503,8 +503,10 @@
+     def __init__(self, config: SuperGlueConfig) -> None:
+         super().__init__(config)
+ 
++        # The detector configuration comes from the checkpoint and is data only. Never let it
++        # vouch for custom code: resolve the detector with the built-in classes exclusively.
+         self.keypoint_detector = AutoModelForKeypointDetection.from_config(
+-            config.keypoint_detector_config, trust_remote_code=config.trust_remote_code
++            config.keypoint_detector_config, trust_remote_code=False
+         )
+ 
+         self.keypoint_encoder = SuperGlueKeypointEncoder(config)

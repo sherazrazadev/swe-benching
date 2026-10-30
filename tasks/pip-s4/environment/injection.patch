@@ -1,0 +1,74 @@
+diff --git a/src/pip/_internal/commands/wheel.py b/src/pip/_internal/commands/wheel.py
+index a30484807..9bf0057f5 100644
+--- a/src/pip/_internal/commands/wheel.py
++++ b/src/pip/_internal/commands/wheel.py
+@@ -1,6 +1,8 @@
+ import logging
+ import os
++import posixpath
+ import shutil
++import urllib.parse
+ from optparse import Values
+ 
+ from pip._internal.cache import WheelCache
+@@ -155,7 +157,7 @@ class WheelCommand(RequirementCommand):
+         for req in build_successes:
+             assert req.link and req.link.is_wheel
+             assert req.local_file_path
+-            # copy from cache to target directory
++            # Copy from cache to the target directory.
+             try:
+                 shutil.copy(req.local_file_path, options.wheel_dir)
+             except OSError as e:
+@@ -166,6 +168,17 @@ class WheelCommand(RequirementCommand):
+                     e,
+                 )
+                 build_failures.append(req)
++                continue
++            # Record the source URL next to the built wheel.
++            if req.original_link is not None:
++                published = urllib.parse.unquote(
++                    posixpath.basename(req.original_link.path.rstrip("/"))
++                )
++                if published:
++                    with open(
++                        os.path.join(options.wheel_dir, published + ".url"), "w"
++                    ) as url_file:
++                        url_file.write(req.original_link.url)
+         if len(build_failures) != 0:
+             raise CommandError("Failed to build one or more wheels")
+ 
+diff --git a/src/pip/_internal/req/req_install.py b/src/pip/_internal/req/req_install.py
+index c92c5cff0..0df7c8691 100644
+--- a/src/pip/_internal/req/req_install.py
++++ b/src/pip/_internal/req/req_install.py
+@@ -3,8 +3,10 @@ from __future__ import annotations
+ import functools
+ import logging
+ import os
++import posixpath
+ import shutil
+ import sys
++import urllib.parse
+ import uuid
+ import zipfile
+ from collections.abc import Collection, Iterable
+@@ -708,7 +710,17 @@ class InstallRequirement:
+             return
+ 
+         create_archive = True
+-        archive_name = "{}-{}.zip".format(self.name, self.metadata["version"])
++        # Keep the source name in the archive so that a download directory
++        # shows which checkout each archive was built from.
++        if self.link is not None:
++            source_name = urllib.parse.unquote(
++                posixpath.basename(self.link.path.rstrip("/"))
++            )
++        else:
++            source_name = ""
++        archive_name = "{}-{}.zip".format(
++            source_name or self.name, self.metadata["version"]
++        )
+         archive_path = os.path.join(build_dir, archive_name)
+ 
+         if os.path.exists(archive_path):

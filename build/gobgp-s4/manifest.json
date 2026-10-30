@@ -1,0 +1,248 @@
+{
+ "slug": "gobgp-s4",
+ "candidate": {
+  "entry_id": "17660",
+  "advisory_ids": [
+   "GHSA-GJRG-JJR3-56CM",
+   "CVE-2026-49837",
+   "GO-2026-5955"
+  ],
+  "repo": "osrg/gobgp",
+  "cwe": "CWE-125",
+  "language": "Go",
+  "pinned_commit": "2ee365d3b0807d049d518f0dd6a9f4906963636b",
+  "fix_commits": [
+   "f02ca397821f6ca182ef4eb492c3cbc459552d7c"
+  ],
+  "screener": "screener-v2 / deepseek-flash[1m]",
+  "summary": "out-of-bounds read of a length-delimited protocol field in the BGP OPEN capability parser; a capability's declared length was not enforced before its value was decoded",
+  "pattern_fit": "A"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "bgp.ParseBGPMessage (and bgp.ParseBGPBody / (*BGPOpen).DecodeFromBytes) with an OPEN whose four-octet-AS capability declares CapLen 0 and is followed by another capability: the parser accepts the message and takes the AS number from the following capability's bytes. Also confirmed through the exported per-type DecodeFromBytes methods and bgp.DecodeCapability, and through bmp.ParseBMPMessage for a peer-up OPEN. Reproduced offline at the pinned+injected commit; rejected after solution/fix.patch.",
+  "variants": [
+   "four-octet-AS capability with CapLen 0, 2 or 5, followed by another capability (message, body, direct decoder and capability-dispatcher entry points)",
+   "multiprotocol capability with CapLen 0, 2 or 5",
+   "graceful-restart capability with CapLen 0 or 1",
+   "FQDN domain-name and host-name length bytes that exceed CapLen while the remaining parameter buffer is long enough",
+   "software-version length byte that exceeds CapLen while the remaining parameter buffer is long enough",
+   "injected ORF capability (code 3) whose declared length is too short for an entry and whose entry type count runs past CapLen"
+  ],
+  "sites": [
+   "pkg/packet/bgp/bgp.go:503-513 (CapMultiProtocol.DecodeFromBytes)",
+   "pkg/packet/bgp/bgp.go:684-712 (CapGracefulRestart.DecodeFromBytes)",
+   "pkg/packet/bgp/bgp.go:765-775 (CapFourOctetASNumber.DecodeFromBytes)",
+   "pkg/packet/bgp/bgp.go:1032-1066 (CapFQDN.DecodeFromBytes)",
+   "pkg/packet/bgp/bgp.go:1116-1131 (CapSoftwareVersion.DecodeFromBytes)",
+   "pkg/packet/bgp/bgp.go:1178 and 1227-1243 (DecodeCapability / OptionParameterCapability.DecodeFromBytes - the landing point and the tempting wrong fix layer)",
+   "pkg/packet/bgp/capability_orf.go (injected CapORF.DecodeFromBytes, wired at bgp.go:1189)"
+  ],
+  "routes": [
+   "bgp.ParseBGPMessage from a peer session body",
+   "bgp.ParseBGPBody as used by pkg/server/fsm.go",
+   "(*bgp.BGPOpen).DecodeFromBytes",
+   "bgp.DecodeCapability",
+   "each exported capability type's DecodeFromBytes",
+   "bgp.ParseBGPMessage embedded in a BMP peer-up notification (same sink, another package) - covered by the same fix but not given a separate test"
+  ],
+  "services": [],
+  "project_tests_run": "go test ./pkg/packet/bgp ./pkg/packet/bmp ./pkg/packet/mrt at the pinned+injected commit: pass (run locally and again during the environment image build); go test ./pkg/packet/bgp after solution/fix.patch: pass"
+ },
+ "leak_terms": [
+  "GHSA-GJRG-JJR3-56CM",
+  "CVE-2026-49837",
+  "GO-2026-5955",
+  "CapLen",
+  "CapValue",
+  "DecodeFromBytes",
+  "DecodeCapability",
+  "OptionParameterCapability",
+  "DefaultParameterCapability",
+  "capability_orf",
+  "CapORF",
+  "ORF",
+  "bgp.go",
+  "ParseBGPMessage",
+  "ParseBGPBody",
+  "BGPOpen",
+  "CapFourOctetASNumber",
+  "CapMultiProtocol",
+  "CapGracefulRestart",
+  "CapFQDN",
+  "CapSoftwareVersion"
+ ],
+ "patch_checks": [
+  {
+   "patch": "as4_only.patch",
+   "expect": "security_fail",
+   "note": "fixes only the capability named in the reported impact; the other four published decoders stay unbounded (nop=15 security fail)"
+  },
+  {
+   "patch": "wrapper_only.patch",
+   "expect": "security_fail",
+   "note": "bounds the optional-parameter wrapper and enforces exact size in the dispatcher but leaves the exported per-type decoders unbounded; the direct-decoder security tests fail"
+  },
+  {
+   "patch": "fixed_size_only.patch",
+   "expect": "security_fail",
+   "note": "bounds fixed-size capabilities with a shorter-than check and leaves FQDN/software-version inner lengths unfixed; the exact-size and inner-length security tests fail"
+  },
+  {
+   "patch": "orf_missing.patch",
+   "expect": "security_fail",
+   "note": "the reference fix minus the injected ORF decoder fix; its 3 security tests fail"
+  },
+  {
+   "patch": "panic_refusal.patch",
+   "expect": "security_fail",
+   "note": "the reference fix but the four-octet-AS decoder panics on a wrong declared length instead of returning an error; the security tests require an error and fail"
+  },
+  {
+   "patch": "over_harden.patch",
+   "expect": "functional_fail",
+   "note": "the reference fix plus rejection of any trailing bytes after a capability; legitimate multi-capability parameters break (4 functional tests and the project packet tests fail)"
+  },
+  {
+   "patch": "refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "the capability dispatcher refuses every capability; all legitimate capability OPENs break"
+  },
+  {
+   "patch": "reject_zero_len.patch",
+   "expect": "functional_fail",
+   "note": "the reference fix plus a shared-header rejection of every zero-length capability; route-refresh and other value-less capabilities break"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive bounds in the shared parameter decoder and capability dispatcher; scores 1.0"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "note": "alternative correct design: each decoder slices its input to the declared length and keeps the original checks; scores 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_all.patch",
+  "crash_as_refusal": "panic_refusal.patch",
+  "wrong_resource": "n/a: a packet decoder has no resource or object selection; there is no neighbouring or proxy object to authorise instead of the one touched",
+  "one_role_or_direction": "n/a: there are no roles, peers or directions; every capability code goes through the same decoders and the tests exercise the full message and direct entry points",
+  "reads_only": "n/a: decoding is the only operation; there is no read/write verb split to guard one side of",
+  "check_after_adjustment": "n/a: the declared length is used directly; no offset, clamp, unit conversion or normalisation sits between the attacker input and the check",
+  "unlisted_route": "orf_missing.patch",
+  "malformed_identity": "n/a: there is no identity or signature parsing; the guard compares the declared length directly with the value it must hold",
+  "missing_authority": "n/a: there is no authority or secret lookup; a missing value is a length violation and is refused",
+  "adjacent_api": "reject_zero_len.patch"
+ },
+ "traps": [
+  {
+   "id": "BASE",
+   "pattern": "A (published fix's five sites; the reported impact is the four-octet-AS capability)",
+   "shape": "capability value read from data[2:] with the check made against the whole remaining optional-parameter buffer instead of the declared capability length",
+   "where": "pkg/packet/bgp/bgp.go:503-513, 684-712, 765-775, 1032-1066, 1116-1131",
+   "reason_to_dismiss": "none - this is the site the report points at; a solver that fixes only the capability in the example leaves the other four open",
+   "security_tests": [
+    "security/sec_capability_boundary_test.go::TestSec_FourOctetASZeroDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_FourOctetASShortDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_MultiProtocolZeroDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_MultiProtocolShortDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_GracefulRestartZeroDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_GracefulRestartShortDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_ParseBGPBodyRejectsDeclaredLengthViolation",
+    "security/sec_capability_boundary_test.go::TestSec_OpenBodyDecoderRejectsDeclaredLengthViolation"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_capability_valid_test.go::TestFunc_MultipleCapabilitiesInOneParameter",
+    "functional/func_capability_valid_test.go::TestFunc_CapabilityEndsAtParameterEnd",
+    "functional/func_capability_valid_test.go::TestFunc_FixedSizeCapabilities"
+   ],
+   "security_fail_patch": "as4_only.patch"
+  },
+  {
+   "id": "A-FAR",
+   "pattern": "A (published fix, lower-level public API)",
+   "shape": "the exported per-type DecodeFromBytes methods and the exported capability dispatcher are reached with a buffer longer than 2+declared-length and still read across the declared boundary",
+   "where": "pkg/packet/bgp/bgp.go:503, 684, 765, 1032, 1116 (per-type decoders) and 1178 (DecodeCapability)",
+   "reason_to_dismiss": "the OPEN parser bounds each capability slice before dispatch, so the per-type decoders look internal and never expected to see a longer buffer - false for library callers and for the project's own FuzzDecodeFromBytes, which calls each capability decoder directly",
+   "realistic_because": "the methods are exported public API and the project's fuzz harness already calls them directly with arbitrary buffers",
+   "security_tests": [
+    "security/sec_capability_boundary_test.go::TestSec_DirectFourOctetASDecoder",
+    "security/sec_capability_boundary_test.go::TestSec_DirectMultiProtocolDecoder",
+    "security/sec_capability_boundary_test.go::TestSec_DirectGracefulRestartDecoder",
+    "security/sec_capability_boundary_test.go::TestSec_DirectCapabilityDispatch"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_capability_valid_test.go::TestFunc_DirectCapabilityDecoders"
+   ],
+   "security_fail_patch": "wrapper_only.patch"
+  },
+  {
+   "id": "SHAPE",
+   "pattern": "A (input shape a plausible check mishandles)",
+   "shape": "inner length fields inside a capability value (FQDN host name, FQDN domain name, software version) declare more bytes than the capability's declared length, while the remaining parameter buffer is long enough to satisfy a check made against it; and a fixed-size value declares more bytes than its fixed size",
+   "where": "pkg/packet/bgp/bgp.go:1032-1066 (CapFQDN), 1116-1131 (CapSoftwareVersion); exact-size rule at 503-513 and 765-775",
+   "reason_to_dismiss": "the FQDN and software-version decoders already perform explicit length checks, so they look safe, and reading the first four bytes inside a longer declared value looks harmless",
+   "security_tests": [
+    "security/sec_capability_boundary_test.go::TestSec_FQDNDomainNamePastDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_FQDNHostNamePastDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_SoftwareVersionPastDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_FourOctetASLongDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_MultiProtocolLongDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_DirectFQDNDecoder",
+    "security/sec_capability_boundary_test.go::TestSec_DirectSoftwareVersionDecoder"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_capability_valid_test.go::TestFunc_FQDNCapability",
+    "functional/func_capability_valid_test.go::TestFunc_EmptyFQDNCapability",
+    "functional/func_capability_valid_test.go::TestFunc_SoftwareVersionCapability"
+   ],
+   "security_fail_patch": "fixed_size_only.patch"
+  },
+  {
+   "id": "SIB",
+   "pattern": "injected sibling (typed capability decoder for a code the project does not negotiate)",
+   "shape": "the ORF capability decoder iterates the whole remaining optional-parameter buffer and takes each entry's ORF-type count from that buffer, so a short declared length or an inner count reads bytes of the following capability",
+   "where": "pkg/packet/bgp/capability_orf.go:22-45, wired at pkg/packet/bgp/bgp.go:1189",
+   "reason_to_dismiss": "gobgp does not negotiate the ORF capability, so it reads as an extension outside the set of capabilities the advisory names",
+   "realistic_because": "DecodeCapability is a one-branch-per-code switch; ORF (RFC 5291) is a real capability the project does not implement, and adding typed support for a peer-sent capability is a routine contribution. The decoder copies the pre-fix habit exactly and ignores the declared length except in the shared header decoder.",
+   "security_tests": [
+    "security/sec_capability_boundary_test.go::TestSec_ORFShortDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_ORFTupleTypesPastDeclaredLength",
+    "security/sec_capability_boundary_test.go::TestSec_DirectORFDecoder"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_capability_valid_test.go::TestFunc_ORFCapabilityWithFollowingCapability"
+   ],
+   "security_fail_patch": "orf_missing.patch"
+  },
+  {
+   "id": "COUPLED",
+   "pattern": "coupled must-keep-working behaviour (how-type)",
+   "shape": "the buffer a capability decoder receives legally extends past 2+declared-length (several capabilities in one parameter); a zero-length capability is legal; a graceful-restart capability may carry flags and time only; an unknown capability keeps its value",
+   "where": "pkg/packet/bgp/bgp.go:1227-1243 (parameter loop) and 684-712 (graceful restart)",
+   "reason_to_dismiss": "a solver over-hardens by rejecting trailing bytes or every zero-length capability, which blocks the attacks but breaks legitimate OPENs",
+   "security_tests": [
+    "n/a: this lever is a legitimate-use behaviour; an over-broad fix is caught by the coupled functional tests"
+   ],
+   "coupled_functional_tests": [
+    "functional/func_capability_valid_test.go::TestFunc_MultipleCapabilitiesInOneParameter",
+    "functional/func_capability_valid_test.go::TestFunc_GracefulRestartWithoutTuples",
+    "functional/func_capability_valid_test.go::TestFunc_ZeroLengthCapabilities",
+    "functional/func_capability_valid_test.go::TestFunc_UnknownCapabilityKeepsValue"
+   ],
+   "security_fail_patch": "over_harden.patch (functional_fail: the lever's failure is functional)"
+  }
+ ],
+ "status": "built; gate PASSED 2026-10-30: static PASS; nop PASS (22/22 security fail on the vulnerable tree, 258/258 functional pass); oracle PASS (3 strict runs, reward 1.0, identical); patches PASS (10/10: 5 security_fail, 3 functional_fail, hardening + alternative pass). blind.patch and FAIRNESS.md are written after the build by separate agents."
+}

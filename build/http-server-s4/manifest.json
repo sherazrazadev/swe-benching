@@ -1,0 +1,227 @@
+{
+ "slug": "http-server-s4",
+ "candidate": {
+  "entry_id": "7559",
+  "advisory_ids": [
+   "GHSA-2M6Q-8V3H-JQWW",
+   "CVE-2026-107718"
+  ],
+  "repo": "adonisjs/http-server",
+  "screener_version": "screener-v2"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "9088623d39e775b8a6ab4b5f4e2daf50e211c4f2 is the direct parent of the published fix ab607a29 (git log --format='%H %P'); the injection patch applies cleanly to that tree (patch -p1 dry run) and the same tree with the oracle applies solution/fix.patch with git apply",
+  "regression_tests_absent_at_pin": "the upstream regression tests (tests/router/url_builder.spec.ts and tests/redirect.spec.ts additions in ab607a29) do not exist at the pinned commit; the commit's own diff was checked with git show",
+  "entry_points": [
+   "library API: router.urlBuilder.urlFor and its .get/.post/.put/.patch/.delete/.method builders (src/client/url_builder.ts)",
+   "library API: response.redirect().toRoute (src/redirect.ts) reaching urlFor",
+   "library API: router.makeUrl named and pattern (disableRouteLookup) mode",
+   "library API: router.makeSignedUrl named and pattern mode",
+   "library API: signedUrlFor named and pattern mode (src/router/signed_url_builder.ts)",
+   "library API: router.builder()/builderForDomain().make/makeSigned (src/router/legacy/url_builder.ts)",
+   "public helper subpaths: createURL / createSignedURL from ./helpers and ./client/url_builder",
+   "library API: declarative route redirects (redirect/redirectToPath/redirectToPattern on a brisk route)"
+  ],
+  "sites": [
+   "src/client/helpers.ts:126-135 (wildcard branch of createURL) - published fix site",
+   "src/client/helpers.ts:147-152 (named/optional branch of createURL) - published fix site",
+   "src/router/legacy/pattern_url.ts:24-99 (injected pattern-mode builder) used by src/router/main.ts:754",
+   "src/router/signed_url_builder.ts:21-76 and 96-119 (injected single-pass pattern-mode signed URL builder)",
+   "src/router/brisk.ts:30-72 and 198-216 (injected declarative pattern redirect builder)"
+  ],
+  "routes": "48 security tests fail on the pinned+injected image (all of them) and pass with the oracle; 15 hidden functional tests plus 252 pristine project tests (267 together) pass on both. Verified locally and in the gate's nop trial with the same Japa runner and file set the verifier uses.",
+  "services": "none; offline after image build",
+  "project_tests_run": [
+   "tests/router/url_builder.spec.ts",
+   "tests/router/legacy_url_builder.spec.ts",
+   "tests/router/router.spec.ts",
+   "tests/client/url_builder.spec.ts",
+   "tests/helpers/is_valid_redirect_url.spec.ts",
+   "tests/redirect.spec.ts",
+   "tests/request.spec.ts"
+  ],
+  "project_tests_excluded": "tests/router/brisk.spec.ts is not run from the pristine copy: its shared fixture lines also appear in the injected test hunk, which trips the hidden-test leak check. The injected redirectToPattern helper is exercised by tests/functional/legitimate-urls.spec.ts and tests/security/declarative-redirect.spec.ts instead.",
+  "injection": "environment/injection.patch adds three pattern-mode URL builders to src/: a legacy pattern helper used by Router.makeUrl's disableRouteLookup branch, a single-pass signed pattern builder, and a declarative redirectToPattern on brisk routes. Applied in the Dockerfile before the dependency install; the published fix never touches these files."
+ },
+ "leak_terms": [
+  "BriskRoute",
+  "GHSA-2M6Q-8V3H-JQWW",
+  "CVE-2026-107718",
+  "Redirect",
+  "Router",
+  "appendQueryString",
+  "brisk",
+  "client/helpers",
+  "createSignedURL",
+  "createURL",
+  "encodeURIComponent",
+  "helpers.ts",
+  "isValidRedirectUrl",
+  "makePatternUrl",
+  "makeSignedUrl",
+  "makeUrl",
+  "parseRoute",
+  "pattern_url",
+  "prefixUrl",
+  "redirectToPattern",
+  "signedUrlFor",
+  "signed_url_builder",
+  "toPath",
+  "toRoute",
+  "urlBuilder",
+  "urlFor",
+  "uriSegments",
+  "wildcard"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_miss_wildcard.patch",
+   "expect": "security_fail",
+   "note": "T1: every named param encoded, every wildcard list left raw"
+  },
+  {
+   "patch": "sf_miss_pattern_mode.patch",
+   "expect": "security_fail",
+   "note": "T2: pattern-mode URL and signed-URL builders left raw"
+  },
+  {
+   "patch": "sf_miss_declarative.patch",
+   "expect": "security_fail",
+   "note": "T3: declarative pattern redirect left raw"
+  },
+  {
+   "patch": "sf_report_site_only.patch",
+   "expect": "security_fail",
+   "note": "T4: only the reported redirect call encodes its params; the shared builder and every other entry point stay raw"
+  },
+  {
+   "patch": "sf_only_leading_slash.patch",
+   "expect": "security_fail",
+   "note": "escapes only a leading slash, so backslash, query and fragment shapes still pass"
+  },
+  {
+   "patch": "sf_throw_on_attack.patch",
+   "expect": "security_fail",
+   "note": "throws on a structural character instead of carrying the value (crash as refusal)"
+  },
+  {
+   "patch": "ff_encode_joined_wildcard.patch",
+   "expect": "functional_fail",
+   "note": "encodes the wildcard list after joining it, collapsing a legitimate multi-segment URL"
+  },
+  {
+   "patch": "ff_encode_whole_uri.patch",
+   "expect": "functional_fail",
+   "note": "encodes the whole URI, breaking prefixes, query strings and plain URLs"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every URL that has a param, so ordinary use stops working"
+  },
+  {
+   "patch": "pass_alt_strict_segments.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "different design: a strict RFC 3986 unreserved-character encoder instead of encodeURIComponent, applied in the same four builders"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "the oracle plus a defence in depth refusal of a protocol-relative redirect target at the response layer"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_throw_on_attack.patch",
+  "wrong_resource": "n/a: the protected object is the generated URL itself; no neighbouring resource can be substituted for it",
+  "one_role_or_direction": "sf_miss_wildcard.patch",
+  "reads_only": "n/a: URL generation has no read/write split; the same builders serve both",
+  "check_after_adjustment": "ff_encode_joined_wildcard.patch",
+  "unlisted_route": "sf_report_site_only.patch",
+  "malformed_identity": "sf_only_leading_slash.patch",
+  "missing_authority": "n/a: there is no authority or secret that can be absent, so the rule has no fail-open branch",
+  "adjacent_api": "ff_encode_whole_uri.patch"
+ },
+ "traps": [
+  {
+   "id": "T1-wildcard-list-shape",
+   "shape": "list-valued parameters: each element must stay in its own segment while a multi-element list keeps spanning segments (the joined string must not be encoded, the elements must be)",
+   "where": "src/client/helpers.ts:126-135",
+   "security_tests": [
+    "tests/security/wildcard-segments.spec.ts (7 tests)",
+    "tests/security/url-builder.spec.ts::urlFor keeps a positional param inside its segment",
+    "tests/security/redirect-routes.spec.ts::a wildcard redirect target stays inside its segments"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate-urls.spec.ts::keeps a multi segment wildcard list",
+    "functional/legitimate-urls.spec.ts::declarative pattern redirects keep multi segment wildcards",
+    "project tests/router/url_builder.spec.ts (make route with wildcard params)"
+   ],
+   "security_fail_patch": "sf_miss_wildcard.patch",
+   "reason_to_dismiss": "a list already reads as a list of path segments, and the join to '/' looks structural; a fix that encodes the joined string looks right until a legitimate multi-segment URL collapses",
+   "realistic_because": "real, unmodified upstream code (published fix site)"
+  },
+  {
+   "id": "T2-pattern-mode-builders",
+   "shape": "injected sibling: URL built from a route pattern by a copy of the interpolation that never calls the shared builder - a legacy pattern helper used by the deprecated makeUrl pattern branch, and a single-pass signed pattern builder",
+   "where": "src/router/legacy/pattern_url.ts:24-99 (reached from src/router/main.ts:754); src/router/signed_url_builder.ts:21-76 and 96-119",
+   "security_tests": [
+    "tests/security/pattern-mode.spec.ts (11 tests)"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate-urls.spec.ts::keeps makeUrl for names and patterns",
+    "functional/legitimate-urls.spec.ts::keeps the legacy builder",
+    "functional/legitimate-urls.spec.ts::signed URLs keep their prefix and query string",
+    "project tests/router/legacy_url_builder.spec.ts",
+    "project tests/request.spec.ts"
+   ],
+   "security_fail_patch": "sf_miss_pattern_mode.patch",
+   "reason_to_dismiss": "deprecated URL APIs; a raw pattern is the developer's own template, and a signed URL looks verified by its signature",
+   "realistic_because": "our-copy-only: a partial refactor that left the pattern branches with the old interpolation, and a single-pass signed builder"
+  },
+  {
+   "id": "T3-declarative-pattern-redirect",
+   "shape": "injected sibling: a declarative redirect to a route pattern fills the pattern from the request params with its own builder",
+   "where": "src/router/brisk.ts:30-72 and 198-216",
+   "security_tests": [
+    "tests/security/declarative-redirect.spec.ts (6 tests)"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate-urls.spec.ts::declarative pattern redirects keep plain params"
+   ],
+   "security_fail_patch": "sf_miss_declarative.patch",
+   "reason_to_dismiss": "redirect sugar on a route definition reads as a thin wrapper over the redirect builder, and the report is about a redirect written in a handler",
+   "realistic_because": "our-copy-only: the brisk route already offers redirect and redirectToPath; a pattern variant sits next to them"
+  },
+  {
+   "id": "T4-far-entry-points",
+   "shape": "every other public URL entry point (route-name builder and its method variants, signed URLs, legacy builders, public helper exports) reaches the shared builder, so a fix placed at the reported call leaves them raw",
+   "where": "src/redirect.ts:303-315 (reported call) vs src/client/url_builder.ts, src/router/main.ts:746-800, src/router/legacy/url_builder.ts, src/helpers.ts:178-206",
+   "security_tests": [
+    "tests/security/url-builder.spec.ts (16 tests)",
+    "tests/security/redirect-routes.spec.ts (8 tests)"
+   ],
+   "coupled_functional_tests": [
+    "functional/legitimate-urls.spec.ts",
+    "project tests/router/url_builder.spec.ts",
+    "project tests/client/url_builder.spec.ts",
+    "project tests/redirect.spec.ts"
+   ],
+   "security_fail_patch": "sf_report_site_only.patch",
+   "reason_to_dismiss": "the report shows one redirect call; the deprecated and lower-level URL APIs look out of scope",
+   "realistic_because": "real, unmodified upstream code: all listed entry points exist at the pinned commit"
+  }
+ ],
+ "status": "built + hardened: full gate PASSED (static/nop/oracle/patches; 2026-10-30T06:08:41Z). nop 48/48 security fail and 267/267 functional pass; oracle 3x reward 1.0 with identical results; 11/11 check patches behave as declared. Blind patch and FAIRNESS.md are written after the build by the harness."
+}
