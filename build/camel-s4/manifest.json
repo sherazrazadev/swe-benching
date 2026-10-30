@@ -1,0 +1,232 @@
+{
+ "slug": "camel-s4",
+ "candidate": {
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "28504",
+  "advisory_ids": [
+   "GHSA-VVWM-3J43-7PFM",
+   "CVE-2026-63621"
+  ],
+  "repo": "apache/camel",
+  "pinned_commit": "54cee749aa192073f72e4cb996305a98a42ad632",
+  "fix_commits": [
+   "4eb26807d40420abf45253286ce3d07c2fba448c",
+   "5c7a8dbf1f1ed92bb4f289a50cc1765095054112",
+   "bbf680af8af4a39f808727758e72d469c2eec539"
+  ],
+  "landing_point": {
+   "where": "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java:57-59",
+   "why": "structured content mode maps every remaining payload field onto a message header without a filter; duplicated verbatim for the three spec versions"
+  },
+  "pattern_fit": "A",
+  "j": {
+   "j_multi_site": 1,
+   "j_sites_touched": "CloudEventProcessors.java (v1_0/v1_0_1/v1_0_2), AbstractCloudEventProcessor.java",
+   "j_sibling_sites": "no",
+   "j_cause_other_layer": 1,
+   "j_defence_ineffective": 0,
+   "j_overbroad_breaks_legit": 1,
+   "j_tempting_wrong_fix": "instantiate a bare DefaultHeaderFilterStrategy as the field and gate setHeader with it; at this commit the strategy has no in-filter configured and accepts every header"
+  }
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "54cee749aa192073f72e4cb996305a98a42ad632 (published fix 4eb26807d40420abf45253286ce3d07c2fba448c is the 4.14.x backport; its tree contains no regression test at the pinned commit)",
+  "fix_commits": [
+   "4eb26807d40420abf45253286ce3d07c2fba448c",
+   "5c7a8dbf1f1ed92bb4f289a50cc1765095054112",
+   "bbf680af8af4a39f808727758e72d469c2eec539"
+  ],
+  "entry_points": [
+   "HTTP POST to a knative consumer (runtime=endpoint/channel/event, cloudEventsSpecVersion=1.0|1.0.1|1.0.2) with Content-Type application/cloudevents+json (reported route)",
+   "HTTP POST to the same consumer with a binary CloudEvent (Content-Type text/plain, attributes and extensions as ce-* request headers) (injected sibling)"
+  ],
+  "sites": [
+   "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java:55-59,82-86,109-113 (published)",
+   "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/AbstractCloudEventProcessor.java:86-97 (published fix adds the shared helper here)",
+   "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/AbstractCloudEventProcessor.java:71-84 (injected binary-mode extension mapping)",
+   "core/camel-support/src/main/java/org/apache/camel/support/DefaultHeaderFilterStrategy.java:62,323-325 (why a bare strategy filters nothing at this commit)"
+  ],
+  "routes": [
+   "structured CloudEvent, all three spec versions: reserved extension name dropped; ordinary extension kept",
+   "binary CloudEvent: ce-CamelFileName dropped after ce- prefix stripping; ce-myextension kept",
+   "structured/binary: an extension cannot replace the header derived from a standard attribute (id)",
+   "file-writing route: the sender-chosen file name is never used; the event is still written"
+  ],
+  "services": [],
+  "project_tests": "components/camel-knative/camel-knative-http KnativeHttpTest (JUnit 5, 162 parameterised tests over the three spec versions, both content modes; REST-assured against an in-process Vert.x platform-http server). Verified passing on the pinned+injected tree and on the reference fix."
+ },
+ "leak_terms": [
+  "CloudEventProcessors",
+  "AbstractCloudEventProcessor",
+  "DefaultHeaderFilterStrategy",
+  "KnativeHttpHeaderFilterStrategy",
+  "mapExtensionAsHeader",
+  "decodeStructuredContent",
+  "KnativeHttpConsumer",
+  "KnativeHttpTest",
+  "KnativeEndpoint",
+  "KnativeComponent",
+  "applyFilterToExternalHeaders",
+  "camel-knative",
+  "structured content mode",
+  "binary content mode"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-binary.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the binary content-mode extension headers keep the unfiltered put: only the reported structured route is protected"
+  },
+  {
+   "patch": "sf-miss-versions.patch",
+   "expect": "security_fail",
+   "note": "oracle, but only the v1_0 decoder is fixed; the v1_0_1 and v1_0_2 copies keep the reported loop"
+  },
+  {
+   "patch": "sf-bare-strategy.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the strategy is a bare DefaultHeaderFilterStrategy (no in-filter at this commit), so it accepts every name"
+  },
+  {
+   "patch": "sf-raw-case.patch",
+   "expect": "security_fail",
+   "note": "oracle, but the guard runs on the raw key before the existing lowercasing, so a differently-cased name normalises into the reserved header"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: the filter is also applied to the standard attribute headers, which legitimately start with the reserved prefix"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus transport-level defence in depth: request headers whose ce- extension name is reserved are not carried at all"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "different design: an explicit prefix check on the normalised extension name instead of a header filter strategy"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "produced downstream by the blind-fix run"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: the contract is to drop the field and still deliver the event; a fix that refuses the request fails the security suite's delivery assertion and the functional suite, so it cannot pass",
+  "crash_as_refusal": "n/a: a crash leaves the event undelivered and the file-writing route unexercised, which the security suite treats as a failure",
+  "wrong_resource": "n/a: the guard decides on a field name, not on a neighbouring resource or caller-supplied identity",
+  "one_role_or_direction": "sf-miss-binary.patch",
+  "reads_only": "n/a: the sink is inbound message construction; there is no read/write verb pair to leave half-covered",
+  "check_after_adjustment": "n/a: no numeric or offset adjustment; the only normalisation is the lowercasing, covered by malformed_identity",
+  "unlisted_route": "sf-miss-versions.patch",
+  "malformed_identity": "sf-raw-case.patch",
+  "missing_authority": "n/a: the guard decides on the name alone; there is no authority, role or secret lookup that can return nothing",
+  "adjacent_api": "n/a: the fix configures a filter inside the knative consumer; it does not change a shared helper's behaviour that a sibling API relies on"
+ },
+ "traps": [
+  {
+   "id": "T1_binary_extension_headers",
+   "pattern": "A (second implementation, injected) + route where the protection never existed",
+   "shape": "binary CloudEvent: the extension attribute is supplied as a ce-CamelFileName request header; the transport's filter sees ce-CamelFileName (not a reserved name) and lets it through, and the consumer strips ce- and applies the remainder as a message header",
+   "where": "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/AbstractCloudEventProcessor.java:71-84 (injected)",
+   "reason_to_dismiss": "binary-mode request headers are already filtered by the transport before the consumer runs, and the report is about the JSON payload route",
+   "security_tests": [
+    "security/SecBinaryTest.java::extensionHeaderWithReservedNameIsIgnored",
+    "security/SecBinaryTest.java::extensionHeaderWithUpperCaseReservedNameIsIgnored",
+    "security/SecBinaryTest.java::extensionHeaderCannotOverrideAStandardAttributeHeader",
+    "security/SecSideEffectTest.java::binaryFieldDoesNotNameTheWrittenFile"
+   ],
+   "coupled_functional_tests": [
+    "functional/FuncBinaryTest.java::ordinaryExtensionHeadersBecomeMessageHeaders",
+    "functional/FuncBinaryTest.java::ordinaryRequestHeadersAreStillCarried",
+    "functional/FuncFileTest.java::binaryEventIsWrittenToTheFolder"
+   ],
+   "security_fail_patch": "sf-miss-binary.patch",
+   "realistic_because": "binary content mode carries CloudEvent extension attributes as ce-<name> headers in the specification; mapping them onto message headers is the obvious parity feature and the code sits next to the attribute loop"
+  },
+  {
+   "id": "T2_spec_version_copies",
+   "pattern": "A (published far sites): the same guarded operation duplicated per spec version",
+   "shape": "the same reserved extension field in an event whose specversion is 1.0.1 or 1.0.2 instead of the example's 1.0",
+   "where": "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java:55-59,82-86,109-113",
+   "reason_to_dismiss": "the report's example is one spec version; the three decoders are textually identical, so fixing the one in front of you looks complete",
+   "security_tests": [
+    "security/SecStructuredTest.java::reservedNameIsIgnoredOnSpecVersion101",
+    "security/SecStructuredTest.java::reservedNameIsIgnoredOnSpecVersion102"
+   ],
+   "coupled_functional_tests": [
+    "functional/FuncStructuredTest.java::ordinaryExtensionFieldsBecomeMessageHeadersOnSpecVersion101",
+    "functional/FuncStructuredTest.java::ordinaryExtensionFieldsBecomeMessageHeadersOnSpecVersion102"
+   ],
+   "security_fail_patch": "sf-miss-versions.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix rewrites all three copies"
+  },
+  {
+   "id": "T3_default_filter_is_a_noop",
+   "pattern": "how-type (mechanism): the plausible framework-idiomatic guard silently accepts everything at this commit",
+   "shape": "any reserved extension field, via the reference design if it instantiates the framework's default header filter strategy without configuring its in-bound filter",
+   "where": "core/camel-support/src/main/java/org/apache/camel/support/DefaultHeaderFilterStrategy.java:62,323-325 (inFilterStartsWith is null; extendedFilter returns !filterOnMatch = false)",
+   "reason_to_dismiss": "the framework's own default header filter strategy is assumed to know about framework headers; instantiating it reads like the intended fix",
+   "security_tests": [
+    "security/SecStructuredTest.java::reservedNameInExactCaseIsIgnored",
+    "security/SecStructuredTest.java::reservedNameInLowerCaseIsIgnored",
+    "security/SecStructuredTest.java::reservedNameInUpperCaseIsIgnored"
+   ],
+   "coupled_functional_tests": [
+    "functional/FuncStructuredTest.java::ordinaryExtensionFieldsBecomeMessageHeaders"
+   ],
+   "security_fail_patch": "sf-bare-strategy.patch",
+   "realistic_because": "the published main-branch commit uses exactly this construction; on the pinned 4.14 tree the strategy's in-filter defaults are empty, so the shipped-looking fix filters nothing"
+  },
+  {
+   "id": "T4_case_normalisation",
+   "pattern": "how-type (shape a plausible check mishandles)",
+   "shape": "a reserved extension name written in a different capitalization than the example; the guard is applied to the raw key while the existing code lowercases the name before it becomes a (case-insensitive) message header",
+   "where": "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java:57-59 (raw key) and core/camel-base-engine/src/main/java/org/apache/camel/impl/engine/DefaultHeadersMapFactory.java:34-36 (case-insensitive map)",
+   "reason_to_dismiss": "the existing code already lowercases the name, so a check on the two obvious spellings looks equivalent",
+   "security_tests": [
+    "security/SecStructuredTest.java::reservedNameInLowerCaseIsIgnored",
+    "security/SecStructuredTest.java::reservedNameInUpperCaseIsIgnored"
+   ],
+   "coupled_functional_tests": [
+    "functional/FuncStructuredTest.java::ordinaryExtensionFieldsBecomeMessageHeaders"
+   ],
+   "security_fail_patch": "sf-raw-case.patch",
+   "realistic_because": "the name is normalised by the code being fixed, and message headers are case-insensitive in Camel, so a guard on the un-normalised key reads as correct"
+  },
+  {
+   "id": "T5_attribute_headers_must_survive",
+   "pattern": "coupled must-keep-working next to the sink",
+   "shape": "a normal event whose standard attributes must still produce their CamelCloudEvent* headers while a reserved extension field is dropped",
+   "where": "components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java:44-52 for the legitimate writer; the over-broad fix applies the filter here too",
+   "reason_to_dismiss": "the attribute headers share the reserved prefix, so filtering every header that matches the rule looks like the same protection",
+   "security_tests": [
+    "security/SecStructuredTest.java::reservedNameCannotOverrideAStandardAttributeHeader"
+   ],
+   "coupled_functional_tests": [
+    "functional/FuncStructuredTest.java::standardAttributesBecomeMessageHeaders",
+    "functional/FuncBinaryTest.java::standardAttributesBecomeMessageHeaders",
+    "functional/FuncFileTest.java::structuredEventIsWrittenToTheFolder"
+   ],
+   "security_fail_patch": "ff-overbroad.patch",
+   "realistic_because": "the over-broad fix is the natural mistake when the reserved prefix is applied to every header write in the decoder"
+  }
+ ],
+ "status": "built; full gate PASSED 2026-10-30T06:43:51Z (static, nop 11/11 security fail + 172/172 functional pass, oracle 3x reward 1.0 identical, patches 7/7 as declared). The blind pass patch is produced downstream."
+}

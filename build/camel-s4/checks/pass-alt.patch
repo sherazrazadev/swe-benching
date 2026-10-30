@@ -1,0 +1,108 @@
+--- a/components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/AbstractCloudEventProcessor.java
++++ b/components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/AbstractCloudEventProcessor.java
+@@ -27,11 +27,14 @@
+ import java.util.function.Supplier;
+ 
+ import org.apache.camel.Exchange;
++import org.apache.camel.Message;
+ import org.apache.camel.Processor;
+ import org.apache.camel.cloudevents.CloudEvent;
+ import org.apache.camel.component.knative.KnativeEndpoint;
+ import org.apache.camel.component.knative.spi.Knative;
+ import org.apache.camel.component.knative.spi.KnativeResource;
++import org.apache.camel.spi.HeaderFilterStrategy;
++import org.apache.camel.support.DefaultHeaderFilterStrategy;
+ import org.apache.camel.util.StringHelper;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -40,11 +43,20 @@
+     private static final String CLOUD_EVENT_EXTENSION_PREFIX = "ce-";
+ 
+     private final CloudEvent cloudEvent;
++    // Filters internal Camel headers (Camel*/camel*) from extension attributes so that the
++    // extension-to-header mapping is consistent with the HTTP request header filtering.
++    private final HeaderFilterStrategy headerFilterStrategy = createHeaderFilterStrategy();
+ 
+     protected AbstractCloudEventProcessor(CloudEvent cloudEvent) {
+         this.cloudEvent = cloudEvent;
+     }
+ 
++    private static HeaderFilterStrategy createHeaderFilterStrategy() {
++        DefaultHeaderFilterStrategy strategy = new DefaultHeaderFilterStrategy();
++        strategy.setInFilterStartsWith(DefaultHeaderFilterStrategy.CAMEL_FILTER_STARTS_WITH);
++        return strategy;
++    }
++
+     @Override
+     public CloudEvent cloudEvent() {
+         return cloudEvent;
+@@ -81,7 +93,7 @@
+                         extensions.put(name.substring(CLOUD_EVENT_EXTENSION_PREFIX.length()), headers.remove(name));
+                     }
+                 }
+-                extensions.forEach((key, val) -> headers.put(key.toLowerCase(Locale.US), val));
++                extensions.forEach((key, val) -> mapExtensionAsHeader(exchange.getMessage(), exchange, key, val));
+             } else {
+                 try (InputStream is = exchange.getIn().getBody(InputStream.class)) {
+                     decodeStructuredContent(exchange, Knative.MAPPER.readValue(is, Map.class));
+@@ -92,6 +104,17 @@
+ 
+     protected abstract void decodeStructuredContent(Exchange exchange, Map<String, Object> content);
+ 
++    /**
++     * Maps a CloudEvent extension attribute to a message header, applying the header filter strategy so that
++     * framework internal headers are filtered consistently with the HTTP request header filtering.
++     */
++    protected void mapExtensionAsHeader(Message message, Exchange exchange, String key, Object value) {
++        final String headerName = key.toLowerCase(Locale.US);
++        if (!headerName.startsWith("camel")) {
++            message.setHeader(headerName, value);
++        }
++    }
++
+     @Override
+     public Processor producer(KnativeEndpoint endpoint, KnativeResource service) {
+         final CloudEvent ce = cloudEvent();
+--- a/components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java
++++ b/components/camel-knative/camel-knative-component/src/main/java/org/apache/camel/component/knative/ce/CloudEventProcessors.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.camel.component.knative.ce;
+ 
+-import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ 
+@@ -54,9 +53,7 @@
+             //
+             // Map every remaining field as it is (extensions).
+             //
+-            content.forEach((key, val) -> {
+-                message.setHeader(key.toLowerCase(Locale.US), val);
+-            });
++            content.forEach((key, val) -> mapExtensionAsHeader(message, exchange, key, val));
+         }
+     }),
+     v1_0_1(new AbstractCloudEventProcessor(CloudEvents.v1_0_1) {
+@@ -81,9 +78,7 @@
+             //
+             // Map every remaining field as it is (extensions).
+             //
+-            content.forEach((key, val) -> {
+-                message.setHeader(key.toLowerCase(Locale.US), val);
+-            });
++            content.forEach((key, val) -> mapExtensionAsHeader(message, exchange, key, val));
+         }
+     }),
+     v1_0_2(new AbstractCloudEventProcessor(CloudEvents.v1_0_2) {
+@@ -108,9 +103,7 @@
+             //
+             // Map every remaining field as it is (extensions).
+             //
+-            content.forEach((key, val) -> {
+-                message.setHeader(key.toLowerCase(Locale.US), val);
+-            });
++            content.forEach((key, val) -> mapExtensionAsHeader(message, exchange, key, val));
+         }
+     });
+ 
