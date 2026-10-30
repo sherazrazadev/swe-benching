@@ -1,0 +1,39 @@
+{
+ "trial": "swc-s4__yP2MgXf",
+ "task": "swc-s4",
+ "grading_audited": "original",
+ "prepared_utc": "2026-10-29T17:25:01+00:00",
+ "auditor": "sub-agent, Claude Opus 5.5, effort high",
+ "recorded_utc": "2026-10-29T21:12:13+00:00",
+ "verdict": {
+  "trustworthy": false,
+  "attribution": "test-fault",
+  "confidence": "high",
+  "summary": "Reward 0.9444: 17/18 security and all functional/project tests pass; the only failure is security::style_svg_namespace_breakout_is_blocked. The model closed that hole at the serializer layer: swc_html_codegen now entity-escapes text of style/script elements outside the HTML namespace (changes.patch:1337-1353), so the SVG stylesheet is emitted as `&lt;/style>&lt;img id=pwned>`. On reparse that stays one SVG style element, no `pwned` element is created, and the text decodes to exactly the CSS the minifier produced. That meets every clause of the instruction's invariant (same element boundaries, data stays in the element and decodes to the intended value, no markup created). The test, however, runs contains_end_tag / contains_markup_start on the *decoded* text node (assert_stylesheet_kept, sec_boundaries.rs:230-247 and 281-289; texts_of_tag pushes value.data, dom.rs:147-158). So it only accepts fixes that rewrite the CSS itself (the reference's `\\3c ` CSS escape, fix.patch:195-244) and rejects a correct serializer-layer fix whose decoded text legitimately contains `</style>` as character data. The instruction never requires a CSS-level escape or a particular layer. The rest of the grading looks sound: tests were not leaked, nothing was looked up upstream, there were no tool calls inside the grading window, and the build ran from touched sources. The model's work deserves a full solve, so the 0.9444 understates it.",
+  "items": [
+   {
+    "test": "security::style_svg_namespace_breakout_is_blocked",
+    "outcome": "fail",
+    "model_behaviour": "The model's minifier-side escaper deliberately skips non-HTML namespaces (raw_text_language returns None for namespace != HTML, changes.patch:331-333). Instead, swc_html_codegen's create_context_for_element now sets need_escape_text=true for foreign-namespace style/script (changes.patch:1341-1353). Input `<svg><style>a{content:\"&lt;/style&gt;&lt;img id=pwned&gt;\"}</style></svg>` is therefore serialized with `&lt;` entities. Reparsed, it is a single SVG style element whose decoded text is `a{content:\"</style><img id=pwned>\"}`, and no injected element exists. The model checked foreign-namespace round-trips with its own roundtrip/fixture tests (transcript.md:183-184, 240, 456-458).",
+    "stated_in_instruction": false,
+    "correct_fix_would_pass": false,
+    "verdict": "test-fault"
+   }
+  ],
+  "lookup_or_leak": "None found. No reads of /tests, sec_boundaries.rs, fun_legit.rs or /logs/verifier appear in the transcript, there are no web fetches or searches, and the published fix commit is never referenced. The model's approach (serializer-layer namespace check plus a script-data tokenizer simulation) is clearly different from the reference fix. run.json shows tool_calls_during_grading=[] and agent_events_after_end=0.",
+  "evidence": [
+   "evidence/grading/results.json:19 \"security::style_svg_namespace_breakout_is_blocked\": \"fail\"; every other security, functional and project test passes",
+   "evidence/tests/security/sec_boundaries.rs:281-289 calls assert_stylesheet_kept, then !contains_markup_start(&stylesheet)",
+   "evidence/tests/security/sec_boundaries.rs:240-243 assert !contains_end_tag(&stylesheet, \"style\"), run on the parsed (entity-decoded) text",
+   "evidence/tests/support/dom.rs:155-158 texts_of_tag collects value.data, i.e. decoded character data, not the serialized bytes",
+   "evidence/final-code/changes.patch:1337-1353 the codegen escapes text for non-HTML-namespace style/script ('In foreign namespaces the same tag names are regular elements whose text is parsed with character references, so their text has to be escaped')",
+   "evidence/final-code/changes.patch:1396-1411 the model's codegen fixture shows SVG/MathML style text emitted as `&lt;`",
+   "evidence/instruction.md:17-23 invariant: element boundaries preserved, data 'must stay in it and decode to the values the minifier meant to write, and no markup may be created'; no layer or escape form is prescribed",
+   "evidence/solution/fix.patch:195-244 the reference rewrites SVG stylesheet `<` as the CSS escape `\\3c `, which is the only kind of fix the decoded-text assertion accepts",
+   "evidence/build-notes.md:216-217 pass_alternative also used CSS `\\3c ` escapes; no serializer-layer alternative was validated against this test",
+   "evidence/run.json:12-20 no tool calls during the grading window; exception_info null",
+   "evidence/grading/test-stdout.tail.txt is empty, so the exact assertion message is not visible; the failure point is inferred from the patch and the test code"
+  ],
+  "recommended_action": "Do not count this trial as a model failure on the SVG style item; treat it as a full solve, or re-grade with a corrected test. Change style_svg_namespace_breakout_is_blocked (and assert_stylesheet_kept when it is used for foreign content) to check structure on reparse rather than markup-like sequences in the decoded text. It should require: no injected element, exactly one style element still inside the svg, the 'after' paragraph outside it, and the decoded stylesheet equal to the minified CSS value. Or else compare the decoded text to the expected CSS value. Then re-validate the task with a serializer-layer alternative fix such as this one."
+ }
+}

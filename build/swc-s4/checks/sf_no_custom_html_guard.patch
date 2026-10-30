@@ -1,0 +1,226 @@
+--- a/crates/swc_html_minifier/src/lib.rs
++++ b/crates/swc_html_minifier/src/lib.rs
+@@ -1413,7 +1413,7 @@
+ 
+         previous.children = vec![Child::Text(Text {
+             span: DUMMY_SP,
+-            data: serialized.into(),
++            data: Self::escape_json_for_html_script(serialized).into(),
+             raw: None,
+         })];
+ 
+@@ -1846,6 +1846,20 @@
+         result.ok()
+     }
+ 
++    /// Escapes serialized JSON so it cannot terminate its containing HTML
++    /// `script` element.
++    ///
++    /// HTML tokenization recognizes `</script` before the JSON is parsed.
++    /// Serializing an escaped `<` as a literal character can therefore turn
++    /// JSON data into a different HTML element structure.
++    fn escape_json_for_html_script(json: String) -> String {
++        if json.contains('<') {
++            json.replace('<', "\\u003C")
++        } else {
++            json
++        }
++    }
++
+     /// Normalizes the fixed-shape JSON documents that browsers consume as structured
+     /// script data. Empty values and repeated list entries carry no meaning in these
+     /// formats, so they are dropped while the document is rewritten.
+@@ -1858,7 +1872,9 @@
+ 
+         normalize_structured_json(&mut value);
+ 
+-        serde_json::to_string(&value).ok()
++        serde_json::to_string(&value)
++            .ok()
++            .map(Self::escape_json_for_html_script)
+     }
+ 
+     fn need_minify_js(&self) -> bool {
+@@ -2156,7 +2172,7 @@
+         let minified = match String::from_utf8(buf) {
+             // Avoid generating the sequence "</script" in JS code
+             // TODO move it to ecma codegen under the option?
+-            Ok(minified) => minified.replace("</script>", "<\\/script>"),
++            Ok(minified) => escape_script_end_tags(&minified),
+             _ => return None,
+         };
+ 
+@@ -2830,7 +2846,7 @@
+                     None => return,
+                 };
+ 
+-                n.data = minified.into();
++                n.data = Self::escape_json_for_html_script(minified).into();
+             }
+             Some(MinifierType::Css) => {
+                 let minified =
+@@ -2839,7 +2855,12 @@
+                         None => return,
+                     };
+ 
+-                n.data = minified.into();
++                let (tag_name, namespace) = match &self.current_element {
++                    Some(element) => (element.tag_name.to_string(), element.namespace),
++                    None => return,
++                };
++
++                n.data = escape_stylesheet_for_raw_text(&minified, &tag_name, namespace).into();
+             }
+             Some(MinifierType::Html) => {
+                 let minified = match self.minify_html(
+@@ -2897,6 +2918,150 @@
+     }
+ }
+ 
++/// Escapes HTML end tags for the enclosing `script` element in JavaScript text.
++///
++/// The tag name is matched case-insensitively and ends at `>`, `/` or whitespace,
++/// which is what the HTML tokenizer accepts, so every form a browser would read as
++/// the end of the element gets a backslash after the `<`.
++fn escape_script_end_tags(code: &str) -> String {
++    escape_end_tags(code, "script")
++}
++
++/// Escapes the end tag of `tag_name` in text written into a raw-text element.
++///
++/// The tag name is matched case-insensitively and ends at `>`, `/` or whitespace,
++/// which is what the HTML tokenizer accepts. The backslash is an escape in CSS and
++/// in JavaScript, so the value the text decodes to is unchanged.
++fn escape_end_tags(code: &str, tag_name: &str) -> String {
++    let tag = tag_name.as_bytes();
++    let bytes = code.as_bytes();
++    let mut result = String::with_capacity(code.len());
++    let mut copied = 0;
++    let mut index = 0;
++    let end = 2 + tag.len();
++
++    while index + end <= bytes.len() {
++        if bytes[index] == b'<'
++            && bytes[index + 1] == b'/'
++            && bytes[index + 2..index + end].eq_ignore_ascii_case(tag)
++            && is_end_tag_terminator(bytes.get(index + end))
++        {
++            result.push_str(&code[copied..=index]);
++            result.push('\\');
++            copied = index + 1;
++        }
++
++        index += 1;
++    }
++
++    result.push_str(&code[copied..]);
++
++    result
++}
++
++/// Returns true when the byte ends an HTML end tag name: `>`, `/` or whitespace.
++fn is_end_tag_terminator(byte: Option<&u8>) -> bool {
++    matches!(
++        byte,
++        Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\x0C' | b'\r')
++    )
++}
++
++/// Returns true when `text` contains an end tag for `tag_name` in any spelling the
++/// HTML tokenizer accepts.
++fn contains_end_tag(text: &str, tag_name: &str) -> bool {
++    let tag = tag_name.as_bytes();
++    let bytes = text.as_bytes();
++    let end = 2 + tag.len();
++    let mut index = 0;
++
++    while index + end <= bytes.len() {
++        if bytes[index] == b'<'
++            && bytes[index + 1] == b'/'
++            && bytes[index + 2..index + end].eq_ignore_ascii_case(tag)
++            && is_end_tag_terminator(bytes.get(index + end))
++        {
++            return true;
++        }
++
++        index += 1;
++    }
++
++    false
++}
++
++/// Returns true when `text` contains a `<` that a browser would read as the start of
++/// a tag, comment or bogus comment.
++fn contains_markup_start(text: &str) -> bool {
++    let bytes = text.as_bytes();
++    let mut index = 0;
++
++    while index + 1 < bytes.len() {
++        if bytes[index] == b'<' {
++            let next = bytes[index + 1];
++
++            if next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?') {
++                return true;
++            }
++        }
++
++        index += 1;
++    }
++
++    false
++}
++
++/// Escapes every `<` in a stylesheet that a browser would read as markup.
++///
++/// In foreign content the element's text is parsed as markup, not as raw text, so
++/// any tag start ends the element's data. A CSS escape keeps the value the text
++/// decodes to; a `<` that cannot start markup (a comparison in a range query, or
++/// one inside a CSS string before a space) is left alone.
++fn escape_css_markup_starts(css: &str) -> String {
++    let bytes = css.as_bytes();
++    let mut result = String::with_capacity(css.len());
++    let mut copied = 0;
++    let mut index = 0;
++
++    while index + 1 < bytes.len() {
++        if bytes[index] == b'<' {
++            let next = bytes[index + 1];
++
++            if next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?') {
++                result.push_str(&css[copied..index]);
++                result.push_str("\\3c ");
++                copied = index + 1;
++            }
++        }
++
++        index += 1;
++    }
++
++    result.push_str(&css[copied..]);
++
++    result
++}
++
++/// Escapes stylesheet text so that it cannot end the element that holds it.
++///
++/// A stylesheet written into a `script` element still ends at `</script`; in
++/// foreign content every tag start must be escaped, because the text is parsed as
++/// markup there.
++fn escape_stylesheet_for_raw_text(
++    css: &str,
++    tag_name: &str,
++    namespace: Namespace,
++) -> String {
++    let terminator = if tag_name == "style" { "style" } else { "script" };
++    let escaped = escape_end_tags(css, terminator);
++
++    if namespace == Namespace::SVG {
++        escape_css_markup_starts(&escaped)
++    } else {
++        escaped
++    }
++}
++
+ /// Returns the text of a plain `application/json` data block, or `None` when the
+ /// element is not one.
+ fn json_data_text(element: &Element) -> Option<String> {
