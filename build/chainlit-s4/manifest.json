@@ -1,0 +1,218 @@
+{
+ "slug": "chainlit-s4",
+ "candidate": "screener-v2 entry 2668: GHSA-C39V-8HRW-H448 / CVE-2026-56104 / PYSEC-2026-4028 (chainlit/chainlit)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "76f59c076c7c1e1b401c7c458e6bf8f67114014c (direct parent of fix 5effb664f1e0af4a4f0a42fe63ea979676039a7f; no regression tests between the two commits)",
+  "entry_points": [
+   "socket.io connect handler chainlit.socket.connect (existing-session restore by the handshake sessionId; real entry point)",
+   "HTTP PUT /feedback on the real FastAPI app through starlette TestClient (real entry point)",
+   "HTTP POST /project/thread/resume (injected sibling route; real entry point)",
+   "socket.io connect with the product's sticky session cookie and no live handshake identifier (injected sibling restore; real entry point)"
+  ],
+  "sites": [
+   "backend/chainlit/socket.py:41-49 (reported landing point; published fix)",
+   "backend/chainlit/socket.py:150-154 (connect calls the restore; published fix)",
+   "backend/chainlit/server.py:881-912 (real uncovered route: feedback lookup + callback, unmodified upstream, still unguarded on upstream main 190ea74)",
+   "backend/chainlit/server.py (injected POST /project/thread/resume: thread author checked, session rebound)",
+   "backend/chainlit/socket.py + backend/chainlit/auth/cookie.py (injected sticky-cookie restore implementation)"
+  ],
+  "routes": [
+   "reported: authenticated client presents another account's session identifier on the handshake -> binds the victim session (confirmed on the pinned tree)",
+   "real uncovered T1: PUT /feedback with another account's session identifier -> application callback runs with the victim session (confirmed on the pinned tree; still present on upstream main)",
+   "injected T2: POST /project/thread/resume where the caller authored the thread but not the session -> victim session rebound (confirmed)",
+   "injected T3: handshake with an unknown identifier plus the victim identifier in the sticky cookie -> victim session restored (confirmed)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "backend/tests/test_socket.py (28 passed, 2 deselected; deselected tests call the internal restore helper whose signature the published fix itself had to change)",
+   "backend/tests/test_server.py (52 passed)",
+   "both files pass on the pinned+injected tree and under the oracle, hardening and alternative fixes"
+  ],
+  "local_runs": "nop: security 6/6 fail, hidden functional 9/9 pass, project 80/80 pass; oracle: security 6/6, functional 9/9, project 80/80; every checks/ patch behaves as declared below"
+ },
+ "leak_terms": [
+  "restore_existing_session",
+  "restore_sticky_session",
+  "session_owner_matches_user",
+  "_session_owner_matches_user",
+  "get_session_id_from_cookies",
+  "WebsocketSession",
+  "BaseSession",
+  "init_ws_context",
+  "on_feedback",
+  "sessionId",
+  "session_id",
+  "X-Chainlit-Session-id",
+  "update_feedback",
+  "resume_thread_in_session",
+  "ResumeThreadRequest",
+  "is_thread_author",
+  "get_by_id",
+  "ws_sessions_id",
+  "ws_sessions_sid",
+  "upsert_feedback",
+  "sticky",
+  "cookie",
+  "feedback",
+  "thread",
+  "socket.io",
+  "socket",
+  "server.py",
+  "socket.py",
+  "session.py",
+  "CVE-2026-56104",
+  "GHSA-C39V-8HRW-H448",
+  "PYSEC-2026-4028",
+  "5effb664",
+  "76f59c07",
+  "2857"
+ ],
+ "patch_checks": [
+  {
+   "patch": "missing_feedback.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_resume.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "missing_sticky.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "published_only.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "permissive_none.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "overbroad_none.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash_identity.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash_as_refusal.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "check_after_restore.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "adjacent_api.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alt"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "overbroad_none.patch",
+  "crash_as_refusal": "crash_as_refusal.patch",
+  "wrong_resource": "missing_resume.patch",
+  "one_role_or_direction": "n/a: the property is a single ownership relation over one identity kind; the product has no roles and no read/write direction to mis-select",
+  "reads_only": "missing_feedback.patch",
+  "check_after_adjustment": "check_after_restore.patch",
+  "unlisted_route": "missing_sticky.patch",
+  "malformed_identity": "crash_identity.patch",
+  "missing_authority": "published_only.patch",
+  "adjacent_api": "adjacent_api.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "shape": "route where the protection never existed: a REST request looks a live session up by a client-supplied identifier and runs the application's callback inside it",
+   "where": "backend/chainlit/server.py:881-912 (pinned commit; still unguarded on upstream main 190ea74)",
+   "security_tests": [
+    "tests/security/test_feedback_session.py::test_feedback_request_does_not_run_in_another_users_session"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_feedback_legit.py::test_owner_feedback_handling_runs_with_their_own_session",
+    "tests/functional/test_feedback_legit.py::test_feedback_handling_still_runs_in_a_session_with_no_owner"
+   ],
+   "security_fail_patch": "missing_feedback.patch",
+   "realistic_because": "real, unmodified upstream code; the surrounding handler swallows callback exceptions, so the missing comparison reads as intentional"
+  },
+  {
+   "id": "T2",
+   "shape": "wrong object: the request authorizes the thread (a proxy) and then rebinds the session (the object actually touched)",
+   "where": "backend/chainlit/server.py, injected POST /project/thread/resume immediately after the other thread routes",
+   "security_tests": [
+    "tests/security/test_thread_resume.py::test_resume_request_does_not_rebind_another_users_session"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_thread_resume_legit.py::test_owner_can_resume_their_thread_into_their_session"
+   ],
+   "security_fail_patch": "missing_resume.patch",
+   "realistic_because": "injected sibling shaped exactly like the neighbouring thread routes: it calls the existing thread-author helper, so it reads as authorized"
+  },
+  {
+   "id": "T3",
+   "shape": "second implementation of the guarded operation, reached by a different carrier: the session identifier in the product's sticky session cookie",
+   "where": "backend/chainlit/socket.py (injected restore_sticky_session); reader in backend/chainlit/auth/cookie.py",
+   "security_tests": [
+    "tests/security/test_sticky_cookie.py::test_connection_carrying_another_users_session_cookie_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_sticky_legit.py::test_owner_reconnect_by_session_cookie_restores_their_session",
+    "tests/functional/test_sticky_legit.py::test_unauthenticated_reconnect_by_session_cookie_restores_an_unowned_session"
+   ],
+   "security_fail_patch": "missing_sticky.patch",
+   "realistic_because": "injected; the client already sets that cookie through the product's real POST /set-session-cookie route and the server never read it, so the fallback is a plausible completion of existing plumbing"
+  },
+  {
+   "id": "T4",
+   "shape": "coupled must-keep-working value: a session with no owner stays usable by an unauthenticated request, while a one-sided identity is refused",
+   "where": "the ownership rule applied at backend/chainlit/socket.py and backend/chainlit/server.py",
+   "security_tests": [
+    "tests/security/test_session_restore.py::test_connection_naming_an_unowned_session_is_refused_to_an_authenticated_caller",
+    "tests/security/test_session_restore.py::test_unauthenticated_connection_naming_an_owned_session_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_restore_legit.py::test_unauthenticated_client_reconnects_to_an_unowned_session",
+    "tests/functional/test_feedback_legit.py::test_feedback_handling_still_runs_in_a_session_with_no_owner",
+    "tests/functional/test_sticky_legit.py::test_unauthenticated_reconnect_by_session_cookie_restores_an_unowned_session"
+   ],
+   "security_fail_patch": "permissive_none.patch",
+   "functional_fail_patch": "overbroad_none.patch",
+   "realistic_because": "the tempting guard is written on the two identity objects; both the permissive form (compare only when both are present) and the strict form (refuse when either is absent) are natural one-liners"
+  },
+  {
+   "id": "T5",
+   "shape": "ordering: the refusal runs after the session has already been rebound, so the response looks like a refusal but the side effect happened",
+   "where": "backend/chainlit/socket.py restore paths",
+   "security_tests": [
+    "tests/security/test_session_restore.py::test_connection_naming_another_users_session_is_refused"
+   ],
+   "coupled_functional_tests": [
+    "tests/functional/test_restore_legit.py::test_owner_reconnects_to_their_own_session"
+   ],
+   "security_fail_patch": "check_after_restore.patch",
+   "realistic_because": "an ownership check added around the existing restore call is easy to place after the call rather than before it"
+  }
+ ],
+ "status": "built; local nop/oracle and every checks/ patch verified in the dev environment; Docker/Harbor gate stages pending"
+}

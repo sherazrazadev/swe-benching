@@ -1,0 +1,128 @@
+diff --git a/packages/kit/src/runtime/client/remote-functions/form.svelte.js b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+index 2dacae4..4ec2882 100644
+--- a/packages/kit/src/runtime/client/remote-functions/form.svelte.js
++++ b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+@@ -8,6 +8,16 @@ import { query_responses, _goto, set_nearest_error_page, invalidateAll } from '.
+ import { tick } from 'svelte';
+ import { categorize_updates, remote_request } from './shared.svelte.js';
+ import { createAttachmentKey } from 'svelte/attachments';
++
++function current_of(object, path_parts) {
++	let current = object;
++	for (let i = 0; i < path_parts.length - 1; i++) {
++		if (current[path_parts[i]] == null) return current;
++		current = current[path_parts[i]];
++	}
++	return current;
++}
++
+ import {
+ 	convert_formdata,
+ 	flatten_issues,
+@@ -18,6 +28,7 @@ import {
+ 	build_path_string,
+ 	normalize_issue,
+ 	serialize_binary_form,
++	DELETE_KEY,
+ 	BINARY_FORM_CONTENT_TYPE
+ } from '../../form-utils.js';
+ 
+@@ -503,12 +514,11 @@ export function form(id) {
+ 					if (is_file && value.length === 0) {
+ 						// an emptied file input means the selection is gone, so drop the field
+ 						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
++						if (['__proto__', 'constructor', 'prototype'].includes(path_parts[0])) {
++							throw new Error(`Invalid key "${path_parts[0]}"`);
+ 						}
+-						delete current[path_parts[path_parts.length - 1]];
++						const target = current_of(input, path_parts);
++						delete target[path_parts[path_parts.length - 1]];
+ 					} else {
+ 						set_nested_value(input, name, value);
+ 					}
+@@ -524,14 +534,12 @@ export function form(id) {
+ 					if (file) {
+ 						set_nested_value(input, name, file);
+ 					} else {
+-						// Remove the property by setting to undefined and clean up
+ 						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
++						if (['__proto__', 'constructor', 'prototype'].includes(path_parts[0])) {
++							throw new Error(`Invalid key "${path_parts[0]}"`);
+ 						}
+-						delete current[path_parts[path_parts.length - 1]];
++						const target = current_of(input, path_parts);
++						delete target[path_parts[path_parts.length - 1]];
+ 					}
+ 				} else {
+ 					set_nested_value(
+diff --git a/packages/kit/src/runtime/form-utils.js b/packages/kit/src/runtime/form-utils.js
+index dce9c52..25de410 100644
+--- a/packages/kit/src/runtime/form-utils.js
++++ b/packages/kit/src/runtime/form-utils.js
+@@ -27,6 +27,9 @@ export function set_nested_value(object, path_string, value) {
+ 	deep_set(object, split_path(path_string), value);
+ }
+ 
++/** Pass this to set_nested_value to delete the last part of the given path */
++export const DELETE_KEY = {};
++
+ /**
+  * Convert `FormData` into a POJO
+  * @param {FormData} data
+@@ -49,16 +52,17 @@ export function convert_formdata(data) {
+ 		if (values.length === 0 && !is_array) {
+ 			// an empty file input was cleared, so drop the field from the result
+ 			const path_parts = key.split(/\.|\[|\]/).filter(Boolean);
++			if (['__proto__', 'constructor', 'prototype'].includes(path_parts[0])) {
++				throw new Error(`Invalid key "${path_parts[0]}"`);
++			}
+ 			let current = /** @type {any} */ (result);
+-			let traversed = true;
+ 			for (let i = 0; i < path_parts.length - 1; i++) {
+-				if (current[path_parts[i]] == null) {
+-					traversed = false;
+-					break;
+-				}
++				if (current[path_parts[i]] == null) break;
+ 				current = current[path_parts[i]];
++				if (i === path_parts.length - 2) {
++					delete current[path_parts[path_parts.length - 1]];
++				}
+ 			}
+-			if (traversed) delete current[path_parts[path_parts.length - 1]];
+ 			continue;
+ 		}
+ 
+@@ -516,6 +520,10 @@ export function deep_set(object, keys, value) {
+ 		}
+ 
+ 		if (!exists) {
++			if (value === DELETE_KEY) {
++				// don't create the nested structure if we want to delete the key anyway
++				return;
++			}
+ 			current[key] = is_array ? [] : {};
+ 		}
+ 
+@@ -524,7 +532,12 @@ export function deep_set(object, keys, value) {
+ 
+ 	const final_key = keys[keys.length - 1];
+ 	check_prototype_pollution(final_key);
+-	current[final_key] = value;
++
++	if (value === DELETE_KEY) {
++		delete current[final_key];
++	} else {
++		current[final_key] = value;
++	}
+ }
+ 
+ /**

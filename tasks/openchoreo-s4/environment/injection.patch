@@ -1,0 +1,165 @@
+diff --git a/internal/openchoreo-api/services/autobuild/dependents.go b/internal/openchoreo-api/services/autobuild/dependents.go
+new file mode 100644
+index 0000000..08f4d09
+--- /dev/null
++++ b/internal/openchoreo-api/services/autobuild/dependents.go
+@@ -0,0 +1,65 @@
++// Copyright 2026 The OpenChoreo Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package autobuild
++
++import (
++	"context"
++	"strings"
++
++	"github.com/openchoreo/openchoreo/api/v1alpha1"
++)
++
++// buildWithAnnotation names the component that a component is rebuilt with.
++// A component that carries "openchoreo.dev/build-with: <namespace>/<component>"
++// is rebuilt whenever the referenced component is rebuilt, so that shared
++// libraries and generated clients pick up the new artifact without needing
++// their own webhook configuration.
++const buildWithAnnotation = "openchoreo.dev/build-with"
++
++// expandBuildDependents appends the components that declare a build dependency
++// on one of the components the webhook already matched.
++func (s *webhookProcessor) expandBuildDependents(ctx context.Context, affected []*v1alpha1.Component) ([]*v1alpha1.Component, error) {
++	if len(affected) == 0 {
++		return affected, nil
++	}
++
++	matched := make(map[string]struct{}, len(affected))
++	seen := make(map[string]struct{}, len(affected))
++	for _, comp := range affected {
++		key := comp.Namespace + "/" + comp.Name
++		matched[key] = struct{}{}
++		seen[key] = struct{}{}
++	}
++
++	all := &v1alpha1.ComponentList{}
++	if err := s.k8sClient.List(ctx, all); err != nil {
++		return nil, err
++	}
++
++	for i := range all.Items {
++		comp := &all.Items[i]
++		ref, ok := comp.Annotations[buildWithAnnotation]
++		if !ok {
++			continue
++		}
++		ref = strings.TrimSpace(ref)
++		if !strings.Contains(ref, "/") {
++			ref = comp.Namespace + "/" + ref
++		}
++		if _, depends := matched[ref]; !depends {
++			continue
++		}
++		key := comp.Namespace + "/" + comp.Name
++		if _, dup := seen[key]; dup {
++			continue
++		}
++		if comp.Spec.AutoBuild == nil || !*comp.Spec.AutoBuild {
++			continue
++		}
++		seen[key] = struct{}{}
++		affected = append(affected, comp)
++	}
++
++	return affected, nil
++}
+diff --git a/internal/openchoreo-api/services/autobuild/webhook_processor.go b/internal/openchoreo-api/services/autobuild/webhook_processor.go
+index 7e0c70e..4f61fc8 100644
+--- a/internal/openchoreo-api/services/autobuild/webhook_processor.go
++++ b/internal/openchoreo-api/services/autobuild/webhook_processor.go
+@@ -70,6 +70,13 @@ func (s *webhookProcessor) ProcessWebhook(ctx context.Context, provider git.Prov
+ 		return nil, fmt.Errorf("failed to find affected components: %w", err)
+ 	}
+ 
++	// Rebuild the components that declare a build dependency on a matched component.
++	affectedComponents, err = s.expandBuildDependents(ctx, affectedComponents)
++	if err != nil {
++		s.logger.Error("Failed to expand build dependents", "error", err)
++		return nil, fmt.Errorf("failed to expand build dependents: %w", err)
++	}
++
+ 	s.logger.Info("Found affected components", "count", len(affectedComponents))
+ 
+ 	// Trigger builds for affected components
+diff --git a/internal/openchoreo-api/services/git/bitbucket_server.go b/internal/openchoreo-api/services/git/bitbucket_server.go
+new file mode 100644
+index 0000000..4c971ee
+--- /dev/null
++++ b/internal/openchoreo-api/services/git/bitbucket_server.go
+@@ -0,0 +1,57 @@
++// Copyright 2026 The OpenChoreo Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package git
++
++import (
++	"encoding/json"
++)
++
++// BitbucketCompatProvider serves webhook deliveries from Bitbucket Data Center
++// (formerly Bitbucket Server) alongside Bitbucket Cloud. Both products deliver
++// push events with the same repository shape, and the Cloud provider parses
++// them both. Data Center installations before 8.0 do not sign webhook
++// deliveries unless a repository-level secret is configured, so an unsigned
++// Data Center push is accepted as a delivery from a trusted instance; every
++// other delivery is validated by the Cloud provider.
++type BitbucketCompatProvider struct {
++	cloud *BitbucketProvider
++}
++
++// NewBitbucketCompatProvider creates a Bitbucket provider that also accepts
++// unsigned Data Center push deliveries.
++func NewBitbucketCompatProvider() *BitbucketCompatProvider {
++	return &BitbucketCompatProvider{cloud: NewBitbucketProvider()}
++}
++
++// ValidateWebhookPayload validates a Bitbucket webhook delivery.
++func (p *BitbucketCompatProvider) ValidateWebhookPayload(payload []byte, signature, secret string) error {
++	if signature == "" && isBitbucketDataCenterPayload(payload) {
++		return nil
++	}
++	return p.cloud.ValidateWebhookPayload(payload, signature, secret)
++}
++
++// ParseWebhookPayload parses a Bitbucket webhook payload.
++func (p *BitbucketCompatProvider) ParseWebhookPayload(payload []byte) (*WebhookEvent, error) {
++	return p.cloud.ParseWebhookPayload(payload)
++}
++
++// isBitbucketDataCenterPayload reports whether a delivery is a Data Center push
++// event. Data Center pushes carry the event key in the body (for example
++// "repo:refs_changed") and name the repository project, neither of which the
++// Cloud push payload carries.
++func isBitbucketDataCenterPayload(payload []byte) bool {
++	var p struct {
++		EventKey   string `json:"eventKey"`
++		Repository struct {
++			Project struct {
++				Key string `json:"key"`
++			} `json:"project"`
++		} `json:"repository"`
++	}
++	if err := json.Unmarshal(payload, &p); err != nil {
++		return false
++	}
++	return p.EventKey != "" || p.Repository.Project.Key != ""
++}
+diff --git a/internal/openchoreo-api/services/git/provider.go b/internal/openchoreo-api/services/git/provider.go
+index bce5b78..fb9e944 100644
+--- a/internal/openchoreo-api/services/git/provider.go
++++ b/internal/openchoreo-api/services/git/provider.go
+@@ -43,7 +43,7 @@ func GetProvider(providerType ProviderType) (Provider, error) {
+ 	case ProviderGitLab:
+ 		return NewGitLabProvider(), nil
+ 	case ProviderBitbucket:
+-		return NewBitbucketProvider(), nil
++		return NewBitbucketCompatProvider(), nil
+ 	default:
+ 		return nil, fmt.Errorf("unsupported provider: %s", providerType)
+ 	}

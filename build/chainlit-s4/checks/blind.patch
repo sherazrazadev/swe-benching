@@ -1,0 +1,139 @@
+--- a/backend/chainlit/server.py	2026-10-29 17:31:42.000000000 +0000
++++ b/backend/chainlit/server.py	2026-10-29 17:52:10.519637458 +0000
+@@ -890,15 +890,24 @@
+     if not data_layer:
+         raise HTTPException(status_code=500, detail="Data persistence is not enabled")
+ 
++    from chainlit.context import init_ws_context
++    from chainlit.session import WebsocketSession
++
++    session = WebsocketSession.get_by_id(update.sessionId)
++
++    # Refuse before the request has any effect: no feedback is stored and no
++    # application callback runs inside a session the caller does not own.
++    if session is not None and not session.owner_matches(current_user):
++        raise HTTPException(
++            status_code=403,
++            detail="You are not authorized to update feedback for this session",
++        )
++
+     try:
+         feedback_id = await data_layer.upsert_feedback(feedback=update.feedback)
+ 
+         if config.code.on_feedback:
+             try:
+-                from chainlit.context import init_ws_context
+-                from chainlit.session import WebsocketSession
+-
+-                session = WebsocketSession.get_by_id(update.sessionId)
+                 init_ws_context(session)
+ 
+                 await config.code.on_feedback(update.feedback)
+@@ -1263,6 +1272,14 @@
+     if not session:
+         raise HTTPException(status_code=404, detail="Session not found")
+ 
++    # The caller's authorship of the thread says nothing about who owns the
++    # session this request would rebind.
++    if not session.owner_matches(current_user):
++        raise HTTPException(
++            status_code=403,
++            detail="You are not authorized to resume this session",
++        )
++
+     session.thread_id_to_resume = payload.threadId
+     session.restore(new_socket_id=payload.socketId)
+ 
+--- a/backend/chainlit/session.py	2026-10-29 17:31:40.000000000 +0000
++++ b/backend/chainlit/session.py	2026-10-29 17:52:01.260657999 +0000
+@@ -88,6 +88,21 @@
+ 
+         self.chat_settings: Dict[str, Any] = {}
+ 
++    def owner_matches(self, user) -> bool:
++        """Whether `user` is the account this session belongs to.
++
++        A session created before anyone logged in has no owner and belongs to
++        the open deployment: only an unauthenticated caller may use it. An
++        owned session is usable only by the account that created it, compared
++        by identifier so that a different object representing the same account
++        on a new connection still matches.
++        """
++        if self.user is None:
++            return user is None
++        if user is None:
++            return False
++        return self.user.identifier == user.identifier
++
+     @property
+     def files_dir(self):
+         from chainlit.config import FILES_DIRECTORY
+--- a/backend/chainlit/socket.py	2026-10-29 17:31:42.000000000 +0000
++++ b/backend/chainlit/socket.py	2026-10-29 17:52:06.239646884 +0000
+@@ -39,18 +39,31 @@
+     threadId: str | None
+ 
+ 
+-def restore_existing_session(sid, session_id, emit_fn, emit_call_fn, environ):
++def _claim_session(sid, session, emit_fn, emit_call_fn, environ, user):
++    """Bind an existing session to a new socket for an allowed caller.
++
++    The ownership check runs before `restore`, so a refused connection leaves
++    the session's socket binding and state untouched.
++    """
++    if not session.owner_matches(user):
++        logger.error("Authorization for the session failed.")
++        raise ConnectionRefusedError("authorization failed")
++
++    session.restore(new_socket_id=sid)
++    session.emit = emit_fn
++    session.emit_call = emit_call_fn
++    session.environ = environ
++    return True
++
++
++def restore_existing_session(sid, session_id, emit_fn, emit_call_fn, environ, user=None):
+     """Restore a session from the sessionId provided by the client."""
+     if session := WebsocketSession.get_by_id(session_id):
+-        session.restore(new_socket_id=sid)
+-        session.emit = emit_fn
+-        session.emit_call = emit_call_fn
+-        session.environ = environ
+-        return True
++        return _claim_session(sid, session, emit_fn, emit_call_fn, environ, user)
+     return False
+ 
+ 
+-def restore_sticky_session(sid, emit_fn, emit_call_fn, environ):
++def restore_sticky_session(sid, emit_fn, emit_call_fn, environ, user=None):
+     """Restore the session referenced by the sticky session cookie, if any."""
+     if not (cookie_header := environ.get("HTTP_COOKIE", None)):
+         return False
+@@ -61,11 +74,7 @@
+         return False
+ 
+     if session := WebsocketSession.get_by_id(session_id):
+-        session.restore(new_socket_id=sid)
+-        session.emit = emit_fn
+-        session.emit_call = emit_call_fn
+-        session.environ = environ
+-        return True
++        return _claim_session(sid, session, emit_fn, emit_call_fn, environ, user)
+ 
+     return False
+ 
+@@ -171,10 +180,12 @@
+         return sio.call(event, data, timeout=timeout, to=sid)
+ 
+     session_id = auth["sessionId"]
+-    if restore_existing_session(sid, session_id, emit_fn, emit_call_fn, environ):
++    if restore_existing_session(
++        sid, session_id, emit_fn, emit_call_fn, environ, user=user
++    ):
+         return True
+ 
+-    if restore_sticky_session(sid, emit_fn, emit_call_fn, environ):
++    if restore_sticky_session(sid, emit_fn, emit_call_fn, environ, user=user):
+         return True
+ 
+     user_env_string = auth.get("userEnv", None)

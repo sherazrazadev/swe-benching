@@ -1,0 +1,230 @@
+{
+ "slug": "vendure-s4",
+ "candidate": "screener-v2 entry 14863: GHSA-XF65-R35X-WMMV / CVE-2026-63461 (vendurehq/vendure)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "f74cbbb0b9a50b5b0131822835fe7ee9b71b42c9 (fix 6daf5cb8 adds the regression e2e tests; they are absent at the pinned commit)",
+  "entry_points": [
+   "Shop GraphQL Query.products(options: ProductListOptions) over HTTP /shop-api",
+   "Shop GraphQL Query.collections(options: CollectionListOptions)",
+   "Shop GraphQL Query.facets(options: FacetListOptions)",
+   "Shop GraphQL Collection.productVariants(options: ProductVariantListOptions)",
+   "Shop GraphQL Product.variantList(options: ProductVariantListOptions) and Product.variants",
+   "Shop GraphQL Query.productVariants(options: ProductVariantListOptions) (added by the injection)"
+  ],
+  "sites": [
+   "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:49-56 (products, published)",
+   "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:109-118 (collections, published)",
+   "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:165-174 (facets, published)",
+   "packages/core/src/api/resolvers/entity/collection-entity.resolver.ts:59-77 (real uncovered route)",
+   "packages/core/src/api/resolvers/entity/product-entity.resolver.ts:77-95 (injected)",
+   "packages/core/src/service/services/product-variant.service.ts:194-199 (injected, guard skip)",
+   "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:62-72 (injected, new query)",
+   "packages/core/src/service/services/product-variant.service.ts:110-125 (injected, missing product guard)"
+  ],
+  "routes": [
+   "Collection.productVariants with filterOperator OR: confirmed on the pinned copy; leaks a disabled variant of an enabled product (the service only hard-ANDs product.enabled when the merged filter carries enabled.eq === true)",
+   "Product.variantList with filterOperator OR: confirmed on the injected copy; the service skips its implicit variant-enabled guard because the options appear to carry it, and the caller's OR defeats the merged guard",
+   "Query.productVariants with default options and with filterOperator OR: confirmed on the injected copy; the guard watches the variant, so a variant of a disabled product is returned (wrong object)"
+  ],
+  "services": [],
+  "project_tests_run": [
+   "packages/core/e2e/shop-catalog.e2e-spec.ts: 18 passed on the injected tree and on the oracle",
+   "packages/core/e2e/list-query-builder.e2e-spec.ts: 112 passed on the injected tree and on the oracle"
+  ],
+  "local_runs": "injected tree nop: security 0/7, functional 17/17; oracle: security 7/7, functional 17/17; 12 check patches verified locally with the same suites",
+  "gate": {
+   "static": "PASS",
+   "nop": "PASS: 0/7 security, 17/17 functional, reward 0.0",
+   "oracle": "PASS: 3 runs, reward 1.0, identical 24/24",
+   "patches": "PASS: 6 security_fail, 4 functional_fail, 2 pass as declared"
+  }
+ },
+ "leak_terms": [
+  "GHSA-XF65-R35X-WMMV",
+  "CVE-2026-63461",
+  "f74cbbb0b9a50b5b0131822835fe7ee9b71b42c9",
+  "6daf5cb8571321eb6c6afa1d8e95a390c060be02",
+  "shop-products.resolver",
+  "shop.api.graphql",
+  "collection-entity.resolver",
+  "product-entity.resolver",
+  "product-variant.service",
+  "product.service",
+  "collection.service",
+  "facet.service",
+  "list-query-builder",
+  "combineGuardFilter",
+  "enforceGuardFilter",
+  "getVariantsByCollectionId",
+  "getVariantsByProductId",
+  "hasEnabledGuard",
+  "productVariants",
+  "variantList",
+  "isPrivate",
+  "enabled",
+  "vendurehq"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-catalogue-guard.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the three published list-query guards (T1 only)"
+  },
+  {
+   "patch": "sf-no-collection-variants.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the real collection-variant route (T2 only)"
+  },
+  {
+   "patch": "sf-no-variantlist.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the injected product-variant list guard (T3 only)"
+  },
+  {
+   "patch": "sf-no-variants-query.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the product-enabled guard on the shop variant listing (T4 only)"
+  },
+  {
+   "patch": "sf-published-only.patch",
+   "expect": "security_fail",
+   "note": "published fix only: misses T2, T3 and T4"
+  },
+  {
+   "patch": "sf-products-only.patch",
+   "expect": "security_fail",
+   "note": "fixes the reported products query only; leaves collections, facets and every variant route"
+  },
+  {
+   "patch": "ff-force-and.patch",
+   "expect": "functional_fail",
+   "note": "always combines the caller's filter fields with AND: closes the guard but breaks legitimate caller OR"
+  },
+  {
+   "patch": "ff-refuse-or.patch",
+   "expect": "functional_fail",
+   "note": "refuses every caller OR request instead of filtering it"
+  },
+  {
+   "patch": "ff-crash-on-or.patch",
+   "expect": "functional_fail",
+   "note": "throws on every caller OR request instead of filtering it"
+  },
+  {
+   "patch": "ff-global-and.patch",
+   "expect": "functional_fail",
+   "note": "forces AND for every list query in the shared builder, changing the Admin API's stated OR behaviour"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus unconditional shop guards in the product, collection, facet and collection-variant service queries"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "guards applied as hard conditions in the service queries only, leaving the resolver merges untouched"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written later by an independent agent from instruction.md and the repository only"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-or.patch",
+  "crash_as_refusal": "ff-crash-on-or.patch",
+  "wrong_resource": "sf-no-variants-query.patch",
+  "one_role_or_direction": "sf-products-only.patch",
+  "reads_only": "n/a: every protected sink is a read query; there is no write counterpart to guard",
+  "check_after_adjustment": "n/a: no normalisation or adjustment runs on caller input before filtering",
+  "unlisted_route": "sf-published-only.patch",
+  "malformed_identity": "n/a: no identity or name parsing decides visibility",
+  "missing_authority": "n/a: visibility is a stored per-entity flag, not an authority lookup that can fail open",
+  "adjacent_api": "ff-global-and.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_published_or_guard",
+   "pattern": "A (landing; published fix)",
+   "shape": "caller filterOperator OR over flat caller filter fields",
+   "where": "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:49-56 (products), :109-118 (collections), :165-174 (facets)",
+   "security_tests": [
+    "security/catalogue_filters.e2e-spec.ts::does not return a disabled product when the caller combines filters with OR",
+    "security/catalogue_filters.e2e-spec.ts::does not return a private collection when the caller combines filters with OR",
+    "security/catalogue_filters.e2e-spec.ts::does not return a private facet when the caller combines filters with OR"
+   ],
+   "coupled_functional_tests": [
+    "functional/catalogue.e2e-spec.ts::keeps OR semantics across the caller filter fields for products",
+    "functional/catalogue.e2e-spec.ts::keeps OR semantics across the caller filter fields for collections",
+    "functional/catalogue.e2e-spec.ts::keeps OR semantics across the caller filter fields for facets",
+    "functional/catalogue.e2e-spec.ts::narrows the products by a caller filter",
+    "functional/catalogue.e2e-spec.ts::keeps a nested OR block in the caller filter for products"
+   ],
+   "security_fail_patch": "sf-no-catalogue-guard.patch",
+   "realistic_because": "the reported site; the published upstream fix changes exactly these three merges"
+  },
+  {
+   "id": "T2_collection_variants",
+   "pattern": "B (uncovered route; real, unmodified upstream code)",
+   "shape": "caller filterOperator OR on the variant list of a collection",
+   "where": "packages/core/src/api/resolvers/entity/collection-entity.resolver.ts:59-77",
+   "security_tests": [
+    "security/collection_variants.e2e-spec.ts::does not return a disabled variant when the caller combines filters with OR"
+   ],
+   "coupled_functional_tests": [
+    "functional/variants.e2e-spec.ts::returns the enabled variants of a collection by default",
+    "functional/variants.e2e-spec.ts::keeps OR semantics across the caller filter fields for collection variants"
+   ],
+   "security_fail_patch": "sf-no-collection-variants.patch",
+   "realistic_because": "real, unmodified upstream code (still present in upstream master); the service re-derives the product guard with a hard AND and the field also merges a variant guard, so the route reads as doubly guarded"
+  },
+  {
+   "id": "T3_variant_lists",
+   "pattern": "injected sibling (guard moved off the sink; how-type)",
+   "shape": "caller filterOperator OR on a product's variant list, where the list options appear to carry the guard",
+   "where": "packages/core/src/api/resolvers/entity/product-entity.resolver.ts:77-95 and packages/core/src/service/services/product-variant.service.ts:194-199",
+   "security_tests": [
+    "security/variant_lists.e2e-spec.ts::does not return a disabled variant when the caller combines filters with OR"
+   ],
+   "coupled_functional_tests": [
+    "functional/variants.e2e-spec.ts::returns the enabled variants of a product by default",
+    "functional/variants.e2e-spec.ts::keeps OR semantics across the caller filter fields for a product variant list",
+    "functional/variants.e2e-spec.ts::keeps disabled variants visible to administrators"
+   ],
+   "security_fail_patch": "sf-no-variantlist.patch",
+   "realistic_because": "consolidating the shop variant guard into the list options is a natural refactor; the service's 'already supplied' check reads as de-duplication and only the operator makes it wrong"
+  },
+  {
+   "id": "T4_variant_query",
+   "pattern": "injected sibling (route where protection never existed; wrong object)",
+   "shape": "shop variant listing with default options and with filterOperator OR",
+   "where": "packages/core/src/api/resolvers/shop/shop-products.resolver.ts:62-72 and packages/core/src/service/services/product-variant.service.ts:110-125",
+   "security_tests": [
+    "security/variant_query.e2e-spec.ts::does not return variants of a disabled product",
+    "security/variant_query.e2e-spec.ts::does not return a disabled variant when the caller combines filters with OR"
+   ],
+   "coupled_functional_tests": [
+    "functional/variants.e2e-spec.ts::returns the public variants from the shop variant listing",
+    "functional/variants.e2e-spec.ts::narrows the shop variant listing by a caller filter",
+    "functional/variants.e2e-spec.ts::keeps OR semantics across the caller filter fields for the shop variant listing"
+   ],
+   "security_fail_patch": "sf-no-variants-query.patch",
+   "realistic_because": "a shop variant listing is a plausible next feature; its guard filters the variant's own flag, the object in hand, while the disabled product that owns it is never consulted"
+  }
+ ],
+ "status": "hardened v1 + Frontier 1.4: static PASS, nop PASS (security 0/7, functional 17/17), oracle PASS (3x reward 1.0, 24/24), patches PASS (12/12 as declared)"
+}

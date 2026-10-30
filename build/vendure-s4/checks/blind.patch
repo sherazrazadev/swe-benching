@@ -1,0 +1,293 @@
+diff -ruN a/packages/core/src/api/common/public-catalogue-guard.ts b/packages/core/src/api/common/public-catalogue-guard.ts
+--- a/packages/core/src/api/common/public-catalogue-guard.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/core/src/api/common/public-catalogue-guard.ts	2026-10-29 18:58:44.226424282 +0000
+@@ -0,0 +1,52 @@
++import { LogicalOperator } from '@vendure/common/lib/generated-types';
++
++import { FilterParameter, ListQueryOptions, NullOptionals } from '../../common/types/common-types';
++import { VendureEntity } from '../../entity/base/base.entity';
++
++export type PublicCatalogueGuard<T extends VendureEntity> = NullOptionals<FilterParameter<T>>;
++
++/**
++ * @description
++ * Returns list options in which the mandatory "public catalogue" guard is always combined with
++ * the caller's filter using AND, regardless of the `filterOperator` the caller supplied.
++ *
++ * The caller's `filterOperator` is not discarded: it is moved into a nested block which keeps
++ * applying to the caller's own top-level filter fields only. In this way a caller can still use
++ * OR to combine their own filter fields, and can still nest `_and` / `_or` groups, but can no
++ * longer turn the guard itself into a disjunction.
++ *
++ * This is used by the shop-facing catalogue resolvers, which must never widen the public
++ * catalogue no matter which options are supplied.
++ *
++ * `options` is deliberately untyped: callers pass the GraphQL-generated list-options type, which
++ * is structurally compatible with `ListQueryOptions` but not identical to it.
++ */
++export function mergePublicCatalogueGuard<T extends VendureEntity>(
++    options: any,
++    guard: PublicCatalogueGuard<T>,
++): ListQueryOptions<T> {
++    const callerOptions: ListQueryOptions<T> = options ?? {};
++    const callerFilter: any = callerOptions.filter ?? null;
++    const guardFilter: any = guard;
++
++    if (!callerFilter || Object.keys(callerFilter).length === 0) {
++        return {
++            ...callerOptions,
++            filter: { ...guardFilter } as any,
++            filterOperator: LogicalOperator.AND,
++        };
++    }
++
++    let callerBlock: any = callerFilter;
++    if (callerOptions.filterOperator === LogicalOperator.OR) {
++        callerBlock = { _or: [callerFilter] };
++    }
++
++    return {
++        ...callerOptions,
++        filter: {
++            _and: [callerBlock, guardFilter],
++        } as any,
++        filterOperator: LogicalOperator.AND,
++    };
++}
+diff -ruN a/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts b/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts
+--- a/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts	2026-10-29 17:51:52.000000000 +0000
++++ b/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts	2026-10-29 18:55:33.675387714 +0000
+@@ -9,16 +9,16 @@
+ 
+ import { RequestContextCacheService } from '../../../cache/request-context-cache.service';
+ import { CacheKey } from '../../../common/constants';
+-import { ListQueryOptions } from '../../../common/types/common-types';
+ import { Translated } from '../../../common/types/locale-types';
+ import { CollectionFilter } from '../../../config/catalog/collection-filter';
+-import { Asset, Collection, Product, ProductVariant } from '../../../entity';
++import { Asset, Collection, ProductVariant } from '../../../entity';
+ import { LocaleStringHydrator } from '../../../service/helpers/locale-string-hydrator/locale-string-hydrator';
+ import { AssetService } from '../../../service/services/asset.service';
+ import { CollectionService } from '../../../service/services/collection.service';
+ import { ProductVariantService } from '../../../service/services/product-variant.service';
+ import { ConfigurableOperationCodec } from '../../common/configurable-operation-codec';
+ import { ApiType } from '../../common/get-api-type';
++import { mergePublicCatalogueGuard } from '../../common/public-catalogue-guard';
+ import { RequestContext } from '../../common/request-context';
+ import { Api } from '../../decorators/api.decorator';
+ import { RelationPaths, Relations } from '../../decorators/relations.decorator';
+@@ -63,16 +63,10 @@
+         @Api() apiType: ApiType,
+         @Relations({ entity: ProductVariant, omit: ['assets'] }) relations: RelationPaths<ProductVariant>,
+     ): Promise<PaginatedList<Translated<ProductVariant>>> {
+-        let options: ListQueryOptions<Product> = args.options;
+-        if (apiType === 'shop') {
+-            options = {
+-                ...args.options,
+-                filter: {
+-                    ...(args.options ? args.options.filter : {}),
+-                    enabled: { eq: true },
+-                },
+-            };
+-        }
++        const options =
++            apiType === 'shop'
++                ? mergePublicCatalogueGuard<ProductVariant>(args.options, { enabled: { eq: true } })
++                : args.options;
+         return this.productVariantService.getVariantsByCollectionId(ctx, collection.id, options, relations);
+     }
+ 
+diff -ruN a/packages/core/src/api/resolvers/entity/product-entity.resolver.ts b/packages/core/src/api/resolvers/entity/product-entity.resolver.ts
+--- a/packages/core/src/api/resolvers/entity/product-entity.resolver.ts	2026-10-29 17:51:57.000000000 +0000
++++ b/packages/core/src/api/resolvers/entity/product-entity.resolver.ts	2026-10-29 18:55:32.678368679 +0000
+@@ -3,7 +3,6 @@
+ import { DEFAULT_CHANNEL_CODE } from '@vendure/common/lib/shared-constants';
+ import { PaginatedList } from '@vendure/common/lib/shared-types';
+ 
+-import { ListQueryOptions } from '../../../common/types/common-types';
+ import { Translated } from '../../../common/types/locale-types';
+ import { idsAreEqual } from '../../../common/utils';
+ import { Asset } from '../../../entity/asset/asset.entity';
+@@ -21,6 +20,7 @@
+ import { ProductVariantService } from '../../../service/services/product-variant.service';
+ import { ProductService } from '../../../service/services/product.service';
+ import { ApiType } from '../../common/get-api-type';
++import { mergePublicCatalogueGuard } from '../../common/public-catalogue-guard';
+ import { RequestContext } from '../../common/request-context';
+ import { Api } from '../../decorators/api.decorator';
+ import { RelationPaths, Relations } from '../../decorators/relations.decorator';
+@@ -81,16 +81,10 @@
+         @Api() apiType: ApiType,
+         @Relations({ entity: ProductVariant, omit: ['assets'] }) relations: RelationPaths<ProductVariant>,
+     ): Promise<PaginatedList<ProductVariant>> {
+-        let options: ListQueryOptions<ProductVariant> = args.options;
+-        if (apiType === 'shop') {
+-            options = {
+-                ...args.options,
+-                filter: {
+-                    ...(args.options && args.options.filter),
+-                    enabled: { eq: true },
+-                },
+-            };
+-        }
++        const options =
++            apiType === 'shop'
++                ? mergePublicCatalogueGuard<ProductVariant>(args.options, { enabled: { eq: true } })
++                : args.options;
+         return this.productVariantService.getVariantsByProductId(ctx, product.id, options, relations);
+     }
+ 
+diff -ruN a/packages/core/src/api/resolvers/shop/shop-products.resolver.ts b/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
+--- a/packages/core/src/api/resolvers/shop/shop-products.resolver.ts	2026-10-29 17:51:57.000000000 +0000
++++ b/packages/core/src/api/resolvers/shop/shop-products.resolver.ts	2026-10-29 18:55:21.157112466 +0000
+@@ -16,7 +16,6 @@
+ import { RequestContextCacheService } from '../../../cache/request-context-cache.service';
+ import { CacheKey } from '../../../common/constants';
+ import { InternalServerError, UserInputError } from '../../../common/error/errors';
+-import { ListQueryOptions } from '../../../common/types/common-types';
+ import { Translated } from '../../../common/types/locale-types';
+ import { Collection } from '../../../entity/collection/collection.entity';
+ import { Facet } from '../../../entity/facet/facet.entity';
+@@ -27,6 +26,7 @@
+ import { ProductVariantService } from '../../../service/services/product-variant.service';
+ import { ProductService } from '../../../service/services/product.service';
+ import { isFieldInSelection } from '../../common/is-field-in-selection';
++import { mergePublicCatalogueGuard } from '../../common/public-catalogue-guard';
+ import { RequestContext } from '../../common/request-context';
+ import { RelationPaths, Relations } from '../../decorators/relations.decorator';
+ import { Ctx } from '../../decorators/request-context.decorator';
+@@ -48,13 +48,7 @@
+         @Args() args: QueryProductsArgs,
+         @Relations({ entity: Product, omit: ['variants', 'assets'] }) relations: RelationPaths<Product>,
+     ): Promise<PaginatedList<Translated<Product>>> {
+-        const options: ListQueryOptions<Product> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                enabled: { eq: true },
+-            },
+-        };
++        const options = mergePublicCatalogueGuard<Product>(args.options, { enabled: { eq: true } });
+         return this.productService.findAll(ctx, options, relations);
+     }
+ 
+@@ -63,13 +57,7 @@
+         @Ctx() ctx: RequestContext,
+         @Args() args: { options?: ProductVariantListOptions },
+     ): Promise<PaginatedList<Translated<ProductVariant>>> {
+-        const options: ListQueryOptions<ProductVariant> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                enabled: { eq: true },
+-            },
+-        };
++        const options = mergePublicCatalogueGuard<ProductVariant>(args.options, { enabled: { eq: true } });
+         return this.productVariantService.findAll(ctx, options);
+     }
+ 
+@@ -108,14 +96,8 @@
+         relations: RelationPaths<Collection>,
+         @Info() info: GraphQLResolveInfo,
+     ): Promise<PaginatedList<Translated<Collection>>> {
+-        const options: ListQueryOptions<Collection> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        const collections = await this.collectionService.findAll(ctx, options || undefined, relations);
++        const options = mergePublicCatalogueGuard<Collection>(args.options, { isPrivate: { eq: false } });
++        const collections = await this.collectionService.findAll(ctx, options, relations);
+         // Cache the variant counts query promise if productVariantCount is requested,
+         // allowing the DB query to start before the field resolvers are called
+         if (isFieldInSelection(info, 'productVariantCount')) {
+@@ -164,14 +146,8 @@
+         @Args() args: QueryFacetsArgs,
+         @Relations(Facet) relations: RelationPaths<Facet>,
+     ): Promise<PaginatedList<Translated<Facet>>> {
+-        const options: ListQueryOptions<Facet> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        return this.facetService.findAll(ctx, options || undefined, relations);
++        const options = mergePublicCatalogueGuard<Facet>(args.options, { isPrivate: { eq: false } });
++        return this.facetService.findAll(ctx, options, relations);
+     }
+ 
+     @Query()
+diff -ruN a/packages/core/src/service/services/product-variant.service.ts b/packages/core/src/service/services/product-variant.service.ts
+--- a/packages/core/src/service/services/product-variant.service.ts	2026-10-29 17:51:57.000000000 +0000
++++ b/packages/core/src/service/services/product-variant.service.ts	2026-10-29 18:55:39.287511723 +0000
+@@ -107,14 +107,22 @@
+             relations.push('facetValues');
+             customPropertyMap.facetValueId = 'facetValues.id';
+         }
+-        return this.listQueryBuilder
+-            .build(ProductVariant, options, {
+-                relations,
+-                channelId: ctx.channelId,
+-                where: { deletedAt: IsNull() },
+-                ctx,
+-                customPropertyMap,
+-            })
++        const qb = this.listQueryBuilder.build(ProductVariant, options, {
++            relations,
++            channelId: ctx.channelId,
++            where: { deletedAt: IsNull() },
++            ctx,
++            customPropertyMap,
++        });
++        if (ctx.apiType === 'shop') {
++            // Public catalogue: a variant is visible only when both the variant and its owning
++            // product are enabled. This is a hard AND, so no caller-supplied filter or
++            // filterOperator can widen the result set.
++            qb.innerJoin('productvariant.product', 'publicguard_product')
++                .andWhere('productvariant.enabled = :enabled', { enabled: true })
++                .andWhere('publicguard_product.enabled = :enabled', { enabled: true });
++        }
++        return qb
+             .getManyAndCount()
+             .then(async ([variants, totalItems]) => {
+                 const items = await this.applyPricesAndTranslateVariants(ctx, variants);
+@@ -191,11 +199,14 @@
+                 productId,
+             });
+ 
+-        // When the caller already supplies the enabled guard through the list options, applying
+-        // it again here would duplicate the condition, so it is only added implicitly otherwise.
+-        const hasEnabledGuard = options && options.filter && options.filter.enabled?.eq === true;
+-        if (ctx.apiType === 'shop' && !hasEnabledGuard) {
+-            qb.andWhere('productvariant.enabled = :enabled', { enabled: true });
++        // Public catalogue: a variant is visible only when both the variant and its owning
++        // product are enabled. Done with a hard AND so the caller's filterOperator cannot turn
++        // it into a disjunction.
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('productvariant.enabled = :enabled', { enabled: true }).andWhere(
++                'product.enabled = :enabled',
++                { enabled: true },
++            );
+         }
+ 
+         return qb.getManyAndCount().then(async ([variants, totalItems]) => {
+@@ -229,8 +240,14 @@
+             .andWhere('productvariant.deletedAt IS NULL')
+             .andWhere('collection.id = :collectionId', { collectionId });
+ 
+-        if (options && options.filter && options.filter.enabled && options.filter.enabled.eq === true) {
+-            qb.andWhere('product.enabled = :enabled', { enabled: true });
++        // Public catalogue: a variant is visible only when both the variant and its owning
++        // product are enabled, applied as a hard AND so the caller's filterOperator cannot
++        // widen the result set.
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('productvariant.enabled = :enabled', { enabled: true }).andWhere(
++                'product.enabled = :enabled',
++                { enabled: true },
++            );
+         }
+ 
+         return qb.getManyAndCount().then(async ([variants, totalItems]) => {

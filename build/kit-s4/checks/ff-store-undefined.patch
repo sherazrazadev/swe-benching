@@ -1,0 +1,101 @@
+diff --git a/packages/kit/src/runtime/client/remote-functions/form.svelte.js b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+index 2dacae4..8e5b850 100644
+--- a/packages/kit/src/runtime/client/remote-functions/form.svelte.js
++++ b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+@@ -18,6 +18,7 @@ import {
+ 	build_path_string,
+ 	normalize_issue,
+ 	serialize_binary_form,
++	DELETE_KEY,
+ 	BINARY_FORM_CONTENT_TYPE
+ } from '../../form-utils.js';
+ 
+@@ -502,13 +503,7 @@ export function form(id) {
+ 
+ 					if (is_file && value.length === 0) {
+ 						// an emptied file input means the selection is gone, so drop the field
+-						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
+-						}
+-						delete current[path_parts[path_parts.length - 1]];
++						set_nested_value(input, name, undefined);
+ 					} else {
+ 						set_nested_value(input, name, value);
+ 					}
+@@ -524,14 +519,7 @@ export function form(id) {
+ 					if (file) {
+ 						set_nested_value(input, name, file);
+ 					} else {
+-						// Remove the property by setting to undefined and clean up
+-						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
+-						}
+-						delete current[path_parts[path_parts.length - 1]];
++						set_nested_value(input, name, undefined);
+ 					}
+ 				} else {
+ 					set_nested_value(
+diff --git a/packages/kit/src/runtime/form-utils.js b/packages/kit/src/runtime/form-utils.js
+index dce9c52..5d0f838 100644
+--- a/packages/kit/src/runtime/form-utils.js
++++ b/packages/kit/src/runtime/form-utils.js
+@@ -27,6 +27,9 @@ export function set_nested_value(object, path_string, value) {
+ 	deep_set(object, split_path(path_string), value);
+ }
+ 
++/** Pass this to set_nested_value to delete the last part of the given path */
++export const DELETE_KEY = {};
++
+ /**
+  * Convert `FormData` into a POJO
+  * @param {FormData} data
+@@ -48,17 +51,7 @@ export function convert_formdata(data) {
+ 		);
+ 		if (values.length === 0 && !is_array) {
+ 			// an empty file input was cleared, so drop the field from the result
+-			const path_parts = key.split(/\.|\[|\]/).filter(Boolean);
+-			let current = /** @type {any} */ (result);
+-			let traversed = true;
+-			for (let i = 0; i < path_parts.length - 1; i++) {
+-				if (current[path_parts[i]] == null) {
+-					traversed = false;
+-					break;
+-				}
+-				current = current[path_parts[i]];
+-			}
+-			if (traversed) delete current[path_parts[path_parts.length - 1]];
++			set_nested_value(result, key, undefined);
+ 			continue;
+ 		}
+ 
+@@ -516,6 +509,10 @@ export function deep_set(object, keys, value) {
+ 		}
+ 
+ 		if (!exists) {
++			if (value === DELETE_KEY) {
++				// don't create the nested structure if we want to delete the key anyway
++				return;
++			}
+ 			current[key] = is_array ? [] : {};
+ 		}
+ 
+@@ -524,7 +521,12 @@ export function deep_set(object, keys, value) {
+ 
+ 	const final_key = keys[keys.length - 1];
+ 	check_prototype_pollution(final_key);
+-	current[final_key] = value;
++
++	if (value === DELETE_KEY) {
++		delete current[final_key];
++	} else {
++		current[final_key] = value;
++	}
+ }
+ 
+ /**

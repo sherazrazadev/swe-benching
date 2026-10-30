@@ -1,0 +1,51 @@
+diff --git a/packages/kit/src/runtime/client/remote-functions/form.svelte.js b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+index 7b6fc97..2dacae4 100644
+--- a/packages/kit/src/runtime/client/remote-functions/form.svelte.js
++++ b/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+@@ -500,7 +500,18 @@ export function form(id) {
+ 						}
+ 					}
+ 
+-					set_nested_value(input, name, value);
++					if (is_file && value.length === 0) {
++						// an emptied file input means the selection is gone, so drop the field
++						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
++						let current = /** @type {any} */ (input);
++						for (let i = 0; i < path_parts.length - 1; i++) {
++							if (current[path_parts[i]] == null) return;
++							current = current[path_parts[i]];
++						}
++						delete current[path_parts[path_parts.length - 1]];
++					} else {
++						set_nested_value(input, name, value);
++					}
+ 				} else if (is_file) {
+ 					if (DEV && element.multiple) {
+ 						throw new Error(
+diff --git a/packages/kit/src/runtime/form-utils.js b/packages/kit/src/runtime/form-utils.js
+index 8fac28c..dce9c52 100644
+--- a/packages/kit/src/runtime/form-utils.js
++++ b/packages/kit/src/runtime/form-utils.js
+@@ -46,7 +46,21 @@ export function convert_formdata(data) {
+ 		values = values.filter(
+ 			(entry) => typeof entry === 'string' || entry.name !== '' || entry.size > 0
+ 		);
+-		if (values.length === 0 && !is_array) continue;
++		if (values.length === 0 && !is_array) {
++			// an empty file input was cleared, so drop the field from the result
++			const path_parts = key.split(/\.|\[|\]/).filter(Boolean);
++			let current = /** @type {any} */ (result);
++			let traversed = true;
++			for (let i = 0; i < path_parts.length - 1; i++) {
++				if (current[path_parts[i]] == null) {
++					traversed = false;
++					break;
++				}
++				current = current[path_parts[i]];
++			}
++			if (traversed) delete current[path_parts[path_parts.length - 1]];
++			continue;
++		}
+ 
+ 		if (key.startsWith('n:')) {
+ 			key = key.slice(2);

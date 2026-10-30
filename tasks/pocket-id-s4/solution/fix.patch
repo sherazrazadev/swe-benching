@@ -1,0 +1,304 @@
+diff --git a/backend/internal/controller/oidc_controller.go b/backend/internal/controller/oidc_controller.go
+index db8b750..919361a 100644
+--- a/backend/internal/controller/oidc_controller.go
++++ b/backend/internal/controller/oidc_controller.go
+@@ -32,6 +32,7 @@ func NewOidcController(group *gin.RouterGroup, authMiddleware *middleware.AuthMi
+ 	}
+ 
+ 	group.POST("/oidc/authorize", authMiddleware.WithAdminNotRequired().Add(), oc.authorizeHandler)
++	group.POST("/oidc/authorize/callback-url", oc.authorizeCallbackURLHandler)
+ 	group.POST("/oidc/authorization-required", authMiddleware.WithAdminNotRequired().Add(), oc.authorizationConfirmationRequiredHandler)
+ 	group.GET("/oidc/par-request-info", authMiddleware.WithAdminNotRequired().Add(), oc.parRequestInfoHandler)
+ 
+@@ -111,6 +112,7 @@ func (oc *OidcController) authorizeHandler(c *gin.Context) {
+ 			c.JSON(http.StatusOK, gin.H{
+ 				"error":            err.Error(),
+ 				"requiresRedirect": true,
++				"callbackURL":      callbackURL,
+ 			})
+ 			return
+ 		}
+@@ -127,6 +129,36 @@ func (oc *OidcController) authorizeHandler(c *gin.Context) {
+ 	c.JSON(http.StatusOK, response)
+ }
+ 
++// authorizeCallbackURLHandler godoc
++// @Summary Resolve a validated callback URL for an OIDC authorization request
++// @Description Resolves the redirect URI against the client's configured callback URLs without consuming PAR records.
++// @Tags OIDC
++// @Accept json
++// @Produce json
++// @Param request body dto.AuthorizeOidcClientCallbackRequestDto true "Authorization callback parameters"
++// @Success 200 {object} dto.AuthorizeOidcClientCallbackResponseDto "Resolved callback URL"
++// @Router /api/oidc/authorize/callback-url [post]
++func (oc *OidcController) authorizeCallbackURLHandler(c *gin.Context) {
++	var input dto.AuthorizeOidcClientCallbackRequestDto
++	if err := c.ShouldBindJSON(&input); err != nil {
++		_ = c.Error(err)
++		return
++	}
++
++	callbackURL, err := oc.oidcService.ResolveAuthorizeCallbackURL(
++		c.Request.Context(),
++		input.ClientID,
++		input.CallbackURL,
++		input.RequestURI,
++	)
++	if err != nil {
++		_ = c.Error(err)
++		return
++	}
++
++	c.JSON(http.StatusOK, dto.AuthorizeOidcClientCallbackResponseDto{CallbackURL: callbackURL})
++}
++
+ // isOidcPromptError checks if an error is a prompt-related OIDC error that should trigger a redirect
+ func isOidcPromptError(err error) bool {
+ 	var loginReq *common.OidcLoginRequiredError
+diff --git a/backend/internal/dto/oidc_dto.go b/backend/internal/dto/oidc_dto.go
+index 03ebf20..dfebd7a 100644
+--- a/backend/internal/dto/oidc_dto.go
++++ b/backend/internal/dto/oidc_dto.go
+@@ -105,6 +105,16 @@ type AuthorizeOidcClientResponseDto struct {
+ 	Issuer      string `json:"issuer"`
+ }
+ 
++type AuthorizeOidcClientCallbackRequestDto struct {
++	ClientID    string `json:"clientID" binding:"required"`
++	CallbackURL string `json:"callbackURL"`
++	RequestURI  string `json:"requestURI"`
++}
++
++type AuthorizeOidcClientCallbackResponseDto struct {
++	CallbackURL string `json:"callbackURL"`
++}
++
+ type AuthorizationRequiredDto struct {
+ 	ClientID   string `json:"clientID" binding:"required"`
+ 	Scope      string `json:"scope"`
+diff --git a/backend/internal/service/oidc_service.go b/backend/internal/service/oidc_service.go
+index 87b87b1..ef6f005 100644
+--- a/backend/internal/service/oidc_service.go
++++ b/backend/internal/service/oidc_service.go
+@@ -216,7 +216,7 @@ func (s *OidcService) Authorize(ctx context.Context, input dto.AuthorizeOidcClie
+ 			return "", "", err
+ 		}
+ 		if !hasAlreadyAuthorized {
+-			return "", "", &common.OidcConsentRequiredError{}
++			return "", callbackURL, &common.OidcConsentRequiredError{}
+ 		}
+ 	}
+ 
+@@ -820,7 +820,41 @@ func (s *OidcService) ResolveAllowedCallbackURL(ctx context.Context, clientID, i
+ 		return "", err
+ 	}
+ 
+-	if inputCallbackURL == "" || len(client.CallbackURLs) == 0 {
++	return resolveConfiguredCallbackURL(&client, inputCallbackURL)
++}
++
++// ResolveAuthorizeCallbackURL resolves the callback URL for a browser authorization
++// request without authorizing the user or consuming PAR state.
++func (s *OidcService) ResolveAuthorizeCallbackURL(ctx context.Context, clientID, inputCallbackURL, requestURI string) (string, error) {
++	client, err := s.GetClient(ctx, clientID)
++	if err != nil {
++		return "", err
++	}
++
++	if client.RequiresPushedAuthorizationRequests && requestURI == "" {
++		return "", &common.OidcPARRequiredError{}
++	}
++
++	if requestURI != "" {
++		par, err := s.GetPushedAuthorizationRequest(ctx, clientID, requestURI)
++		if err != nil {
++			return "", err
++		}
++		inputCallbackURL = par.Parameters.RedirectURI
++	}
++
++	return resolveConfiguredCallbackURL(&client, inputCallbackURL)
++}
++
++func resolveConfiguredCallbackURL(client *model.OidcClient, inputCallbackURL string) (string, error) {
++	if inputCallbackURL == "" {
++		if len(client.CallbackURLs) > 0 {
++			return client.CallbackURLs[0], nil
++		}
++		return "", &common.OidcMissingCallbackURLError{}
++	}
++
++	if len(client.CallbackURLs) == 0 {
+ 		return "", &common.OidcMissingCallbackURLError{}
+ 	}
+ 
+diff --git a/frontend/src/lib/services/oidc-service.ts b/frontend/src/lib/services/oidc-service.ts
+index fb4594a..78257ed 100644
+--- a/frontend/src/lib/services/oidc-service.ts
++++ b/frontend/src/lib/services/oidc-service.ts
+@@ -1,6 +1,7 @@
+ import type { ListRequestOptions, Paginated } from '$lib/types/list-request.type';
+ import type {
+ 	AccessibleOidcClient,
++	AuthorizeCallbackResponse,
+ 	AuthorizeResponse,
+ 	OidcClient,
+ 	OidcClientCreate,
+@@ -44,6 +45,20 @@ class OidcService extends APIService {
+ 		return res.data as AuthorizeResponse;
+ 	};
+ 
++	resolveAuthorizeCallbackURL = async (
++		clientId: string,
++		callbackURL: string,
++		requestURI?: string
++	) => {
++		const res = await this.api.post('/oidc/authorize/callback-url', {
++			clientId,
++			callbackURL,
++			requestURI
++		});
++
++		return res.data as AuthorizeCallbackResponse;
++	};
++
+ 	isAuthorizationRequired = async (clientId: string, scope: string, requestURI?: string) => {
+ 		const res = await this.api.post('/oidc/authorization-required', {
+ 			scope,
+diff --git a/frontend/src/lib/types/oidc.type.ts b/frontend/src/lib/types/oidc.type.ts
+index 9fd78d4..8c11022 100644
+--- a/frontend/src/lib/types/oidc.type.ts
++++ b/frontend/src/lib/types/oidc.type.ts
+@@ -70,6 +70,10 @@ export type AuthorizeResponse = {
+ 	requiresRedirect?: boolean;
+ };
+ 
++export type AuthorizeCallbackResponse = {
++	callbackURL: string;
++};
++
+ export type AccessibleOidcClient = OidcClientMetaData & {
+ 	lastUsedAt: Date | null;
+ };
+diff --git a/frontend/src/routes/authorize/+page.svelte b/frontend/src/routes/authorize/+page.svelte
+index 0a80516..46af351 100644
+--- a/frontend/src/routes/authorize/+page.svelte
++++ b/frontend/src/routes/authorize/+page.svelte
+@@ -12,7 +12,7 @@
+ 	import appConfigStore from '$lib/stores/application-configuration-store';
+ 	import userStore from '$lib/stores/user-store';
+ 	import { cachedProfilePicture } from '$lib/utils/cached-image-util';
+-	import { getWebauthnErrorMessage } from '$lib/utils/error-util';
++	import { getAxiosErrorMessage, getWebauthnErrorMessage } from '$lib/utils/error-util';
+ 	import { startAuthentication, type AuthenticationResponseJSON } from '@simplewebauthn/browser';
+ 	import { onMount } from 'svelte';
+ 	import { slide } from 'svelte/transition';
+@@ -64,15 +64,19 @@
+ 	const hasPromptSelectAccount = promptValues.includes('select_account');
+ 
+ 	onMount(() => {
++		void handleInitialAuthorization();
++	});
++
++	async function handleInitialAuthorization() {
+ 		// Conflicting prompt values - none can't be combined with any interactive prompt
+ 		if (hasPromptNone && (hasPromptConsent || hasPromptLogin || hasPromptSelectAccount)) {
+-			redirectWithError('interaction_required');
++			await redirectWithError('interaction_required');
+ 			return;
+ 		}
+ 
+ 		// If prompt=none and user is not signed in, redirect immediately with login_required
+ 		if (hasPromptNone && !$userStore) {
+-			redirectWithError('login_required');
++			await redirectWithError('login_required');
+ 			return;
+ 		}
+ 
+@@ -85,9 +89,9 @@
+ 		}
+ 
+ 		if ($userStore) {
+-			authorize();
++			await authorize();
+ 		}
+-	});
++	}
+ 
+ 	async function useDifferentAccount() {
+ 		try {
+@@ -130,7 +134,7 @@
+ 
+ 				// If prompt=none and consent required, redirect with error
+ 				if (hasPromptNone && authorizationRequired) {
+-					redirectWithError('consent_required');
++					await redirectWithError('consent_required');
+ 					return;
+ 				}
+ 
+@@ -169,7 +173,7 @@
+ 			// Check if backend returned a redirect error
+ 			if (result.requiresRedirect && result.error) {
+ 				if (hasPromptNone) {
+-					redirectWithError(result.error);
++					await redirectWithError(result.error, result.callbackURL);
+ 				} else {
+ 					errorMessage = result.error;
+ 					isLoading = false;
+@@ -182,8 +186,7 @@
+ 			// With prompt=none the client is waiting for an answer, not for a page,
+ 			// so send the failure back to its callback instead of showing it here.
+ 			if (hasPromptNone) {
+-				redirectWithError('server_error');
+-				isLoading = false;
++				await redirectWithError('server_error');
+ 				return;
+ 			}
+ 			errorMessage = getWebauthnErrorMessage(e);
+@@ -191,24 +194,32 @@
+ 		}
+ 	}
+ 
+-	function denyAccess() {
++	async function denyAccess() {
+ 		// Let the client know the user declined so it can show its own message.
+-		window.location.href = createRedirectURL(callbackURL, {
+-			error: 'access_denied',
+-			state: authorizeState
+-		});
++		await redirectWithError('access_denied');
+ 	}
+ 
+-	function redirectWithError(error: string) {
+-		const redirectURL = new URL(callbackURL);
+-		if (redirectURL.protocol == 'javascript:' || redirectURL.protocol == 'data:') {
+-			throw new Error('Invalid redirect URL protocol');
+-		}
++	async function redirectWithError(error: string, validatedCallbackURL?: string) {
++		isLoading = true;
++
++		try {
++			const safeCallbackURL =
++				validatedCallbackURL ||
++				(await oidService.resolveAuthorizeCallbackURL(client!.id, callbackURL, requestURI))
++					.callbackURL;
++			const redirectURL = new URL(safeCallbackURL);
++			if (redirectURL.protocol == 'javascript:' || redirectURL.protocol == 'data:') {
++				throw new Error('Invalid redirect URL protocol');
++			}
+ 
+-		window.location.href = createRedirectURL(callbackURL, {
+-			error,
+-			state: authorizeState
+-		});
++			window.location.href = createRedirectURL(safeCallbackURL, {
++				error,
++				state: authorizeState
++			});
++		} catch (e) {
++			errorMessage = getAxiosErrorMessage(e);
++			isLoading = false;
++		}
+ 	}
+ 
+ 	function onSuccess(code: string, callbackURL: string, issuer: string) {

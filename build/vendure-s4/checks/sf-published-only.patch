@@ -1,0 +1,95 @@
+--- a/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
++++ b/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
+@@ -1,4 +1,5 @@
+ import { Args, Info, Query, Resolver } from '@nestjs/graphql';
++import { LogicalOperator } from '@vendure/common/lib/generated-types';
+ import {
+     QueryCollectionArgs,
+     QueryCollectionsArgs,
+@@ -17,6 +18,7 @@
+ import { CacheKey } from '../../../common/constants';
+ import { InternalServerError, UserInputError } from '../../../common/error/errors';
+ import { ListQueryOptions } from '../../../common/types/common-types';
++import { combineGuardFilter } from '../../../service/helpers/list-query-builder/combine-guard-filter';
+ import { Translated } from '../../../common/types/locale-types';
+ import { Collection } from '../../../entity/collection/collection.entity';
+ import { Facet } from '../../../entity/facet/facet.entity';
+@@ -48,13 +50,7 @@
+         @Args() args: QueryProductsArgs,
+         @Relations({ entity: Product, omit: ['variants', 'assets'] }) relations: RelationPaths<Product>,
+     ): Promise<PaginatedList<Translated<Product>>> {
+-        const options: ListQueryOptions<Product> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                enabled: { eq: true },
+-            },
+-        };
++        const options = combineGuardFilter<Product>(args.options, { enabled: { eq: true } });
+         return this.productService.findAll(ctx, options, relations);
+     }
+ 
+@@ -108,14 +104,8 @@
+         relations: RelationPaths<Collection>,
+         @Info() info: GraphQLResolveInfo,
+     ): Promise<PaginatedList<Translated<Collection>>> {
+-        const options: ListQueryOptions<Collection> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        const collections = await this.collectionService.findAll(ctx, options || undefined, relations);
++        const options = combineGuardFilter<Collection>(args.options, { isPrivate: { eq: false } });
++        const collections = await this.collectionService.findAll(ctx, options, relations);
+         // Cache the variant counts query promise if productVariantCount is requested,
+         // allowing the DB query to start before the field resolvers are called
+         if (isFieldInSelection(info, 'productVariantCount')) {
+@@ -164,14 +154,8 @@
+         @Args() args: QueryFacetsArgs,
+         @Relations(Facet) relations: RelationPaths<Facet>,
+     ): Promise<PaginatedList<Translated<Facet>>> {
+-        const options: ListQueryOptions<Facet> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        return this.facetService.findAll(ctx, options || undefined, relations);
++        const options = combineGuardFilter<Facet>(args.options, { isPrivate: { eq: false } });
++        return this.facetService.findAll(ctx, options, relations);
+     }
+ 
+     @Query()
+--- a/packages/core/src/service/helpers/list-query-builder/combine-guard-filter.ts
++++ b/packages/core/src/service/helpers/list-query-builder/combine-guard-filter.ts
+@@ -0,0 +1,27 @@
++import { LogicalOperator } from '@vendure/common/lib/generated-types';
++
++import { FilterParameter, ListQueryOptions, NullOptionals } from '../../../common/types/common-types';
++import { VendureEntity } from '../../../entity/base/base.entity';
++
++/**
++ * Combines the caller-supplied filter with a mandatory guard filter using AND semantics, while
++ * preserving the caller's own `filterOperator` over their own filter fields.
++ */
++export function combineGuardFilter<T extends VendureEntity>(
++    options: ListQueryOptions<T> | null | undefined,
++    guard: NullOptionals<FilterParameter<T>>,
++): ListQueryOptions<T> {
++    const userFilter = options?.filter;
++    if (!userFilter || Object.keys(userFilter).length === 0) {
++        return { ...options, filter: guard, filterOperator: undefined };
++    }
++    type Filter = NullOptionals<FilterParameter<T>>;
++    const userBlock = (
++        options?.filterOperator === LogicalOperator.OR ? { _or: [userFilter] } : { _and: [userFilter] }
++    ) as Filter;
++    return {
++        ...options,
++        filter: { _and: [userBlock, guard] } as Filter,
++        filterOperator: undefined,
++    };
++}

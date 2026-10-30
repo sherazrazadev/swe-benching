@@ -1,0 +1,196 @@
+--- a/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts
++++ b/packages/core/src/api/resolvers/entity/collection-entity.resolver.ts
+@@ -10,6 +10,7 @@
+ import { RequestContextCacheService } from '../../../cache/request-context-cache.service';
+ import { CacheKey } from '../../../common/constants';
+ import { ListQueryOptions } from '../../../common/types/common-types';
++import { combineGuardFilter } from '../../../service/helpers/list-query-builder/combine-guard-filter';
+ import { Translated } from '../../../common/types/locale-types';
+ import { CollectionFilter } from '../../../config/catalog/collection-filter';
+ import { Asset, Collection, Product, ProductVariant } from '../../../entity';
+@@ -63,15 +64,9 @@
+         @Api() apiType: ApiType,
+         @Relations({ entity: ProductVariant, omit: ['assets'] }) relations: RelationPaths<ProductVariant>,
+     ): Promise<PaginatedList<Translated<ProductVariant>>> {
+-        let options: ListQueryOptions<Product> = args.options;
++        let options: ListQueryOptions<ProductVariant> = args.options;
+         if (apiType === 'shop') {
+-            options = {
+-                ...args.options,
+-                filter: {
+-                    ...(args.options ? args.options.filter : {}),
+-                    enabled: { eq: true },
+-                },
+-            };
++            options = combineGuardFilter<ProductVariant>(args.options, { enabled: { eq: true } });
+         }
+         return this.productVariantService.getVariantsByCollectionId(ctx, collection.id, options, relations);
+     }
+--- a/packages/core/src/api/resolvers/entity/product-entity.resolver.ts
++++ b/packages/core/src/api/resolvers/entity/product-entity.resolver.ts
+@@ -81,17 +81,7 @@
+         @Api() apiType: ApiType,
+         @Relations({ entity: ProductVariant, omit: ['assets'] }) relations: RelationPaths<ProductVariant>,
+     ): Promise<PaginatedList<ProductVariant>> {
+-        let options: ListQueryOptions<ProductVariant> = args.options;
+-        if (apiType === 'shop') {
+-            options = {
+-                ...args.options,
+-                filter: {
+-                    ...(args.options && args.options.filter),
+-                    enabled: { eq: true },
+-                },
+-            };
+-        }
+-        return this.productVariantService.getVariantsByProductId(ctx, product.id, options, relations);
++        return this.productVariantService.getVariantsByProductId(ctx, product.id, args.options, relations);
+     }
+ 
+     @ResolveField()
+--- a/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
++++ b/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
+@@ -1,4 +1,5 @@
+ import { Args, Info, Query, Resolver } from '@nestjs/graphql';
++import { LogicalOperator } from '@vendure/common/lib/generated-types';
+ import {
+     QueryCollectionArgs,
+     QueryCollectionsArgs,
+@@ -17,6 +18,7 @@
+ import { CacheKey } from '../../../common/constants';
+ import { InternalServerError, UserInputError } from '../../../common/error/errors';
+ import { ListQueryOptions } from '../../../common/types/common-types';
++import { combineGuardFilter } from '../../../service/helpers/list-query-builder/combine-guard-filter';
+ import { Translated } from '../../../common/types/locale-types';
+ import { Collection } from '../../../entity/collection/collection.entity';
+ import { Facet } from '../../../entity/facet/facet.entity';
+@@ -48,13 +50,7 @@
+         @Args() args: QueryProductsArgs,
+         @Relations({ entity: Product, omit: ['variants', 'assets'] }) relations: RelationPaths<Product>,
+     ): Promise<PaginatedList<Translated<Product>>> {
+-        const options: ListQueryOptions<Product> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                enabled: { eq: true },
+-            },
+-        };
++        const options = combineGuardFilter<Product>(args.options, { enabled: { eq: true } });
+         return this.productService.findAll(ctx, options, relations);
+     }
+ 
+@@ -63,13 +59,7 @@
+         @Ctx() ctx: RequestContext,
+         @Args() args: { options?: ProductVariantListOptions },
+     ): Promise<PaginatedList<Translated<ProductVariant>>> {
+-        const options: ListQueryOptions<ProductVariant> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                enabled: { eq: true },
+-            },
+-        };
++        const options = combineGuardFilter<ProductVariant>(args.options, { enabled: { eq: true } });
+         return this.productVariantService.findAll(ctx, options);
+     }
+ 
+@@ -108,14 +98,8 @@
+         relations: RelationPaths<Collection>,
+         @Info() info: GraphQLResolveInfo,
+     ): Promise<PaginatedList<Translated<Collection>>> {
+-        const options: ListQueryOptions<Collection> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        const collections = await this.collectionService.findAll(ctx, options || undefined, relations);
++        const options = combineGuardFilter<Collection>(args.options, { isPrivate: { eq: false } });
++        const collections = await this.collectionService.findAll(ctx, options, relations);
+         // Cache the variant counts query promise if productVariantCount is requested,
+         // allowing the DB query to start before the field resolvers are called
+         if (isFieldInSelection(info, 'productVariantCount')) {
+@@ -164,14 +148,8 @@
+         @Args() args: QueryFacetsArgs,
+         @Relations(Facet) relations: RelationPaths<Facet>,
+     ): Promise<PaginatedList<Translated<Facet>>> {
+-        const options: ListQueryOptions<Facet> = {
+-            ...args.options,
+-            filter: {
+-                ...(args.options && args.options.filter),
+-                isPrivate: { eq: false },
+-            },
+-        };
+-        return this.facetService.findAll(ctx, options || undefined, relations);
++        const options = combineGuardFilter<Facet>(args.options, { isPrivate: { eq: false } });
++        return this.facetService.findAll(ctx, options, relations);
+     }
+ 
+     @Query()
+--- a/packages/core/src/service/helpers/list-query-builder/combine-guard-filter.ts
++++ b/packages/core/src/service/helpers/list-query-builder/combine-guard-filter.ts
+@@ -0,0 +1,27 @@
++import { LogicalOperator } from '@vendure/common/lib/generated-types';
++
++import { FilterParameter, ListQueryOptions, NullOptionals } from '../../../common/types/common-types';
++import { VendureEntity } from '../../../entity/base/base.entity';
++
++/**
++ * Combines the caller-supplied filter with a mandatory guard filter using AND semantics, while
++ * preserving the caller's own `filterOperator` over their own filter fields.
++ */
++export function combineGuardFilter<T extends VendureEntity>(
++    options: ListQueryOptions<T> | null | undefined,
++    guard: NullOptionals<FilterParameter<T>>,
++): ListQueryOptions<T> {
++    const userFilter = options?.filter;
++    if (!userFilter || Object.keys(userFilter).length === 0) {
++        return { ...options, filter: guard, filterOperator: undefined };
++    }
++    type Filter = NullOptionals<FilterParameter<T>>;
++    const userBlock = (
++        options?.filterOperator === LogicalOperator.OR ? { _or: [userFilter] } : { _and: [userFilter] }
++    ) as Filter;
++    return {
++        ...options,
++        filter: { _and: [userBlock, guard] } as Filter,
++        filterOperator: undefined,
++    };
++}
+--- a/packages/core/src/service/services/product-variant.service.ts
++++ b/packages/core/src/service/services/product-variant.service.ts
+@@ -107,14 +107,14 @@
+             relations.push('facetValues');
+             customPropertyMap.facetValueId = 'facetValues.id';
+         }
+-        return this.listQueryBuilder
+-            .build(ProductVariant, options, {
+-                relations,
+-                channelId: ctx.channelId,
+-                where: { deletedAt: IsNull() },
+-                ctx,
+-                customPropertyMap,
+-            })
++        const qb = this.listQueryBuilder.build(ProductVariant, options, {
++            relations,
++            channelId: ctx.channelId,
++            where: { deletedAt: IsNull() },
++            ctx,
++            customPropertyMap,
++        });
++        return qb
+             .getManyAndCount()
+             .then(async ([variants, totalItems]) => {
+                 const items = await this.applyPricesAndTranslateVariants(ctx, variants);
+@@ -191,10 +191,7 @@
+                 productId,
+             });
+ 
+-        // When the caller already supplies the enabled guard through the list options, applying
+-        // it again here would duplicate the condition, so it is only added implicitly otherwise.
+-        const hasEnabledGuard = options && options.filter && options.filter.enabled?.eq === true;
+-        if (ctx.apiType === 'shop' && !hasEnabledGuard) {
++        if (ctx.apiType === 'shop') {
+             qb.andWhere('productvariant.enabled = :enabled', { enabled: true });
+         }
+ 

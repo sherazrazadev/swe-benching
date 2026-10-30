@@ -1,0 +1,214 @@
+diff -ruN pristine/packages/asset-emitter/src/asset-emitter.ts app/packages/asset-emitter/src/asset-emitter.ts
+--- a/packages/asset-emitter/src/asset-emitter.ts	2026-10-29 17:57:29.000000000 +0000
++++ b/packages/asset-emitter/src/asset-emitter.ts	2026-10-29 19:26:02.816707109 +0000
+@@ -7,7 +7,7 @@
+   compilerAssert,
+   getTypeName,
+   isTemplateDeclaration,
+-  joinPaths,
++  resolvePathUnder,
+ } from "@typespec/compiler";
+ import { $ } from "@typespec/compiler/typekit";
+ import { CustomKeyMap } from "./custom-key-map.js";
+@@ -198,7 +198,7 @@
+       const basePath = options.emitterOutputDir;
+       const sourceFile = {
+         globalScope: undefined as any,
+-        path: joinPaths(basePath, path),
++        path: resolvePathUnder(basePath, path),
+         imports: new Map(),
+         meta: {},
+       };
+diff -ruN pristine/packages/compiler/src/core/helpers/index.ts app/packages/compiler/src/core/helpers/index.ts
+--- a/packages/compiler/src/core/helpers/index.ts	2026-10-29 17:57:29.000000000 +0000
++++ b/packages/compiler/src/core/helpers/index.ts	2026-10-29 19:25:54.904771141 +0000
+@@ -5,6 +5,7 @@
+ export type { DiscriminatedUnion, DiscriminatedUnionLegacy } from "./discriminator-utils.js";
+ export { getLocationContext } from "./location-context.js";
+ export { listOperationsIn, type ListOperationOptions } from "./operation-utils.js";
++export { resolvePathUnder, sanitizePathComponent } from "./path-containment.js";
+ export { interpolatePath } from "./path-interpolation.js";
+ 
+ export { cacheRawText, getCachedRawText, getRawTextWithCache } from "./raw-text-cache.js";
+diff -ruN pristine/packages/compiler/src/core/helpers/path-containment.ts app/packages/compiler/src/core/helpers/path-containment.ts
+--- a/packages/compiler/src/core/helpers/path-containment.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/packages/compiler/src/core/helpers/path-containment.ts	2026-10-29 19:27:16.752121208 +0000
+@@ -0,0 +1,59 @@
++import { joinPaths } from "../path-utils.js";
++
++/**
++ * Characters that let a value change the shape of a path instead of naming a single
++ * entry: path separators, the volume/drive separator, and NUL.
++ */
++const PathComponentSeparatorChars = /[/\\:\0]/g;
++
++/** A component that is nothing but dots refers to the current or a parent directory. */
++const DirectoryReferenceComponent = /^\.+$/;
++
++/**
++ * Turn an arbitrary value into a single, ordinary path component.
++ *
++ * Separators, drive separators and NUL become `_`, and a component made only of dots
++ * (`.`, `..`, `...`) becomes `_`. Everything else, including embedded dots such as
++ * `Pet.Store` or `2021-10-01-preview`, is preserved so that legitimate names keep the
++ * file and directory names they always had.
++ *
++ * @param value Value to turn into one path component.
++ */
++export function sanitizePathComponent(value: string): string {
++  const component = value.replace(PathComponentSeparatorChars, "_");
++  return DirectoryReferenceComponent.test(component) ? "_" : component;
++}
++
++/**
++ * Resolve a path relative to `baseDir`, guaranteeing that the result is inside `baseDir`.
++ *
++ * The path is split on both separator styles, empty and `.` components are dropped,
++ * `..` components are resolved without ever climbing above `baseDir`, and every
++ * remaining component is passed through {@link sanitizePathComponent}. Absolute input
++ * therefore becomes relative to `baseDir` instead of replacing it.
++ *
++ * @param baseDir Directory the result must stay inside.
++ * @param path Path built from untrusted values (for example a spec-supplied name).
++ */
++export function resolvePathUnder(baseDir: string, path: string): string {
++  // Preserve the previous behaviour for a path that does not name anything at all.
++  if (path === "") {
++    return baseDir;
++  }
++
++  const components: string[] = [];
++  for (const component of path.split(/[/\\]+/)) {
++    if (component === "" || component === ".") {
++      continue;
++    }
++    if (component === "..") {
++      // Stay at `baseDir` rather than escaping it.
++      components.pop();
++      continue;
++    }
++    components.push(sanitizePathComponent(component));
++  }
++
++  // An empty result would name `baseDir` itself, which is never a writable file.
++  return joinPaths(baseDir, components.length === 0 ? "_" : components.join("/"));
++}
+diff -ruN pristine/packages/compiler/src/index.ts app/packages/compiler/src/index.ts
+--- a/packages/compiler/src/index.ts	2026-10-29 17:57:29.000000000 +0000
++++ b/packages/compiler/src/index.ts	2026-10-29 19:25:56.713756494 +0000
+@@ -61,7 +61,9 @@
+   isStdNamespace,
+   listOperationsIn,
+   printIdentifier,
++  resolvePathUnder,
+   resolveUsages,
++  sanitizePathComponent,
+   UsageFlags,
+ } from "./core/helpers/index.js";
+ export type {
+diff -ruN pristine/packages/graphql/src/emitter.tsx app/packages/graphql/src/emitter.tsx
+--- a/packages/graphql/src/emitter.tsx	2026-10-29 17:57:29.000000000 +0000
++++ b/packages/graphql/src/emitter.tsx	2026-10-29 19:26:12.874623627 +0000
+@@ -3,6 +3,7 @@
+   emitFile,
+   interpolatePath,
+   resolvePath,
++  sanitizePathComponent,
+   type EmitContext,
+   type Namespace,
+   type Program,
+@@ -32,7 +33,7 @@
+       if (!context.program.compilerOptions.dryRun) {
+         const outputFile = context.options["output-file"] ?? "{schema-name}.graphql";
+         const fileName = interpolatePath(outputFile, {
+-          "schema-name": schema.name ?? "schema",
++          "schema-name": sanitizePathComponent(schema.name ?? "schema"),
+         });
+         await emitFile(context.program, {
+           path: resolvePath(context.emitterOutputDir, fileName),
+diff -ruN pristine/packages/json-schema/src/output-index.ts app/packages/json-schema/src/output-index.ts
+--- a/packages/json-schema/src/output-index.ts	2026-10-29 17:58:02.000000000 +0000
++++ b/packages/json-schema/src/output-index.ts	2026-10-29 19:26:19.909560094 +0000
+@@ -1,4 +1,4 @@
+-import { emitFile, joinPaths, type Program } from "@typespec/compiler";
++import { emitFile, joinPaths, resolvePathUnder, type Program } from "@typespec/compiler";
+ 
+ /**
+  * Write the index files for the namespaces that had schemas emitted.
+@@ -19,7 +19,7 @@
+ ): Promise<void> {
+   for (const [namespace, files] of entries) {
+     await emitFile(program, {
+-      path: joinPaths(emitterOutputDir, namespace, "index.json"),
++      path: joinPaths(resolvePathUnder(emitterOutputDir, namespace), "index.json"),
+       content: JSON.stringify({ namespace, files: [...files].sort() }, null, 2),
+     });
+   }
+diff -ruN pristine/packages/openapi3/src/openapi.ts app/packages/openapi3/src/openapi.ts
+--- a/packages/openapi3/src/openapi.ts	2026-10-29 17:57:30.000000000 +0000
++++ b/packages/openapi3/src/openapi.ts	2026-10-29 19:26:09.719652765 +0000
+@@ -41,6 +41,7 @@
+   navigateTypesInNamespace,
+   NoTarget,
+   resolvePath,
++  sanitizePathComponent,
+ } from "@typespec/compiler";
+ import type { unsafe_MutatorWithNamespace } from "@typespec/compiler/experimental";
+ import { unsafe_mutateSubgraphWithNamespace } from "@typespec/compiler/experimental";
+@@ -634,10 +635,12 @@
+   ): string {
+     return interpolatePath(options.outputFile, {
+       "openapi-version": specVersion,
+-      "service-name-if-multiple": multipleService ? getNamespaceFullName(service.type) : undefined,
+-      "service-name": getNamespaceFullName(service.type),
++      "service-name-if-multiple": multipleService
++        ? sanitizePathComponent(getNamespaceFullName(service.type))
++        : undefined,
++      "service-name": sanitizePathComponent(getNamespaceFullName(service.type)),
+       "file-type": fileType,
+-      version,
++      version: version === undefined ? undefined : sanitizePathComponent(version),
+     });
+   }
+ 
+diff -ruN pristine/packages/protobuf/src/transform/descriptor-index.ts app/packages/protobuf/src/transform/descriptor-index.ts
+--- a/packages/protobuf/src/transform/descriptor-index.ts	2026-10-29 17:58:02.000000000 +0000
++++ b/packages/protobuf/src/transform/descriptor-index.ts	2026-10-29 19:26:29.450477025 +0000
+@@ -1,7 +1,7 @@
+ // Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+-import { resolvePath, type Program } from "@typespec/compiler";
++import { resolvePath, sanitizePathComponent, type Program } from "@typespec/compiler";
+ import type { ProtoFile } from "../ast.js";
+ 
+ /**
+@@ -29,7 +29,7 @@
+   }));
+ 
+   await program.host.writeFile(
+-    resolvePath(outDir, `${file.package}.descriptor.json`),
++    resolvePath(outDir, `${sanitizePathComponent(file.package)}.descriptor.json`),
+     JSON.stringify({ package: file.package, declarations }, null, 2),
+   );
+ }
+diff -ruN pristine/packages/protobuf/src/transform/index.ts app/packages/protobuf/src/transform/index.ts
+--- a/packages/protobuf/src/transform/index.ts	2026-10-29 17:58:02.000000000 +0000
++++ b/packages/protobuf/src/transform/index.ts	2026-10-29 19:26:25.407512299 +0000
+@@ -27,6 +27,7 @@
+   isTemplateInstance,
+   isType,
+   resolvePath,
++  sanitizePathComponent,
+ } from "@typespec/compiler";
+ import { SyntaxKind } from "@typespec/compiler/ast";
+ import { capitalize } from "@typespec/compiler/casing";
+@@ -74,7 +75,7 @@
+ 
+         // Collisions have already been detected.
+ 
+-        const packageSlug = file.package?.split(".") ?? ["main"];
++        const packageSlug = (file.package?.split(".") ?? ["main"]).map(sanitizePathComponent);
+         const filePath = resolvePath(outDir, ...packageSlug.slice(0, -1));
+ 
+         await program.host.mkdirp(filePath);

@@ -1,0 +1,119 @@
+--- a/packages/core/src/service/services/collection.service.ts
++++ b/packages/core/src/service/services/collection.service.ts
+@@ -209,6 +209,10 @@
+             });
+         }
+ 
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('collection.isPrivate = :isPrivate', { isPrivate: false });
++        }
++
+         return qb.getManyAndCount().then(async ([collections, totalItems]) => {
+             const items = collections.map(collection =>
+                 this.translator.translate(collection, ctx, ['parent']),
+--- a/packages/core/src/service/services/facet.service.ts
++++ b/packages/core/src/service/services/facet.service.ts
+@@ -63,12 +63,15 @@
+         options?: ListQueryOptions<Facet>,
+         relations?: RelationPaths<Facet>,
+     ): Promise<PaginatedList<Translated<Facet>>> {
+-        return this.listQueryBuilder
+-            .build(Facet, options, {
+-                relations: relations ?? ['values', 'values.facet', 'channels'],
+-                ctx,
+-                channelId: ctx.channelId,
+-            })
++        const qb = this.listQueryBuilder.build(Facet, options, {
++            relations: relations ?? ['values', 'values.facet', 'channels'],
++            ctx,
++            channelId: ctx.channelId,
++        });
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('facet.isPrivate = :isPrivate', { isPrivate: false });
++        }
++        return qb
+             .getManyAndCount()
+             .then(([facets, totalItems]) => {
+                 const items = facets.map(facet =>
+--- a/packages/core/src/service/services/product-variant.service.ts
++++ b/packages/core/src/service/services/product-variant.service.ts
+@@ -107,14 +107,19 @@
+             relations.push('facetValues');
+             customPropertyMap.facetValueId = 'facetValues.id';
+         }
+-        return this.listQueryBuilder
+-            .build(ProductVariant, options, {
+-                relations,
+-                channelId: ctx.channelId,
+-                where: { deletedAt: IsNull() },
+-                ctx,
+-                customPropertyMap,
+-            })
++        const qb = this.listQueryBuilder.build(ProductVariant, options, {
++            relations,
++            channelId: ctx.channelId,
++            where: { deletedAt: IsNull() },
++            ctx,
++            customPropertyMap,
++        });
++        if (ctx.apiType === 'shop') {
++            qb.innerJoin('productvariant.product', 'product')
++                .andWhere('productvariant.enabled = :enabled', { enabled: true })
++                .andWhere('product.enabled = :enabled', { enabled: true });
++        }
++        return qb
+             .getManyAndCount()
+             .then(async ([variants, totalItems]) => {
+                 const items = await this.applyPricesAndTranslateVariants(ctx, variants);
+@@ -191,10 +196,7 @@
+                 productId,
+             });
+ 
+-        // When the caller already supplies the enabled guard through the list options, applying
+-        // it again here would duplicate the condition, so it is only added implicitly otherwise.
+-        const hasEnabledGuard = options && options.filter && options.filter.enabled?.eq === true;
+-        if (ctx.apiType === 'shop' && !hasEnabledGuard) {
++        if (ctx.apiType === 'shop') {
+             qb.andWhere('productvariant.enabled = :enabled', { enabled: true });
+         }
+ 
+@@ -233,6 +235,11 @@
+             qb.andWhere('product.enabled = :enabled', { enabled: true });
+         }
+ 
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('productvariant.enabled = :enabled', { enabled: true })
++                .andWhere('product.enabled = :enabled', { enabled: true });
++        }
++
+         return qb.getManyAndCount().then(async ([variants, totalItems]) => {
+             const items = await this.applyPricesAndTranslateVariants(ctx, variants);
+             return {
+--- a/packages/core/src/service/services/product.service.ts
++++ b/packages/core/src/service/services/product.service.ts
+@@ -104,14 +104,17 @@
+             customPropertyMap.optionGroupId = 'optionGroups.id';
+         }
+ 
+-        return this.listQueryBuilder
+-            .build(Product, options, {
+-                relations: effectiveRelations,
+-                channelId: ctx.channelId,
+-                where: { deletedAt: IsNull() },
+-                ctx,
+-                customPropertyMap,
+-            })
++        const qb = this.listQueryBuilder.build(Product, options, {
++            relations: effectiveRelations,
++            channelId: ctx.channelId,
++            where: { deletedAt: IsNull() },
++            ctx,
++            customPropertyMap,
++        });
++        if (ctx.apiType === 'shop') {
++            qb.andWhere('product.enabled = :enabled', { enabled: true });
++        }
++        return qb
+             .getManyAndCount()
+             .then(async ([products, totalItems]) => {
+                 const items = products.map(product =>

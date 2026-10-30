@@ -1,0 +1,114 @@
+diff -ruN pristine/packages/kit/src/runtime/client/remote-functions/form.svelte.js app/packages/kit/src/runtime/client/remote-functions/form.svelte.js
+--- a/packages/kit/src/runtime/client/remote-functions/form.svelte.js	2026-10-29 17:29:56.000000000 +0000
++++ b/packages/kit/src/runtime/client/remote-functions/form.svelte.js	2026-10-29 17:51:13.156666589 +0000
+@@ -14,6 +14,7 @@
+ 	create_field_proxy,
+ 	deep_set,
+ 	set_nested_value,
++	unset_nested_value,
+ 	throw_on_old_property_access,
+ 	build_path_string,
+ 	normalize_issue,
+@@ -502,13 +503,7 @@
+ 
+ 					if (is_file && value.length === 0) {
+ 						// an emptied file input means the selection is gone, so drop the field
+-						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
+-						}
+-						delete current[path_parts[path_parts.length - 1]];
++						unset_nested_value(input, name);
+ 					} else {
+ 						set_nested_value(input, name, value);
+ 					}
+@@ -524,14 +519,8 @@
+ 					if (file) {
+ 						set_nested_value(input, name, file);
+ 					} else {
+-						// Remove the property by setting to undefined and clean up
+-						const path_parts = name.split(/\.|\[|\]/).filter(Boolean);
+-						let current = /** @type {any} */ (input);
+-						for (let i = 0; i < path_parts.length - 1; i++) {
+-							if (current[path_parts[i]] == null) return;
+-							current = current[path_parts[i]];
+-						}
+-						delete current[path_parts[path_parts.length - 1]];
++						// no file selected, so drop the field from the stored values
++						unset_nested_value(input, name);
+ 					}
+ 				} else {
+ 					set_nested_value(
+diff -ruN pristine/packages/kit/src/runtime/form-utils.js app/packages/kit/src/runtime/form-utils.js
+--- a/packages/kit/src/runtime/form-utils.js	2026-10-29 17:29:56.000000000 +0000
++++ b/packages/kit/src/runtime/form-utils.js	2026-10-29 17:51:09.332652506 +0000
+@@ -28,6 +28,48 @@
+ }
+ 
+ /**
++ * Removes the value at `path_string` from a nested object, mutating the original object.
++ *
++ * Every part of the path is treated as data and validated before anything is touched, so a
++ * field name can never reach a shared object by way of an inherited member. A path that is not
++ * currently stored is left alone: no intermediate objects or arrays are created, and the leaf
++ * is only removed when it is an own property of its container.
++ * @param {Record<string, any>} object
++ * @param {string} path_string
++ */
++export function unset_nested_value(object, path_string) {
++	if (path_string.startsWith('n:') || path_string.startsWith('b:')) {
++		path_string = path_string.slice(2);
++	}
++
++	const keys = split_path(path_string);
++
++	// validate the entire name up front so a dangerous part is refused even when the
++	// containing path turns out not to be stored
++	for (const key of keys) {
++		check_prototype_pollution(key);
++	}
++
++	let current = object;
++
++	for (let i = 0; i < keys.length - 1; i += 1) {
++		const key = keys[i];
++
++		if (!Object.hasOwn(current, key)) return;
++
++		const next = current[key];
++		if (next === null || typeof next !== 'object') return;
++
++		current = next;
++	}
++
++	const final_key = keys[keys.length - 1];
++	if (Object.hasOwn(current, final_key)) {
++		delete current[final_key];
++	}
++}
++
++/**
+  * Convert `FormData` into a POJO
+  * @param {FormData} data
+  */
+@@ -48,17 +90,7 @@
+ 		);
+ 		if (values.length === 0 && !is_array) {
+ 			// an empty file input was cleared, so drop the field from the result
+-			const path_parts = key.split(/\.|\[|\]/).filter(Boolean);
+-			let current = /** @type {any} */ (result);
+-			let traversed = true;
+-			for (let i = 0; i < path_parts.length - 1; i++) {
+-				if (current[path_parts[i]] == null) {
+-					traversed = false;
+-					break;
+-				}
+-				current = current[path_parts[i]];
+-			}
+-			if (traversed) delete current[path_parts[path_parts.length - 1]];
++			unset_nested_value(result, key);
+ 			continue;
+ 		}
+ 

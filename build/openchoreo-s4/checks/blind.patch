@@ -1,0 +1,563 @@
+diff -ruN a/internal/openchoreo-api/api/handlers/webhook_handler.go b/internal/openchoreo-api/api/handlers/webhook_handler.go
+--- a/internal/openchoreo-api/api/handlers/webhook_handler.go	2026-10-29 17:30:36.000000000 +0000
++++ b/internal/openchoreo-api/api/handlers/webhook_handler.go	2026-10-29 18:28:46.151309523 +0000
+@@ -21,6 +21,21 @@
+ // capture the raw bytes in a middleware before decoding occurs.
+ type webhookRawBodyKey struct{}
+ 
++// webhookHeadersKey is the context key for the webhook request's headers.
++// The OpenAPI parameter decoding only keeps the headers declared in the spec,
++// so the middleware also captures the full header set: a provider's credential
++// header is not necessarily one of the declared parameters.
++type webhookHeadersKey struct{}
++
++// Headers that carry a delivery's credential, per provider. GitHub and GitLab
++// also appear in the generated request parameters; Bitbucket's signature header
++// does not, and is read from the captured request headers.
++const (
++	githubSignatureHeader    = "X-Hub-Signature-256"
++	gitlabTokenHeader        = "X-Gitlab-Token"
++	bitbucketSignatureHeader = "X-Hub-Signature"
++)
++
+ // maxWebhookPayloadSize is the maximum accepted webhook request body size (1 MB).
+ const maxWebhookPayloadSize = 1 << 20
+ 
+@@ -41,7 +56,9 @@
+ 				}
+ 				return
+ 			}
+-			r = r.WithContext(context.WithValue(r.Context(), webhookRawBodyKey{}, rawBody))
++			ctx := context.WithValue(r.Context(), webhookRawBodyKey{}, rawBody)
++			ctx = context.WithValue(ctx, webhookHeadersKey{}, r.Header.Clone())
++			r = r.WithContext(ctx)
+ 			r.Body = io.NopCloser(bytes.NewReader(rawBody))
+ 		}
+ 		next.ServeHTTP(w, r)
+@@ -52,24 +69,25 @@
+ func detectGitProviderFromParams(params gen.HandleAutoBuildParams) (git.ProviderType, string, string, bool) {
+ 	switch {
+ 	case params.XHubSignature256 != nil && *params.XHubSignature256 != "":
+-		return git.ProviderGitHub, "X-Hub-Signature-256", "github-secret", true
++		return git.ProviderGitHub, githubSignatureHeader, "github-secret", true
+ 	case params.XGitlabToken != nil && *params.XGitlabToken != "":
+-		return git.ProviderGitLab, "X-Gitlab-Token", "gitlab-secret", true
++		return git.ProviderGitLab, gitlabTokenHeader, "gitlab-secret", true
+ 	case params.XEventKey != nil && *params.XEventKey != "":
+-		return git.ProviderBitbucket, "", "bitbucket-secret", true
++		return git.ProviderBitbucket, bitbucketSignatureHeader, "bitbucket-secret", true
+ 	default:
+ 		return "", "", "", false
+ 	}
+ }
+ 
+-// signatureFromParams extracts the signature value from the parsed header parameters.
++// signatureFromParams extracts the credential value from the parsed header
++// parameters.
+ func signatureFromParams(params gen.HandleAutoBuildParams, signatureHeader string) string {
+ 	switch signatureHeader {
+-	case "X-Hub-Signature-256":
++	case githubSignatureHeader:
+ 		if params.XHubSignature256 != nil {
+ 			return *params.XHubSignature256
+ 		}
+-	case "X-Gitlab-Token":
++	case gitlabTokenHeader:
+ 		if params.XGitlabToken != nil {
+ 			return *params.XGitlabToken
+ 		}
+@@ -77,6 +95,17 @@
+ 	return ""
+ }
+ 
++// signatureFromHeaders extracts the credential value from the request headers
++// captured by WebhookRawBodyMiddleware. It covers the providers whose credential
++// header is not part of the generated request parameters.
++func signatureFromHeaders(ctx context.Context, signatureHeader string) string {
++	headers, ok := ctx.Value(webhookHeadersKey{}).(http.Header)
++	if !ok {
++		return ""
++	}
++	return headers.Get(signatureHeader)
++}
++
+ // HandleAutoBuild processes incoming webhook events from any supported git provider.
+ // The provider is detected from the request headers (X-Hub-Signature-256, X-Gitlab-Token, X-Event-Key).
+ func (h *Handler) HandleAutoBuild(
+@@ -105,10 +134,18 @@
+ 		}, nil
+ 	}
+ 
++	// The credential is taken from the parsed parameters when the spec declares
++	// its header, and from the captured request headers otherwise. Either way the
++	// service validates it; an absent credential is refused, never skipped.
++	signature := signatureFromParams(request.Params, signatureHeader)
++	if signature == "" {
++		signature = signatureFromHeaders(ctx, signatureHeader)
++	}
++
+ 	result, err := h.services.AutoBuildService.ProcessWebhook(ctx, &autobuildsvc.ProcessWebhookParams{
+ 		ProviderType:    providerType,
+ 		SignatureHeader: signatureHeader,
+-		Signature:       signatureFromParams(request.Params, signatureHeader),
++		Signature:       signature,
+ 		SecretKey:       secretKey,
+ 		Payload:         rawBody,
+ 	})
+diff -ruN a/internal/openchoreo-api/services/autobuild/dependents.go b/internal/openchoreo-api/services/autobuild/dependents.go
+--- a/internal/openchoreo-api/services/autobuild/dependents.go	2026-10-29 17:30:43.000000000 +0000
++++ b/internal/openchoreo-api/services/autobuild/dependents.go	2026-10-29 18:28:35.015166396 +0000
+@@ -8,6 +8,7 @@
+ 	"strings"
+ 
+ 	"github.com/openchoreo/openchoreo/api/v1alpha1"
++	"github.com/openchoreo/openchoreo/internal/openchoreo-api/services/git"
+ )
+ 
+ // buildWithAnnotation names the component that a component is rebuilt with.
+@@ -18,8 +19,10 @@
+ const buildWithAnnotation = "openchoreo.dev/build-with"
+ 
+ // expandBuildDependents appends the components that declare a build dependency
+-// on one of the components the webhook already matched.
+-func (s *webhookProcessor) expandBuildDependents(ctx context.Context, affected []*v1alpha1.Component) ([]*v1alpha1.Component, error) {
++// on one of the components the webhook already matched. A dependent is subject
++// to the same authority rule as a matched component: the git service that
++// authenticated the delivery must also host its repository.
++func (s *webhookProcessor) expandBuildDependents(ctx context.Context, affected []*v1alpha1.Component, event *git.WebhookEvent) ([]*v1alpha1.Component, error) {
+ 	if len(affected) == 0 {
+ 		return affected, nil
+ 	}
+@@ -57,6 +60,23 @@
+ 		if comp.Spec.AutoBuild == nil || !*comp.Spec.AutoBuild {
+ 			continue
+ 		}
++		repoURL, _, _, err := s.extractRepoInfoFromComponent(ctx, comp)
++		if err != nil {
++			// Without the repository location the hosting service cannot be
++			// checked, and an unchecked component is not rebuilt.
++			s.logger.Info("Skipping build dependent: failed to extract repository info",
++				"component", comp.Name,
++				"error", err)
++			continue
++		}
++		if !deliveryMayBuild(event.Provider, repoURL) {
++			s.logger.Info("Skipping build dependent: source is hosted by another git service",
++				"component", comp.Name,
++				"componentRepo", repoURL,
++				"webhookProvider", event.Provider,
++				"hostingProvider", providerFromRepositoryURL(repoURL))
++			continue
++		}
+ 		seen[key] = struct{}{}
+ 		affected = append(affected, comp)
+ 	}
+diff -ruN a/internal/openchoreo-api/services/autobuild/service.go b/internal/openchoreo-api/services/autobuild/service.go
+--- a/internal/openchoreo-api/services/autobuild/service.go	2026-10-29 17:30:36.000000000 +0000
++++ b/internal/openchoreo-api/services/autobuild/service.go	2026-10-29 18:28:20.594980287 +0000
+@@ -53,11 +53,12 @@
+ 		return nil, fmt.Errorf("failed to get git provider: %w", err)
+ 	}
+ 
+-	allowEmpty := params.SignatureHeader == ""
+-	webhookSecret, err := s.getWebhookSecret(ctx, params.SecretKey, allowEmpty)
++	// Every delivery is validated against the secret configured for its service.
++	// There is no delivery shape for which a missing secret is acceptable: an
++	// unconfigured key is an authentication failure, not an operational detail.
++	webhookSecret, err := s.getWebhookSecret(ctx, params.SecretKey)
+ 	if err != nil {
+-		s.logger.Error("Failed to get webhook secret", "error", err, "provider", params.ProviderType)
+-		return nil, ErrSecretNotConfigured
++		return nil, err
+ 	}
+ 
+ 	if err := provider.ValidateWebhookPayload(params.Payload, params.Signature, webhookSecret); err != nil {
+@@ -78,33 +79,31 @@
+ 	return &WebhookResult{AffectedComponents: affectedComponents}, nil
+ }
+ 
+-// getWebhookSecret retrieves the webhook secret value for the given key from the Kubernetes Secret.
+-// When allowEmpty is true (e.g. Bitbucket, which has no HMAC header), a missing or empty key is not an error.
+-func (s *autobuildService) getWebhookSecret(ctx context.Context, secretKey string, allowEmpty bool) (string, error) {
++// getWebhookSecret retrieves the webhook secret value for the given key from the
++// Kubernetes Secret. A Secret that cannot be read, a key that is absent and a
++// key with an empty value all fail closed: the caller must not be able to
++// authenticate a delivery for that service.
++//
++// Failures are logged here with non-sensitive metadata only, and reported to
++// callers as ErrSecretNotConfigured so the handler can answer the delivery.
++func (s *autobuildService) getWebhookSecret(ctx context.Context, secretKey string) (string, error) {
+ 	secret := &corev1.Secret{}
+ 	if err := s.k8sClient.Get(ctx, client.ObjectKey{
+ 		Name:      webhookSecretName,
+ 		Namespace: webhookSecretNamespace,
+ 	}, secret); err != nil {
+-		return "", fmt.Errorf("failed to get webhook secret %s/%s: %w",
+-			webhookSecretNamespace, webhookSecretName, err)
++		s.logger.Error("Failed to read webhook secret",
++			"namespace", webhookSecretNamespace, "name", webhookSecretName, "error", err)
++		return "", ErrSecretNotConfigured
+ 	}
+ 
+ 	secretData, ok := secret.Data[secretKey]
+-	if !ok {
+-		if allowEmpty {
+-			return "", nil
+-		}
+-		return "", fmt.Errorf("secret %s/%s does not contain '%s' key",
+-			webhookSecretNamespace, webhookSecretName, secretKey)
+-	}
+-
+-	if len(secretData) == 0 {
+-		if allowEmpty {
+-			return "", nil
+-		}
+-		return "", fmt.Errorf("secret %s/%s has empty '%s' value",
+-			webhookSecretNamespace, webhookSecretName, secretKey)
++	if !ok || len(secretData) == 0 {
++		// The provider key name is deliberately not logged together with the
++		// failure; the caller logs the provider for correlation.
++		s.logger.Error("Webhook secret key is missing or empty",
++			"namespace", webhookSecretNamespace, "name", webhookSecretName)
++		return "", ErrSecretNotConfigured
+ 	}
+ 
+ 	return string(secretData), nil
+diff -ruN a/internal/openchoreo-api/services/autobuild/webhook_processor.go b/internal/openchoreo-api/services/autobuild/webhook_processor.go
+--- a/internal/openchoreo-api/services/autobuild/webhook_processor.go	2026-10-29 17:30:43.000000000 +0000
++++ b/internal/openchoreo-api/services/autobuild/webhook_processor.go	2026-10-29 18:28:30.246107860 +0000
+@@ -8,6 +8,7 @@
+ 	"encoding/json"
+ 	"fmt"
+ 	"log/slog"
++	"net/url"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -71,7 +72,7 @@
+ 	}
+ 
+ 	// Rebuild the components that declare a build dependency on a matched component.
+-	affectedComponents, err = s.expandBuildDependents(ctx, affectedComponents)
++	affectedComponents, err = s.expandBuildDependents(ctx, affectedComponents, event)
+ 	if err != nil {
+ 		s.logger.Error("Failed to expand build dependents", "error", err)
+ 		return nil, fmt.Errorf("failed to expand build dependents: %w", err)
+@@ -143,6 +144,20 @@
+ 			continue
+ 		}
+ 
++		// The delivery was authenticated against the secret of one git service. Its
++		// authority stops at the repositories that service hosts: a component whose
++		// source lives on another service is not built, however the repository
++		// location is written. Locations on services that cannot be classified
++		// (self-managed installations) are left to the repository match.
++		if !deliveryMayBuild(event.Provider, repoURL) {
++			s.logger.Info("Skipping component: source is hosted by another git service",
++				"component", comp.Name,
++				"componentRepo", repoURL,
++				"webhookProvider", event.Provider,
++				"hostingProvider", providerFromRepositoryURL(repoURL))
++			continue
++		}
++
+ 		// Check if component's repository matches the webhook repository
+ 		if !s.matchesRepository(repoURL, event.RepositoryURL) {
+ 			s.logger.Info("Skipping component: repository mismatch",
+@@ -311,6 +326,72 @@
+ 	return def
+ }
+ 
++// hostedGitServices lists the hosted git services a delivery can be authenticated
++// as, keyed by the domain their repository locations use.
++var hostedGitServices = []struct {
++	domain   string
++	provider git.ProviderType
++}{
++	{domain: "github.com", provider: git.ProviderGitHub},
++	{domain: "gitlab.com", provider: git.ProviderGitLab},
++	{domain: "bitbucket.org", provider: git.ProviderBitbucket},
++}
++
++// deliveryMayBuild reports whether a delivery authenticated as authenticatedProvider
++// is allowed to start a build for a component whose repository is at repoURL.
++//
++// A repository on a hosted git service may only be built by a delivery
++// authenticated as that service. A repository on a host that maps to none of
++// them belongs to a self-managed installation, where the hosting service cannot
++// be inferred from the location; such components keep being selected by the
++// repository match alone, as they always have been.
++func deliveryMayBuild(authenticatedProvider, repoURL string) bool {
++	hosting := providerFromRepositoryURL(repoURL)
++	if hosting == "" {
++		return true
++	}
++	return string(hosting) == authenticatedProvider
++}
++
++// providerFromRepositoryURL reports which hosted git service owns repoURL, or ""
++// when the location belongs to a host that is not one of them. It inspects the
++// same normalised form the repository matcher compares, so that every spelling
++// of a location — with a scheme, without a scheme, scp-like or ssh:// — names
++// the same service.
++func providerFromRepositoryURL(repoURL string) git.ProviderType {
++	host := repositoryHost(repoURL)
++	if host == "" {
++		return ""
++	}
++	for _, service := range hostedGitServices {
++		// Match the domain itself and its subdomains, never a host that merely
++		// contains it: "bitbucket.org.example.net" is not Bitbucket.
++		if host == service.domain || strings.HasSuffix(host, "."+service.domain) {
++			return service.provider
++		}
++	}
++	return ""
++}
++
++// repositoryHost extracts the lower-cased host name from a repository location.
++func repositoryHost(repoURL string) string {
++	location := strings.TrimSpace(normalizeWebhookRepoURL(repoURL))
++	if location == "" {
++		return ""
++	}
++	// normalizeWebhookRepoURL rewrites scp-like locations to https://, but leaves
++	// scheme-less ones ("github.com/org/repo") untouched; parse those as https so
++	// the host is inspected rather than silently reported as absent.
++	if !strings.Contains(location, "://") {
++		location = "https://" + location
++	}
++	parsed, err := url.Parse(location)
++	if err != nil {
++		return ""
++	}
++	return strings.ToLower(parsed.Hostname())
++}
++
+ // matchesRepository checks if component's repository matches the webhook repository.
+ func (s *webhookProcessor) matchesRepository(componentRepoURL, webhookRepoURL string) bool {
+ 	// Normalize both URLs for comparison
+diff -ruN a/internal/openchoreo-api/services/git/bitbucket.go b/internal/openchoreo-api/services/git/bitbucket.go
+--- a/internal/openchoreo-api/services/git/bitbucket.go	2026-10-29 17:30:36.000000000 +0000
++++ b/internal/openchoreo-api/services/git/bitbucket.go	2026-10-29 18:28:09.776838989 +0000
+@@ -17,20 +17,11 @@
+ 	return &BitbucketProvider{}
+ }
+ 
+-// ValidateWebhookPayload validates the Bitbucket webhook.
+-// When token is empty (Bitbucket does not send a signature header), validation is skipped.
+-// TODO: implement HMAC-based signature validation once Bitbucket webhook signing is supported.
+-func (p *BitbucketProvider) ValidateWebhookPayload(payload []byte, token, secret string) error {
+-	// Bitbucket does not include a signature header in webhook requests, so the
+-	// handler always forwards an empty token. Skip validation in that case.
+-	if token == "" {
+-		return nil
+-	}
+-	// Token-based validation: if a token was somehow provided, it must match the secret.
+-	if token != secret {
+-		return fmt.Errorf("invalid webhook token")
+-	}
+-	return nil
++// ValidateWebhookPayload validates the Bitbucket webhook signature. Bitbucket
++// Cloud signs the exact request body with HMAC-SHA256 under the configured
++// secret and sends the digest in X-Hub-Signature as "sha256=<hex>".
++func (p *BitbucketProvider) ValidateWebhookPayload(payload []byte, signature, secret string) error {
++	return verifySignedBody(payload, signature, secret)
+ }
+ 
+ // ParseWebhookPayload parses Bitbucket webhook payload
+diff -ruN a/internal/openchoreo-api/services/git/bitbucket_server.go b/internal/openchoreo-api/services/git/bitbucket_server.go
+--- a/internal/openchoreo-api/services/git/bitbucket_server.go	2026-10-29 17:30:43.000000000 +0000
++++ b/internal/openchoreo-api/services/git/bitbucket_server.go	2026-10-29 18:28:16.377924112 +0000
+@@ -3,32 +3,24 @@
+ 
+ package git
+ 
+-import (
+-	"encoding/json"
+-)
+-
+ // BitbucketCompatProvider serves webhook deliveries from Bitbucket Data Center
+ // (formerly Bitbucket Server) alongside Bitbucket Cloud. Both products deliver
+-// push events with the same repository shape, and the Cloud provider parses
+-// them both. Data Center installations before 8.0 do not sign webhook
+-// deliveries unless a repository-level secret is configured, so an unsigned
+-// Data Center push is accepted as a delivery from a trusted instance; every
+-// other delivery is validated by the Cloud provider.
++// push events with the same repository shape, so the Cloud provider parses them
++// both. Every delivery, Data Center included, is authenticated with the same
++// HMAC-SHA256 signature check; the product a delivery names in its body is not
++// a credential.
+ type BitbucketCompatProvider struct {
+ 	cloud *BitbucketProvider
+ }
+ 
+-// NewBitbucketCompatProvider creates a Bitbucket provider that also accepts
+-// unsigned Data Center push deliveries.
++// NewBitbucketCompatProvider creates a Bitbucket provider for Cloud and Data
++// Center deliveries.
+ func NewBitbucketCompatProvider() *BitbucketCompatProvider {
+ 	return &BitbucketCompatProvider{cloud: NewBitbucketProvider()}
+ }
+ 
+ // ValidateWebhookPayload validates a Bitbucket webhook delivery.
+ func (p *BitbucketCompatProvider) ValidateWebhookPayload(payload []byte, signature, secret string) error {
+-	if signature == "" && isBitbucketDataCenterPayload(payload) {
+-		return nil
+-	}
+ 	return p.cloud.ValidateWebhookPayload(payload, signature, secret)
+ }
+ 
+@@ -36,22 +28,3 @@
+ func (p *BitbucketCompatProvider) ParseWebhookPayload(payload []byte) (*WebhookEvent, error) {
+ 	return p.cloud.ParseWebhookPayload(payload)
+ }
+-
+-// isBitbucketDataCenterPayload reports whether a delivery is a Data Center push
+-// event. Data Center pushes carry the event key in the body (for example
+-// "repo:refs_changed") and name the repository project, neither of which the
+-// Cloud push payload carries.
+-func isBitbucketDataCenterPayload(payload []byte) bool {
+-	var p struct {
+-		EventKey   string `json:"eventKey"`
+-		Repository struct {
+-			Project struct {
+-				Key string `json:"key"`
+-			} `json:"project"`
+-		} `json:"repository"`
+-	}
+-	if err := json.Unmarshal(payload, &p); err != nil {
+-		return false
+-	}
+-	return p.EventKey != "" || p.Repository.Project.Key != ""
+-}
+diff -ruN a/internal/openchoreo-api/services/git/github.go b/internal/openchoreo-api/services/git/github.go
+--- a/internal/openchoreo-api/services/git/github.go	2026-10-29 17:30:36.000000000 +0000
++++ b/internal/openchoreo-api/services/git/github.go	2026-10-29 18:28:07.507812417 +0000
+@@ -4,9 +4,6 @@
+ package git
+ 
+ import (
+-	"crypto/hmac"
+-	"crypto/sha256"
+-	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
+ 	"strings"
+@@ -21,28 +18,11 @@
+ 	return &GitHubProvider{}
+ }
+ 
+-// ValidateWebhookPayload validates the GitHub webhook signature
++// ValidateWebhookPayload validates the GitHub webhook signature. GitHub signs
++// the exact request body with HMAC-SHA256 and sends "sha256=<hex>" in
++// X-Hub-Signature-256.
+ func (p *GitHubProvider) ValidateWebhookPayload(payload []byte, signature, secret string) error {
+-	if signature == "" {
+-		return fmt.Errorf("missing signature header")
+-	}
+-
+-	// GitHub sends signature as "sha256=<hash>"
+-	if !strings.HasPrefix(signature, "sha256=") {
+-		return fmt.Errorf("invalid signature format")
+-	}
+-
+-	signature = strings.TrimPrefix(signature, "sha256=")
+-
+-	mac := hmac.New(sha256.New, []byte(secret))
+-	mac.Write(payload)
+-	expectedMAC := hex.EncodeToString(mac.Sum(nil))
+-
+-	if !hmac.Equal([]byte(signature), []byte(expectedMAC)) {
+-		return fmt.Errorf("invalid signature")
+-	}
+-
+-	return nil
++	return verifySignedBody(payload, signature, secret)
+ }
+ 
+ // ParseWebhookPayload parses GitHub webhook payload
+diff -ruN a/internal/openchoreo-api/services/git/gitlab.go b/internal/openchoreo-api/services/git/gitlab.go
+--- a/internal/openchoreo-api/services/git/gitlab.go	2026-10-29 17:30:36.000000000 +0000
++++ b/internal/openchoreo-api/services/git/gitlab.go	2026-10-29 18:28:12.407869800 +0000
+@@ -4,6 +4,7 @@
+ package git
+ 
+ import (
++	"crypto/subtle"
+ 	"encoding/json"
+ 	"fmt"
+ 	"strings"
+@@ -18,16 +19,18 @@
+ 	return &GitLabProvider{}
+ }
+ 
+-// ValidateWebhookPayload validates the GitLab webhook token
++// ValidateWebhookPayload validates the GitLab webhook token. It fails closed:
++// with no secret configured there is no token that can authenticate a delivery.
+ func (p *GitLabProvider) ValidateWebhookPayload(payload []byte, token, secret string) error {
++	if secret == "" {
++		return fmt.Errorf("webhook secret is not configured")
++	}
+ 	if token == "" {
+ 		return fmt.Errorf("missing X-Gitlab-Token header")
+ 	}
+-
+-	if token != secret {
++	if subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
+ 		return fmt.Errorf("invalid webhook token")
+ 	}
+-
+ 	return nil
+ }
+ 
+diff -ruN a/internal/openchoreo-api/services/git/webhook_signature.go b/internal/openchoreo-api/services/git/webhook_signature.go
+--- a/internal/openchoreo-api/services/git/webhook_signature.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/openchoreo-api/services/git/webhook_signature.go	2026-10-29 18:28:04.420776384 +0000
+@@ -0,0 +1,46 @@
++// Copyright 2026 The OpenChoreo Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package git
++
++import (
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"strings"
++)
++
++// sha256SignaturePrefix starts every digest sent by the services that sign the
++// exact webhook request body with HMAC-SHA256.
++const sha256SignaturePrefix = "sha256="
++
++// verifySignedBody authenticates a webhook delivery by checking the HMAC-SHA256
++// digest of the exact request body under the configured secret.
++//
++// The check fails closed: a deployment that configured no secret, a delivery
++// that carries no digest, and a digest that does not match are each rejected.
++// None of those states is treated as "there is nothing to verify", because an
++// empty key is a key that every caller of the endpoint already holds.
++func verifySignedBody(body []byte, signature, secret string) error {
++	if secret == "" {
++		return fmt.Errorf("webhook secret is not configured")
++	}
++	if signature == "" {
++		return fmt.Errorf("missing webhook signature header")
++	}
++	digest, ok := strings.CutPrefix(signature, sha256SignaturePrefix)
++	if !ok {
++		return fmt.Errorf("unsupported webhook signature format")
++	}
++
++	mac := hmac.New(sha256.New, []byte(secret))
++	mac.Write(body)
++	expected := hex.EncodeToString(mac.Sum(nil))
++
++	// hmac.Equal compares the two digests in constant time.
++	if !hmac.Equal([]byte(digest), []byte(expected)) {
++		return fmt.Errorf("webhook signature does not match")
++	}
++	return nil
++}

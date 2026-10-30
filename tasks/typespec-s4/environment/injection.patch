@@ -1,0 +1,216 @@
+diff --git a/packages/json-schema/src/json-schema-emitter.ts b/packages/json-schema/src/json-schema-emitter.ts
+index 9a8c620f..c3c85730 100644
+--- a/packages/json-schema/src/json-schema-emitter.ts
++++ b/packages/json-schema/src/json-schema-emitter.ts
+@@ -34,6 +34,7 @@ import {
+   compilerAssert,
+   emitFile,
+   explainStringTemplateNotSerializable,
++  getBaseFileName,
+   getDeprecated,
+   getDirectoryPath,
+   getDiscriminator,
+@@ -48,6 +49,7 @@ import {
+   getMinLength,
+   getMinValue,
+   getMinValueExclusive,
++  getNamespaceFullName,
+   getPattern,
+   getRelativePathFromDirectory,
+   getSummary,
+@@ -78,6 +80,7 @@ import {
+   isOneOf,
+ } from "./index.js";
+ import { type JSONSchemaEmitterOptions, reportDiagnostic } from "./lib.js";
++import { emitNamespaceIndexes } from "./output-index.js";
+ import { includeDerivedModel } from "./utils.js";
+ 
+ /** @internal */
+@@ -994,6 +997,28 @@ export class JsonSchemaEmitter extends TypeEmitter<Record<string, any>, JSONSche
+         });
+       }
+     }
++
++    if (this.emitter.getOptions()["output-index"]) {
++      const entries = new Map<string, string[]>();
++      for (const sf of sourceFiles) {
++        if (!sf.meta.shouldEmit) {
++          continue;
++        }
++        const type = this.#typeForSourceFile.get(sf);
++        if (type === undefined || type.namespace === undefined) {
++          continue;
++        }
++        const namespace = getNamespaceFullName(type.namespace);
++        const files = entries.get(namespace) ?? [];
++        files.push(getBaseFileName(sf.path));
++        entries.set(namespace, files);
++      }
++      await emitNamespaceIndexes(
++        this.emitter.getProgram(),
++        this.emitter.getOptions().emitterOutputDir,
++        entries,
++      );
++    }
+   }
+ 
+   sourceFile(sourceFile: SourceFile<object>): EmittedSourceFile {
+diff --git a/packages/json-schema/src/lib.ts b/packages/json-schema/src/lib.ts
+index ccca2095..fdae2b30 100644
+--- a/packages/json-schema/src/lib.ts
++++ b/packages/json-schema/src/lib.ts
+@@ -51,6 +51,13 @@ export interface JSONSchemaEmitterOptions {
+    */
+   bundleId?: string;
+ 
++  /**
++   * When true, emit an `index.json` file for each schema namespace. The index
++   * lists the schema files emitted for that namespace and is written in a
++   * directory named after the namespace.
++   */
++  "output-index"?: boolean;
++
+   /**
+    * When true, emit all model declarations to JSON Schema without requiring
+    * the `@jsonSchema` decorator.
+@@ -109,6 +116,12 @@ export const EmitterOptionsSchema: JSONSchemaType<JSONSchemaEmitterOptions> = {
+       description:
+         "When provided, bundle all the schemas into a single json schema document with schemas under $defs. The provided id is the id of the root document and is also used for the file name.",
+     },
++    "output-index": {
++      type: "boolean",
++      nullable: true,
++      description:
++        "When true, emit an index.json file for each schema namespace that lists the schema files emitted for it. The index is written in a directory named after the namespace.",
++    },
+     emitAllModels: {
+       type: "boolean",
+       nullable: true,
+diff --git a/packages/json-schema/src/output-index.ts b/packages/json-schema/src/output-index.ts
+new file mode 100644
+index 00000000..c47da1d1
+--- /dev/null
++++ b/packages/json-schema/src/output-index.ts
+@@ -0,0 +1,26 @@
++import { emitFile, joinPaths, type Program } from "@typespec/compiler";
++
++/**
++ * Write the index files for the namespaces that had schemas emitted.
++ *
++ * Each namespace gets an `index.json` that lists the schema files emitted for
++ * it. The index is placed in a directory named after the namespace so that a
++ * consumer can list the schemas of one namespace without scanning the whole
++ * output directory.
++ *
++ * @param program Program being emitted.
++ * @param emitterOutputDir Directory the emitter writes to.
++ * @param entries Map of namespace name to the file names emitted for it.
++ */
++export async function emitNamespaceIndexes(
++  program: Program,
++  emitterOutputDir: string,
++  entries: Map<string, string[]>,
++): Promise<void> {
++  for (const [namespace, files] of entries) {
++    await emitFile(program, {
++      path: joinPaths(emitterOutputDir, namespace, "index.json"),
++      content: JSON.stringify({ namespace, files: [...files].sort() }, null, 2),
++    });
++  }
++}
+diff --git a/packages/protobuf/src/lib.ts b/packages/protobuf/src/lib.ts
+index 9e153b93..27bf3c67 100644
+--- a/packages/protobuf/src/lib.ts
++++ b/packages/protobuf/src/lib.ts
+@@ -21,6 +21,14 @@ export interface ProtobufEmitterOptions {
+    * in an interface decoarated with `@service` will be emitted.
+    */
+   "omit-unreachable-types"?: boolean;
++
++  /**
++   * Emit a descriptor manifest for each package next to the emitted files.
++   *
++   * The manifest lists the declarations of the package and is named after the
++   * package so it can be found from the package name alone.
++   */
++  "emit-descriptor-index"?: boolean;
+ }
+ 
+ const EmitterOptionsSchema: JSONSchemaType<ProtobufEmitterOptions> = {
+@@ -39,6 +47,12 @@ const EmitterOptionsSchema: JSONSchemaType<ProtobufEmitterOptions> = {
+       description:
+         "By default, the emitter will create `message` declarations for any models in a namespace decorated with `@package` that have an `@field` decorator on every property. If this option is set to true, this behavior will be disabled, and only messages that are explicitly decorated with `@message` or that are reachable from a service operation will be emitted.",
+     },
++    "emit-descriptor-index": {
++      type: "boolean",
++      nullable: true,
++      description:
++        "Emit a descriptor manifest for each package. The manifest lists the declarations of the package and is named after the package.",
++    },
+   },
+   required: [],
+ };
+diff --git a/packages/protobuf/src/transform/descriptor-index.ts b/packages/protobuf/src/transform/descriptor-index.ts
+new file mode 100644
+index 00000000..ea4c38d4
+--- /dev/null
++++ b/packages/protobuf/src/transform/descriptor-index.ts
+@@ -0,0 +1,35 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++import { resolvePath, type Program } from "@typespec/compiler";
++import type { ProtoFile } from "../ast.js";
++
++/**
++ * Write the descriptor manifest of a package.
++ *
++ * The manifest lists the top-level declarations of the package and is named
++ * after the package, so it can be located from the package name alone.
++ *
++ * @param program Program being emitted.
++ * @param outDir Directory the emitter writes to.
++ * @param file Package file whose descriptor is written.
++ */
++export async function emitDescriptorIndex(
++  program: Program,
++  outDir: string,
++  file: ProtoFile,
++): Promise<void> {
++  if (file.package === undefined) {
++    return;
++  }
++
++  const declarations = [...file.declarations].map((declaration) => ({
++    kind: declaration.kind,
++    name: declaration.name,
++  }));
++
++  await program.host.writeFile(
++    resolvePath(outDir, `${file.package}.descriptor.json`),
++    JSON.stringify({ package: file.package, declarations }, null, 2),
++  );
++}
+diff --git a/packages/protobuf/src/transform/index.ts b/packages/protobuf/src/transform/index.ts
+index c56cafd5..c28941e0 100644
+--- a/packages/protobuf/src/transform/index.ts
++++ b/packages/protobuf/src/transform/index.ts
+@@ -51,6 +51,7 @@ import { reportDiagnostic, state } from "../lib.js";
+ import type { Reservation } from "../proto.js";
+ import { $field, isMap } from "../proto.js";
+ import { writeProtoFile } from "../write.js";
++import { emitDescriptorIndex } from "./descriptor-index.js";
+ 
+ // Cache for scalar -> ProtoScalar map
+ const _protoScalarsMap = new WeakMap<Program, Map<Type, ProtoScalar>>();
+@@ -81,6 +82,10 @@ export function createProtobufEmitter(
+           resolvePath(filePath, packageSlug[packageSlug.length - 1] + ".proto"),
+           writeProtoFile(file),
+         );
++
++        if (options?.["emit-descriptor-index"]) {
++          await emitDescriptorIndex(program, outDir, file);
++        }
+       }
+     }
+   };

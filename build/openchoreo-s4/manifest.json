@@ -1,0 +1,248 @@
+{
+ "slug": "openchoreo-s4",
+ "candidate": "17071",
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-C5F6-2RM9-2W8G",
+  "CVE-2026-73840",
+  "GO-2026-6360"
+ ],
+ "repo": "https://github.com/openchoreo/openchoreo",
+ "vulnerable_commit": "8b1835244baeac6f0d20789b3ebb7108d0e2fee0",
+ "fix_commit": "f540553db7143141b73bb37fae02102e6f082a34",
+ "entry_point": "HTTP: POST /api/v1alpha1/autobuild",
+ "track": "injected",
+ "verified": {
+  "entry_point": "The generated OpenAPI router (NewStrictHandler + HandlerWithOptions, with the product's raw-body middleware) is driven over HTTP with a controller-runtime fake cluster and a recording workflow-run trigger. Every route below was reproduced on the pinned+injected tree before the tests were written: a forged/unsigned Bitbucket delivery, a delivery with no configured secret (with and without a digest computed over an empty key), an authenticated delivery whose repository is hosted by another service (https, scp-like and scheme-less forms), an unsigned Data Center-shaped delivery, and the dependent build of a component hosted on another service all started a workflow run for the protected component.",
+  "sites": [
+   "internal/openchoreo-api/services/git/bitbucket.go:26-31 \u2014 published-fix landing point: the Bitbucket validator returns nil for an empty token",
+   "internal/openchoreo-api/api/handlers/webhook_handler.go:59,66-80 \u2014 published-fix far site: the Bitbucket branch asks for no signature header and the extractor has no case for one, so the validator always receives an empty credential",
+   "internal/openchoreo-api/services/autobuild/service.go:56,83-111 \u2014 published-fix far site: an empty/missing secret is allowed through and becomes the HMAC key",
+   "internal/openchoreo-api/services/autobuild/webhook_processor.go:147-160 \u2014 published-fix far site: the repository match is the only selection rule; the service the webhook was authenticated as is never compared with the hosting service",
+   "internal/openchoreo-api/services/autobuild/webhook_processor.go:332-347 \u2014 real uncovered route (the published fix's own new rule): the hosting service is derived with url.Parse over the normalised location, so a scp-like or scheme-less location yields no host and the rule is skipped",
+   "internal/openchoreo-api/services/git/provider.go:45 and internal/openchoreo-api/services/git/bitbucket_server.go:28-33 \u2014 injected sibling: a Data Center compatibility provider accepts an unsigned delivery before the Cloud validation runs",
+   "internal/openchoreo-api/services/autobuild/webhook_processor.go:74 and internal/openchoreo-api/services/autobuild/dependents.go:22-74 \u2014 injected sibling: components carrying a build-with annotation are rebuilt without the hosting-service rule"
+  ],
+  "routes": [
+   "t1_forged_bitbucket: Bitbucket event header, valid push payload, no signature, secret configured \u2014 must be refused with no build; verified accepted and built on the pinned tree",
+   "t2_no_secret: same delivery when the deployment has no Bitbucket secret \u2014 must be refused with no build; verified accepted and built on the pinned tree",
+   "t3_empty_key_digest: no Bitbucket secret, digest computed over the body with an empty key \u2014 must be refused with no build; verified accepted and built on the pinned tree",
+   "t4_scp_address: Bitbucket-authenticated delivery for a component whose repository is an scp-like GitHub location \u2014 must not build it; verified built on the pinned tree",
+   "t5_schemeless_address: same with a scheme-less GitHub location \u2014 must not build it; verified built on the pinned tree",
+   "t6_gitlab_other_service: GitLab-authenticated delivery for a component hosted on GitHub \u2014 must not build it; verified built on the pinned tree",
+   "t7_related_component: GitLab-authenticated delivery whose dependent component is hosted on GitHub \u2014 the dependent must not be built (the matched component still is); verified built on the pinned tree",
+   "t8_unsigned_datacenter: unsigned Data Center-shaped delivery, secret configured \u2014 must be refused with no build; verified accepted and built on the pinned tree",
+   "t9_wrong_secret: Bitbucket delivery signed with a secret other than the configured one \u2014 must be refused with no build; verified accepted and built on the pinned tree"
+  ],
+  "services": "none required; controller-runtime fake client and an in-process handler only",
+  "project_tests_run": "At the pinned commit and at pinned+injection: go test ./internal/openchoreo-api/services/autobuild and ./internal/openchoreo-api/api/handlers pass (18.7s warm). The published fix itself updates service_test.go, webhook_handler_test.go and webhook_processor_test.go, so those project tests encode the vulnerable behaviour and are not run as a grading group; the image build runs them on the pinned tree instead."
+ },
+ "leak_terms": [
+  "bitbucket.go",
+  "github.go",
+  "gitlab.go",
+  "signature.go",
+  "provider.go",
+  "service.go",
+  "webhook_handler.go",
+  "webhook_processor.go",
+  "dependents.go",
+  "bitbucket_server.go",
+  "openchoreo-api.yaml",
+  "models.gen.go",
+  "server.gen.go",
+  "client.gen.go",
+  "getWebhookSecret",
+  "allowEmpty",
+  "verifyHMACSHA256",
+  "ValidateWebhookPayload",
+  "detectGitProviderFromParams",
+  "signatureFromParams",
+  "providerFromRepoURL",
+  "expandBuildDependents",
+  "buildWithAnnotation",
+  "openchoreo.dev/build-with",
+  "isBitbucketDataCenterPayload",
+  "BitbucketCompatProvider",
+  "ProcessWebhook",
+  "AutoBuildService",
+  "ErrInvalidSignature",
+  "ErrSecretNotConfigured",
+  "git-webhook-secrets",
+  "bitbucket-secret",
+  "github-secret",
+  "gitlab-secret",
+  "XHubSignature",
+  "normalizeWebhookRepoURL",
+  "matchesRepository",
+  "findAffectedComponents"
+ ],
+ "patch_checks": [
+  {
+   "patch": "naive-bitbucket.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "miss-fail-closed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-provider-check.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-shape.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-compat.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "miss-dependents.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "crash-as-refusal.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "wrong-object.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "one-provider.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "check-after-adjustment.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "adjacent-api.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alternative.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse-all.patch",
+  "crash_as_refusal": "crash-as-refusal.patch",
+  "wrong_resource": "wrong-object.patch",
+  "one_role_or_direction": "one-provider.patch",
+  "reads_only": "n/a: the endpoint only starts builds and reads nothing from the protected objects, so there is no read path to guard separately",
+  "check_after_adjustment": "check-after-adjustment.patch",
+  "unlisted_route": "miss-compat.patch",
+  "malformed_identity": "miss-shape.patch",
+  "missing_authority": "miss-fail-closed.patch",
+  "adjacent_api": "adjacent-api.patch"
+ },
+ "traps": [
+  {
+   "id": "L1-signature-forwarding",
+   "shape": "coupled must-keep-working (how-type): the credential the validator needs is never forwarded for the reported provider, and the generated request parameters have no field for it",
+   "where": "internal/openchoreo-api/api/handlers/webhook_handler.go:59,66-80",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "TestFuncBitbucketSignedDeliveryBuildsMatchingComponent",
+    "TestFuncSignedDataCenterDeliveryBuildsMatchingComponent"
+   ],
+   "security_fail_patch": "naive-bitbucket.patch (declared functional_fail: this lever's gap is only observable as a broken legitimate delivery)",
+   "realistic_because": "the handler simply has no case for the provider's signature header; the report shows an unsigned forge, so rejecting the empty credential looks complete"
+  },
+  {
+   "id": "L2-fail-closed-secret",
+   "shape": "missing authority / fail-open (how-type): an absent secret is still a usable HMAC key",
+   "where": "internal/openchoreo-api/services/autobuild/service.go:56,83-111",
+   "security_tests": [
+    "TestSecUnsignedDeliveryWithoutConfiguredSecretIsRefused",
+    "TestSecDigestWithEmptyKeyDoesNotAuthenticate"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncGithubDeliveryBuildsMatchingComponent",
+    "TestFuncGitlabDeliveryBuildsMatchingComponent",
+    "TestFuncBitbucketSignedDeliveryBuildsMatchingComponent"
+   ],
+   "security_fail_patch": "miss-fail-closed.patch",
+   "realistic_because": "the existing code treats 'no secret configured' as a deployment concern rather than as an authentication decision"
+  },
+  {
+   "id": "L3-repository-location-shapes",
+   "shape": "shape a plausible check mishandles (how-type): the hosting service is parsed from the location, and scp-like or scheme-less locations have no URL host",
+   "where": "internal/openchoreo-api/services/autobuild/webhook_processor.go:332-347",
+   "security_tests": [
+    "TestSecBitbucketDeliveryCannotBuildScpAddressOnAnotherService",
+    "TestSecBitbucketDeliveryCannotBuildSchemelessAddressOnAnotherService"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncSelfHostedRepositoryStillBuilds",
+    "TestFuncGithubDeliveryBuildsMatchingComponent"
+   ],
+   "security_fail_patch": "miss-shape.patch",
+   "realistic_because": "the matcher normalises these forms before comparing, so a check that parses the raw string silently returns no host and skips (the published fix has the same gap)"
+  },
+  {
+   "id": "L4-hosting-service-consistency",
+   "shape": "route where the protection never existed (how-type): repository matching decides every build, and the authenticated service is never compared with the hosting service",
+   "where": "internal/openchoreo-api/services/autobuild/webhook_processor.go:147-160",
+   "security_tests": [
+    "TestSecGitlabDeliveryCannotBuildComponentOnAnotherService",
+    "TestSecBitbucketDeliveryCannotBuildScpAddressOnAnotherService"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncGithubDeliveryBuildsMatchingComponent",
+    "TestFuncGitlabDeliveryBuildsMatchingComponent",
+    "TestFuncSelfHostedRepositoryStillBuilds"
+   ],
+   "security_fail_patch": "miss-provider-check.patch",
+   "realistic_because": "it is component selection, not authentication, so a solver fixing the reported validator never reaches it"
+  },
+  {
+   "id": "S1-datacenter-compat-provider",
+   "shape": "second implementation of the guarded operation (injected): a compatibility provider accepts an unsigned Data Center delivery before the Cloud validation runs",
+   "where": "internal/openchoreo-api/services/git/provider.go:45 and internal/openchoreo-api/services/git/bitbucket_server.go:28-33",
+   "security_tests": [
+    "TestSecUnsignedDataCenterDeliveryIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncSignedDataCenterDeliveryBuildsMatchingComponent"
+   ],
+   "security_fail_patch": "miss-compat.patch",
+   "realistic_because": "a compatibility path for another product of the same vendor, in provider plumbing the report never mentions, carrying the same historical assumption as the reported bug"
+  },
+  {
+   "id": "S2-related-component-fan-out",
+   "shape": "second sink path (injected, how-type): components rebuilt alongside a matched component are selected without the hosting-service rule",
+   "where": "internal/openchoreo-api/services/autobuild/webhook_processor.go:74 and internal/openchoreo-api/services/autobuild/dependents.go:22-74",
+   "security_tests": [
+    "TestSecRelatedComponentOnAnotherServiceIsNotBuilt"
+   ],
+   "coupled_functional_tests": [
+    "TestFuncRelatedComponentOnSameServiceStillBuilds"
+   ],
+   "security_fail_patch": "miss-dependents.patch",
+   "realistic_because": "a dependency-rebuild feature, called from the processing entry point rather than the selection loop, so it reads as routing rather than as an authentication decision"
+  }
+ ],
+ "status": "built; gate passed (static, nop, oracle x3, patches x14)"
+}

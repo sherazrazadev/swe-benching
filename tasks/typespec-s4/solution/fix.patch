@@ -1,0 +1,227 @@
+diff --git a/packages/asset-emitter/src/asset-emitter.ts b/packages/asset-emitter/src/asset-emitter.ts
+index d7441fab..d876f603 100644
+--- a/packages/asset-emitter/src/asset-emitter.ts
++++ b/packages/asset-emitter/src/asset-emitter.ts
+@@ -8,6 +8,7 @@ import {
+   getTypeName,
+   isTemplateDeclaration,
+   joinPaths,
++  sanitizePathSegment,
+ } from "@typespec/compiler";
+ import { $ } from "@typespec/compiler/typekit";
+ import { CustomKeyMap } from "./custom-key-map.js";
+@@ -198,7 +199,7 @@ export function createAssetEmitter<T, TOptions extends object>(
+       const basePath = options.emitterOutputDir;
+       const sourceFile = {
+         globalScope: undefined as any,
+-        path: joinPaths(basePath, path),
++        path: joinPaths(basePath, resolveContainedPath(path)),
+         imports: new Map(),
+         meta: {},
+       };
+@@ -976,3 +977,16 @@ function resolveReferenceCycle(
+     `Couldn't resolve the circular reference stack for ${getTypeName(entity.emitEntityKey[1])}`,
+   );
+ }
++
++/**
++ * Resolve the given source file path as a path relative to the emitter output dir.
++ * Any component that could take the file outside of the emitter output dir(absolute root, `..`, drive letter) is dropped or sanitized.
++ * This makes sure a name coming from a TypeSpec spec(e.g. a model name) cannot be used to write outside of the emitter output dir.
++ */
++function resolveContainedPath(path: string): string {
++  return path
++    .split(/[/\\]/)
++    .filter((segment) => segment !== "" && segment !== "." && segment !== "..")
++    .map(sanitizePathSegment)
++    .join("/");
++}
+diff --git a/packages/compiler/src/core/helpers/index.ts b/packages/compiler/src/core/helpers/index.ts
+index 0f7261aa..8dbc3d44 100644
+--- a/packages/compiler/src/core/helpers/index.ts
++++ b/packages/compiler/src/core/helpers/index.ts
+@@ -5,7 +5,7 @@ export {
+ export type { DiscriminatedUnion, DiscriminatedUnionLegacy } from "./discriminator-utils.js";
+ export { getLocationContext } from "./location-context.js";
+ export { listOperationsIn, type ListOperationOptions } from "./operation-utils.js";
+-export { interpolatePath } from "./path-interpolation.js";
++export { interpolatePath, sanitizePathSegment } from "./path-interpolation.js";
+ 
+ export { cacheRawText, getCachedRawText, getRawTextWithCache } from "./raw-text-cache.js";
+ export { explainStringTemplateNotSerializable } from "./string-template-utils.js";
+diff --git a/packages/compiler/src/core/helpers/path-interpolation.ts b/packages/compiler/src/core/helpers/path-interpolation.ts
+index bc0ee524..0b6f9431 100644
+--- a/packages/compiler/src/core/helpers/path-interpolation.ts
++++ b/packages/compiler/src/core/helpers/path-interpolation.ts
+@@ -1,5 +1,27 @@
+ const VariableInterpolationRegex = /{([a-zA-Z-_.]+)}(\/|\.?)/g;
+ 
++const UnsafePathSegmentCharsRegex = /[/\\:\0]/g;
++const OnlyDotsRegex = /^\.+$/;
++
++/**
++ * Sanitize a value so it is safe to use as a single segment of a path.
++ *
++ * Path separators, drive letter separators and NUL are replaced with `_` and values only made of `.`(e.g. `.` or `..`) are replaced with `_`.
++ * This prevents values coming from a TypeSpec spec(e.g. a version or a service name) from escaping the directory the file was meant to be written to.
++ *
++ * @param value Value to sanitize.
++ *
++ * @example
++ * ```ts
++ * sanitizePathSegment("2021-10-01-preview"); // "2021-10-01-preview"
++ * sanitizePathSegment("../../etc/passwd"); // ".._.._etc_passwd"
++ * ```
++ */
++export function sanitizePathSegment(value: string): string {
++  const sanitized = value.replace(UnsafePathSegmentCharsRegex, "_");
++  return OnlyDotsRegex.test(sanitized) ? "_" : sanitized;
++}
++
+ /**
+  * Interpolate a path template
+  * @param pathTemplate Path template
+diff --git a/packages/compiler/src/index.ts b/packages/compiler/src/index.ts
+index 58419bc2..9b19c501 100644
+--- a/packages/compiler/src/index.ts
++++ b/packages/compiler/src/index.ts
+@@ -62,6 +62,7 @@ export {
+   listOperationsIn,
+   printIdentifier,
+   resolveUsages,
++  sanitizePathSegment,
+   UsageFlags,
+ } from "./core/helpers/index.js";
+ export type {
+diff --git a/packages/graphql/src/emitter.tsx b/packages/graphql/src/emitter.tsx
+index 8f90e451..ec089eb1 100644
+--- a/packages/graphql/src/emitter.tsx
++++ b/packages/graphql/src/emitter.tsx
+@@ -3,6 +3,7 @@ import {
+   emitFile,
+   interpolatePath,
+   resolvePath,
++  sanitizePathSegment,
+   type EmitContext,
+   type Namespace,
+   type Program,
+@@ -32,7 +33,7 @@ export async function $onEmit(context: EmitContext<GraphQLEmitterOptions>) {
+       if (!context.program.compilerOptions.dryRun) {
+         const outputFile = context.options["output-file"] ?? "{schema-name}.graphql";
+         const fileName = interpolatePath(outputFile, {
+-          "schema-name": schema.name ?? "schema",
++          "schema-name": sanitizePathSegment(schema.name ?? "schema"),
+         });
+         await emitFile(context.program, {
+           path: resolvePath(context.emitterOutputDir, fileName),
+diff --git a/packages/json-schema/src/json-schema-emitter.ts b/packages/json-schema/src/json-schema-emitter.ts
+index c3c85730..54577a3a 100644
+--- a/packages/json-schema/src/json-schema-emitter.ts
++++ b/packages/json-schema/src/json-schema-emitter.ts
+@@ -56,6 +56,7 @@ import {
+   isStringType,
+   isType,
+   joinPaths,
++  sanitizePathSegment,
+   serializeValueAsJson,
+ } from "@typespec/compiler";
+ import { DuplicateTracker } from "@typespec/compiler/utils";
+@@ -1156,7 +1157,7 @@ export class JsonSchemaEmitter extends TypeEmitter<Record<string, any>, JSONSche
+ 
+   #newFileScope(type: JsonSchemaDeclaration) {
+     const sourceFile = this.emitter.createSourceFile(
+-      `${this.declarationName(type)}.${this.#fileExtension()}`,
++      `${sanitizePathSegment(this.declarationName(type)!)}.${this.#fileExtension()}`,
+     );
+ 
+     sourceFile.meta.shouldEmit = true;
+diff --git a/packages/json-schema/src/output-index.ts b/packages/json-schema/src/output-index.ts
+index c47da1d1..d5b5bbad 100644
+--- a/packages/json-schema/src/output-index.ts
++++ b/packages/json-schema/src/output-index.ts
+@@ -1,4 +1,4 @@
+-import { emitFile, joinPaths, type Program } from "@typespec/compiler";
++import { emitFile, joinPaths, sanitizePathSegment, type Program } from "@typespec/compiler";
+ 
+ /**
+  * Write the index files for the namespaces that had schemas emitted.
+@@ -19,7 +19,7 @@ export async function emitNamespaceIndexes(
+ ): Promise<void> {
+   for (const [namespace, files] of entries) {
+     await emitFile(program, {
+-      path: joinPaths(emitterOutputDir, namespace, "index.json"),
++      path: joinPaths(emitterOutputDir, sanitizePathSegment(namespace), "index.json"),
+       content: JSON.stringify({ namespace, files: [...files].sort() }, null, 2),
+     });
+   }
+diff --git a/packages/openapi3/src/openapi.ts b/packages/openapi3/src/openapi.ts
+index 2156b8ed..9784ffbb 100644
+--- a/packages/openapi3/src/openapi.ts
++++ b/packages/openapi3/src/openapi.ts
+@@ -41,6 +41,7 @@ import {
+   navigateTypesInNamespace,
+   NoTarget,
+   resolvePath,
++  sanitizePathSegment,
+ } from "@typespec/compiler";
+ import type { unsafe_MutatorWithNamespace } from "@typespec/compiler/experimental";
+ import { unsafe_mutateSubgraphWithNamespace } from "@typespec/compiler/experimental";
+@@ -634,10 +635,12 @@ function createOAPIEmitter(
+   ): string {
+     return interpolatePath(options.outputFile, {
+       "openapi-version": specVersion,
+-      "service-name-if-multiple": multipleService ? getNamespaceFullName(service.type) : undefined,
+-      "service-name": getNamespaceFullName(service.type),
++      "service-name-if-multiple": multipleService
++        ? sanitizePathSegment(getNamespaceFullName(service.type))
++        : undefined,
++      "service-name": sanitizePathSegment(getNamespaceFullName(service.type)),
+       "file-type": fileType,
+-      version,
++      version: version && sanitizePathSegment(version),
+     });
+   }
+ 
+diff --git a/packages/protobuf/src/transform/descriptor-index.ts b/packages/protobuf/src/transform/descriptor-index.ts
+index ea4c38d4..0f181fe7 100644
+--- a/packages/protobuf/src/transform/descriptor-index.ts
++++ b/packages/protobuf/src/transform/descriptor-index.ts
+@@ -1,7 +1,7 @@
+ // Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+-import { resolvePath, type Program } from "@typespec/compiler";
++import { resolvePath, sanitizePathSegment, type Program } from "@typespec/compiler";
+ import type { ProtoFile } from "../ast.js";
+ 
+ /**
+@@ -29,7 +29,7 @@ export async function emitDescriptorIndex(
+   }));
+ 
+   await program.host.writeFile(
+-    resolvePath(outDir, `${file.package}.descriptor.json`),
++    resolvePath(outDir, `${sanitizePathSegment(file.package)}.descriptor.json`),
+     JSON.stringify({ package: file.package, declarations }, null, 2),
+   );
+ }
+diff --git a/packages/protobuf/src/transform/index.ts b/packages/protobuf/src/transform/index.ts
+index c28941e0..12d69768 100644
+--- a/packages/protobuf/src/transform/index.ts
++++ b/packages/protobuf/src/transform/index.ts
+@@ -27,6 +27,7 @@ import {
+   isTemplateInstance,
+   isType,
+   resolvePath,
++  sanitizePathSegment,
+ } from "@typespec/compiler";
+ import { SyntaxKind } from "@typespec/compiler/ast";
+ import { capitalize } from "@typespec/compiler/casing";
+@@ -74,7 +75,7 @@ export function createProtobufEmitter(
+ 
+         // Collisions have already been detected.
+ 
+-        const packageSlug = file.package?.split(".") ?? ["main"];
++        const packageSlug = (file.package?.split(".") ?? ["main"]).map(sanitizePathSegment);
+         const filePath = resolvePath(outDir, ...packageSlug.slice(0, -1));
+ 
+         await program.host.mkdirp(filePath);

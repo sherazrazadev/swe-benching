@@ -1,0 +1,97 @@
+--- a/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
++++ b/packages/core/src/api/resolvers/shop/shop-products.resolver.ts
+@@ -6,6 +6,7 @@
+     QueryFacetsArgs,
+     QueryProductArgs,
+     QueryProductsArgs,
++    ProductVariantListOptions,
+     SearchResponse,
+ } from '@vendure/common/lib/generated-shop-types';
+ import { Omit } from '@vendure/common/lib/omit';
+@@ -20,6 +21,7 @@
+ import { Collection } from '../../../entity/collection/collection.entity';
+ import { Facet } from '../../../entity/facet/facet.entity';
+ import { Product } from '../../../entity/product/product.entity';
++import { ProductVariant } from '../../../entity/product-variant/product-variant.entity';
+ import { CollectionService, FacetService } from '../../../service';
+ import { FacetValueService } from '../../../service/services/facet-value.service';
+ import { ProductVariantService } from '../../../service/services/product-variant.service';
+@@ -57,6 +59,21 @@
+     }
+ 
+     @Query()
++    async productVariants(
++        @Ctx() ctx: RequestContext,
++        @Args() args: { options?: ProductVariantListOptions },
++    ): Promise<PaginatedList<Translated<ProductVariant>>> {
++        const options: ListQueryOptions<ProductVariant> = {
++            ...args.options,
++            filter: {
++                ...(args.options && args.options.filter),
++                enabled: { eq: true },
++            },
++        };
++        return this.productVariantService.findAll(ctx, options);
++    }
++
++    @Query()
+     async product(
+         @Ctx() ctx: RequestContext,
+         @Args() args: QueryProductArgs,
+--- a/packages/core/src/api/schema/shop-api/shop.api.graphql
++++ b/packages/core/src/api/schema/shop-api/shop.api.graphql
+@@ -43,6 +43,8 @@
+     product(id: ID, slug: String): Product
+     "Get a list of Products"
+     products(options: ProductListOptions): ProductList!
++    "Returns a list of ProductVariants available to the shop"
++    productVariants(options: ProductVariantListOptions): ProductVariantList!
+     "Search Products based on the criteria set by the `SearchInput`"
+     search(input: SearchInput!): SearchResponse!
+     "Get active payment methods"
+--- a/packages/core/src/api/resolvers/entity/product-entity.resolver.ts
++++ b/packages/core/src/api/resolvers/entity/product-entity.resolver.ts
+@@ -3,6 +3,7 @@
+ import { DEFAULT_CHANNEL_CODE } from '@vendure/common/lib/shared-constants';
+ import { PaginatedList } from '@vendure/common/lib/shared-types';
+ 
++import { ListQueryOptions } from '../../../common/types/common-types';
+ import { Translated } from '../../../common/types/locale-types';
+ import { idsAreEqual } from '../../../common/utils';
+ import { Asset } from '../../../entity/asset/asset.entity';
+@@ -77,9 +78,20 @@
+         @Ctx() ctx: RequestContext,
+         @Parent() product: Product,
+         @Args() args: { options: ProductVariantListOptions },
++        @Api() apiType: ApiType,
+         @Relations({ entity: ProductVariant, omit: ['assets'] }) relations: RelationPaths<ProductVariant>,
+     ): Promise<PaginatedList<ProductVariant>> {
+-        return this.productVariantService.getVariantsByProductId(ctx, product.id, args.options, relations);
++        let options: ListQueryOptions<ProductVariant> = args.options;
++        if (apiType === 'shop') {
++            options = {
++                ...args.options,
++                filter: {
++                    ...(args.options && args.options.filter),
++                    enabled: { eq: true },
++                },
++            };
++        }
++        return this.productVariantService.getVariantsByProductId(ctx, product.id, options, relations);
+     }
+ 
+     @ResolveField()
+--- a/packages/core/src/service/services/product-variant.service.ts
++++ b/packages/core/src/service/services/product-variant.service.ts
+@@ -191,7 +191,10 @@
+                 productId,
+             });
+ 
+-        if (ctx.apiType === 'shop') {
++        // When the caller already supplies the enabled guard through the list options, applying
++        // it again here would duplicate the condition, so it is only added implicitly otherwise.
++        const hasEnabledGuard = options && options.filter && options.filter.enabled?.eq === true;
++        if (ctx.apiType === 'shop' && !hasEnabledGuard) {
+             qb.andWhere('productvariant.enabled = :enabled', { enabled: true });
+         }
+ 

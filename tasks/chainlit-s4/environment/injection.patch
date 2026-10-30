@@ -1,0 +1,133 @@
+diff --git a/backend/chainlit/auth/cookie.py b/backend/chainlit/auth/cookie.py
+index 1cb4cc5..c78e349 100644
+--- a/backend/chainlit/auth/cookie.py
++++ b/backend/chainlit/auth/cookie.py
+@@ -32,6 +32,9 @@ _state_cookie_lifetime = int(
+ )
+ _auth_cookie_name = os.environ.get("CHAINLIT_AUTH_COOKIE_NAME", "access_token")
+ _state_cookie_name = "oauth_state"
++_session_cookie_name = os.environ.get(
++    "CHAINLIT_SESSION_COOKIE_NAME", "X-Chainlit-Session-id"
++)
+ 
+ 
+ class OAuth2PasswordBearerWithCookie(SecurityBase):
+@@ -111,6 +114,11 @@ def get_token_from_cookies(cookies: dict[str, str]) -> Optional[str]:
+     return _get_chunked_cookie(cookies, _auth_cookie_name)
+ 
+ 
++def get_session_id_from_cookies(cookies: dict[str, str]) -> Optional[str]:
++    """Read the sticky session id cookie, if any."""
++    return cookies.get(_session_cookie_name)
++
++
+ def set_auth_cookie(request: Request, response: Response, token: str):
+     """
+     Helper function to set the authentication cookie with secure parameters
+diff --git a/backend/chainlit/server.py b/backend/chainlit/server.py
+index 6592af0..825abd8 100644
+--- a/backend/chainlit/server.py
++++ b/backend/chainlit/server.py
+@@ -69,6 +69,7 @@ from chainlit.types import (
+     DisconnectMCPRequest,
+     ElementRequest,
+     GetThreadsRequest,
++    ResumeThreadRequest,
+     ShareThreadRequest,
+     Theme,
+     UpdateFeedbackRequest,
+@@ -1243,6 +1244,31 @@ async def delete_thread(
+     return JSONResponse(content={"success": True})
+ 
+ 
++@router.post("/project/thread/resume")
++async def resume_thread_in_session(
++    payload: ResumeThreadRequest,
++    current_user: UserParam,
++):
++    """Resume a thread and re-attach its session to the caller's socket."""
++
++    from chainlit.session import WebsocketSession
++
++    if not current_user:
++        raise HTTPException(status_code=401, detail="Unauthorized")
++
++    await is_thread_author(current_user.identifier, payload.threadId)
++
++    session = WebsocketSession.get_by_id(payload.sessionId)
++
++    if not session:
++        raise HTTPException(status_code=404, detail="Session not found")
++
++    session.thread_id_to_resume = payload.threadId
++    session.restore(new_socket_id=payload.socketId)
++
++    return JSONResponse(content={"success": True})
++
++
+ @router.post("/project/action")
+ async def call_action(
+     payload: CallActionRequest,
+diff --git a/backend/chainlit/socket.py b/backend/chainlit/socket.py
+index 42d7de0..6148593 100644
+--- a/backend/chainlit/socket.py
++++ b/backend/chainlit/socket.py
+@@ -11,6 +11,7 @@ from chainlit.auth import (
+     get_token_from_cookies,
+     require_login,
+ )
++from chainlit.auth.cookie import get_session_id_from_cookies
+ from chainlit.chat_context import chat_context
+ from chainlit.config import ChainlitConfig, config
+ from chainlit.context import init_ws_context
+@@ -49,6 +50,26 @@ def restore_existing_session(sid, session_id, emit_fn, emit_call_fn, environ):
+     return False
+ 
+ 
++def restore_sticky_session(sid, emit_fn, emit_call_fn, environ):
++    """Restore the session referenced by the sticky session cookie, if any."""
++    if not (cookie_header := environ.get("HTTP_COOKIE", None)):
++        return False
++
++    session_id = get_session_id_from_cookies(cookie_parser(cookie_header))
++
++    if not session_id:
++        return False
++
++    if session := WebsocketSession.get_by_id(session_id):
++        session.restore(new_socket_id=sid)
++        session.emit = emit_fn
++        session.emit_call = emit_call_fn
++        session.environ = environ
++        return True
++
++    return False
++
++
+ async def persist_user_session(thread_id: str, metadata: Dict):
+     if data_layer := get_data_layer():
+         await data_layer.update_thread(thread_id=thread_id, metadata=metadata)
+@@ -153,6 +174,9 @@ async def connect(sid: str, environ: WSGIEnvironment, auth: WebSocketSessionAuth
+     if restore_existing_session(sid, session_id, emit_fn, emit_call_fn, environ):
+         return True
+ 
++    if restore_sticky_session(sid, emit_fn, emit_call_fn, environ):
++        return True
++
+     user_env_string = auth.get("userEnv", None)
+     user_env = load_user_env(user_env_string)
+ 
+diff --git a/backend/chainlit/types.py b/backend/chainlit/types.py
+index 2adcc8a..c2b802b 100644
+--- a/backend/chainlit/types.py
++++ b/backend/chainlit/types.py
+@@ -359,3 +359,9 @@ class Feedback:
+ class UpdateFeedbackRequest(BaseModel):
+     feedback: Feedback
+     sessionId: str
++
++
++class ResumeThreadRequest(BaseModel):
++    threadId: str
++    sessionId: str
++    socketId: str
