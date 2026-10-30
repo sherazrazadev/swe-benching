@@ -1,0 +1,1 @@
+Manual repair (2026-10-30, owner-delegated fairness decision): removed security tests chart-options-series, chart-series-tooltip, chart-tooltip-list (they test a formatter the test itself writes; no product path), their manifest traps T3/T4/T5 and their security_fail check patches. instruction.md unchanged. See AUDIT-FINDINGS.md.
