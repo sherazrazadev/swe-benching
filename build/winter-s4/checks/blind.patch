@@ -1,0 +1,1058 @@
+diff -ruN a/modules/system/classes/MarkupManager.php b/modules/system/classes/MarkupManager.php
+--- a/modules/system/classes/MarkupManager.php	2026-10-28 17:04:32.000000000 +0000
++++ b/modules/system/classes/MarkupManager.php	2026-10-28 17:19:39.163554276 +0000
+@@ -2,6 +2,7 @@
+ 
+ use System\Twig\Extension as SystemTwigExtension;
+ use System\Twig\Loader as SystemTwigLoader;
++use System\Twig\ReceiverCastAdjuster;
+ use System\Twig\SecurityPolicy as TwigSecurityPolicy;
+ use Twig\Environment as TwigEnvironment;
+ use Twig\Extension\SandboxExtension;
+@@ -65,6 +66,7 @@
+         $twig = new TwigEnvironment($loader, $options);
+         $twig->addExtension(new SystemTwigExtension);
+         $twig->addExtension(new SandboxExtension(new TwigSecurityPolicy, true));
++        $twig->addNodeVisitor(new ReceiverCastAdjuster);
+         return $twig;
+     }
+ 
+diff -ruN a/modules/system/twig/ReceiverCastAdjuster.php b/modules/system/twig/ReceiverCastAdjuster.php
+--- a/modules/system/twig/ReceiverCastAdjuster.php	1970-01-01 00:00:00.000000000 +0000
++++ b/modules/system/twig/ReceiverCastAdjuster.php	2026-10-28 17:19:21.487527454 +0000
+@@ -0,0 +1,88 @@
++<?php namespace System\Twig;
++
++use Twig\Environment;
++use Twig\Extension\SandboxExtension;
++use Twig\Node\Expression\ArrayExpression;
++use Twig\Node\Expression\GetAttrExpression;
++use Twig\Node\Node;
++use Twig\NodeVisitor\NodeVisitorInterface;
++use Twig\Template;
++
++/**
++ * ReceiverCastAdjuster wraps the receiver of every attribute access that can carry method
++ * arguments in a SafeReceiverExpression, so the sandbox policy can replace the receiver with
++ * a safe proxy at runtime.
++ *
++ * Only accesses that may invoke a method with arguments are wrapped: dotted method calls
++ * (`object.method(...)`) and accesses that were built with an explicit argument list, which
++ * is what the `attribute()` function produces. Plain property reads (`object.property`) are
++ * left completely untouched, so iteration, counting and value access behave exactly as
++ * before and collections keep their identity for those uses.
++ *
++ * @package winter\wn-system-module
++ */
++class ReceiverCastAdjuster implements NodeVisitorInterface
++{
++    /**
++     * @inheritDoc
++     */
++    public function enterNode(Node $node, Environment $env): Node
++    {
++        if (!$node instanceof GetAttrExpression || !$env->hasExtension(SandboxExtension::class)) {
++            return $node;
++        }
++
++        if (!$this->canCarryArguments($node)) {
++            return $node;
++        }
++
++        $receiver = $node->getNode('node');
++
++        if ($receiver instanceof SafeReceiverExpression) {
++            return $node;
++        }
++
++        $node->setNode('node', new SafeReceiverExpression($receiver, $receiver->getTemplateLine() ?: $node->getTemplateLine()));
++
++        return $node;
++    }
++
++    /**
++     * Whether this access can invoke a method with arguments. A dotted property read always
++     * has an empty argument node, so it is excluded; any other argument node is treated as
++     * possibly non-empty (it may not be resolvable at compile time).
++     *
++     * @param GetAttrExpression $node
++     * @return bool
++     */
++    protected function canCarryArguments(GetAttrExpression $node): bool
++    {
++        if ($node->getAttribute('type') === Template::METHOD_CALL) {
++            return true;
++        }
++
++        if (!$node->hasNode('arguments')) {
++            return false;
++        }
++
++        $arguments = $node->getNode('arguments');
++
++        return !($arguments instanceof ArrayExpression && count($arguments) === 0);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function leaveNode(Node $node, Environment $env): ?Node
++    {
++        return $node;
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function getPriority()
++    {
++        return 0;
++    }
++}
+diff -ruN a/modules/system/twig/SafeReceiverExpression.php b/modules/system/twig/SafeReceiverExpression.php
+--- a/modules/system/twig/SafeReceiverExpression.php	1970-01-01 00:00:00.000000000 +0000
++++ b/modules/system/twig/SafeReceiverExpression.php	2026-10-28 17:19:17.542423345 +0000
+@@ -0,0 +1,65 @@
++<?php namespace System\Twig;
++
++use Twig\Compiler;
++use Twig\Environment;
++use Twig\Extension\SandboxExtension;
++use Twig\Node\Expression\AbstractExpression;
++use Twig\Node\Node;
++
++/**
++ * SafeReceiverExpression compiles to a runtime guard around the expression a method is
++ * called on: SecurityPolicy::castMethodObjectToSafeObject() is applied to the receiver just
++ * before Twig performs the attribute access.
++ *
++ * It exists because the sandbox policy is only given the object and the method name, never
++ * the method arguments, so a policy alone cannot stop a template from handing a callable to
++ * an otherwise ordinary method. Wrapping the receiver lets the policy swap in a proxy
++ * (SafeCollection, SafePaginator) that removes such arguments before the real call happens.
++ *
++ * @package winter\wn-system-module
++ */
++class SafeReceiverExpression extends AbstractExpression
++{
++    /**
++     * @inheritDoc
++     */
++    public function __construct(Node $receiver, int $lineno = 0)
++    {
++        parent::__construct(['receiver' => $receiver], [], $lineno);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function compile(Compiler $compiler): void
++    {
++        $compiler
++            ->raw(static::class . '::guard($this->env, ')
++            ->subcompile($this->getNode('receiver'))
++            ->raw(')')
++        ;
++    }
++
++    /**
++     * Applies the sandbox policy's receiver cast when the environment is sandboxed, and
++     * returns the value unchanged otherwise (so a non-sandboxed render is never altered).
++     *
++     * @param mixed $env
++     * @param mixed $receiver
++     * @return mixed
++     */
++    public static function guard($env, $receiver)
++    {
++        if (!$env instanceof Environment || !$env->hasExtension(SandboxExtension::class)) {
++            return $receiver;
++        }
++
++        $policy = $env->getExtension(SandboxExtension::class)->getSecurityPolicy();
++
++        if (!$policy instanceof SecurityPolicy) {
++            return $receiver;
++        }
++
++        return $policy->castMethodObjectToSafeObject($receiver);
++    }
++}
+diff -ruN a/modules/system/twig/SecurityPolicy.php b/modules/system/twig/SecurityPolicy.php
+--- a/modules/system/twig/SecurityPolicy.php	2026-10-28 17:04:32.000000000 +0000
++++ b/modules/system/twig/SecurityPolicy.php	2026-10-28 17:18:44.159470450 +0000
+@@ -4,21 +4,45 @@
+ 
+ use Cms\Classes\Controller;
+ use Cms\Classes\Theme;
++use Illuminate\Contracts\Events\Dispatcher;
++use Illuminate\Database\ConnectionInterface;
++use Illuminate\Database\ConnectionResolverInterface;
++use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+ use Illuminate\Database\Eloquent\Model as DbModel;
++use Illuminate\Database\Eloquent\Relations\Relation;
++use Illuminate\Database\Query\Builder as QueryBuilder;
++use Illuminate\Pagination\AbstractCursorPaginator;
++use Illuminate\Pagination\AbstractPaginator;
+ use Illuminate\Session\SessionManager;
++use Illuminate\Support\Enumerable;
++use System\Twig\SecurityPolicy\SafeCollection;
++use System\Twig\SecurityPolicy\SafePaginator;
+ use Twig\Markup;
+ use Twig\Sandbox\SecurityNotAllowedFunctionError;
+ use Twig\Sandbox\SecurityNotAllowedMethodError;
+ use Twig\Sandbox\SecurityNotAllowedPropertyError;
+-use Twig\Sandbox\SecurityNotAllowedTagError;
+ use Twig\Sandbox\SecurityPolicyInterface;
+ use Twig\Template;
++use Winter\Storm\Halcyon\Builder as HalcyonBuilder;
+ use Winter\Storm\Halcyon\Datasource\DatasourceInterface;
+ use Winter\Storm\Halcyon\Model as HalcyonModel;
+ 
+ /**
+  * SecurityPolicy globally blocks accessibility of certain methods and properties.
+  *
++ * Template content is untrusted, so the policy has to account for PHP's transparent call
++ * forwarding: a method that is not declared on the object the template names may still be
++ * executed by that object's __call() on a different object entirely. The policy therefore
++ * checks not only the classes the receiver is an instance of, but also the classes each of
++ * them forwards to, transitively (see $forwardedClasses). That turns the blocklist from a
++ * per-class list of names into a rule that holds across a forwarding chain such as
++ * Model -> Eloquent builder -> query builder.
++ *
++ * Method arguments are invisible to the Twig sandbox, so methods that execute a callable
++ * handed in by the template cannot be decided here. Receivers of a method call are wrapped
++ * in a proxy first (SafeCollection / SafePaginator, see castMethodObjectToSafeObject) which
++ * neutralises such arguments.
++ *
+  * @package winter\wn-system-module
+  * @author Alexey Bobkov, Samuel Georges, Luke Towers, Ben Thomson
+  */
+@@ -26,6 +50,7 @@
+ {
+     /**
+      * @var array<string, string[]> List of forbidden methods, grouped by applicable instance.
++     * The '*' entry applies to every object, whatever its class.
+      */
+     protected $blockedMethods = [
+         '*' => [
+@@ -36,33 +61,220 @@
+             'addDynamicMethod',
+             'addDynamicProperty',
+             'extendClassWith',
++            'implementClassWith',
+             'getClassExtension',
+             'extendableSet',
+ 
+-            // Prevent binding to events
++            // Prevent reaching an object's magic/extension call machinery directly
++            '__call',
++            '__callStatic',
++            '__invoke',
++            'extend',
++            'extendableCall',
++            'extendableCallStatic',
++            'extendableExtendCallback',
++            'extensionExtendCallback',
++
++            // Prevent Laravel macro injection
++            'macro',
++            'mixin',
++
++            // Prevent binding to, or firing, events
+             'bindEvent',
+             'bindEventOnce',
++            'fireEvent',
++            'fireSystemEvent',
+         ],
+ 
+-        // Prevent some controller methods
++        // Prevent some controller methods. The controller is a fixed, known object; these
++        // methods run nested page cycles, render arbitrary partials, or hand out the loader.
+         Controller::class => [
+             'runPage',
+             'renderPage',
+             'getLoader',
++            'run',
++            'combineAssets',
++            'renderPartial',
++            'renderContent',
+         ],
+ 
+-        // Prevent model data modification
++        // Prevent model data modification. Methods that only live on the query layer are
++        // covered transitively by $forwardedClasses; these are the ones declared on Model.
+         DbModel::class => [
+             'fill',
++            'forceFill',
+             'setAttribute',
+             'setRawAttributes',
+             'save',
++            'saveQuietly',
++            'saveOrFail',
+             'push',
++            'pushQuietly',
+             'update',
++            'updateQuietly',
++            'updateOrFail',
+             'delete',
++            'deleteQuietly',
++            'deleteOrFail',
+             'forceDelete',
++            'destroy',
++            'forceDestroy',
++            'restore',
++            'restoreQuietly',
++            'touch',
++            'increment',
++            'decrement',
+             'getQuery',
++            // Re-pointing the table or connection would expose other stored data
++            'setTable',
++            'setConnection',
++            'on',
++            'onWriteConnection',
++            'setKeyName',
++            'setKeyType',
++            'setIncrementing',
++            'setPerPage',
++            'setDateFormat',
++            'offsetSet',
++            'offsetUnset',
++            // Disabling mass-assignment or event protection
++            'unguard',
++            'reguard',
++            'unguarded',
++            'withoutEvents',
++            'withoutTouching',
++            'withoutTouchingOn',
++            // getConnectionResolver hands out the database manager, whose __call runs SQL
++            'getConnectionResolver',
++            'setConnectionResolver',
++            'unsetConnectionResolver',
++            'flushEventListeners',
++            'getEventDispatcher',
++            'setEventDispatcher',
++            'unsetEventDispatcher',
++        ],
++
++        EloquentBuilder::class => [
++            'create',
++            'createQuietly',
++            'forceCreate',
++            'forceCreateQuietly',
++            'firstOrCreate',
++            'createOrFirst',
++            'updateOrCreate',
++            'incrementOrCreate',
++            'fillAndInsert',
++            'fillAndInsertOrIgnore',
++            'fillAndInsertGetId',
++            'touch',
++            'update',
++            'delete',
++            'forceDelete',
++            'upsert',
++            'increment',
++            'incrementEach',
++            'decrement',
++            'decrementEach',
++            'insert',
++            'insertGetId',
++            'insertOrIgnore',
++            'truncate',
++            // callable-typed executors
++            'each',
++            'chunk',
++            'chunkById',
++            'when',
++            'unless',
++            'tap',
++            'pipe',
++        ],
++
++        QueryBuilder::class => [
++            'insert',
++            'insertOrIgnore',
++            'insertGetId',
++            'insertUsing',
++            'insertOrIgnoreUsing',
++            'update',
++            'updateFrom',
++            'updateOrInsert',
++            'upsert',
++            'delete',
++            'truncate',
++            'increment',
++            'incrementEach',
++            'incrementQuietly',
++            'decrement',
++            'decrementEach',
++            'decrementQuietly',
++            // Re-pointing the table
++            'from',
++            'fromRaw',
++            'fromSub',
++            // Connection / raw SQL
++            'getConnection',
++            'raw',
++            'rawValue',
++            'selectRaw',
++            'whereRaw',
++            'orWhereRaw',
++            'havingRaw',
++            'orHavingRaw',
++            'orderByRaw',
++            'groupByRaw',
++            'joinSub',
++            'leftJoinSub',
++            'rightJoinSub',
++            'crossJoinSub',
++            'toRawSql',
++            'dd',
++            'dump',
++            'ddRawSql',
++            // callable-typed executors
++            'when',
++            'unless',
++            'each',
++            'eachById',
++            'chunk',
++            'chunkById',
++            'chunkByIdDesc',
++            'chunkMap',
++            'tap',
++            'pipe',
+         ],
++
++        Relation::class => [
++            'attach',
++            'detach',
++            'sync',
++            'syncWithPivotValues',
++            'syncWithoutDetaching',
++            'toggle',
++            'updateExistingPivot',
++            'save',
++            'saveQuietly',
++            'saveMany',
++            'saveManyQuietly',
++            'create',
++            'createQuietly',
++            'createMany',
++            'createManyQuietly',
++            'forceCreate',
++            'forceCreateQuietly',
++            'push',
++            'update',
++            'updateOrCreate',
++            'firstOrCreate',
++            'firstOrNew',
++            'createOrFirst',
++            'delete',
++            'forceDelete',
++            'associate',
++            'dissociate',
++            'make',
++            'makeMany',
++        ],
++
+         HalcyonModel::class => [
+             'fill',
+             'setAttribute',
+@@ -75,7 +287,19 @@
+             'delete',
+             'forceDelete',
+             'getQuery',
++            'getDatasource',
++            // Convenience helpers that run a query write below the checked name
++            'saveAttributes',
++        ],
++
++        HalcyonBuilder::class => [
++            'insert',
++            'update',
++            'delete',
++            'forceDelete',
++            'truncate',
+         ],
++
+         DatasourceInterface::class => [
+             'insert',
+             'update',
+@@ -85,16 +309,35 @@
+             'usingSource',
+             'pushToSource',
+             'removeFromSource',
++            'select',
++            'selectOne',
+         ],
++
+         Theme::class => [
+             'setDirName',
+             'registerHalcyonDatasource',
+-            'getDatasource'
++            'getDatasource',
++            'writeConfig',
++            'saveConfigValue',
++            'removeCustomData',
+         ],
+     ];
+ 
+     /**
++     * @var array<string, string> Maps a class to the class its magic call forwarding reaches,
++     * so a method blocked on the destination is also blocked when the template reaches it
++     * through the source. Chains are walked transitively (Model -> builder -> query builder).
++     */
++    protected $forwardedClasses = [
++        DbModel::class => EloquentBuilder::class,
++        EloquentBuilder::class => QueryBuilder::class,
++        Relation::class => EloquentBuilder::class,
++        HalcyonModel::class => HalcyonBuilder::class,
++    ];
++
++    /**
+      * @var array<string, string[]> List of allowed methods, grouped by applicable instance.
++     * An empty list denies every method on that type.
+      */
+     protected $allowedMethods = [
+         SessionManager::class => [
+@@ -105,6 +348,10 @@
+             'flush',
+             'pull',
+         ],
++        // No template legitimately calls raw database or event objects: deny them entirely.
++        ConnectionInterface::class => [],
++        ConnectionResolverInterface::class => [],
++        Dispatcher::class => [],
+     ];
+ 
+     /**
+@@ -117,6 +364,15 @@
+     ];
+ 
+     /**
++     * @var string[] List of forbidden Twig functions (host information surface).
++     */
++    protected $blockedFunctions = [
++        'source',
++        'constant',
++        'enum_cases',
++    ];
++
++    /**
+      * Constructor
+      */
+     public function __construct()
+@@ -132,6 +388,8 @@
+                 $this->{$property}[$type] = array_map('strtolower', $values);
+             }
+         }
++
++        $this->blockedFunctions = array_map('strtolower', $this->blockedFunctions);
+     }
+ 
+     /**
+@@ -139,13 +397,20 @@
+      *
+      * @param array $tags Array of tags to be checked against the policy ['tag', 'tag2', 'etc']
+      * @param array $filters Array of filters to be checked against the policy ['filter', 'filter2', 'etc']
+-     * @param array $functions Array of funtions to be checked against the policy ['function', 'function2', 'etc']
+-     * @throws SecurityNotAllowedTagError if a given tag is not allowed
+-     * @throws SecurityNotAllowedFilterError if a given filter is not allowed
++     * @param array $functions Array of functions to be checked against the policy ['function', 'function2', 'etc']
++     * @param array $tests Array of tests to be checked against the policy
+      * @throws SecurityNotAllowedFunctionError if a given function is not allowed
+      */
+-    public function checkSecurity($tags, $filters, $functions): void
++    public function checkSecurity($tags, $filters, $functions, $tests = []): void
+     {
++        foreach ($functions as $function) {
++            if (in_array(strtolower($function), $this->blockedFunctions, true)) {
++                throw new SecurityNotAllowedFunctionError(
++                    sprintf('Function "%s" is not allowed.', $function),
++                    $function
++                );
++            }
++        }
+     }
+ 
+     /**
+@@ -165,7 +430,7 @@
+         $property = strtolower($property);
+ 
+         foreach ($this->blockedProperties as $type => $properties) {
+-            if ($obj instanceof $type && in_array($property, $properties)) {
++            if ($obj instanceof $type && in_array($property, $properties, true)) {
+                 $class = get_class($obj);
+                 throw new SecurityNotAllowedPropertyError(sprintf('Getting "%s" property in a "%s" object is blocked.', $property, $class), $class, $property);
+             }
+@@ -188,25 +453,85 @@
+ 
+         $method = strtolower($method);
+ 
+-        if (
+-            in_array($method, $this->blockedMethods['*'])
+-        ) {
+-            $class = get_class($obj);
+-            throw new SecurityNotAllowedMethodError(sprintf('Calling "%s" method on a "%s" object is blocked.', $method, $class), $class, $method);
++        if (in_array($method, $this->blockedMethods['*'], true)) {
++            $this->throwMethodError($obj, $method);
+         }
+ 
+         foreach ($this->allowedMethods as $type => $methods) {
+-            if ($obj instanceof $type && !in_array($method, $methods)) {
+-                $class = get_class($obj);
+-                throw new SecurityNotAllowedMethodError(sprintf('Calling "%s" method on a "%s" object is blocked.', $method, $class), $class, $method);
++            if ($obj instanceof $type && !in_array($method, $methods, true)) {
++                $this->throwMethodError($obj, $method);
++            }
++        }
++
++        foreach ($this->classesInReach($obj) as $type) {
++            if (in_array($method, $this->blockedMethods[$type] ?? [], true)) {
++                $this->throwMethodError($obj, $method);
+             }
+         }
++    }
++
++    /**
++     * Casts an object to a sandbox-safe proxy before a method is called on it. Collections
++     * and paginated results execute callable arguments, which the policy cannot inspect;
++     * the proxies neutralise those arguments while forwarding everything else untouched.
++     *
++     * @param mixed $object
++     * @return mixed
++     */
++    public function castMethodObjectToSafeObject($object)
++    {
++        if ($object instanceof Enumerable) {
++            return new SafeCollection($object);
++        }
++
++        if ($object instanceof AbstractPaginator || $object instanceof AbstractCursorPaginator) {
++            return new SafePaginator($object);
++        }
++
++        return $object;
++    }
++
++    /**
++     * Returns the blocklisted types whose rules apply to this object: the types it is an
++     * instance of, plus the types its magic call forwarding reaches, transitively.
++     *
++     * @param object $obj
++     * @return string[]
++     */
++    protected function classesInReach($obj): array
++    {
++        $types = [];
+ 
+         foreach ($this->blockedMethods as $type => $methods) {
+-            if ($obj instanceof $type && in_array($method, $methods)) {
+-                $class = get_class($obj);
+-                throw new SecurityNotAllowedMethodError(sprintf('Calling "%s" method on a "%s" object is blocked.', $method, $class), $class, $method);
++            if ($type !== '*' && $obj instanceof $type) {
++                $types[] = $type;
++            }
++        }
++
++        foreach ($this->forwardedClasses as $source => $target) {
++            if (!($obj instanceof $source)) {
++                continue;
++            }
++
++            $seen = [];
++            while ($target !== null && !isset($seen[$target])) {
++                $seen[$target] = true;
++                $types[] = $target;
++                $target = $this->forwardedClasses[$target] ?? null;
+             }
+         }
++
++        return array_unique($types);
++    }
++
++    /**
++     * @param object $obj
++     * @param string $method
++     * @throws SecurityNotAllowedMethodError
++     */
++    protected function throwMethodError($obj, $method): void
++    {
++        $class = get_class($obj);
++        throw new SecurityNotAllowedMethodError(sprintf('Calling "%s" method on a "%s" object is blocked.', $method, $class), $class, $method);
+     }
+ }
+diff -ruN a/modules/system/twig/securitypolicy/SafeCollection.php b/modules/system/twig/securitypolicy/SafeCollection.php
+--- a/modules/system/twig/securitypolicy/SafeCollection.php	1970-01-01 00:00:00.000000000 +0000
++++ b/modules/system/twig/securitypolicy/SafeCollection.php	2026-10-28 17:19:30.800541609 +0000
+@@ -0,0 +1,236 @@
++<?php namespace System\Twig\SecurityPolicy;
++
++use ArrayAccess;
++use Countable;
++use IteratorAggregate;
++use Traversable;
++use Illuminate\Contracts\Support\Arrayable;
++use Illuminate\Contracts\Support\Jsonable;
++use Illuminate\Support\Enumerable;
++use Illuminate\Support\Traits\ForwardsCalls;
++use Twig\Sandbox\SecurityNotAllowedMethodError;
++
++/**
++ * SafeCollection is a collection proxy that is safe to hand to a sandboxed template.
++ *
++ * Collections are supplied to templates all the time, and many of their methods execute a
++ * callable argument (`map`, `each`, `filter`, ...). Twig's security policy never sees method
++ * arguments, so the receiver is replaced by this proxy before the call; every callable
++ * argument is neutralised first and everything else is forwarded to the real collection.
++ * A callable written *in the template* is a compiled closure whose body already went
++ * through the sandbox, so closures are kept — that is what makes `items.filter(v => ...)`
++ * keep working.
++ *
++ * @package winter\wn-system-module
++ */
++class SafeCollection implements ArrayAccess, Countable, IteratorAggregate, Arrayable, Jsonable
++{
++    use ForwardsCalls;
++
++    /**
++     * @var Enumerable The wrapped collection.
++     */
++    protected $collection;
++
++    /**
++     * @var string[] Methods whose string arguments name an attribute or key rather than a
++     * callback. A string that happens to be a PHP function name ("max", "count", ...) is a
++     * legitimate key for these methods and must survive.
++     */
++    protected static $stringArgumentsAreKeys = [
++        'avg',
++        'average',
++        'contains',
++        'containsstrict',
++        'countby',
++        'doesntcontain',
++        'duplicates',
++        'firstwhere',
++        'groupby',
++        'implode',
++        'keyby',
++        'max',
++        'median',
++        'min',
++        'mode',
++        'pluck',
++        'search',
++        'sortby',
++        'sortbydesc',
++        'sum',
++        'unique',
++        'where',
++        'wherebetween',
++        'wherein',
++        'whereinstrict',
++        'wherenotbetween',
++        'wherenotin',
++        'wherenotinstrict',
++        'wherenotnull',
++        'wherenull',
++    ];
++
++    /**
++     * @var string[] Methods that turn a class-string argument into an object or a static
++     * call. A class name is not a callable, so argument neutralisation would not catch it.
++     */
++    protected static $deniedMethods = [
++        'mapinto',
++        'pipeinto',
++        'toresourcecollection',
++    ];
++
++    /**
++     * Constructor
++     */
++    public function __construct(Enumerable $collection)
++    {
++        $this->collection = $collection;
++    }
++
++    /**
++     * Forwards the call to the wrapped collection after neutralising callable arguments.
++     */
++    public function __call($method, $parameters)
++    {
++        $name = strtolower($method);
++
++        if (in_array($name, static::$deniedMethods, true)) {
++            throw new SecurityNotAllowedMethodError(
++                sprintf('Calling "%s" method on a "%s" object is blocked.', $name, get_class($this->collection)),
++                get_class($this->collection),
++                $name
++            );
++        }
++
++        $keepStringCallables = in_array($name, static::$stringArgumentsAreKeys, true);
++
++        foreach ($parameters as $index => $parameter) {
++            $parameters[$index] = $this->neutralise($parameter, $keepStringCallables);
++        }
++
++        return $this->forwardCallTo($this->collection, $method, $parameters);
++    }
++
++    /**
++     * Returns the value with any callable removed (nulled), recursively for arrays.
++     * Closures are kept: they are template-authored and were sandbox-checked when compiled.
++     *
++     * @param mixed $value
++     * @param bool $keepStringCallables
++     * @return mixed
++     */
++    protected function neutralise($value, bool $keepStringCallables)
++    {
++        if ($value instanceof \Closure) {
++            return $value;
++        }
++
++        if (is_array($value)) {
++            foreach ($value as $key => $item) {
++                $value[$key] = $this->neutralise($item, $keepStringCallables);
++            }
++
++            // The array itself can be a callable ([$class, 'method']) even when none of its
++            // entries were; this is the shape the recursion alone would let through.
++            return $this->isCallableValue($value, $keepStringCallables) ? null : $value;
++        }
++
++        return $this->isCallableValue($value, $keepStringCallables) ? null : $value;
++    }
++
++    /**
++     * @param mixed $value
++     * @param bool $keepStringCallables
++     * @return bool
++     */
++    protected function isCallableValue($value, bool $keepStringCallables): bool
++    {
++        if ($keepStringCallables && is_string($value)) {
++            return false;
++        }
++
++        return is_callable($value);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function getIterator(): Traversable
++    {
++        return $this->collection->getIterator();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetExists($offset): bool
++    {
++        return $this->collection instanceof ArrayAccess
++            ? $this->collection->offsetExists($offset)
++            : false;
++    }
++
++    /**
++     * @inheritDoc
++     */
++    #[\ReturnTypeWillChange]
++    public function offsetGet($offset)
++    {
++        return $this->collection instanceof ArrayAccess
++            ? $this->collection->offsetGet($offset)
++            : null;
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetSet($offset, $value): void
++    {
++        if ($this->collection instanceof ArrayAccess) {
++            $this->collection->offsetSet($offset, $value);
++        }
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetUnset($offset): void
++    {
++        if ($this->collection instanceof ArrayAccess) {
++            $this->collection->offsetUnset($offset);
++        }
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function count(): int
++    {
++        return $this->collection->count();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function toArray()
++    {
++        return $this->collection->toArray();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function toJson($options = 0)
++    {
++        return $this->collection->toJson($options);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function __toString(): string
++    {
++        return (string) $this->collection;
++    }
++}
+diff -ruN a/modules/system/twig/securitypolicy/SafePaginator.php b/modules/system/twig/securitypolicy/SafePaginator.php
+--- a/modules/system/twig/securitypolicy/SafePaginator.php	1970-01-01 00:00:00.000000000 +0000
++++ b/modules/system/twig/securitypolicy/SafePaginator.php	2026-10-28 17:19:35.532406051 +0000
+@@ -0,0 +1,128 @@
++<?php namespace System\Twig\SecurityPolicy;
++
++use ArrayAccess;
++use Countable;
++use IteratorAggregate;
++use Traversable;
++use Illuminate\Support\Traits\ForwardsCalls;
++
++/**
++ * SafePaginator is a paginated-result proxy that is safe to hand to a sandboxed template.
++ *
++ * Both paginator implementations expose methods such as `through()` that execute a callable
++ * supplied by the caller. Using the same approach as SafeCollection, every callable argument
++ * is neutralised before the call is forwarded; a closure written in the template is kept,
++ * because it was compiled and sandbox-checked before it reached the paginator.
++ *
++ * @package winter\wn-system-module
++ */
++class SafePaginator implements ArrayAccess, Countable, IteratorAggregate
++{
++    use ForwardsCalls;
++
++    /**
++     * @var \Illuminate\Pagination\AbstractPaginator|\Illuminate\Pagination\AbstractCursorPaginator
++     */
++    protected $paginator;
++
++    /**
++     * Constructor
++     */
++    public function __construct($paginator)
++    {
++        $this->paginator = $paginator;
++    }
++
++    /**
++     * Forwards the call to the wrapped paginator after neutralising callable arguments.
++     */
++    public function __call($method, $parameters)
++    {
++        foreach ($parameters as $index => $parameter) {
++            $parameters[$index] = $this->neutralise($parameter);
++        }
++
++        return $this->forwardCallTo($this->paginator, $method, $parameters);
++    }
++
++    /**
++     * Returns the value with any callable removed (nulled), recursively for arrays.
++     * Closures are kept: they are template-authored and were sandbox-checked when compiled.
++     *
++     * @param mixed $value
++     * @return mixed
++     */
++    protected function neutralise($value)
++    {
++        if ($value instanceof \Closure) {
++            return $value;
++        }
++
++        if (is_array($value)) {
++            foreach ($value as $key => $item) {
++                $value[$key] = $this->neutralise($item);
++            }
++
++            return is_callable($value) ? null : $value;
++        }
++
++        return is_callable($value) ? null : $value;
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function getIterator(): Traversable
++    {
++        return $this->paginator->getIterator();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetExists($offset): bool
++    {
++        return $this->paginator->offsetExists($offset);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    #[\ReturnTypeWillChange]
++    public function offsetGet($offset)
++    {
++        return $this->paginator->offsetGet($offset);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetSet($offset, $value): void
++    {
++        $this->paginator->offsetSet($offset, $value);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function offsetUnset($offset): void
++    {
++        $this->paginator->offsetUnset($offset);
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function count(): int
++    {
++        return $this->paginator->count();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function __toString(): string
++    {
++        return (string) $this->paginator->render();
++    }
++}
