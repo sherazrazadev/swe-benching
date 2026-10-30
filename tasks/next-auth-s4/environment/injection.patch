@@ -1,0 +1,185 @@
+diff --git a/packages/core/src/lib/actions/callback/index.ts b/packages/core/src/lib/actions/callback/index.ts
+index d11048f..983949f 100644
+--- a/packages/core/src/lib/actions/callback/index.ts
++++ b/packages/core/src/lib/actions/callback/index.ts
+@@ -11,6 +11,7 @@ import {
+ import { handleLoginOrRegister } from "./handle-login.js"
+ import { handleOAuth } from "./oauth/callback.js"
+ import { state } from "./oauth/checks.js"
++import { openLinkIntent } from "../signin/link-intent.js"
+ import { createHash } from "../../utils/web.js"
+ 
+ import type { AdapterSession } from "../../../adapters.js"
+@@ -130,6 +131,38 @@ export async function callback(
+       )
+       if (redirect) return { redirect, cookies }
+ 
++      // If the user asked to link the provider account to their existing
++      // account, the callback finishes that link before signing in.
++      const linkIntentValue =
++        request.cookies?.[options.cookies.linkIntent.name]
++      let linkUserId: string | undefined
++      if (linkIntentValue) {
++        linkUserId = await openLinkIntent(linkIntentValue, options)
++      } else if (options.callbackUrl) {
++        // A page can also ask for the link in its own address, e.g. a settings
++        // page opened as /account?linkTo=<user id>. That address is kept as the
++        // callback URL for the whole sign-in, so the request that finishes the
++        // sign-in carries the same value back.
++        try {
++          linkUserId =
++            new URL(options.callbackUrl).searchParams.get("linkTo") ?? undefined
++        } catch {}
++      }
++      if (linkUserId) {
++        if (adapter) {
++          const linkTarget = await adapter.getUser(linkUserId)
++          if (!linkTarget) {
++            throw new AuthError("Link target account not found")
++          }
++          await adapter.linkAccount({ ...account, userId: linkUserId })
++          await events.linkAccount?.({
++            user: linkTarget,
++            account,
++            profile: linkTarget,
++          })
++        }
++      }
++
+       const { user, session, isNewUser } = await handleLoginOrRegister(
+         sessionStore.value,
+         userFromProvider,
+diff --git a/packages/core/src/lib/actions/signin/index.ts b/packages/core/src/lib/actions/signin/index.ts
+index e47c934..69496a5 100644
+--- a/packages/core/src/lib/actions/signin/index.ts
++++ b/packages/core/src/lib/actions/signin/index.ts
+@@ -1,5 +1,8 @@
+ import { getAuthorizationUrl } from "./authorization-url.js"
+ import { sendToken } from "./send-token.js"
++import { sealLinkIntent } from "./link-intent.js"
++import { SessionStore } from "../../utils/cookie.js"
++import { getLoggedInUser } from "../../utils/session.js"
+ 
+ import type { Cookie } from "../../utils/cookie.js"
+ import type {
+@@ -25,6 +28,18 @@ export async function signIn(
+         options
+       )
+       if (authCookies) cookies.push(...authCookies)
++      // Remember which account the user wants to link, so the callback can
++      // finish the link even when the session cookie is not sent along. A
++      // signed-in user signing in with another provider is asking to link it.
++      const sessionStore = new SessionStore(
++        options.cookies.sessionToken,
++        request.cookies,
++        options.logger
++      )
++      const loggedInUser = await getLoggedInUser(options, sessionStore)
++      if (loggedInUser?.id) {
++        cookies.push(await sealLinkIntent(loggedInUser.id, options))
++      }
+       return { redirect, cookies }
+     }
+     case "email": {
+diff --git a/packages/core/src/lib/actions/signin/link-intent.ts b/packages/core/src/lib/actions/signin/link-intent.ts
+new file mode 100644
+index 0000000..aeec096
+--- /dev/null
++++ b/packages/core/src/lib/actions/signin/link-intent.ts
+@@ -0,0 +1,63 @@
++import { InvalidCheck } from "../../../errors.js"
++
++// The payload is encrypted with the same JWT helpers the other client-side
++// sign-in values use, but kept in its own module so the sign-in intent can be
++// read without pulling in the OAuth check machinery.
++import { decode, encode } from "../../../jwt.js"
++
++import type { InternalOptions } from "../../../types.js"
++import type { Cookie } from "../../utils/cookie.js"
++
++const LINK_INTENT_TTL = 60 * 15 // 15 minutes
++
++interface LinkIntentPayload {
++  value: string
++}
++
++/**
++ * Stores the id of the user an in-progress sign-in should be linked to.
++ * The intent is carried in an encrypted cookie so the browser cannot change
++ * which account the provider will be linked to.
++ */
++export async function sealLinkIntent(
++  userId: string,
++  options: InternalOptions
++): Promise<Cookie> {
++  const cookie = options.cookies.linkIntent
++  const expires = new Date()
++  expires.setTime(expires.getTime() + LINK_INTENT_TTL * 1000)
++
++  const encoded = await encode({
++    ...options.jwt,
++    maxAge: LINK_INTENT_TTL,
++    token: { value: userId } satisfies LinkIntentPayload,
++    salt: cookie.name,
++  })
++
++  return {
++    name: cookie.name,
++    value: encoded,
++    options: { ...cookie.options, expires },
++  }
++}
++
++/** Reads the link intent stored by `sealLinkIntent`. */
++export async function openLinkIntent(
++  value: string | undefined,
++  options: InternalOptions
++): Promise<string> {
++  try {
++    if (!value) throw new InvalidCheck("link intent cookie was missing")
++    const parsed = await decode<LinkIntentPayload>({
++      ...options.jwt,
++      token: value,
++      salt: options.cookies.linkIntent.name,
++    })
++    if (parsed?.value) return parsed.value
++    throw new Error("Invalid cookie")
++  } catch (error) {
++    throw new InvalidCheck("link intent value could not be parsed", {
++      cause: error,
++    })
++  }
++}
+diff --git a/packages/core/src/lib/utils/cookie.ts b/packages/core/src/lib/utils/cookie.ts
+index 7932b37..f5803cd 100644
+--- a/packages/core/src/lib/utils/cookie.ts
++++ b/packages/core/src/lib/utils/cookie.ts
+@@ -128,6 +128,16 @@ export function defaultCookies(useSecureCookies: boolean) {
+         maxAge: 60 * 15, // 15 minutes in seconds
+       },
+     },
++    linkIntent: {
++      name: `${cookiePrefix}authjs.link-intent`,
++      options: {
++        httpOnly: true,
++        sameSite: "lax",
++        path: "/",
++        secure: useSecureCookies,
++        maxAge: 60 * 15, // 15 minutes in seconds
++      },
++    },
+   } as const satisfies CookiesOptions
+ }
+ 
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index b6653ff..0cad100 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -196,6 +196,7 @@ export interface CookiesOptions {
+   state: Partial<CookieOption>
+   nonce: Partial<CookieOption>
+   webauthnChallenge: Partial<CookieOption>
++  linkIntent: Partial<CookieOption>
+ }
+ 
+ /** TODO: Check if all these are used/correct */
