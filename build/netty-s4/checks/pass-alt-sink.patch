@@ -1,0 +1,82 @@
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+index 088d2d7..4ff44be 100644
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+@@ -15,11 +15,17 @@
+  */
+ package io.netty.handler.ssl.ocsp;
+ 
++import org.bouncycastle.cert.X509CertificateHolder;
++import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
+ import org.bouncycastle.cert.ocsp.BasicOCSPResp;
+ import org.bouncycastle.cert.ocsp.OCSPException;
+ import org.bouncycastle.cert.ocsp.RevokedStatus;
+ import org.bouncycastle.cert.ocsp.SingleResp;
++import org.bouncycastle.operator.DigestCalculatorProvider;
++import org.bouncycastle.operator.OperatorCreationException;
++import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
+ 
++import java.security.cert.CertificateEncodingException;
+ import java.security.cert.X509Certificate;
+ import java.util.Date;
+ 
+@@ -69,7 +75,18 @@ public final class OcspResponseValidator {
+             throw new OCSPException("OCSP Response is out-of-date");
+         }
+ 
+-        if (!singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
++        X509CertificateHolder issuerHolder;
++        DigestCalculatorProvider digestCalculatorProvider;
++        try {
++            issuerHolder = new JcaX509CertificateHolder(issuer);
++            digestCalculatorProvider = new JcaDigestCalculatorProviderBuilder().build();
++        } catch (CertificateEncodingException e) {
++            throw new OCSPException("Error while parsing the issuer certificate", e);
++        } catch (OperatorCreationException e) {
++            throw new OCSPException("Error while creating the digest calculator", e);
++        }
++        if (!singleResponse.getCertID().matchesIssuer(issuerHolder, digestCalculatorProvider)
++                || !singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
+             throw new OCSPException("OCSP response does not match the certificate");
+         }
+ 
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java
+index 96af17a..6014450 100644
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java
+@@ -25,6 +25,9 @@ import io.netty.util.AttributeKey;
+ import io.netty.util.concurrent.Future;
+ import io.netty.util.concurrent.GenericFutureListener;
+ import io.netty.util.concurrent.Promise;
++import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
++import org.bouncycastle.cert.ocsp.CertificateID;
++import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
+ import org.bouncycastle.cert.ocsp.BasicOCSPResp;
+ import org.bouncycastle.cert.ocsp.OCSPException;
+ import org.bouncycastle.cert.ocsp.RevokedStatus;
+@@ -152,6 +155,25 @@ public class OcspServerCertificateValidator extends ChannelInboundHandlerAdapter
+                     // from OCSP responder. We will validate it now and process.
+                     if (future.isSuccess()) {
+                         SingleResp response = future.getNow().getResponses()[0];
++                        try {
++                            CertificateID responseCertId = response.getCertID();
++                            if (!responseCertId.matchesIssuer(
++                                    new JcaX509CertificateHolder((X509Certificate) certificates[1]),
++                                    new JcaDigestCalculatorProviderBuilder().build())
++                                    || !responseCertId.getSerialNumber().equals(
++                                            ((X509Certificate) certificates[0]).getSerialNumber())) {
++                                ctx.fireExceptionCaught(new OCSPException(
++                                        "OCSP response does not match the certificate"));
++                                if (closeAndThrowIfNotValid) {
++                                    ctx.close();
++                                }
++                                return;
++                            }
++                        } catch (Exception e) {
++                            ctx.fireExceptionCaught(new OCSPException(
++                                    "Failed to bind the OCSP response", e));
++                            return;
++                        }
+ 
+                         Date current = new Date();
+                         if (!(current.after(response.getThisUpdate()) &&

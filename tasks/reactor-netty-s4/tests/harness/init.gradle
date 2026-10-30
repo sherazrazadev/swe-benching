@@ -1,0 +1,37 @@
+// Runs the hidden suites in their own source set, so the project's own test sources are
+// neither compiled nor trusted at grading time.
+allprojects { p ->
+	if (p.path == ':reactor-netty-http') {
+		p.afterEvaluate {
+			def srcDir = System.getenv('HIDDEN_SRC') ?: '/workspace/.htests/src'
+			def outDir = System.getenv('HIDDEN_RESULTS') ?: '/workspace/.htests/results'
+			def hidden = p.sourceSets.create('hiddenTest')
+			hidden.java.srcDirs = [srcDir]
+			hidden.compileClasspath += p.sourceSets.main.output + p.configurations.testCompileClasspath
+			hidden.runtimeClasspath += hidden.output + p.sourceSets.main.output + p.configurations.testRuntimeClasspath
+			p.tasks.register('hiddenTest', Test) {
+				dependsOn hidden.classesTaskName
+				testClassesDirs = hidden.output.classesDirs
+				classpath = hidden.runtimeClasspath
+				useJUnitPlatform()
+				ignoreFailures = true
+				maxHeapSize = '1g'
+				retry {
+					maxRetries = 0
+					maxFailures = 0
+				}
+				systemProperty 'java.awt.headless', 'true'
+				systemProperty 'io.netty.leakDetection.level', 'disabled'
+				systemProperty 'reactor.trace.cancel', 'true'
+				systemProperty 'reactor.trace.nocapacity', 'true'
+				testLogging {
+					showExceptions = true
+					exceptionFormat = 'full'
+				}
+				reports.junitXml.required = true
+				reports.junitXml.outputLocation = p.file(outDir)
+				reports.html.required = false
+			}
+		}
+	}
+}

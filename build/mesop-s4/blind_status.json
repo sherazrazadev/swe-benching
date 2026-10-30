@@ -1,0 +1,33 @@
+{
+ "output_file": "/home/runner/work/swe-benching/swe-benching/build/mesop-s4/blind-run.json",
+ "exit_code": 0,
+ "stderr_file": "/home/runner/work/swe-benching/swe-benching/build/mesop-s4/blind-run.err",
+ "stderr_tail": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+ "is_error": false,
+ "subtype": "success",
+ "terminal_reason": "completed",
+ "num_turns": 58,
+ "duration_ms": 334885,
+ "total_cost_usd": 1.8011368,
+ "errors": null,
+ "permission_denials": [],
+ "session_id": "c39d929b-6bbe-4cd5-8e22-fb2776b0d3d2",
+ "modelUsage": {
+  "deepseek-flash[1m]": {
+   "inputTokens": 58683,
+   "outputTokens": 40614,
+   "cacheReadInputTokens": 3770624,
+   "cacheCreationInputTokens": 0,
+   "webSearchRequests": 0,
+   "costUSD": 1.8011368,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 32000,
+   "thinkingTokens": 0,
+   "canonicalModel": "deepseek-flash[1m]",
+   "provider": "firstParty",
+   "costBasis": "unknown"
+  }
+ },
+ "agent_result": "**Patch:** `/home/runner/.tb-graders/cwe/blind/mesop-s4/blind.patch` (212 lines; two files \u2014 `mesop/server/static_file_serving.py` modified, `mesop/server/terminal_safety.py` added; `patch -p1` verified on a fresh `pristine` copy and reproduces `app/` exactly).\n\n**5-line summary**\n1. Added `mesop/server/terminal_safety.py`: strips whole ANSI/VT100 sequences (CSI/OSC/DCS/SOS/PM/APC/short two-byte) and then all residual C0/C1 controls, DEL, and Unicode bidi/format controls, recursively over decoded JSON strings and keys; ordinary non-ASCII and percent-encoded text is untouched.\n2. The CSP handler sanitizes the report once at the JSON decode boundary, so every downstream sink \u2014 banner, operational record, tracker module, warning channel \u2014 only ever sees clean values.\n3. `serve_web_components` now returns fixed-text 400 responses on all three rejection branches instead of raising `MesopException` with the raw path/extension, so Flask's unhandled-error log can never repeat the request target.\n4. Unknown directives and malformed/non-object reports now return 400 instead of raising, satisfying the refusal-form contract.\n5. Added a before-request guard refusing request paths that carry terminal controls with a 400, covering routes such as the catch-all/error paths beyond the two tested sinks.\n\n**Mechanisms (one line per site)**\n- **T1 \u2014 banner:** boundary sanitization removes ANSI/VT100 from `document-uri`, `blocked-uri`, `violated-directive` before they reach the printed diagnostic.\n- **T2 \u2014 bare controls:** the same sanitizer removes C0/C1, DEL, CR/LF/BS/NUL and bidi overrides, not just ESC sequences.\n- **T3 \u2014 asset route:** the three rejection branches return fixed-text 400s; nothing is raised or logged with the decoded target.\n- **T4 \u2014 operational record:** `logging.warning(\"CSP violation on page %s: blocked %s\", \u2026)` logs the already-sanitized fields.\n- **T5 \u2014 violation tracker:** `note_violation` receives sanitized URI/directive values, so its separate-module log record is clean.\n- **T6 \u2014 refused-document warning:** only the sanitized value is concatenated; `warn()`'s own colour prefix is untouched.\n- **T7 \u2014 no over-broad scrub:** the banner's own colours, `\u26a0`/`\u2501` symbols and multi-line layout never pass through the sanitizer.\n- **Target guard:** request paths with terminal controls are refused 400 before any handler or error record can echo them.\n- **Refusal form:** non-object bodies, non-object/missing `csp-report`, non-string fields, and unknown directives return 400, never an unhandled 500.\n\n**Verification (task toolchain image):** on the patched tree, hidden security 39/39, hidden functional 8/8, project 3/3, plus 46 extra probes (sanitizer unit cases, malformed reports, unknown directives, catch-all route, preservation) \u2014 all pass. On pristine, the security suite fails 39/39, confirming the tests exercise the flaw.",
+ "status": "ok"
+}

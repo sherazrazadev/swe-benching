@@ -1,0 +1,179 @@
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java	2026-10-30 11:58:42.000000000 +0000
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java	2026-10-30 12:36:34.934252535 +0000
+@@ -144,12 +144,24 @@
+                     // Get OCSP URL from Certificate and query it.
+                     URL uri = new URL(parseOcspUrlFromCertificate(x509Certificate));
+ 
+-                    // Reuse a fresh response for this responder if one is still cached.
+-                    final String cacheKey = uri.toString();
++                    // Reuse a fresh response for this responder and certificate if one is still
++                    // cached. The key must identify the certificate as well: an answer kept for
++                    // one certificate is never evidence about another one, even from the same
++                    // responder.
++                    final String cacheKey = cacheKey(certificateID, uri);
+                     BasicOCSPResp cachedResponse = RESPONSE_CACHE.get(cacheKey);
+                     if (cachedResponse != null && isFresh(cachedResponse)) {
+-                        responsePromise.trySuccess(cachedResponse);
+-                        return;
++                        try {
++                            // Re-check the binding of an answer obtained earlier before trusting it.
++                            OcspResponseBinding.verify(
++                                    cachedResponse.getResponses()[0].getCertID(), x509Certificate, issuer);
++                            responsePromise.trySuccess(cachedResponse);
++                            return;
++                        } catch (Exception e) {
++                            // The stored answer cannot be used for this certificate; discard it
++                            // and ask the responder instead.
++                            RESPONSE_CACHE.remove(cacheKey);
++                        }
+                     }
+ 
+                     // Find port
+@@ -179,7 +191,8 @@
+                         if (future.isSuccess()) {
+                             try {
+                                 BasicOCSPResp resp = (BasicOCSPResp) future.getNow().getResponseObject();
+-                                validateResponse(responsePromise, resp, derNonce, issuer, validateResponseNonce);
++                                validateResponse(responsePromise, resp, derNonce, issuer, validateResponseNonce,
++                                        x509Certificate);
+                                 if (responsePromise.isSuccess()) {
+                                     RESPONSE_CACHE.put(cacheKey, resp);
+                                 }
+@@ -261,7 +274,8 @@
+     }
+ 
+     private static void validateResponse(Promise<BasicOCSPResp> responsePromise, BasicOCSPResp basicResponse,
+-                                         DEROctetString derNonce, X509Certificate issuer, boolean validateNonce) {
++                                         DEROctetString derNonce, X509Certificate issuer, boolean validateNonce,
++                                         X509Certificate x509Certificate) {
+         try {
+             // Validate number of responses. We only requested for 1 certificate
+             // so number of responses must be 1. If not, we will throw an error.
+@@ -273,6 +287,11 @@
+             if (validateNonce) {
+                 validateNonce(basicResponse, derNonce);
+             }
++
++            // The response must be bound to the certificate we asked about: an answer for another
++            // certificate from the same responder is never evidence about this one.
++            OcspResponseBinding.verify(basicResponse.getResponses()[0].getCertID(), x509Certificate, issuer);
++
+             validateSignature(basicResponse, issuer);
+             responsePromise.trySuccess(basicResponse);
+         } catch (Exception ex) {
+@@ -280,6 +299,22 @@
+         }
+     }
+ 
++    private static String cacheKey(CertificateID certificateID, URL uri) {
++        return uri.toString() + '|' + certificateID.getHashAlgOID() + '|' +
++                toHex(certificateID.getIssuerNameHash()) + '|' +
++                toHex(certificateID.getIssuerKeyHash()) + '|' +
++                certificateID.getSerialNumber();
++    }
++
++    private static String toHex(byte[] value) {
++        StringBuilder hex = new StringBuilder(value.length * 2);
++        for (byte b : value) {
++            hex.append(Character.forDigit(b >>> 4 & 0xf, 16));
++            hex.append(Character.forDigit(b & 0xf, 16));
++        }
++        return hex.toString();
++    }
++
+     private static boolean isFresh(BasicOCSPResp response) {
+         SingleResp[] responses = response.getResponses();
+         if (responses.length != 1) {
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseBinding.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseBinding.java
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseBinding.java	1970-01-01 00:00:00.000000000 +0000
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseBinding.java	2026-10-30 12:36:27.094258501 +0000
+@@ -0,0 +1,71 @@
++/*
++ * Copyright 2026 The Netty Project
++ *
++ * The Netty Project licenses this file to you under the Apache License,
++ * version 2.0 (the "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at:
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ */
++package io.netty.handler.ssl.ocsp;
++
++import org.bouncycastle.cert.X509CertificateHolder;
++import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
++import org.bouncycastle.cert.ocsp.CertificateID;
++import org.bouncycastle.cert.ocsp.OCSPException;
++import org.bouncycastle.operator.DigestCalculatorProvider;
++import org.bouncycastle.operator.OperatorCreationException;
++import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
++
++import java.security.cert.CertificateEncodingException;
++import java.security.cert.X509Certificate;
++
++/**
++ * Binds an OCSP answer to the certificate it is claimed to describe.
++ *
++ * <p>An OCSP {@link CertificateID} names the certificate it is about by the serial number of that
++ * certificate together with a digest of its issuer's name and public key. Both parts must line up
++ * with the certificate under validation before the answer may be used as evidence about it. The
++ * issuer digest is computed with the hash algorithm that the responder selected for the identifier,
++ * so the binding is recomputed with the identifier's own algorithm rather than assuming one.</p>
++ */
++final class OcspResponseBinding {
++
++    private OcspResponseBinding() {
++        // Prevent outside initialization
++    }
++
++    /**
++     * Verify that {@code certificateID} is bound to {@code certificate} issued by {@code issuer}.
++     *
++     * @throws OCSPException if the identifier names another issuer, another serial number, or uses
++     *                       a digest algorithm that cannot be reproduced
++     */
++    static void verify(CertificateID certificateID, X509Certificate certificate, X509Certificate issuer)
++            throws OCSPException {
++        if (!certificateID.getSerialNumber().equals(certificate.getSerialNumber())) {
++            throw new OCSPException("OCSP response does not match the certificate");
++        }
++
++        final X509CertificateHolder issuerHolder;
++        final DigestCalculatorProvider digestCalculators;
++        try {
++            issuerHolder = new JcaX509CertificateHolder(issuer);
++            digestCalculators = new JcaDigestCalculatorProviderBuilder().build();
++        } catch (CertificateEncodingException e) {
++            throw new OCSPException("Error while parsing the issuer certificate", e);
++        } catch (OperatorCreationException e) {
++            throw new OCSPException("Error while creating the digest calculator", e);
++        }
++
++        if (!certificateID.matchesIssuer(issuerHolder, digestCalculators)) {
++            throw new OCSPException("OCSP response does not match the certificate issuer");
++        }
++    }
++}
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java	2026-10-30 11:58:42.000000000 +0000
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java	2026-10-30 12:36:37.128255062 +0000
+@@ -69,9 +69,10 @@
+             throw new OCSPException("OCSP Response is out-of-date");
+         }
+ 
+-        if (!singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
+-            throw new OCSPException("OCSP response does not match the certificate");
+-        }
++        // An answer obtained out of band must be bound to the certificate under validation just as
++        // strictly as one the client fetched itself. The serial number alone is not enough: the
++        // identifier must also name this certificate's issuer.
++        OcspResponseBinding.verify(singleResponse.getCertID(), certificate, issuer);
+ 
+         OcspResponse.Status status;
+         if (singleResponse.getCertStatus() == null) {

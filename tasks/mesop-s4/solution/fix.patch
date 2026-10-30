@@ -1,0 +1,99 @@
+diff -ruN b/mesop/server/static_file_serving.py b_fixed/mesop/server/static_file_serving.py
+--- b/mesop/server/static_file_serving.py	2026-10-30 11:39:11.780443747 +0000
++++ b_fixed/mesop/server/static_file_serving.py	2026-10-30 11:50:36.906520709 +0000
+@@ -47,6 +47,53 @@
+   pass
+ 
+ 
++# Matches ANSI CSI, OSC and other common ANSI/VT100 escape sequences so they
++# can be stripped from untrusted data before it is written to the terminal.
++_ANSI_ESCAPE_RE = re.compile(
++  r"""
++    \x1B
++    (?:
++        \[[0-?]*[ -/]*[@-~]              # CSI
++      | \][^\x07\x1B]*(?:\x07|\x1B\\)    # OSC
++      | [PX^_][^\x1B]*\x1B\\             # DCS/APC/PM/SOS
++      | [@-_]                            # 2-byte escape
++    )
++    """,
++  re.VERBOSE,
++)
++
++# Control characters that can move the cursor, overwrite text or forge a log
++# line, plus the Unicode bidi overrides that can reorder displayed text.
++_CONTROL_CHARS_RE = re.compile(
++  r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]"
++)
++
++
++def _sanitize_terminal(value: object) -> str:
++  # Prevent terminal escape and control character injection when writing
++  # untrusted data to the console or the server log.
++  if not isinstance(value, str):
++    value = str(value)
++  value = _ANSI_ESCAPE_RE.sub("", value)
++  return _CONTROL_CHARS_RE.sub("", value)
++
++
++def _sanitize_report(value: object) -> object:
++  """Return a copy of a decoded JSON value with every string sanitized."""
++  if isinstance(value, str):
++    return _sanitize_terminal(value)
++  if isinstance(value, dict):
++    return {
++      _sanitize_terminal(key) if isinstance(key, str) else key: _sanitize_report(
++        item
++      )
++      for key, item in value.items()
++    }
++  if isinstance(value, list):
++    return [_sanitize_report(item) for item in value]
++  return value
++
++
+ def configure_static_file_serving(
+   app: Flask,
+   static_file_runfiles_base: str,
+@@ -148,7 +195,7 @@
+   @app.route(prefix_base_url(f"/{WEB_COMPONENTS_PATH_SEGMENT}/<path:path>"))
+   def serve_web_components(path: str):
+     if not is_file_path(path):
+-      raise MesopException("Unexpected request to " + path)
++      return make_response("Unexpected request", 400)
+     serving_path = (
+       get_runfile_location(path)
+       if has_runfiles()
+@@ -159,12 +206,10 @@
+     file_extension = os.path.splitext(file_name)[1].lower()
+     allowed_extensions = {".js", ".css"}
+     if file_extension not in allowed_extensions:
+-      raise MesopException(
+-        f"Unexpected file type: {file_extension}. Only {', '.join(allowed_extensions)} files are allowed."
+-      )
++      return make_response("Unexpected file type", 400)
+ 
+     if not serving_path:
+-      raise MesopException("Unexpected request to " + path)
++      return make_response("Unexpected request", 400)
+     return send_file_compressed(
+       serving_path,
+       disable_gzip_cache=disable_gzip_cache,
+@@ -186,7 +231,7 @@
+     # Get the CSP violation report from the request
+     # Flask expects the MIME type to be application/json
+     # but it's actually application/csp-report
+-    report = request.get_json(force=True)
++    report = _sanitize_report(request.get_json(force=True))
+ 
+     csp_report_body = report["csp-report"]
+ 
+@@ -223,7 +268,7 @@
+     elif violated_directive in ("require-trusted-types-for", "trusted-types"):
+       keyword_arg = "dangerously_disable_trusted_types"
+     else:
+-      raise Exception("Unexpected CSP violation:", violated_directive, report)
++      return make_response("", 400)
+     keyword_arg_value = f"""[
+       '{tc.CYAN}{blocked_site}{tc.RESET}',
+     ]"""

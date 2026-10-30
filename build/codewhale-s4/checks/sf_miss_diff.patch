@@ -1,0 +1,127 @@
+diff --git a/crates/tui/src/tools/git_history.rs b/crates/tui/src/tools/git_history.rs
+index 464484ab4..d67ccd46f 100644
+--- a/crates/tui/src/tools/git_history.rs
++++ b/crates/tui/src/tools/git_history.rs
+@@ -14,6 +14,7 @@ use super::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+     optional_bool, optional_str, optional_u64, required_str,
+ };
++use super::git_rev::validate_git_rev;
+ use crate::dependencies::ExternalTool;
+ 
+ const MAX_OUTPUT_CHARS: usize = 40_000;
+@@ -115,6 +116,7 @@ impl ToolSpec for GitLogTool {
+         if let Some(revs) = revs {
+             for rev in revs {
+                 if let Some(rev) = rev.as_str() {
++                    validate_git_rev("revs entry", rev)?;
+                     args.push(rev.to_string());
+                 }
+             }
+@@ -218,6 +220,7 @@ impl ToolSpec for GitShowTool {
+ 
+     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+         let rev = required_str(&input, "rev")?;
++        validate_git_rev("rev", rev)?;
+         let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
+         let patch = optional_bool(&input, "patch", true);
+         let stat = optional_bool(&input, "stat", true);
+@@ -353,6 +356,7 @@ impl ToolSpec for GitBlameTool {
+         })?;
+         let pathspec = pathspec_from(working_dir, &resolved_path);
+         let rev = optional_str(&input, "rev").unwrap_or("HEAD");
++        validate_git_rev("rev", rev)?;
+         let start_line = optional_u64(&input, "start_line", DEFAULT_BLAME_START_LINE).max(1);
+         let max_lines = optional_u64(&input, "max_lines", DEFAULT_BLAME_MAX_LINES)
+             .clamp(1, MAX_BLAME_MAX_LINES);
+diff --git a/crates/tui/src/tools/git_rev.rs b/crates/tui/src/tools/git_rev.rs
+new file mode 100644
+index 000000000..0411a5750
+--- /dev/null
++++ b/crates/tui/src/tools/git_rev.rs
+@@ -0,0 +1,31 @@
++//! Validation for caller-supplied git revision arguments.
++//!
++//! A revision, range or comparison base handed to git must always be data:
++//! git must never read a caller-supplied value as an option.
++
++use super::spec::ToolError;
++
++/// Reject a caller-supplied revision that git could read as an option rather
++/// than as a revision expression.
++pub(crate) fn validate_git_rev(field: &str, rev: &str) -> Result<(), ToolError> {
++    let trimmed = rev.trim();
++    if trimmed.is_empty() {
++        return Err(ToolError::invalid_input(format!(
++            "{field} must not be empty"
++        )));
++    }
++    if trimmed.starts_with('-') {
++        return Err(ToolError::invalid_input(format!(
++            "{field} must not start with '-'"
++        )));
++    }
++    if trimmed
++        .chars()
++        .any(|ch| ch == '\0' || ch.is_ascii_control())
++    {
++        return Err(ToolError::invalid_input(format!(
++            "{field} must not contain control characters"
++        )));
++    }
++    Ok(())
++}
+diff --git a/crates/tui/src/tools/mod.rs b/crates/tui/src/tools/mod.rs
+index a0f68102a..e2739e4a0 100644
+--- a/crates/tui/src/tools/mod.rs
++++ b/crates/tui/src/tools/mod.rs
+@@ -24,6 +24,7 @@ pub mod fetch_url;
+ pub mod fim;
+ pub mod git;
+ pub mod git_history;
++pub mod git_rev;
+ pub mod github;
+ pub mod goal;
+ pub mod handle;
+diff --git a/crates/tui/src/tools/review.rs b/crates/tui/src/tools/review.rs
+index de597f5b3..54025e1ad 100644
+--- a/crates/tui/src/tools/review.rs
++++ b/crates/tui/src/tools/review.rs
+@@ -17,6 +17,7 @@ use super::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+     optional_bool, optional_str, optional_u64, required_str,
+ };
++use super::git_rev::validate_git_rev;
+ 
+ const DEFAULT_MAX_CHARS: usize = 200_000;
+ const MAX_MAX_CHARS: usize = 1_000_000;
+@@ -216,6 +217,9 @@ impl ToolSpec for ReviewTool {
+ 
+         let kind = optional_str(&input, "kind").map(|s| s.trim().to_ascii_lowercase());
+         let base = optional_str(&input, "base").map(|s| s.trim().to_string());
++        if let Some(base) = &base {
++            validate_git_rev("base", base)?;
++        }
+         let staged = optional_bool(&input, "staged", false);
+         let max_chars =
+             usize::try_from(optional_u64(&input, "max_chars", DEFAULT_MAX_CHARS as u64))
+diff --git a/crates/tui/src/tools/subagent/mod.rs b/crates/tui/src/tools/subagent/mod.rs
+index b3f3b4c29..a93995f21 100644
+--- a/crates/tui/src/tools/subagent/mod.rs
++++ b/crates/tui/src/tools/subagent/mod.rs
+@@ -36,6 +36,7 @@ use crate::request_tuning::RequestTuning;
+ use crate::tools::handle::VarHandle;
+ use crate::tools::plan::{PlanState, SharedPlanState};
+ use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
++use crate::tools::git_rev::validate_git_rev;
+ use crate::tools::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+ };
+@@ -5838,6 +5839,7 @@ fn create_isolated_worktree(
+         .filter(|value| !value.is_empty())
+         .unwrap_or("HEAD")
+         .to_string();
++    validate_git_rev("worktree_base", &base_ref)?;
+     let worktree_path = resolve_worktree_path(&repo_root, &branch, request.path.as_ref())?;
+     if let Some(parent) = worktree_path.parent() {
+         fs::create_dir_all(parent).map_err(|err| {

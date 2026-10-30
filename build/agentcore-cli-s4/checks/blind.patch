@@ -1,0 +1,324 @@
+diff -ruN a/src/cli/operations/agent/import/base-translator.ts b/src/cli/operations/agent/import/base-translator.ts
+--- a/src/cli/operations/agent/import/base-translator.ts	2026-10-30 11:49:44.000000000 +0000
++++ b/src/cli/operations/agent/import/base-translator.ts	2026-10-30 12:07:17.562556874 +0000
+@@ -130,10 +130,13 @@
+     // Collaboration context
+     this.isCollaborator = !!collaboratorContext;
+     this.isAcceptingRelays = collaboratorContext?.relayHistory === 'TO_COLLABORATOR';
+-    this.collaboratorDescriptions = this.collaborators.map(
+-      c =>
+-        `{'agentName': '${BaseBedrockTranslator.escapePySingleQuote(c.agent?.agentName ?? '')}', 'collaboratorName': 'invoke_${sanitizePyIdentifier(c.collaboratorName ?? '')}', 'collaboratorInstruction': '${BaseBedrockTranslator.escapePySingleQuote(c.collaborationInstruction ?? '')}'}`
+-    );
++    // These descriptions are emitted inside a triple-quoted tool docstring, so every
++    // value is escaped for that construct only.
++    this.collaboratorDescriptions = this.collaborators.map(c => {
++      const agentName = BaseBedrockTranslator.pyDocstring(c.agent?.agentName ?? '');
++      const instruction = BaseBedrockTranslator.pyDocstring(c.collaborationInstruction ?? '');
++      return `{'agentName': '${agentName}', 'collaboratorName': 'invoke_${sanitizePyIdentifier(c.collaboratorName ?? '')}', 'collaboratorInstruction': '${instruction}'}`;
++    });
+     this.collaboratorMap = new Map(this.collaborators.map(c => [c.collaboratorName ?? '', c]));
+ 
+     this.cleanedAgentName = (this.agentInfo.agentName ?? 'agent')
+@@ -169,19 +172,62 @@
+    */
+   abstract translate(): TranslationResult;
+ 
+-  /** Escape a string for use inside Python double-quoted strings. */
+-  static escapePyDoubleQuote(s: string): string {
+-    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
++  /*
++   * Python emission helpers.
++   *
++   * Every value that reaches the generated project comes from the imported agent
++   * definition and is therefore untrusted text. Each helper below makes its value
++   * inert in the one syntactic construct it is written into, so a value can never
++   * terminate or extend that construct, start a new statement or expression, or
++   * otherwise change what the generated code does. They escape in a single pass,
++   * so the value Python reads back is exactly the value that was imported.
++   */
++
++  /** A complete Python double-quoted string literal holding `value` verbatim. */
++  static pyString(value: string): string {
++    const body = value
++      .replace(/\\/g, '\\\\')
++      .replace(/"/g, '\\"')
++      .replace(/\r/g, '\\r')
++      .replace(/\n/g, '\\n');
++    return `"${BaseBedrockTranslator.escapePyControlChars(body)}"`;
+   }
+ 
+-  /** Escape a string for use inside Python single-quoted strings. */
+-  static escapePySingleQuote(s: string): string {
+-    return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
++  /**
++   * The body of a Python triple-quoted docstring holding `value` verbatim.
++   * Every double quote is escaped, so no run of quotes in the value can close the
++   * literal early, and backslash/CR are escaped so the text stays inert.
++   */
++  static pyDocstring(value: string): string {
++    const body = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r');
++    return BaseBedrockTranslator.escapePyControlChars(body);
+   }
+ 
+-  /** Escape a string for use inside Python triple-quoted strings. */
+-  static escapePyTripleQuote(s: string): string {
+-    return s.replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
++  /**
++   * `value` made safe to place after a leading `# ` in a Python line comment:
++   * every line break is replaced by one that is itself commented, so no part of
++   * the value can start a new line of code.
++   */
++  static pyComment(value: string): string {
++    const lines = value.split(/\r\n|\r|\n/).map(line => BaseBedrockTranslator.escapePyControlChars(line));
++    return lines.join('\n# ');
++  }
++
++  /**
++   * Escape bytes that Python source cannot carry literally (NUL and the other
++   * non-printing controls). `\n`, `\r` and `\t` are handled by the callers.
++   */
++  private static escapePyControlChars(s: string): string {
++    return s.replace(
++      /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g,
++      ch => `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`
++    );
++  }
++
++  /** A Python numeric literal for a value that must be a finite number. */
++  static pyNumber(value: unknown, fallback: number): string {
++    const parsed = typeof value === 'number' ? value : Number(value);
++    return String(Number.isFinite(parsed) ? parsed : fallback);
+   }
+ 
+   /**
+@@ -197,6 +243,8 @@
+ 
+       this.enabledPrompts.push(promptType);
+ 
++      const varName = sanitizePyIdentifier(promptType);
++
+       // Inject the agent instruction into the orchestration prompt
+       let processedTemplate = template;
+       if (promptType === 'ORCHESTRATION') {
+@@ -204,13 +252,13 @@
+       }
+ 
+       // Escape for Python triple-quoted string
+-      const escaped = BaseBedrockTranslator.escapePyTripleQuote(processedTemplate);
+-      code += `\n${promptType}_TEMPLATE = """${escaped}"""\n`;
++      const escaped = BaseBedrockTranslator.pyDocstring(processedTemplate);
++      code += `\n${varName}_TEMPLATE = """${escaped}"""\n`;
+     }
+ 
+     // Ensure ORCHESTRATION_TEMPLATE always exists
+     if (!this.enabledPrompts.includes('ORCHESTRATION')) {
+-      const escaped = BaseBedrockTranslator.escapePyTripleQuote(this.instruction);
++      const escaped = BaseBedrockTranslator.pyDocstring(this.instruction);
+       code += `\nORCHESTRATION_TEMPLATE = """${escaped}"""\n`;
+       this.enabledPrompts.push('ORCHESTRATION');
+     }
+@@ -241,7 +289,8 @@
+   protected generateImportHeader(): string {
+     const description = this.agentInfo.description ?? '';
+     if (!description) return '';
+-    return `\n# Imported Bedrock agent: ${description}\n`;
++    // A line comment: every line of the imported text has to be commented too.
++    return `\n# Imported Bedrock agent: ${BaseBedrockTranslator.pyComment(description)}\n`;
+   }
+ 
+   /**
+@@ -253,12 +302,12 @@
+     const parameterNotes: string[] = [];
+     for (const ag of this.customActionGroups) {
+       if (ag.description) {
+-        actionGroupNotes.push(`    "${BaseBedrockTranslator.escapePySingleQuote(ag.description)}",`);
++        actionGroupNotes.push(`    ${BaseBedrockTranslator.pyString(ag.description)},`);
+       }
+       for (const fn of ag.functionSchema?.functions ?? []) {
+         for (const [name, info] of Object.entries(fn.parameters ?? {})) {
+           if (info.description) {
+-            parameterNotes.push(`    f"${name}: ${info.description}",`);
++            parameterNotes.push(`    ${BaseBedrockTranslator.pyString(`${name}: ${info.description}`)},`);
+           }
+         }
+       }
+@@ -275,7 +324,7 @@
+   }
+ 
+   private generateFunctionTool(fn: FunctionDefinition, groupName: string): string {
+-    const fnName = fn.name.replace(/[^a-zA-Z0-9_]/g, '_');
++    const fnName = sanitizePyIdentifier(fn.name);
+     const params = fn.parameters ?? {};
+     const paramList = Object.entries(params)
+       .map(([name, info]) => {
+@@ -289,19 +338,19 @@
+                 : info.type === 'boolean'
+                   ? 'bool'
+                   : 'str';
+-        return `${name}: ${pyType}`;
++        return `${sanitizePyIdentifier(name)}: ${pyType}`;
+       })
+       .join(', ');
+ 
+     const description = fn.description ?? `Function from action group ${groupName}`;
+-    const escapedDesc = BaseBedrockTranslator.escapePyTripleQuote(description);
++    const escapedDesc = BaseBedrockTranslator.pyDocstring(description);
+ 
+     return `
+ @tool
+ def ${fnName}(${paramList}) -> str:
+     """${escapedDesc}"""
+     # TODO: Implement the logic for this action group function.
+-    # This was imported from Bedrock Agent action group "${BaseBedrockTranslator.escapePyDoubleQuote(groupName)}".
++    # This was imported from Bedrock Agent action group "${BaseBedrockTranslator.pyComment(groupName)}".
+     return json.dumps({"status": "not_implemented", "function": "${fnName}"})
+ 
+ action_group_tools.append(${fnName})
+@@ -421,7 +470,7 @@
+ 
+     if (kbArns.length === 0) return '';
+ 
+-    const arnLines = kbArns.map(arn => `#     "${arn}",`).join('\n');
++    const arnLines = kbArns.map(arn => `#     "${BaseBedrockTranslator.pyComment(arn)}",`).join('\n');
+     return `
+ # -------------------------------------------------------------------------------------------------
+ # IMPORTANT: Additional IAM permissions required for deployment.
+@@ -442,7 +491,7 @@
+ #     agentEnv.runtime.addToPolicy(new iam.PolicyStatement({
+ #       actions: ['bedrock:Retrieve'],
+ #       resources: [
+-${kbArns.map(arn => `#         '${arn}',`).join('\n')}
++${kbArns.map(arn => `#         '${BaseBedrockTranslator.pyComment(arn)}',`).join('\n')}
+ #       ],
+ #     }));
+ #   }
+diff -ruN a/src/cli/operations/agent/import/langgraph-translator.ts b/src/cli/operations/agent/import/langgraph-translator.ts
+--- a/src/cli/operations/agent/import/langgraph-translator.ts	2026-10-30 11:49:44.000000000 +0000
++++ b/src/cli/operations/agent/import/langgraph-translator.ts	2026-10-30 12:06:40.901618614 +0000
+@@ -93,22 +93,22 @@
+       const supportsTopK = ['anthropic', 'amazon'].includes(providerName);
+ 
+       let modelKwargs = `{
+-        "top_p": ${ic.topP ?? 1.0},
+-        "temperature": ${ic.temperature ?? 0},
+-        "max_tokens": ${ic.maximumLength ?? 2048}`;
++        "top_p": ${BaseBedrockTranslator.pyNumber(ic.topP, 1.0)},
++        "temperature": ${BaseBedrockTranslator.pyNumber(ic.temperature, 0)},
++        "max_tokens": ${BaseBedrockTranslator.pyNumber(ic.maximumLength, 2048)}`;
+       if (supportsTopK) {
+         modelKwargs += `,
+-        "top_k": ${ic.topK ?? 250},
++        "top_k": ${BaseBedrockTranslator.pyNumber(ic.topK, 250)},
+         "stop_sequences": ${JSON.stringify(ic.stopSequences ?? [])}`;
+       }
+       modelKwargs += '\n    }';
+ 
+       let modelConfig = `
+-# ${promptType} LLM configuration
+-llm_${promptType} = ChatBedrock(
+-    model_id="${this.modelId}",
+-    region_name="${this.agentRegion}",
+-    provider="${providerName}",
++# ${BaseBedrockTranslator.pyComment(promptType)} LLM configuration
++llm_${sanitizePyIdentifier(promptType)} = ChatBedrock(
++    model_id=${BaseBedrockTranslator.pyString(this.modelId)},
++    region_name=${BaseBedrockTranslator.pyString(this.agentRegion)},
++    provider=${BaseBedrockTranslator.pyString(providerName)},
+     model_kwargs=${modelKwargs}`;
+ 
+       if (Object.keys(this.guardrailConfig).length > 0) {
+@@ -124,9 +124,9 @@
+     if (!this.promptConfigs.some(c => c.promptType === 'ORCHESTRATION')) {
+       configs.push(`
+ llm_ORCHESTRATION = ChatBedrock(
+-    model_id="${this.modelId}",
+-    region_name="${this.agentRegion}",
+-    provider="${providerName}"
++    model_id=${BaseBedrockTranslator.pyString(this.modelId)},
++    region_name=${BaseBedrockTranslator.pyString(this.agentRegion)},
++    provider=${BaseBedrockTranslator.pyString(providerName)}
+ )`);
+     }
+ 
+@@ -139,17 +139,17 @@
+     let code = '\n# --- Knowledge Base Tools ---\n';
+     for (const kb of this.knowledgeBases) {
+       const kbName = sanitizePyIdentifier(kb.name ?? '');
+-      const kbDescription = BaseBedrockTranslator.escapePyDoubleQuote(kb.description ?? '');
+-      const kbId = kb.knowledgeBaseId;
+-      const kbRegion = kb.knowledgeBaseArn?.split(':')[3] ?? this.agentRegion;
++      const kbDescription = BaseBedrockTranslator.pyString(kb.description ?? '');
++      const kbId = BaseBedrockTranslator.pyString(kb.knowledgeBaseId ?? '');
++      const kbRegion = BaseBedrockTranslator.pyString(kb.knowledgeBaseArn?.split(':')[3] ?? this.agentRegion);
+ 
+       code += `retriever_${kbName} = AmazonKnowledgeBasesRetriever(
+-    knowledge_base_id="${kbId}",
++    knowledge_base_id=${kbId},
+     retrieval_config={"vectorSearchConfiguration": {"numberOfResults": 5}},
+-    region_name="${kbRegion}"
++    region_name=${kbRegion}
+ )
+ 
+-retriever_tool_${kbName} = retriever_${kbName}.as_tool(name="kb_${kbName}", description="${kbDescription}")
++retriever_tool_${kbName} = retriever_${kbName}.as_tool(name="kb_${kbName}", description=${kbDescription})
+ 
+ `;
+       this.tools.push(`retriever_tool_${kbName}`);
+diff -ruN a/src/cli/operations/agent/import/strands-translator.ts b/src/cli/operations/agent/import/strands-translator.ts
+--- a/src/cli/operations/agent/import/strands-translator.ts	2026-10-30 11:49:44.000000000 +0000
++++ b/src/cli/operations/agent/import/strands-translator.ts	2026-10-30 12:06:33.160420223 +0000
+@@ -83,13 +83,13 @@
+ 
+       const ic = config.inferenceConfiguration ?? {};
+       configs.push(`
+-llm_${promptType} = BedrockModel(
+-    model_id="${this.modelId}",
+-    region_name="${this.agentRegion}",
+-    temperature=${ic.temperature ?? 0},
+-    max_tokens=${ic.maximumLength ?? 2048},
++llm_${sanitizePyIdentifier(promptType)} = BedrockModel(
++    model_id=${BaseBedrockTranslator.pyString(this.modelId)},
++    region_name=${BaseBedrockTranslator.pyString(this.agentRegion)},
++    temperature=${BaseBedrockTranslator.pyNumber(ic.temperature, 0)},
++    max_tokens=${BaseBedrockTranslator.pyNumber(ic.maximumLength, 2048)},
+     stop_sequences=${JSON.stringify(ic.stopSequences ?? [])},
+-    top_p=${ic.topP ?? 1.0}
++    top_p=${BaseBedrockTranslator.pyNumber(ic.topP, 1.0)}
+ )`);
+     }
+ 
+@@ -97,8 +97,8 @@
+     if (!this.promptConfigs.some(c => c.promptType === 'ORCHESTRATION')) {
+       configs.push(`
+ llm_ORCHESTRATION = BedrockModel(
+-    model_id="${this.modelId}",
+-    region_name="${this.agentRegion}"
++    model_id=${BaseBedrockTranslator.pyString(this.modelId)},
++    region_name=${BaseBedrockTranslator.pyString(this.agentRegion)}
+ )`);
+     }
+ 
+@@ -111,18 +111,18 @@
+     let code = '\n# --- Knowledge Base Tools ---\n';
+     for (const kb of this.knowledgeBases) {
+       const kbName = sanitizePyIdentifier(kb.name ?? '');
+-      const kbDescription = BaseBedrockTranslator.escapePyTripleQuote(kb.description ?? '');
+-      const kbId = kb.knowledgeBaseId;
+-      const kbRegion = kb.knowledgeBaseArn?.split(':')[3] ?? this.agentRegion;
++      const kbDescription = BaseBedrockTranslator.pyDocstring(kb.description ?? '');
++      const kbId = BaseBedrockTranslator.pyString(kb.knowledgeBaseId ?? '');
++      const kbRegion = BaseBedrockTranslator.pyString(kb.knowledgeBaseArn?.split(':')[3] ?? this.agentRegion);
+ 
+       code += `
+ @tool
+ def retrieve_${kbName}(query: str):
+     """This is a knowledge base with the following description: ${kbDescription}. Invoke it with a query to get relevant results."""
+-    client = boto3.client("bedrock-agent-runtime", region_name="${kbRegion}")
++    client = boto3.client("bedrock-agent-runtime", region_name=${kbRegion})
+     return client.retrieve(
+         retrievalQuery={"text": query},
+-        knowledgeBaseId="${kbId}",
++        knowledgeBaseId=${kbId},
+         retrievalConfiguration={
+             "vectorSearchConfiguration": {"numberOfResults": 10},
+         },

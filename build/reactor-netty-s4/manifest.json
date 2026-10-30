@@ -1,0 +1,209 @@
+{
+ "slug": "reactor-netty-s4",
+ "candidate": "27301",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-PFC9-2CQG-9WQ6",
+  "CVE-2026-41715"
+ ],
+ "repo": "https://github.com/reactor/reactor-netty",
+ "vulnerable_commit": "b26ac28dffa7d745f17fa2cae31feade30bf1f22",
+ "fix_commit": "e7ef551eead84ba465324531683fafa03ab96ee9",
+ "entry_point": "HttpClient.create() with followRedirect(true) (or followRedirect(predicate[, consumer])) followed by .get()/.post()/.websocket().uri(...).response()/.connect(); every accepted 3xx response re-subscribes the connection publisher, and the redirect request is built in the package-private HttpClientHandler.requestWithBody reached from the public HttpClient API.",
+ "verified": {
+  "entry_point": "Reproduced at the pinned + injected commit with the hidden suite: 6/6 security tests fail and 5/5 functional tests pass. A TLS request redirected to the plaintext address of the same host and port, a WebSocket handshake redirected to another host, a wss handshake redirected to ws on the same port, a client-configured cookie redirected to another host or a plaintext same-port destination, and an ordinary request redirected to a different port of the same host each deliver the supplied Authorization or Cookie value to the redirect target. With the reference fix all 11 tests pass; the project's own HttpRedirectTest (22 tests) and HttpClientTest cookie/header tests (5 tests) pass on the pinned + injected tree.",
+  "sites": [
+   "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:618 \u2014 the redirect header decision (reported landing point; the published fix adds the secure-to-insecure case here)",
+   "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:596-615 \u2014 the WebSocket handshake branch returns before the decision is installed (real, unmodified upstream)",
+   "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java:707-709 \u2014 the retained cookie list is re-added after the redirect decision (injected sibling)",
+   "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConfig.java:138-139 \u2014 the retained cookie values are produced from the configured headers (injected sibling)",
+   "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:694-696 and :704-706 \u2014 a same-site fast path compares host and scheme only, so an explicit different port is treated as the same destination before the decision runs (injected sibling)"
+  ],
+  "routes": "Pattern-B route (unmodified upstream, not covered by the published fix): a WebSocket handshake that follows a redirect goes through its own send path, which returns before the redirect header decision is installed, so configured Authorization/Cookie values are re-sent to the redirect target, including a different host and a wss to ws downgrade. Confirmed behaviourally on the pinned copy: the redirect target records the Authorization value; with the fixed tree the target records none.",
+  "injected_siblings": [
+   "HttpClientOperations.java:707-709 with HttpClientConfig.java:138-139 \u2014 the client keeps the COOKIE values it was configured with and re-adds them at send time for redirect requests. The redirect decision has already removed the header, so the value is put back on a cross-origin or downgraded hop. Reachable from the public HttpClient#cookie/cookiesWhen API. The published fix never touches either file.",
+   "HttpClientConnect.java:694-696 (helper at :704-706) \u2014 a same-host same-scheme redirect updates the reference endpoint used by the decision, so a redirect to a different port keeps the sensitive headers. Reachable from any redirect. The published fix never touches redirect() or the helper."
+  ],
+  "services": "none; offline after build (Gradle distribution and dependency cache are warmed in both images; every test peer is an in-process loopback server and no external network is used)",
+  "project_tests_run": "In the environment image at the pinned + injected commit: `./gradlew :reactor-netty-http:test --tests reactor.netty.http.client.HttpRedirectTest --tests reactor.netty.http.client.HttpClientTest.testCookie --tests reactor.netty.http.client.HttpClientTest.testDeferredCookie --tests reactor.netty.http.client.HttpClientTest.testDeferredHeader` passed (22 redirect tests + 5 cookie/header tests). The verifier image executes the same selection on a throwaway pinned checkout to warm the offline cache."
+ },
+ "leak_terms": [
+  "HttpClientConnect",
+  "HttpClientOperations",
+  "HttpClientConfig",
+  "UriEndpoint",
+  "UriEndpointFactory",
+  "fromURI",
+  "toURI",
+  "isSameSite",
+  "configuredCookies",
+  "suppressConfiguredCookies",
+  "beforeMarkSentHeaders",
+  "redirectRequestConsumer",
+  "redirectRequestBiConsumer",
+  "followRedirect",
+  "HttpHeaderNames",
+  "HttpHeaders",
+  "DefaultCookie",
+  "websocket",
+  "WebsocketClientOperations",
+  "Http2WebsocketClientOperations",
+  "requestWithBody",
+  "RedirectSendHandler",
+  "GHSA-PFC9-2CQG-9WQ6",
+  "CVE-2026-41715",
+  "b26ac28d",
+  "e7ef551e"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_t1_published.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "sf_t2_websocket.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "sf_t3_cookie.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "sf_t4_port.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "n/a: the protected outcome is an outgoing request header that must not be transmitted; there is no refusal response whose form a crash could imitate, and a crashing client cannot reach the redirect target at all.",
+  "wrong_resource": "sf_t4_port.patch",
+  "one_role_or_direction": "sf_t2_websocket.patch",
+  "reads_only": "n/a: the sink is an outgoing request built for a redirect hop; the client never reads the protected value back, so there is no read/write split to guard.",
+  "check_after_adjustment": "n/a: no validation or normalisation of an attacker value is involved; the ordering that matters is a header producer running after the decision, covered by unlisted_route (sf_t3_cookie.patch).",
+  "unlisted_route": "sf_t3_cookie.patch",
+  "malformed_identity": "n/a: no identity, name or path parsing decides the outcome; host, port and scheme come from the redirect URI itself.",
+  "missing_authority": "n/a: there is no authority, role or secret lookup to fail open; the analogous fail-open (never noticing a downgrade) is sf_t1_published.patch.",
+  "adjacent_api": "n/a: the fix changes no shared helper's stated behaviour; the reference fix and the alternative both stay inside the redirect/header machinery."
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "lever": "reported site (published fix): a redirect that drops transport encryption without changing host and port is not treated as a change of destination",
+   "shape": "an https request receives a 302 to http on the same host and port; the endpoint comparison sees no change, so Authorization and Cookie are never removed",
+   "where": "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:618",
+   "reason_to_dismiss": "the followRedirect documentation promises removal only when redirecting to a different domain, so a same-host protocol downgrade reads as outside the documented protection",
+   "security_tests": [
+    "downgradeDoesNotForwardAuthorization",
+    "downgradeDoesNotForwardConfiguredCookie",
+    "websocketDowngradeDoesNotForwardAuthorization"
+   ],
+   "coupled_functional_tests": [
+    "upgradeRedirectKeepsCredentials",
+    "sameOriginRedirectKeepsCredentials"
+   ],
+   "security_fail_patch": "sf_t1_published.patch",
+   "realistic_because": "real, unmodified upstream code; this is the published advisory's own site"
+  },
+  {
+   "id": "T2",
+   "lever": "how-type, route where the protection never existed (real upstream): the WebSocket handshake send path bypasses the redirect header decision",
+   "shape": "a ws or wss handshake that follows a redirect is sent by its own path before the redirect header decision is installed, so a configured Authorization/Cookie is re-sent to another host and survives a wss to ws downgrade",
+   "where": "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:596-615; handshake built in WebsocketClientOperations.java:104-122 and Http2WebsocketClientOperations.java:146-190",
+   "reason_to_dismiss": "WebSockets are a neighbouring feature with their own handshake send path; the early return reads as deliberate, and the documentation only talks about HTTP redirects to a different domain",
+   "security_tests": [
+    "websocketRedirectDoesNotForwardAuthorization",
+    "websocketDowngradeDoesNotForwardAuthorization"
+   ],
+   "coupled_functional_tests": [
+    "websocketHandshakeKeepsCredentials"
+   ],
+   "security_fail_patch": "sf_t2_websocket.patch",
+   "realistic_because": "real, unmodified upstream code (still present on the upstream 1.2.x branch; closed on main only by a later refactor)"
+  },
+  {
+   "id": "T3",
+   "lever": "how-type, producer off the decision's path (injected): the client retains the cookies it was configured with and re-adds them at send time, after the redirect decision has removed the header",
+   "shape": "a client configured with a cookie via the public cookie API re-adds that cookie on a redirect hop where the decision just removed it, so a cross-origin or downgraded destination receives it",
+   "where": "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java:707-709; values produced at HttpClientConfig.java:138-139",
+   "reason_to_dismiss": "a cookie the application configured on the client looks like the application's own decision to send it everywhere, and the per-request cookie re-add that already exists is documented and legitimate",
+   "security_tests": [
+    "crossOriginDoesNotForwardConfiguredCookie",
+    "downgradeDoesNotForwardConfiguredCookie"
+   ],
+   "coupled_functional_tests": [
+    "sameOriginRedirectKeepsCredentials",
+    "upgradeRedirectKeepsCredentials"
+   ],
+   "security_fail_patch": "sf_t3_cookie.patch",
+   "realistic_because": "injected sibling a maintainer could have written: cookie retention across redirects, built next to the existing cookie re-add"
+  },
+  {
+   "id": "T4",
+   "lever": "wrong-object decision (injected): a same-host same-scheme redirect is treated as the same destination, ignoring the port",
+   "shape": "an http request is redirected to a different port of the same host; the fast path updates the reference endpoint before the decision runs, so the decision sees no change and the Authorization value reaches the other port",
+   "where": "reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java:694-696 (helper at :704-706)",
+   "reason_to_dismiss": "host and scheme are unchanged, so the redirect reads as staying on the same site; an explicit port is easy to overlook",
+   "security_tests": [
+    "differentPortDoesNotForwardAuthorization"
+   ],
+   "coupled_functional_tests": [
+    "crossOriginRedirectStripsCredentials",
+    "sameOriginRedirectKeepsCredentials"
+   ],
+   "security_fail_patch": "sf_t4_port.patch",
+   "realistic_because": "injected sibling a maintainer could have written: a same-site shortcut around the redirect bookkeeping, with a plausible comment"
+  }
+ ],
+ "status": "built and gate-green on 2026-10-30 (stages run one at a time, in order): static PASSED; nop PASSED (6/6 security tests fail on the pinned+injected tree, 5/5 functional pass); oracle PASSED 3/3 identical trials at reward 1.0 (6/6 security + 5/5 functional); patches PASSED 8/8 as declared (sf_t1_published 0.5 with the three downgrade-shaped security tests failing; sf_t2_websocket 0.6667 with both handshake tests failing; sf_t3_cookie 0.6667 with both configured-cookie tests failing; sf_t4_port 0.8333 with the different-port test failing; ff_overbroad 0.0 and ff_refuse_all 0.0 with functional tests failing; pass_hardening 1.0; pass_alt 1.0). The blind patch is declared and is produced by the pipeline's blind-fix step; FAIRNESS.md is written after the trial.",
+ "gate": {
+  "static": "pass",
+  "nop": {
+   "security_failing": 6,
+   "security_total": 6,
+   "functional_failing": 0,
+   "functional_total": 5
+  },
+  "oracle": {
+   "runs": 3,
+   "reward": 1.0,
+   "identical": true
+  },
+  "patches": {
+   "checked": 8,
+   "all_as_declared": true
+  }
+ }
+}

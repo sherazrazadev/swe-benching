@@ -1,0 +1,212 @@
+diff -ruN a/mesop/server/static_file_serving.py b/mesop/server/static_file_serving.py
+--- a/mesop/server/static_file_serving.py	2026-10-30 11:49:21.000000000 +0000
++++ b/mesop/server/static_file_serving.py	2026-10-30 12:01:16.650993784 +0000
+@@ -23,7 +23,6 @@
+   MESOP_WEBSOCKETS_PROBE_ON_DISCONNECT,
+   get_app_base_path,
+ )
+-from mesop.exceptions import MesopException
+ from mesop.runtime import runtime
+ from mesop.server.constants import WEB_COMPONENTS_PATH_SEGMENT
+ from mesop.server.csp_diagnostics import note_violation
+@@ -32,6 +31,10 @@
+   prefix_base_url,
+   remove_base_url_path,
+ )
++from mesop.server.terminal_safety import (
++  has_terminal_control,
++  sanitize_json_value,
++)
+ from mesop.utils import terminal_colors as tc
+ from mesop.utils.runfiles import get_runfile_location, has_runfiles
+ from mesop.utils.url_utils import sanitize_url_for_csp
+@@ -147,8 +150,11 @@
+ 
+   @app.route(prefix_base_url(f"/{WEB_COMPONENTS_PATH_SEGMENT}/<path:path>"))
+   def serve_web_components(path: str):
++    # Refuse requests we will not serve with a plain client error.  Raising
++    # here would let Flask's unhandled-error log repeat the (decoded, client
++    # controlled) request target on the terminal.
+     if not is_file_path(path):
+-      raise MesopException("Unexpected request to " + path)
++      return make_response("Unexpected request", 400)
+     serving_path = (
+       get_runfile_location(path)
+       if has_runfiles()
+@@ -159,12 +165,10 @@
+     file_extension = os.path.splitext(file_name)[1].lower()
+     allowed_extensions = {".js", ".css"}
+     if file_extension not in allowed_extensions:
+-      raise MesopException(
+-        f"Unexpected file type: {file_extension}. Only {', '.join(allowed_extensions)} files are allowed."
+-      )
++      return make_response("Unexpected file type", 400)
+ 
+     if not serving_path:
+-      raise MesopException("Unexpected request to " + path)
++      return make_response("Unexpected request", 400)
+     return send_file_compressed(
+       serving_path,
+       disable_gzip_cache=disable_gzip_cache,
+@@ -186,34 +190,48 @@
+     # Get the CSP violation report from the request
+     # Flask expects the MIME type to be application/json
+     # but it's actually application/csp-report
+-    report = request.get_json(force=True)
++    # The browser controls every field in this report, so strip terminal
++    # escape/control sequences from all strings before any of them reaches a
++    # log record, the warning channel or the diagnostic below.
++    decoded_report = request.get_json(force=True, silent=True)
++    if not isinstance(decoded_report, dict):
++      return make_response("", 400)
++    report = sanitize_json_value(decoded_report)
+ 
+-    csp_report_body = report["csp-report"]
++    csp_report_body = report.get("csp-report")
++    if not isinstance(csp_report_body, dict):
++      return make_response("", 400)
+ 
+     document_uri = csp_report_body.get("document-uri", "")
++    if not isinstance(document_uri, str):
++      return make_response("", 400)
+     if not document_uri.startswith(("http://", "https://")):
+       warn("Ignoring CSP report with a non-URL document: " + document_uri)
+       return make_response("", 400)
+ 
++    blocked_uri = csp_report_body.get("blocked-uri")
++    violated_directive = csp_report_body.get("violated-directive")
++    if not isinstance(blocked_uri, str) or not isinstance(
++      violated_directive, str
++    ):
++      return make_response("", 400)
++
+     logging.warning(
+       "CSP violation on page %s: blocked %s",
+-      csp_report_body["document-uri"],
+-      csp_report_body["blocked-uri"],
++      document_uri,
++      blocked_uri,
+     )
+     note_violation(
+-      csp_report_body["document-uri"],
+-      csp_report_body["blocked-uri"],
+-      csp_report_body["violated-directive"],
++      document_uri,
++      blocked_uri,
++      violated_directive,
+     )
+ 
+-    document_uri: str = report["csp-report"]["document-uri"]
+     path = urlparse(document_uri).path
+-    blocked_uri: str = report["csp-report"]["blocked-uri"]
+     # Remove the path from blocked_uri, keeping only the origin.
+     blocked_site = (
+       urlparse(blocked_uri).scheme + "://" + urlparse(blocked_uri).netloc
+     )
+-    violated_directive: str = report["csp-report"]["violated-directive"]
+     if violated_directive == "script-src-elem":
+       keyword_arg = "allowed_script_srcs"
+     elif violated_directive == "connect-src":
+@@ -223,7 +241,10 @@
+     elif violated_directive in ("require-trusted-types-for", "trusted-types"):
+       keyword_arg = "dangerously_disable_trusted_types"
+     else:
+-      raise Exception("Unexpected CSP violation:", violated_directive, report)
++      # A directive we do not know how to suggest a fix for: refuse the
++      # report with a client error rather than raising an unhandled
++      # exception that would repeat the report on the terminal.
++      return make_response("", 400)
+     keyword_arg_value = f"""[
+       '{tc.CYAN}{blocked_site}{tc.RESET}',
+     ]"""
+@@ -260,6 +281,15 @@
+   def generate_nonce():
+     g.csp_nonce = secrets.token_urlsafe(16)
+ 
++  @app.before_request
++  def reject_controlled_request_target():
++    # The request target ends up in HTTP error pages and, for an unexpected
++    # failure, in Flask's unhandled-error log.  A target carrying terminal
++    # controls is never a legitimate Mesop request, so refuse it before any
++    # handler can echo it.
++    if has_terminal_control(request.path):
++      return make_response("", 400)
++
+   @app.after_request
+   def add_security_headers(response: Response):
+     page_config = runtime().get_page_config(
+diff -ruN a/mesop/server/terminal_safety.py b/mesop/server/terminal_safety.py
+--- a/mesop/server/terminal_safety.py	1970-01-01 00:00:00.000000000 +0000
++++ b/mesop/server/terminal_safety.py	2026-10-30 12:02:35.002296534 +0000
+@@ -0,0 +1,71 @@
++"""Make untrusted request data safe to show on a terminal or in a log.
++
++Security-policy violation reports are submitted by the browser and their
++fields are entirely client controlled.  If such a value is written to the
++console or to the server log unchanged, the terminal interprets ANSI/VT100
++escape sequences in it: it can clear the screen, move the cursor, recolour
++text, open an OSC hyperlink, or make a forged line appear in the log.
++Bare control characters (CR, LF, backspace, NUL) and Unicode bidirectional
++controls can likewise overwrite or reorder what the developer sees.
++
++The helpers here delete exactly those sequences and characters.  Ordinary
++text, including non-ASCII text and percent-encoded text, is left untouched.
++"""
++
++import re
++
++# A terminal escape sequence: CSI, OSC, DCS/SOS/PM/APC, or one of the short
++# two-character escapes such as ESC 7 (save cursor).  Matching the whole
++# sequence removes its printable payload too, so no stray "[2J" is left.
++_ESCAPE_SEQUENCE_RE = re.compile(
++  r"\x1b(?:"
++  r"\[[0-?]*[ -/]*[@-~]"  # CSI: parameter/intermediate bytes, final byte
++  r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: terminated by BEL or ST
++  r"|[PX^_][^\x1b]*(?:\x1b\\)?"  # DCS / SOS / PM / APC, optionally ST
++  r"|[@-_]"  # two-character escape (e.g. ESC 7, ESC =, ESC c)
++  r"|[\x20-\x7e]"  # any remaining ESC + printable: still an escape prefix
++  r")"
++)
++
++# Anything else that changes what a terminal shows without being a printable
++# character: C0 controls, DEL, C1 controls, and the Unicode bidi/format
++# controls that can reverse or hide displayed text.
++_CONTROL_RE = re.compile(
++  "[\x00-\x1f\x7f-\x9f"
++  "؜"  # ARABIC LETTER MARK
++  "‎‏"  # LEFT-TO-RIGHT / RIGHT-TO-LEFT MARK
++  "‪-‮"  # bidi embedding / override controls
++  "⁦-⁩"  # bidi isolate controls
++  "]"
++)
++
++
++def sanitize_terminal_text(value: object) -> str:
++  """Return ``value`` as a string with terminal controls removed."""
++  text = value if isinstance(value, str) else str(value)
++  return _CONTROL_RE.sub("", _ESCAPE_SEQUENCE_RE.sub("", text))
++
++
++def has_terminal_control(value: str) -> bool:
++  """Whether ``value`` contains anything :func:`sanitize_terminal_text` removes."""
++  return bool(_CONTROL_RE.search(value) or _ESCAPE_SEQUENCE_RE.search(value))
++
++
++def sanitize_json_value(value: object) -> object:
++  """Recursively copy a decoded JSON value with every string sanitized.
++
++  Object keys are sanitized too, so a caller that later prints the whole
++  value cannot leak controls through a key.
++  """
++  if isinstance(value, str):
++    return sanitize_terminal_text(value)
++  if isinstance(value, dict):
++    return {
++      sanitize_terminal_text(key)
++      if isinstance(key, str)
++      else key: sanitize_json_value(item)
++      for key, item in value.items()
++    }
++  if isinstance(value, (list, tuple)):
++    return [sanitize_json_value(item) for item in value]
++  return value

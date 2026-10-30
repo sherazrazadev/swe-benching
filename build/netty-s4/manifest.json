@@ -1,0 +1,186 @@
+{
+ "slug": "netty-s4",
+ "candidate": "screener-v2 entry 22304: GHSA-272M-GCWP-MPWG / CVE-2026-56820 (netty/netty)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "de5d27666a5b5ff52fc7b115122bede78c2b0b24 (direct parent of published fix 5b68c61f37aa4a3045cba624cbea239655c9003b; the fix commit adds the regression test, so the pinned tree does not contain it)",
+  "entry_points": [
+   "library API: OcspServerCertificateValidator added to a TLS client pipeline; the test performs a real TLS handshake with a local server and a local OCSP responder on loopback",
+   "library API: OcspResponseValidator.validate(BasicOCSPResp, X509Certificate[]) for an answer the application obtained out of band (injected sibling)"
+  ],
+  "sites": [
+   "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:243-261 (pinned landing point, published fix)",
+   "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java:46-90 (injected out-of-band helper, serial-only binding)",
+   "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:149-155 and 180-185 (injected response cache keyed by responder URL)"
+  ],
+  "routes": [
+   "REAL, UNBUILT: example/src/main/java/io/netty/example/ocsp/OcspClientExample.java:227-246 validates a stapled answer by serial only; the handler is a private static nested class, so no behavioural test can reach it. Still serial-only in current upstream (2cf45cb).",
+   "REAL, UNBUILT: example/src/main/java/io/netty/example/ocsp/OcspServerExample.java:96-112 validates a response before stapling by serial only; demo main() code with no key material. Still serial-only in current upstream.",
+   "INJECTED, BUILT: out-of-band public helper (OcspResponseValidator) accepts an answer that names another issuer with the same serial.",
+   "INJECTED, BUILT: response cache returns a stored answer for another certificate under the same responder URL."
+  ],
+  "services": [],
+  "project_tests_run": [
+   "handler-ssl-ocsp OcspClientTest#validateSignatureWithIncludedChainSucceeds and #validateSignatureWithInvalidChainThrows: run offline in the image and in the functional suite (copied). simpleOcspQueryTest, OcspServerCertificateValidatorTest and OcspTest need the network or native OpenSSL and were not run."
+  ],
+  "local_runs": "oracle: security 4/4, functional 11/11 (twice, identical). nop (pinned+injection): security 0/4, functional 11/11. Local check-patch runs: sf-reported-only sec 2/4 fun 11/11; sf-no-issuer-binding 2/4 11/11; sf-no-out-of-band 3/4 11/11; sf-no-cache 3/4 11/11; ff-require-issuer-signer 4/4 9/11; ff-sha1-rebuild 4/4 10/11; ff-reject-all 3/4 6/11; ff-wrong-certificate 3/4 6/11; pass-alt-sink 4/4 11/11; pass-hardening 4/4 11/11. Environment image built locally (native unix-common module included) without network at test time."
+ },
+ "leak_terms": [
+  "OcspClient",
+  "OcspResponseValidator",
+  "OcspServerCertificateValidator",
+  "OcspClientHandler",
+  "validateResponse",
+  "validateSignature",
+  "matchesIssuer",
+  "CertificateID",
+  "CertID",
+  "BasicOCSPResp",
+  "SingleResp",
+  "getResponses",
+  "getCertID",
+  "getSerialNumber",
+  "RESPONSE_CACHE",
+  "cacheKey",
+  "isFresh",
+  "handler-ssl-ocsp",
+  "io.netty.handler.ssl.ocsp",
+  "OcspValidationEvent",
+  "OcspResponse.Status"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-issuer-binding.patch",
+   "expect": "security_fail",
+   "note": "oracle minus issuer name/key-hash binding (serial-only in both acceptance paths): fails both answers that name another issuer"
+  },
+  {
+   "patch": "sf-no-out-of-band.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the out-of-band public helper: fails the answer for another issuer through that helper"
+  },
+  {
+   "patch": "sf-no-cache.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the cache-key binding: a stored answer is reused for another certificate"
+  },
+  {
+   "patch": "sf-reported-only.patch",
+   "expect": "security_fail",
+   "note": "tempting shallow fix: only the reported client check; leaves the out-of-band helper and the cache open"
+  },
+  {
+   "patch": "ff-require-issuer-signer.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: requires the issuer itself to be the signer, rejecting an authorized delegated responder"
+  },
+  {
+   "patch": "ff-sha1-rebuild.patch",
+   "expect": "functional_fail",
+   "note": "over-broad: rebuilds a SHA-1 certificate identifier locally, rejecting legitimate non-SHA-1 answers"
+  },
+  {
+   "patch": "ff-reject-all.patch",
+   "expect": "functional_fail",
+   "note": "refuse-all: every single-entry answer is rejected, so legitimate answers break"
+  },
+  {
+   "patch": "ff-wrong-certificate.patch",
+   "expect": "functional_fail",
+   "note": "wrong object: binds the answer to the issuer certificate's serial instead of the presented certificate"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus a second binding check at the pipeline sink; still 1.0"
+  },
+  {
+   "patch": "pass-alt-sink.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent valid design: binding enforced at the pipeline sink (so cache hits are checked), out-of-band helper fixed, client code left as injected"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "written by a fresh agent from instruction.md and the repository only (produced after this build)"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-reject-all.patch",
+  "crash_as_refusal": "n/a: a failure here is a promise failure surfaced as a pipeline exception; a thrown error inside the promise listener is caught and turned into that same refusal, so a crash cannot be separated from a clean refusal",
+  "wrong_resource": "ff-wrong-certificate.patch",
+  "one_role_or_direction": "n/a: the client validates a server certificate in one direction; there is no role or read/write split",
+  "reads_only": "n/a: the protected surface is a single validation decision, not a read/write pair",
+  "check_after_adjustment": "n/a: no attacker-controlled value is normalised or adjusted before the decision",
+  "unlisted_route": "sf-reported-only.patch",
+  "malformed_identity": "sf-no-issuer-binding.patch",
+  "missing_authority": "n/a: there is no authority or secret lookup that can return nothing; the issuer certificate is taken from the TLS peer chain",
+  "adjacent_api": "ff-require-issuer-signer.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_landing_certid_binding",
+   "pattern": "A (reported landing point; published fix)",
+   "shape": "answer whose certificate identifier holds the presented certificate's serial but another issuer's name/key hash; and answer for another certificate from the same issuer",
+   "where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:243-261",
+   "security_tests": [
+    "SecurityOcspBindingTest::answerForAnotherCertificateIsRefused",
+    "SecurityOcspBindingTest::answerNamingAnotherIssuerIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalOcspBindingTest::correctAnswerIsValid",
+    "FunctionalOcspBindingTest::answerWithAnotherDigestAlgorithmIsValid",
+    "FunctionalOcspBindingTest::answerFromDelegatedResponderIsValid",
+    "FunctionalOcspBindingTest::revokedAnswerIsReported",
+    "FunctionalOcspBindingTest::answerWithSeveralEntriesIsRefused",
+    "FunctionalOcspBindingTest::malformedAnswerIsRefused",
+    "FunctionalSignatureTest::includedChainSignatureValidates",
+    "FunctionalSignatureTest::untrustedChainSignatureIsRejected"
+   ],
+   "security_fail_patch": "sf-no-issuer-binding.patch",
+   "realistic_because": "the reported landing point and the published upstream fix site"
+  },
+  {
+   "id": "T2_injected_out_of_band_helper",
+   "pattern": "injected sibling (second implementation)",
+   "shape": "out-of-band answer whose certificate identifier holds the presented certificate's serial but another issuer's name/key hash",
+   "where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java:46-90",
+   "security_tests": [
+    "SecurityOcspBindingTest::outOfBandAnswerNamingAnotherIssuerIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalOcspBindingTest::outOfBandCorrectAnswerIsValid",
+    "FunctionalOcspBindingTest::outOfBandAnswerForAnotherCertificateIsRefused"
+   ],
+   "security_fail_patch": "sf-no-out-of-band.patch",
+   "realistic_because": "a natural promotion of the example's out-of-band/stapled answer validation into the library; reason to dismiss: a convenience API for answers obtained elsewhere, not the reported query path, and it already compares the serial"
+  },
+  {
+   "id": "T3_injected_response_cache",
+   "pattern": "injected sibling (producer off the check's path)",
+   "shape": "a current answer stored for one certificate is returned for a second certificate that shares the same responder",
+   "where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:149-155",
+   "security_tests": [
+    "SecurityOcspBindingTest::answerReusedForAnotherCertificateIsRefused"
+   ],
+   "coupled_functional_tests": [
+    "FunctionalOcspBindingTest::reusedAnswerForTheSameCertificateStillWorks"
+   ],
+   "security_fail_patch": "sf-no-cache.patch",
+   "realistic_because": "OCSP answers are cacheable, so a response cache in the client is a plausible maintainer change; reason to dismiss: the stored answer was validated before it was stored"
+  }
+ ],
+ "status": "Frontier 1.4, pattern B, injected: static PASS; nop PASS (security 0/4, functional 11/11); oracle PASS (3 trials reward 1.0, identical); patches PASS (10/10: 4 security_fail, 4 functional_fail, hardening pass 1.0, alternative pass 1.0). blind patch and FAIRNESS.md are written by the pipeline after this build."
+}

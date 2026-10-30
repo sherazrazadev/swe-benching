@@ -1,0 +1,172 @@
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
+index 7a08149..6c66ef3 100644
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
+@@ -50,6 +50,7 @@ import org.bouncycastle.cert.ocsp.CertificateID;
+ import org.bouncycastle.cert.ocsp.OCSPException;
+ import org.bouncycastle.cert.ocsp.OCSPReqBuilder;
+ import org.bouncycastle.cert.ocsp.OCSPResp;
++import org.bouncycastle.cert.ocsp.SingleResp;
+ import org.bouncycastle.operator.ContentVerifierProvider;
+ import org.bouncycastle.operator.OperatorCreationException;
+ import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder;
+@@ -72,7 +73,10 @@ import java.security.cert.X509CertSelector;
+ import java.security.cert.X509Certificate;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.Date;
+ import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import static io.netty.handler.codec.http.HttpMethod.POST;
+ import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
+@@ -91,6 +95,11 @@ final class OcspClient {
+     private static final int OCSP_RESPONSE_MAX_SIZE = SystemPropertyUtil.getInt(
+             "io.netty.ocsp.responseSize", 1024 * 10);
+ 
++    // OCSP responses are cacheable, so a fresh response for a responder is kept and reused to avoid
++    // another network round-trip.
++    private static final Map<String, BasicOCSPResp> RESPONSE_CACHE =
++            new ConcurrentHashMap<String, BasicOCSPResp>();
++
+     static {
+         logger.debug("-Dio.netty.ocsp.responseSize: {} bytes", OCSP_RESPONSE_MAX_SIZE);
+     }
+@@ -135,6 +144,14 @@ final class OcspClient {
+                     // Get OCSP URL from Certificate and query it.
+                     URL uri = new URL(parseOcspUrlFromCertificate(x509Certificate));
+ 
++                    // Reuse a fresh response for this responder if one is still cached.
++                    final String cacheKey = uri.toString();
++                    BasicOCSPResp cachedResponse = RESPONSE_CACHE.get(cacheKey);
++                    if (cachedResponse != null && isFresh(cachedResponse)) {
++                        responsePromise.trySuccess(cachedResponse);
++                        return;
++                    }
++
+                     // Find port
+                     int port = uri.getPort();
+                     if (port == -1) {
+@@ -163,6 +180,9 @@ final class OcspClient {
+                             try {
+                                 BasicOCSPResp resp = (BasicOCSPResp) future.getNow().getResponseObject();
+                                 validateResponse(responsePromise, resp, derNonce, issuer, validateResponseNonce);
++                                if (responsePromise.isSuccess()) {
++                                    RESPONSE_CACHE.put(cacheKey, resp);
++                                }
+                             } catch (Throwable t) {
+                                 responsePromise.tryFailure(t);
+                             }
+@@ -260,6 +280,18 @@ final class OcspClient {
+         }
+     }
+ 
++    private static boolean isFresh(BasicOCSPResp response) {
++        SingleResp[] responses = response.getResponses();
++        if (responses.length != 1) {
++            return false;
++        }
++        Date current = new Date();
++        Date thisUpdate = responses[0].getThisUpdate();
++        Date nextUpdate = responses[0].getNextUpdate();
++        return thisUpdate != null && current.after(thisUpdate) &&
++                (nextUpdate == null || current.before(nextUpdate));
++    }
++
+     /**
+      * Validate OCSP response nonce
+      */
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+new file mode 100644
+index 0000000..088d2d7
+--- /dev/null
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+@@ -0,0 +1,87 @@
++/*
++ * Copyright 2026 The Netty Project
++ *
++ * The Netty Project licenses this file to you under the Apache License,
++ * version 2.0 (the "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at:
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ */
++package io.netty.handler.ssl.ocsp;
++
++import org.bouncycastle.cert.ocsp.BasicOCSPResp;
++import org.bouncycastle.cert.ocsp.OCSPException;
++import org.bouncycastle.cert.ocsp.RevokedStatus;
++import org.bouncycastle.cert.ocsp.SingleResp;
++
++import java.security.cert.X509Certificate;
++import java.util.Date;
++
++import static io.netty.util.internal.ObjectUtil.checkNotNull;
++
++/**
++ * Validates an OCSP response that was obtained outside of an active {@link OcspClient} query, for
++ * example a response that the application cached, or one that was received out of band.
++ */
++public final class OcspResponseValidator {
++
++    private OcspResponseValidator() {
++        // Prevent outside initialization
++    }
++
++    /**
++     * Validate the given OCSP response against the peer certificate chain that it is meant to cover.
++     *
++     * @param response          the OCSP response to validate
++     * @param peerCertificates  the peer certificate chain, leaf certificate first
++     * @return the certificate status carried by the response
++     * @throws OCSPException if the response is not a valid, fresh statement about the leaf certificate
++     */
++    public static OcspResponse validate(BasicOCSPResp response, X509Certificate[] peerCertificates)
++            throws OCSPException {
++        checkNotNull(response, "response");
++        checkNotNull(peerCertificates, "peerCertificates");
++        if (peerCertificates.length < 2) {
++            throw new IllegalArgumentException("Expected at least a certificate and its issuer");
++        }
++        X509Certificate certificate = peerCertificates[0];
++        X509Certificate issuer = peerCertificates[1];
++
++        SingleResp[] responses = response.getResponses();
++        if (responses.length != 1) {
++            throw new OCSPException("Expected number of responses was 1 but got: " + responses.length);
++        }
++        SingleResp singleResponse = responses[0];
++
++        OcspClient.validateSignature(response, issuer);
++
++        Date current = new Date();
++        Date thisUpdate = singleResponse.getThisUpdate();
++        Date nextUpdate = singleResponse.getNextUpdate();
++        if (thisUpdate == null || !current.after(thisUpdate) ||
++                nextUpdate != null && !current.before(nextUpdate)) {
++            throw new OCSPException("OCSP Response is out-of-date");
++        }
++
++        if (!singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
++            throw new OCSPException("OCSP response does not match the certificate");
++        }
++
++        OcspResponse.Status status;
++        if (singleResponse.getCertStatus() == null) {
++            // 'null' means certificate is valid
++            status = OcspResponse.Status.VALID;
++        } else if (singleResponse.getCertStatus() instanceof RevokedStatus) {
++            status = OcspResponse.Status.REVOKED;
++        } else {
++            status = OcspResponse.Status.UNKNOWN;
++        }
++        return new OcspResponse(status, thisUpdate, nextUpdate);
++    }
++}

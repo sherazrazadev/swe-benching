@@ -1,0 +1,232 @@
+{
+ "slug": "mesop-s4",
+ "candidate": "screener-v2 entry 3430: GHSA-G7F6-RXC4-QHPH / CVE-2026-93421 / PYSEC-2026-4105 (mesop-dev/mesop, CWE-150/CWE-117)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "8f7e1e230975f6f763a090f647d34a4cad7977c1 (parent of fix f38c42a1d3eba246941ef8d7f645072d53c58785; the fix commit adds the advisory regression tests, the pinned commit has none of them)",
+  "entry_points": [
+   "HTTP POST /__csp__ (browser security-policy violation report, unauthenticated)",
+   "HTTP GET /{prefix}__web-components-module__/<path> (asset route; rejected requests)",
+   "HTTP POST /__csp__ (injected one-line operational record)",
+   "HTTP POST /__csp__ (injected de-duplicating violation tracker in a second module)",
+   "HTTP POST /__csp__ (injected warning branch for a non-web document)"
+  ],
+  "sites": [
+   "mesop/server/static_file_serving.py:232-253 (csp_report console diagnostic; raw document-uri path, blocked-uri and directive)",
+   "mesop/server/static_file_serving.py:148-167 (serve_web_components rejection raises with the raw path/extension)",
+   "mesop/server/static_file_serving.py:198-202 (injected operational record)",
+   "mesop/server/csp_diagnostics.py:11-24 (injected violation tracker) called from static_file_serving.py:203-207",
+   "mesop/server/static_file_serving.py:193-196 (injected non-web-document warning) using mesop/warn/warn.py:6-7"
+  ],
+  "routes": [
+   "POST /__csp__ accepted report: escape sequences in document-uri/blocked-uri reach the printed diagnostic",
+   "POST /__csp__ accepted report: raw control characters (CR, LF, BS, NUL, bidi) reach the printed diagnostic",
+   "GET /__web-components-module__/<no-dot path>: escape/control sequences in the requested location reach the framework's unhandled-error record",
+   "GET /__web-components-module__/x.<bad extension>: escape sequences in the extension reach the framework's unhandled-error record",
+   "POST /__csp__: escape/control sequences reach the operational record and the violation tracker",
+   "POST /__csp__ with a non-http(s) document: escape sequences reach the warning"
+  ],
+  "services": [],
+  "exploit_reproduced": "Yes, on the pinned+injected tree through the Flask test client exactly as a browser would: the console diagnostic contains the submitted escape/control bytes, and rejected asset requests produce an unhandled-error record containing the decoded target.",
+  "project_tests_run": "mesop/server/static_file_serving_test.py (3 tests) passes at the pinned commit and after the reference fix; it is shipped from the verifier and run as the project group."
+ },
+ "leak_terms": [
+  "static_file_serving",
+  "csp_diagnostics",
+  "csp_report",
+  "serve_web_components",
+  "note_violation",
+  "_sanitize_terminal",
+  "_sanitize_report",
+  "MesopException",
+  "terminal_colors",
+  "WEB_COMPONENTS_PATH_SEGMENT",
+  "__web-components-module__",
+  "warn.py"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf_sgr_only.patch",
+   "expect": "security_fail",
+   "note": "the tempting shallow fix: strip only ESC[..m colour codes from the submitted values; every non-SGR escape and every control character still reaches the output"
+  },
+  {
+   "patch": "sf_no_control.patch",
+   "expect": "security_fail",
+   "note": "reference fix with control-character stripping removed; only the ANSI sequence forms are neutralized"
+  },
+  {
+   "patch": "sf_no_asset.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the rejected-asset-request route, which still raises with the raw requested location"
+  },
+  {
+   "patch": "sf_no_s1.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the operational one-line record, which still logs the raw submitted fields"
+  },
+  {
+   "patch": "sf_no_s2.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the violation tracker, which still logs the raw submitted directive"
+  },
+  {
+   "patch": "sf_no_warn.patch",
+   "expect": "security_fail",
+   "note": "reference fix minus the warning message, which still carries the raw submitted location"
+  },
+  {
+   "patch": "ff_overbroad.patch",
+   "expect": "functional_fail",
+   "note": "neutralizes the whole formatted diagnostic, removing the product's own colour, symbols and line layout"
+  },
+  {
+   "patch": "ff_refuse_all.patch",
+   "expect": "functional_fail",
+   "note": "refuses every report instead of printing the diagnostic"
+  },
+  {
+   "patch": "pass_hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus defensive path hardening in product code the suites import (a request-target guard and a static-file route guard)"
+  },
+  {
+   "patch": "pass_alt.patch",
+   "expect": "pass",
+   "note": "second valid design: per-field sanitization at every write, with a request-target guard rejecting unsafe paths before routing instead of changing the route handler"
+  },
+  {
+   "patch": "blind-fix.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "produced after the build by a fresh agent that saw only instruction.md and the repository"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff_refuse_all.patch",
+  "crash_as_refusal": "sf_no_asset.patch",
+  "wrong_resource": "n/a: the protected outcome is what the server writes, not a stored resource; no neighbouring or proxy object decides a check",
+  "one_role_or_direction": "n/a: there is no role, peer or direction; every client-supplied value is treated alike",
+  "reads_only": "n/a: there is no read/write verb split on the protected path",
+  "check_after_adjustment": "n/a: the value is sanitized at the last point before it is written; no later normalising step reintroduces sequence bytes (urlparse only removes line breaks, it cannot add them)",
+  "unlisted_route": "sf_no_asset.patch",
+  "malformed_identity": "n/a: no parsed identity or spelling decides the protection; every string in the report is sanitized",
+  "missing_authority": "n/a: there is no external authority lookup that could fail open",
+  "adjacent_api": "ff_overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_escape_sequences_in_diagnostic",
+   "pattern": "B (reported site)",
+   "shape": "ANSI/VT100 escape sequences in the submitted report fields are interpolated verbatim into the console diagnostic",
+   "where": "mesop/server/static_file_serving.py:232-253",
+   "security_tests": [
+    "security/test_report_values_terminal.py::test_escape_sequence_in_page_and_blocked_url",
+    "security/test_report_values_terminal.py::test_two_byte_escape_alone_in_page_path"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_csp_diagnostic.py::test_accepted_report_still_prints_the_diagnostic",
+    "functional/test_csp_diagnostic.py::test_diagnostic_keeps_its_colour_and_layout",
+    "functional/test_csp_diagnostic.py::test_suggested_policy_shows_the_plain_origin"
+   ],
+   "security_fail_patch": "sf_sgr_only.patch",
+   "realistic_because": "the reported site; the handler already builds the banner from these fields"
+  },
+  {
+   "id": "T2_control_characters_survive_ansi_only_check",
+   "pattern": "B (shape a plausible check mishandles)",
+   "shape": "bare control characters (CR, LF, backspace, NUL, bidi overrides) are not ANSI sequences, so an escape-only sanitizer leaves them to overwrite text and forge lines",
+   "where": "mesop/server/static_file_serving.py:232-253 (and the injected records)",
+   "security_tests": [
+    "security/test_report_values_terminal.py::test_control_character_in_blocked_url",
+    "security/test_report_values_terminal.py::test_control_character_in_page_path",
+    "security/test_report_log_records_terminal.py::test_report_summary_record"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_csp_diagnostic.py::test_diagnostic_keeps_its_colour_and_layout",
+    "functional/test_csp_diagnostic.py::test_non_ascii_page_values_are_preserved"
+   ],
+   "security_fail_patch": "sf_no_control.patch",
+   "realistic_because": "the reported example is an ANSI escape; a regex for escape sequences is the obvious check and leaves the C0 control class untouched"
+  },
+  {
+   "id": "T3_asset_route_unhandled_rejection",
+   "pattern": "B (route where the protection never existed)",
+   "shape": "a rejected asset request raises with the raw requested location, and the framework's unhandled-error record additionally repeats the decoded request target",
+   "where": "mesop/server/static_file_serving.py:148-167",
+   "security_tests": [
+    "security/test_asset_location_terminal.py::test_escape_sequence_in_asset_location",
+    "security/test_asset_location_terminal.py::test_escape_sequence_in_rejected_file_extension",
+    "security/test_asset_location_terminal.py::test_control_character_in_asset_location"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_csp_diagnostic.py::test_valid_web_component_asset_is_still_served"
+   ],
+   "security_fail_patch": "sf_no_asset.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4_operational_record",
+   "pattern": "injected sibling (where-type)",
+   "shape": "a one-line operational record logs the submitted report fields before the handler parses them",
+   "where": "mesop/server/static_file_serving.py:198-202 (injected)",
+   "security_tests": [
+    "security/test_report_log_records_terminal.py::test_report_summary_record"
+   ],
+   "coupled_functional_tests": [],
+   "security_fail_patch": "sf_no_s1.patch",
+   "realistic_because": "operators routinely add a one-line warning so a violation shows up in log aggregation; it reads as telemetry, not as the console diagnostic"
+  },
+  {
+   "id": "T5_violation_tracker_second_module",
+   "pattern": "injected sibling (where-type, different module)",
+   "shape": "a de-duplicating tracker in a separate module logs the submitted directive, so a fix aimed at the handler's own statements misses it",
+   "where": "mesop/server/csp_diagnostics.py:11-24 (injected); called from mesop/server/static_file_serving.py:203-207",
+   "security_tests": [
+    "security/test_report_log_records_terminal.py::test_violation_tracker_record"
+   ],
+   "coupled_functional_tests": [],
+   "security_fail_patch": "sf_no_s2.patch",
+   "realistic_because": "log-spam control is ordinary infrastructure; the helper is a small local module with a bounded cache"
+  },
+  {
+   "id": "T6_warning_on_refused_document",
+   "pattern": "injected sibling (where-type, project warning channel)",
+   "shape": "a graceful rejection branch for a non-web document warns with the raw submitted location; the warning carries the project's own colour prefix, so a sanitizer applied to the whole message breaks it",
+   "where": "mesop/server/static_file_serving.py:193-196 (injected); mesop/warn/warn.py:6-7",
+   "security_tests": [
+    "security/test_report_log_records_terminal.py::test_rejected_document_warning"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_csp_diagnostic.py::test_warning_keeps_its_own_marker"
+   ],
+   "security_fail_patch": "sf_no_warn.patch",
+   "realistic_because": "routing a warning through the project's existing warning helper is the natural choice, and the helper adds its own styling"
+  },
+  {
+   "id": "T7_over_broad_whole_message_sanitization",
+   "pattern": "coupled must-keep-working (over-hardening)",
+   "shape": "sanitizing the finished diagnostic removes the product's own colour, symbols and newlines, so the console output no longer looks or reads as today",
+   "where": "mesop/server/static_file_serving.py:232-253",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_csp_diagnostic.py::test_diagnostic_keeps_its_colour_and_layout",
+    "functional/test_csp_diagnostic.py::test_accepted_report_still_prints_the_diagnostic",
+    "functional/test_csp_diagnostic.py::test_non_ascii_page_values_are_preserved"
+   ],
+   "security_fail_patch": "ff_overbroad.patch (expect functional_fail)",
+   "realistic_because": "stripping the whole formatted string is the shortest way to neutralize the banner; it also removes the product's own formatting"
+  }
+ ],
+ "status": "gate-green 2026-10-30: static PASS; nop PASS (39/39 security fail on the pinned+injected tree, 11/11 functional pass); oracle PASS 3/3 reward 1.0 (50/50 each, identical); patches PASS 10/10 as declared (sf_sgr_only 0.2564, sf_no_control 0.6667, sf_no_asset 0.7436, sf_no_s1 0.8974, sf_no_s2 0.9231, sf_no_warn 0.9487, ff_overbroad 0.0, ff_refuse_all 0.0, pass_hardening 1.0, pass_alt 1.0). The blind patch is declared and is written by the pipeline's blind-fix step."
+}

@@ -1,0 +1,49 @@
+diff --git a/lib/streamlit/runtime/caching/hashing.py b/lib/streamlit/runtime/caching/hashing.py
+index 7802d5c..3e1ece4 100644
+--- a/lib/streamlit/runtime/caching/hashing.py
++++ b/lib/streamlit/runtime/caching/hashing.py
+@@ -536,25 +536,30 @@ class _CacheFuncHasher:
+             self.update(h, np_obj.tobytes())
+             return h.digest()
+ 
+-        elif type_util.is_type(obj, re.compile(r"^PIL\..*ImageFile$")):
+-            import numpy as np
+-
+-            # Images opened from a file are instances of PIL's format-specific
+-            # plugin classes rather than PIL.Image.Image itself, so the branch
+-            # below does not match them. Hash their pixel buffer so that they
+-            # can be used with the cache decorators.
+-            np_array = np.frombuffer(obj.tobytes(), dtype="uint8")
+-            return self.to_bytes(np_array)
+-
+-        elif type_util.is_type(obj, "PIL.Image.Image"):
++        elif type_util.is_type(obj, "PIL.Image.Image") or type_util.is_type(
++            obj, re.compile(r"^PIL\..*ImageFile$")
++        ):
+             import numpy as np
+ 
+             pil_obj: Image = cast("Image", obj)
+ 
+-            # we don't just hash the results of obj.tobytes() because we want to use
+-            # the sampling logic for numpy data
++            # Include the colour table (any palette-carrying mode) outside the
++            # sampled array, plus PNG-style transparency metadata.
++            try:
++                palette_data = pil_obj.getpalette()
++            except Exception:
++                palette_data = None
++            if palette_data:
++                self.update(h, b"palette", )
++                self.update(h, bytes(palette_data))
++            transparency = getattr(pil_obj, "info", {}).get("transparency")
++            if transparency is not None:
++                self.update(h, b"transparency")
++                self.update(h, str(transparency))
++
+             np_array = np.frombuffer(pil_obj.tobytes(), dtype="uint8")
+-            return self.to_bytes(np_array)
++            self.update(h, np_array)
++            return h.digest()
+ 
+         elif inspect.isbuiltin(obj):
+             return bytes(obj.__name__.encode())

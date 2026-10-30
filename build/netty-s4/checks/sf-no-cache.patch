@@ -1,0 +1,96 @@
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
+index 6c66ef3..65c10ee 100644
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java
+@@ -73,6 +73,7 @@ import java.security.cert.X509CertSelector;
+ import java.security.cert.X509Certificate;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.Arrays;
+ import java.util.Date;
+ import java.util.List;
+ import java.util.Map;
+@@ -179,7 +180,8 @@ final class OcspClient {
+                         if (future.isSuccess()) {
+                             try {
+                                 BasicOCSPResp resp = (BasicOCSPResp) future.getNow().getResponseObject();
+-                                validateResponse(responsePromise, resp, derNonce, issuer, validateResponseNonce);
++                                validateResponse(responsePromise, resp, derNonce, issuer, validateResponseNonce,
++                                        x509Certificate);
+                                 if (responsePromise.isSuccess()) {
+                                     RESPONSE_CACHE.put(cacheKey, resp);
+                                 }
+@@ -261,8 +263,16 @@ final class OcspClient {
+     }
+ 
+     private static void validateResponse(Promise<BasicOCSPResp> responsePromise, BasicOCSPResp basicResponse,
+-                                         DEROctetString derNonce, X509Certificate issuer, boolean validateNonce) {
++                                         DEROctetString derNonce, X509Certificate issuer, boolean validateNonce,
++                                         X509Certificate x509Certificate) {
+         try {
++            CertificateID responseCertId = basicResponse.getResponses()[0].getCertID();
++            if (!responseCertId.matchesIssuer(new JcaX509CertificateHolder(issuer),
++                    new JcaDigestCalculatorProviderBuilder().build())
++                    || !responseCertId.getSerialNumber().equals(x509Certificate.getSerialNumber())) {
++                throw new java.security.cert.CertificateException(
++                        "OCSP response CertID does not match queried certificate");
++            }
+             // Validate number of responses. We only requested for 1 certificate
+             // so number of responses must be 1. If not, we will throw an error.
+             int responses = basicResponse.getResponses().length;
+@@ -280,6 +290,13 @@ final class OcspClient {
+         }
+     }
+ 
++    private static String cacheKey(CertificateID certificateID, URL uri) {
++        return uri + "|" + certificateID.getHashAlgOID() + "|" +
++                Arrays.toString(certificateID.getIssuerNameHash()) + "|" +
++                Arrays.toString(certificateID.getIssuerKeyHash()) + "|" +
++                certificateID.getSerialNumber();
++    }
++
+     private static boolean isFresh(BasicOCSPResp response) {
+         SingleResp[] responses = response.getResponses();
+         if (responses.length != 1) {
+diff --git a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+index 088d2d7..4ff44be 100644
+--- a/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
++++ b/handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspResponseValidator.java
+@@ -15,11 +15,17 @@
+  */
+ package io.netty.handler.ssl.ocsp;
+ 
++import org.bouncycastle.cert.X509CertificateHolder;
++import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
+ import org.bouncycastle.cert.ocsp.BasicOCSPResp;
+ import org.bouncycastle.cert.ocsp.OCSPException;
+ import org.bouncycastle.cert.ocsp.RevokedStatus;
+ import org.bouncycastle.cert.ocsp.SingleResp;
++import org.bouncycastle.operator.DigestCalculatorProvider;
++import org.bouncycastle.operator.OperatorCreationException;
++import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
+ 
++import java.security.cert.CertificateEncodingException;
+ import java.security.cert.X509Certificate;
+ import java.util.Date;
+ 
+@@ -69,7 +75,18 @@ public final class OcspResponseValidator {
+             throw new OCSPException("OCSP Response is out-of-date");
+         }
+ 
+-        if (!singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
++        X509CertificateHolder issuerHolder;
++        DigestCalculatorProvider digestCalculatorProvider;
++        try {
++            issuerHolder = new JcaX509CertificateHolder(issuer);
++            digestCalculatorProvider = new JcaDigestCalculatorProviderBuilder().build();
++        } catch (CertificateEncodingException e) {
++            throw new OCSPException("Error while parsing the issuer certificate", e);
++        } catch (OperatorCreationException e) {
++            throw new OCSPException("Error while creating the digest calculator", e);
++        }
++        if (!singleResponse.getCertID().matchesIssuer(issuerHolder, digestCalculatorProvider)
++                || !singleResponse.getCertID().getSerialNumber().equals(certificate.getSerialNumber())) {
+             throw new OCSPException("OCSP response does not match the certificate");
+         }
+ 

@@ -1,0 +1,92 @@
+diff --git a/src/cli/operations/agent/import/base-translator.ts b/src/cli/operations/agent/import/base-translator.ts
+index e922770..4b95d9b 100644
+--- a/src/cli/operations/agent/import/base-translator.ts
++++ b/src/cli/operations/agent/import/base-translator.ts
+@@ -235,6 +235,45 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
+     return code;
+   }
+ 
++  /**
++   * Comment header recording the agent definition the project was imported from.
++   */
++  protected generateImportHeader(): string {
++    const description = this.agentInfo.description ?? '';
++    if (!description) return '';
++    return `\n# Imported Bedrock agent: ${description}\n`;
++  }
++
++  /**
++   * Python constants describing the imported action groups and their parameters, so the
++   * generated agent keeps that information next to the code it was translated into.
++   */
++  protected generateImportedMetadata(): string {
++    const actionGroupNotes: string[] = [];
++    const parameterNotes: string[] = [];
++    for (const ag of this.customActionGroups) {
++      if (ag.description) {
++        actionGroupNotes.push(`    "${BaseBedrockTranslator.escapePySingleQuote(ag.description)}",`);
++      }
++      for (const fn of ag.functionSchema?.functions ?? []) {
++        for (const [name, info] of Object.entries(fn.parameters ?? {})) {
++          if (info.description) {
++            parameterNotes.push(`    f"${name}: ${info.description}",`);
++          }
++        }
++      }
++    }
++
++    let code = '';
++    if (actionGroupNotes.length > 0) {
++      code += `\n# --- Imported action group notes ---\nACTION_GROUP_NOTES = [\n${actionGroupNotes.join('\n')}\n]\n`;
++    }
++    if (parameterNotes.length > 0) {
++      code += `\n# --- Imported parameter notes ---\nPARAMETER_NOTES = [\n${parameterNotes.join('\n')}\n]\n`;
++    }
++    return code;
++  }
++
+   private generateFunctionTool(fn: FunctionDefinition, groupName: string): string {
+     const fnName = fn.name.replace(/[^a-zA-Z0-9_]/g, '_');
+     const params = fn.parameters ?? {};
+diff --git a/src/cli/operations/agent/import/langgraph-translator.ts b/src/cli/operations/agent/import/langgraph-translator.ts
+index c6d9038..472a949 100644
+--- a/src/cli/operations/agent/import/langgraph-translator.ts
++++ b/src/cli/operations/agent/import/langgraph-translator.ts
+@@ -41,9 +41,11 @@ LangchainInstrumentor().instrument()
+     const mainPyContent = this.assembleCode([
+       importsCode,
+       iamComment,
++      this.generateImportHeader(),
+       modelsCode,
+       promptsCode,
+       collaborationCode,
++      this.generateImportedMetadata(),
+       toolsCode,
+       memoryCode,
+       kbCode,
+@@ -269,7 +271,7 @@ def get_agent():
+         post_process_prompt = POST_PROCESSING_TEMPLATE.replace("$question$", question).replace("$latest_response$", response["messages"][-1].content).replace("$responses$", str(response["messages"]))
+         post_process_output = llm_POST_PROCESSING.invoke([HumanMessage(post_process_prompt)])
+         return [AIMessage(post_process_output.content)]`
+-      : `    return response['messages']`;
++      : `return response['messages']`;
+ 
+     code += `
+ def invoke_agent(question: str${relayParamDef}):
+diff --git a/src/cli/operations/agent/import/strands-translator.ts b/src/cli/operations/agent/import/strands-translator.ts
+index cece610..7085e56 100644
+--- a/src/cli/operations/agent/import/strands-translator.ts
++++ b/src/cli/operations/agent/import/strands-translator.ts
+@@ -39,10 +39,12 @@ export class StrandsTranslator extends BaseBedrockTranslator {
+     const mainPyContent = this.assembleCode([
+       importsCode,
+       iamComment,
++      this.generateImportHeader(),
+       guardrailWarning,
+       modelsCode,
+       promptsCode,
+       collaborationCode,
++      this.generateImportedMetadata(),
+       toolsCode,
+       memoryCode,
+       kbCode,

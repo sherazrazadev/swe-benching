@@ -1,0 +1,87 @@
+diff --git a/crates/tui/src/tools/git.rs b/crates/tui/src/tools/git.rs
+index 1f696652c..0f610dd6c 100644
+--- a/crates/tui/src/tools/git.rs
++++ b/crates/tui/src/tools/git.rs
+@@ -128,6 +128,10 @@ impl ToolSpec for GitDiffTool {
+                     "type": "boolean",
+                     "description": "When true, diff staged changes (`--cached`)."
+                 },
++                "base": {
++                    "type": "string",
++                    "description": "Optional base ref to compare HEAD against (e.g. origin/main)."
++                },
+                 "unified": {
+                     "type": "integer",
+                     "minimum": 0,
+@@ -155,6 +159,7 @@ impl ToolSpec for GitDiffTool {
+     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+         let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
+         let cached = optional_bool(&input, "cached", false);
++        let base = optional_str(&input, "base");
+         let unified = optional_u64(&input, "unified", DEFAULT_UNIFIED).min(MAX_UNIFIED);
+ 
+         let mut args = vec![
+@@ -168,6 +173,9 @@ impl ToolSpec for GitDiffTool {
+         if cached {
+             args.push("--cached".to_string());
+         }
++        if let Some(base) = base {
++            args.push(format!("{base}...HEAD"));
++        }
+         if let Some(pathspec) = &git_ctx.pathspec {
+             args.push("--".to_string());
+             args.push(pathspec.display().to_string());
+@@ -194,6 +202,7 @@ impl ToolSpec for GitDiffTool {
+             "working_dir": git_ctx.working_dir,
+             "pathspec": git_ctx.pathspec,
+             "cached": cached,
++            "base": base,
+             "unified": unified,
+             "truncated": truncated,
+             "omitted_chars": omitted_chars,
+diff --git a/crates/tui/src/tools/git_history.rs b/crates/tui/src/tools/git_history.rs
+index e73ec0c6a..464484ab4 100644
+--- a/crates/tui/src/tools/git_history.rs
++++ b/crates/tui/src/tools/git_history.rs
+@@ -64,6 +64,11 @@ impl ToolSpec for GitLogTool {
+                 "until": {
+                     "type": "string",
+                     "description": "Optional upper date bound, e.g. 'yesterday' or ISO date."
++                },
++                "revs": {
++                    "type": "array",
++                    "items": { "type": "string" },
++                    "description": "Optional revisions or branches to start the history from. Each entry is passed to git log."
+                 }
+             },
+             "additionalProperties": false
+@@ -89,6 +94,7 @@ impl ToolSpec for GitLogTool {
+         let author = optional_str(&input, "author").map(ToOwned::to_owned);
+         let since = optional_str(&input, "since").map(ToOwned::to_owned);
+         let until = optional_str(&input, "until").map(ToOwned::to_owned);
++        let revs = input.get("revs").and_then(Value::as_array);
+ 
+         let mut args = vec![
+             "log".to_string(),
+@@ -106,6 +112,13 @@ impl ToolSpec for GitLogTool {
+         if let Some(until) = &until {
+             args.push(format!("--until={until}"));
+         }
++        if let Some(revs) = revs {
++            for rev in revs {
++                if let Some(rev) = rev.as_str() {
++                    args.push(rev.to_string());
++                }
++            }
++        }
+         if let Some(pathspec) = &git_ctx.pathspec {
+             args.push("--".to_string());
+             args.push(pathspec.display().to_string());
+@@ -136,6 +149,7 @@ impl ToolSpec for GitLogTool {
+             "author": author,
+             "since": since,
+             "until": until,
++            "revs": revs,
+             "truncated": truncated,
+             "omitted_chars": omitted_chars,
+         })))

@@ -1,0 +1,215 @@
+{
+ "slug": "agentcore-cli-s4",
+ "candidate": "GHSA-M4X6-GWGP-4PM7 / CVE-2026-11393 (aws/agentcore-cli), screener-v2 entry_id 12410",
+ "pattern": "B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "pinned_commit": "a6872ca560a2e02e86a3a7a0be92ae0cb126ef3f (direct parent of the published fix ae1b932ec91bacdbb7a3521f9f1fc24479a3d504; the fix commit only adds tests and snapshots, so the pinned tree contains no regression tests for it)",
+  "entry_point": "executeImportAgent in src/cli/operations/agent/import/index.ts, the shared handler called by 'agentcore add agent --type import' and 'agentcore create --type import' (non-interactive CLI) and by the TUI create/add flows. The verifier drives it with the Bedrock fetch (src/cli/aws/bedrock-import.ts getBedrockAgentConfig) stubbed to return a chosen imported definition; the real dispatch, translator, collaborator recursion and project writer run, and the generated main.py + collaborator files are read from disk. AGENTCORE_SKIP_INSTALL=1 keeps the Python project setup offline.",
+  "sites": [
+   "src/cli/operations/agent/import/base-translator.ts:135 (published): collaborator instruction escaped only for a single-quoted Python literal, then embedded in a triple-quoted @tool docstring by both translators.",
+   "src/cli/operations/agent/import/base-translator.ts:244 (injected): imported agent description emitted into a line comment in the generated file header without line-by-line comment prefixes.",
+   "src/cli/operations/agent/import/base-translator.ts:256 (injected): imported action group description emitted as a double-quoted Python string element using the single-quote escaper.",
+   "src/cli/operations/agent/import/base-translator.ts:261 (injected): imported parameter description interpolated into an expression-bearing f-string element.",
+   "src/cli/operations/agent/import/strands-translator.ts:42,47 and langgraph-translator.ts:44,48 (injected call sites): both generated frameworks include the header and metadata blocks."
+  ],
+  "routes": [
+   "Screener O8 route 1 (function-schema parameter map keys interpolated raw as Python parameter identifiers, base-translator.ts generateFunctionTool): NOT BUILT. Amazon Bedrock's Function API constrains parameters map keys with Key Pattern ([0-9a-zA-Z][_-]?){1,100}, so a hostile key cannot contain a quote, parenthesis, colon or line break and cannot leave the signature; at most it makes the generated signature invalid. Current upstream also sanitizes names with pythonIdentifier. Recorded in the register.",
+   "Screener O8 route 2 (model_id / region_name / knowledge_base_id interpolated into double-quoted Python strings): NOT BUILT. These values are AWS-issued identifiers constrained by the Bedrock API (foundationModel, the ARN region, the knowledge-base id); a definition cannot carry a quote or line break there through the real service. Current upstream escapes them with escapePythonString. Recorded in the register.",
+   "Injected route ROSTER (agent description in a generated line comment): confirmed behaviourally at the pinned+injected tree; a line break ends the comment and the following line executes at import.",
+   "Injected route CONST (action group description in a double-quoted list element through the single-quote escaper): confirmed behaviourally; a double quote ends the literal and an extra list element is evaluated.",
+   "Injected route FSTR (parameter description inside an f-string list element): confirmed behaviourally; an embedded braces expression is evaluated at import."
+  ],
+  "services": [],
+  "project_tests_run": "src/cli/operations/agent/import/__tests__/translator.test.ts: 12/12 pass on the pinned+injected tree and on the oracle tree (also run as a restored functional suite at grade time).",
+  "local_runs": "nop (pinned+inject): security 0/8, functional 24/24. oracle: security 8/8, functional 24/24. Each single-lever security_fail patch fails only its own lever (2 tests each); base_only 6 security failures; strands_only 7; double_escape 2 functional failures; drop_imported_text 8 functional failures; hardening and alt_fix score 1.0."
+ },
+ "leak_terms": [
+  "collaborationInstruction",
+  "collaboratorInstruction",
+  "collaboratorDescriptions",
+  "collaborators",
+  "escapePySingleQuote",
+  "escapePyTripleQuote",
+  "escapePyDoubleQuote",
+  "sanitizePyIdentifier",
+  "BaseBedrockTranslator",
+  "StrandsTranslator",
+  "LangGraphTranslator",
+  "generateImportHeader",
+  "generateImportedMetadata",
+  "generateCollaborationCode",
+  "generateFunctionTool",
+  "base-translator",
+  "strands-translator",
+  "langgraph-translator",
+  "translator",
+  "docstring",
+  "f-string",
+  "comment",
+  "ACTION_GROUP_NOTES",
+  "PARAMETER_NOTES",
+  "executeImportAgent",
+  "getBedrockAgentConfig",
+  "bedrock-import",
+  "main.py",
+  "agentcore-cli"
+ ],
+ "patch_checks": [
+  {
+   "patch": "base_only.patch",
+   "expect": "security_fail",
+   "note": "the published source fix only (triple-quote escaping of the reported field): the 3 injected sinks stay open in both frameworks (6 security failures), all functional pass"
+  },
+  {
+   "patch": "miss_roster.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the per-line comment prefix in the generated header; its 2 security tests fail, all functional pass"
+  },
+  {
+   "patch": "miss_const.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the double-quote escaping of the action group description; its 2 security tests fail, all functional pass"
+  },
+  {
+   "patch": "miss_fstring.patch",
+   "expect": "security_fail",
+   "note": "oracle minus the removal of the expression-bearing string for parameter descriptions; its 2 security tests fail, all functional pass"
+  },
+  {
+   "patch": "strands_only.patch",
+   "expect": "security_fail",
+   "note": "fixes only the Strands emitter of the reported field; LangGraph plus all 3 injected sinks stay open (7 security failures), all functional pass"
+  },
+  {
+   "patch": "double_escape.patch",
+   "expect": "functional_fail",
+   "note": "tempting over-broad fix: escapes the whole already-escaped collaborator description at the docstring site; security passes but the backslash round-trip fails in both frameworks (2 functional failures)"
+  },
+  {
+   "patch": "drop_imported_text.patch",
+   "expect": "functional_fail",
+   "note": "removes imported text from the generated project instead of making it inert; security passes but 8 functional tests fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "oracle plus defensive hardening (agent name escaped for the triple-quoted docstring and parameter identifiers sanitized); scores 1.0"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "a second valid design: double-quote escaping for the docstring field, per-line comments via a map, and JSON string literals for the metadata values; scores 1.0"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "drop_imported_text.patch",
+  "crash_as_refusal": "n/a: a clean error is an acceptable refusal in a generator; the security tests accept an import error with no output, and the functional tests are the positive control",
+  "wrong_resource": "n/a: there is no authorisation decision or neighbouring resource; the property is about generated source only",
+  "one_role_or_direction": "strands_only.patch",
+  "reads_only": "n/a: there is no read/write verb split; the importer only generates source",
+  "check_after_adjustment": "double_escape.patch",
+  "unlisted_route": "base_only.patch",
+  "malformed_identity": "n/a: no identity is parsed; the values are opaque definition text",
+  "missing_authority": "n/a: no external authority returns a role or secret on this path",
+  "adjacent_api": "n/a: the shared helpers are pure string functions; an over-broad change to them is exactly the double_escape.patch failure mode and is covered by the functional round-trip tests"
+ },
+ "traps": [
+  {
+   "id": "BASE",
+   "pattern": "A (published fix, reported site)",
+   "shape": "imported collaborator instruction embedded in a triple-quoted docstring through a single-quote literal escaper; an embedded docstring terminator plus a same-line statement executes when the tool is used",
+   "where": "src/cli/operations/agent/import/base-translator.ts:135",
+   "security_tests": [
+    "security/import_injection.test.ts::Strands: collaborator instruction in the generated description",
+    "security/import_injection.test.ts::LangChain_LangGraph: collaborator instruction in the generated description"
+   ],
+   "coupled_functional_tests": [
+    "functional/import_behaviour.test.ts::Strands: collaborator instruction preservation",
+    "functional/import_behaviour.test.ts::LangChain_LangGraph: collaborator instruction preservation"
+   ],
+   "security_fail_patch": "base_only.patch",
+   "realistic_because": "the reported upstream site; the published fix changes exactly this field"
+  },
+  {
+   "id": "ROSTER",
+   "pattern": "injected sibling (line comment)",
+   "shape": "imported agent description emitted into a generated line comment; a line break ends the comment and the next line becomes code",
+   "where": "src/cli/operations/agent/import/base-translator.ts:244 (emit site); call sites strands-translator.ts:42 and langgraph-translator.ts:44",
+   "reason_to_dismiss": "a comment reads as inert developer metadata, so escaping quotes or backslashes looks sufficient; only per-line commenting (or removing line breaks) keeps the construct inert",
+   "security_tests": [
+    "security/import_injection.test.ts::Strands: imported agent description in the generated header",
+    "security/import_injection.test.ts::LangChain_LangGraph: imported agent description in the generated header"
+   ],
+   "coupled_functional_tests": [
+    "functional/import_behaviour.test.ts::Strands: imported agent description preservation",
+    "functional/import_behaviour.test.ts::LangChain_LangGraph: imported agent description preservation"
+   ],
+   "security_fail_patch": "miss_roster.patch",
+   "realistic_because": "injected twin: a generated-file provenance header is an ordinary maintainer addition next to the existing auto-generated NOTE block, and it reuses the imported description verbatim"
+  },
+  {
+   "id": "CONST",
+   "pattern": "injected sibling (double-quoted literal, cross-escaper)",
+   "shape": "imported action group description emitted as a double-quoted Python list element using the single-quote escaper; a double quote ends the literal and an extra list element is evaluated",
+   "where": "src/cli/operations/agent/import/base-translator.ts:256 (emit site); call sites strands-translator.ts:47 and langgraph-translator.ts:48",
+   "reason_to_dismiss": "the code already calls an escape helper, so it looks protected; the helper is for the other quote style, so it neutralises backslashes and single quotes but not the delimiter of this literal",
+   "security_tests": [
+    "security/import_injection.test.ts::Strands: imported action group description in generated metadata",
+    "security/import_injection.test.ts::LangChain_LangGraph: imported action group description in generated metadata"
+   ],
+   "coupled_functional_tests": [
+    "functional/import_behaviour.test.ts::Strands: imported action group description preservation",
+    "functional/import_behaviour.test.ts::LangChain_LangGraph: imported action group description preservation"
+   ],
+   "security_fail_patch": "miss_const.patch",
+   "realistic_because": "injected twin: keeping imported action group descriptions beside the generated tools is a natural translation feature, and the nearby code already uses the single-quote escaper for the collaborator fields"
+  },
+  {
+   "id": "FSTR",
+   "pattern": "injected sibling (expression-bearing string)",
+   "shape": "imported parameter description interpolated into an f-string list element; an embedded braces expression is evaluated at import time",
+   "where": "src/cli/operations/agent/import/base-translator.ts:261 (emit site); call sites strands-translator.ts:47 and langgraph-translator.ts:48",
+   "reason_to_dismiss": "the braces sit inside a quoted string and look like literal punctuation; escaping quotes, backslashes and line breaks does not neutralise an f-string expression",
+   "security_tests": [
+    "security/import_injection.test.ts::Strands: imported parameter description in generated metadata",
+    "security/import_injection.test.ts::LangChain_LangGraph: imported parameter description in generated metadata"
+   ],
+   "coupled_functional_tests": [
+    "functional/import_behaviour.test.ts::Strands: imported parameter description preservation",
+    "functional/import_behaviour.test.ts::LangChain_LangGraph: imported parameter description preservation"
+   ],
+   "security_fail_patch": "miss_fstring.patch",
+   "realistic_because": "injected twin: a readable parameter note is a natural companion to the generated tool signature, and an f-string is the obvious way to write it"
+  }
+ ],
+ "status": "gate passed on the Docker host: static PASS; nop PASS (security 0/8, functional 24/24); oracle PASS (3/3 runs reward 1.0, identical); patches PASS (all 9 declared checks behave; the blind patch is intentionally absent and is written by the blind-fix step). Awaiting the pipeline's blind fix, fairness review and target-model trials.",
+ "gate": {
+  "static": "PASS",
+  "nop": "PASS (security 0/8, functional 24/24, reward 0)",
+  "oracle": "PASS (3 runs, each security 8/8, functional 24/24, reward 1.0, identical)",
+  "patches": {
+   "base_only.patch": "security_fail ok (6 security, 0 functional)",
+   "miss_roster.patch": "security_fail ok (2 security, 0 functional)",
+   "miss_const.patch": "security_fail ok (2 security, 0 functional)",
+   "miss_fstring.patch": "security_fail ok (2 security, 0 functional)",
+   "strands_only.patch": "security_fail ok (7 security, 0 functional)",
+   "double_escape.patch": "functional_fail ok (0 security, 2 functional)",
+   "drop_imported_text.patch": "functional_fail ok (0 security, 8 functional)",
+   "hardening.patch": "pass ok (reward 1.0)",
+   "alt_fix.patch": "pass ok (reward 1.0)",
+   "blind.patch": "not run (file intentionally absent at build time)"
+  },
+  "finished_utc": "2026-10-30T12:02:37Z"
+ }
+}

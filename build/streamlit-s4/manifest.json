@@ -1,0 +1,182 @@
+{
+ "slug": "streamlit-s4",
+ "candidate": "screener-v2 entry 5856: GHSA-VQWP-45WM-R9R5 / CVE-2026-10804 / PYSEC-2026-212 (streamlit/streamlit, CWE-327, cache-key hash collision / incomplete input fingerprinting, data integrity)",
+ "pattern": "B",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "4d2a62a151466f7dc2fb9d076092526c6b2aeec6 (parent of fix fec0f584dae9261abed16cad35b32922104bb933; the fix commit adds the advisory's regression test test_PIL_pmode_palette_collision_prevention, the pinned commit does not contain it)",
+  "entry_points": [
+   "library API: calls to any function decorated with @st.cache_data",
+   "library API: calls to any function decorated with @st.cache_resource"
+  ],
+  "sites": [
+   "lib/streamlit/runtime/caching/hashing.py:549-557 (PIL image branch; the same branch is 539-547 in the pinned tree)",
+   "lib/streamlit/runtime/caching/hashing.py:525-537 (fixed-seed numpy sampling reused by the image branch)",
+   "lib/streamlit/runtime/caching/hashing.py:539-548 (injected PIL plugin-class dispatch arm, immediately before the image branch)"
+  ],
+  "routes": [
+   "Image.new('P') images with different colour tables (reported shape)",
+   "Image.new('PA') images with different colour tables (palette plus alpha)",
+   "large P-mode image whose differing colour-table bytes are not selected by the fixed sample",
+   "image opened from a PNG buffer (PIL plugin class) with different colour tables",
+   "P-mode image nested inside a dict argument",
+   "same shapes through @st.cache_resource"
+  ],
+  "services": [],
+  "project_tests_run": "lib/tests/streamlit/runtime/caching/hashing_test.py: 78 passed, 7 skipped on the pinned+injected tree and after the reference fix (pytest 8.4.2 + pytest-benchmark 5.3.0, -o addopts= -o filterwarnings=)"
+ },
+ "leak_terms": [
+  "hashing.py",
+  "cache_utils",
+  "_CacheFuncHasher",
+  "getpalette",
+  "putpalette",
+  "PIL.Image.Image",
+  "ImageFile",
+  "PngImageFile",
+  "RandomState",
+  "_NP_SIZE_LARGE",
+  "_NP_SAMPLE_SIZE",
+  "to_bytes",
+  "palette",
+  "sample seed"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-no-pa.patch",
+   "expect": "security_fail",
+   "note": "reference fix with the colour-table decision reduced to the reported mode only; the palette-plus-alpha security test fails, every functional test passes"
+  },
+  {
+   "patch": "sf-large-sample.patch",
+   "expect": "security_fail",
+   "note": "reference fix with the colour table folded into the sampled pixel array; the large-image security test fails, every functional test passes"
+  },
+  {
+   "patch": "sf-no-opened.patch",
+   "expect": "security_fail",
+   "note": "reference fix for the reported image branch only, leaving the injected opened-image arm hashing the pixel buffer; the opened-image security test fails, every functional test passes"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail",
+   "note": "image key includes object identity, so equal images stop sharing one cached result"
+  },
+  {
+   "patch": "ff-random-seed.patch",
+   "expect": "functional_fail",
+   "note": "reference fix with the large-value sample seed randomised; the second process computes a different disk-cache identity and recomputes"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference fix plus exception-safe colour-table handling, an explicit tag, and transparency metadata"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "note": "second valid design: hash the pixels the palette-carrying image renders to instead of hashing the table on its own"
+  },
+  {
+   "patch": "blind-fix.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "note": "produced after the build by a fresh agent that saw only instruction.md and the repository"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "n/a: the protected outcome is a correct cached result, not a permission decision; refusing or raising for every image fails the correctness assertions, so it is not a passing wrong fix",
+  "crash_as_refusal": "n/a: the security tests require the correct result for each image; a crash or exception cannot satisfy them",
+  "wrong_resource": "n/a: the protected object is the image's rendered content itself; there is no neighbouring or proxy resource a check could decide on instead",
+  "one_role_or_direction": "n/a: there is no role, peer or direction; the property is per image value and applies to both public cache decorators",
+  "reads_only": "n/a: cache-key construction has no read/write verb split; every cached call builds its key the same way",
+  "check_after_adjustment": "sf-large-sample.patch",
+  "unlisted_route": "sf-no-opened.patch",
+  "malformed_identity": "n/a: no parsed identity or spelling decides the key; the hasher receives the image object itself",
+  "missing_authority": "n/a: there is no external authority lookup that could fail open",
+  "adjacent_api": "n/a: no shared helper API whose sibling behaviour changes; the nearest sibling miss is the palette-plus-alpha shape, covered by sf-no-pa.patch"
+ },
+ "traps": [
+  {
+   "id": "T1_large_image_sampling",
+   "pattern": "B (uncovered route; how-type: a shape a plausible check mishandles)",
+   "shape": "the colour table is packed in front of the pixel buffer and then sampled with the large-value fingerprint, so a differing table entry outside the fixed sample is not hashed",
+   "where": "lib/streamlit/runtime/caching/hashing.py:549-557 (with the sampling at 525-537)",
+   "security_tests": [
+    "security/test_image_cache_key.py::test_large_palette_image_colours_change_the_cache_entry"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_cache_behaviour.py::test_equal_large_palette_images_share_one_cached_result",
+    "functional/test_cache_key_stability.py::test_disk_cache_identity_is_stable_across_processes"
+   ],
+   "security_fail_patch": "sf-large-sample.patch",
+   "realistic_because": "real, unmodified upstream code; still present in current upstream after the published fix"
+  },
+  {
+   "id": "T2_palette_alpha_mode",
+   "pattern": "B (uncovered route; how-type: a shape a plausible check mishandles)",
+   "shape": "a palette-carrying image mode other than the reported one (palette plus alpha) still stores colour in a table that tobytes() omits",
+   "where": "lib/streamlit/runtime/caching/hashing.py:549-557",
+   "security_tests": [
+    "security/test_image_cache_key.py::test_palette_with_alpha_colours_change_the_cache_entry"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_cache_behaviour.py::test_equal_palette_with_alpha_images_share_one_cached_result"
+   ],
+   "security_fail_patch": "sf-no-pa.patch",
+   "realistic_because": "real, unmodified upstream code; still present in current upstream after the published fix"
+  },
+  {
+   "id": "T3_opened_image_dispatch",
+   "pattern": "injected sibling (where-type: a second dispatch route to the same sink)",
+   "shape": "PIL's format-specific image-file classes bypass the exact image type check and take a compatibility arm that hashes only the pixel buffer",
+   "where": "lib/streamlit/runtime/caching/hashing.py:539-548 (injected arm immediately before the image branch)",
+   "security_tests": [
+    "security/test_opened_image_cache_key.py::test_opened_palette_image_colours_change_the_cache_entry"
+   ],
+   "coupled_functional_tests": [
+    "functional/test_cache_behaviour.py::test_equal_opened_palette_images_share_one_cached_result"
+   ],
+   "security_fail_patch": "sf-no-opened.patch",
+   "realistic_because": "the hasher dispatches on the exact fully-qualified type, and a maintainer adding support for images opened from disk would add a compatibility arm; the published fix never touches it"
+  },
+  {
+   "id": "T4_object_identity_overbreadth",
+   "pattern": "coupled must-keep-working (functional only)",
+   "shape": "distinguishing images by object identity instead of content, so equal images stop sharing an entry",
+   "where": "lib/streamlit/runtime/caching/hashing.py:549-557 (image branch)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_cache_behaviour.py::test_equal_palette_images_share_one_cached_result",
+    "functional/test_cache_behaviour.py::test_equal_palette_with_alpha_images_share_one_cached_result",
+    "functional/test_cache_behaviour.py::test_equal_large_palette_images_share_one_cached_result",
+    "functional/test_cache_behaviour.py::test_equal_opened_palette_images_share_one_cached_result"
+   ],
+   "security_fail_patch": "ff-overbroad.patch",
+   "realistic_because": "including the object is an obvious way to guarantee different images never collide, at the cost of the cache's stated reuse behaviour"
+  },
+  {
+   "id": "T5_sample_seed_nondeterminism",
+   "pattern": "coupled must-keep-working (functional only)",
+   "shape": "randomising the large-value sample seed, which makes a value key differ between processes and defeats a disk-persisted cache",
+   "where": "lib/streamlit/runtime/caching/hashing.py:525-537 (large-value sampling)",
+   "security_tests": [],
+   "coupled_functional_tests": [
+    "functional/test_cache_key_stability.py::test_disk_cache_identity_is_stable_across_processes",
+    "functional/test_cache_behaviour.py::test_equal_large_palette_images_share_one_cached_result"
+   ],
+   "security_fail_patch": "ff-random-seed.patch",
+   "realistic_because": "randomising the sample looks like a way to stop fixed-sample collisions, but a disk cache is named after the value key, so a second process must compute the same key"
+  }
+ ],
+ "status": "gate-green 2026-10-30: static PASS; nop PASS (6/6 security tests fail on the pinned+injected tree, 87/87 functional pass); oracle PASS (3/3 identical trials, reward 1.0, 93/93 each); patches PASS (7/7 as declared: sf-no-pa, sf-large-sample and sf-no-opened each 0.8333 with only their lever's security test failing and functional green; ff-overbroad 0.0 and ff-random-seed 0.0 functional_fail; pass-hardening 1.0 and pass-alt 1.0). The blind patch and FAIRNESS.md are written downstream."
+}

@@ -1,0 +1,106 @@
+diff --git a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConfig.java b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConfig.java
+index a2aaa8c07..c33a8a40d 100644
+--- a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConfig.java
++++ b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConfig.java
+@@ -45,6 +45,7 @@ import io.netty.handler.codec.http.HttpClientCodec;
+ import io.netty.handler.codec.http.HttpClientUpgradeHandler;
+ import io.netty.handler.codec.http.HttpContentDecompressor;
+ import io.netty.handler.codec.http.HttpDecoderConfig;
++import io.netty.handler.codec.http.HttpHeaderNames;
+ import io.netty.handler.codec.http.HttpHeaders;
+ import io.netty.handler.codec.http.HttpMethod;
+ import io.netty.handler.codec.http.HttpResponse;
+@@ -134,7 +135,8 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
+ 
+ 	@Override
+ 	public ChannelOperations.OnSetup channelOperationsProvider() {
+-		return (ch, c, msg) -> new HttpClientOperations(ch, c, cookieEncoder, cookieDecoder, httpMessageLogFactory);
++		return (ch, c, msg) -> new HttpClientOperations(ch, c, cookieEncoder, cookieDecoder,
++				headers.getAll(HttpHeaderNames.COOKIE), httpMessageLogFactory);
+ 	}
+ 
+ 	@Override
+diff --git a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java
+index b6057d411..e46999e78 100644
+--- a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java
++++ b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java
+@@ -691,9 +691,20 @@ class HttpClientConnect extends HttpClient {
+ 				toURITemp = UriEndpointFactory.createUriEndpoint(from, to, address);
+ 			}
+ 			toURI = toURITemp;
++			if (isSameSite(from, toURITemp)) {
++				fromURI = toURITemp;
++			}
+ 			this.redirectedFrom = addToRedirectedFromArray(redirectedFrom, from);
+ 		}
+ 
++		/**
++		 * Returns true when the redirect target stays within the same site as the request
++		 * it redirects from.
++		 */
++		static boolean isSameSite(UriEndpoint from, UriEndpoint to) {
++			return from.host.equals(to.host) && from.scheme.equals(to.scheme);
++		}
++
+ 		@SuppressWarnings({"unchecked", "rawtypes"})
+ 		static Supplier<String>[] addToRedirectedFromArray(@Nullable Supplier<String>[] redirectedFrom, UriEndpoint from) {
+ 			Supplier<String> fromUrlSupplier = from::toExternalForm;
+diff --git a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java
+index 7cf3ac5bb..dee776b03 100644
+--- a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java
++++ b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java
+@@ -113,6 +113,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 	final HttpHeaders            requestHeaders;
+ 	final ClientCookieEncoder    cookieEncoder;
+ 	final ClientCookieDecoder    cookieDecoder;
++	List<String>                 configuredCookies;
+ 	final List<Cookie>           cookieList;
+ 	final Sinks.One<HttpHeaders> trailerHeaders;
+ 	final HttpVersion            version;
+@@ -153,6 +154,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 		this.requestHeaders = replaced.requestHeaders;
+ 		this.cookieEncoder = replaced.cookieEncoder;
+ 		this.cookieDecoder = replaced.cookieDecoder;
++		this.configuredCookies = replaced.configuredCookies;
+ 		this.cookieList = replaced.cookieList;
+ 		this.uriEndpoint = replaced.uriEndpoint;
+ 		this.path = replaced.path;
+@@ -182,6 +184,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 		this.requestHeaders = replaced.requestHeaders;
+ 		this.cookieEncoder = replaced.cookieEncoder;
+ 		this.cookieDecoder = replaced.cookieDecoder;
++		this.configuredCookies = replaced.configuredCookies;
+ 		this.cookieList = replaced.cookieList;
+ 		this.uriEndpoint = replaced.uriEndpoint;
+ 		this.path = replaced.path;
+@@ -197,6 +200,11 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 
+ 	HttpClientOperations(Connection c, ConnectionObserver listener, ClientCookieEncoder encoder,
+ 			ClientCookieDecoder decoder, HttpMessageLogFactory httpMessageLogFactory) {
++		this(c, listener, encoder, decoder, Collections.emptyList(), httpMessageLogFactory);
++	}
++
++	HttpClientOperations(Connection c, ConnectionObserver listener, ClientCookieEncoder encoder,
++			ClientCookieDecoder decoder, List<String> configuredCookies, HttpMessageLogFactory httpMessageLogFactory) {
+ 		super(c, listener, httpMessageLogFactory);
+ 		this.isSecure = c.channel()
+ 		                 .pipeline()
+@@ -205,6 +213,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 		this.requestHeaders = nettyRequest.headers();
+ 		this.cookieDecoder = decoder;
+ 		this.cookieEncoder = encoder;
++		this.configuredCookies = configuredCookies;
+ 		this.cookieList = new ArrayList<>();
+ 		this.version = initHttpVersion(c);
+ 		this.trailerHeaders = Sinks.unsafe().one();
+@@ -695,6 +704,10 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+ 			}
+ 		}
+ 
++		if (redirectedFrom.length > 0 && !configuredCookies.isEmpty() && !requestHeaders.contains(HttpHeaderNames.COOKIE)) {
++			requestHeaders.set(HttpHeaderNames.COOKIE, configuredCookies);
++		}
++
+ 		if (!cookieList.isEmpty()) {
+ 			requestHeaders.add(HttpHeaderNames.COOKIE, cookieEncoder.encode(cookieList));
+ 		}

@@ -1,0 +1,86 @@
+diff -ruN pristine/lib/streamlit/runtime/caching/hashing.py app/lib/streamlit/runtime/caching/hashing.py
+--- a/lib/streamlit/runtime/caching/hashing.py	2026-10-30 11:51:04.000000000 +0000
++++ b/lib/streamlit/runtime/caching/hashing.py	2026-10-30 12:06:07.941307125 +0000
+@@ -57,6 +57,34 @@
+ _NP_SIZE_LARGE: Final = 500_000
+ _NP_SAMPLE_SIZE: Final = 100_000
+ 
++# Matching the type name avoids importing Pillow solely to recognize images.
++_PIL_IMAGEFILE_TYPE: Final = re.compile(r"^PIL\..*ImageFile$")
++
++
++def _pil_colour_table(image: Any) -> bytes | None:
++    """Return every byte of a PIL image's colour table, or None if it has none.
++
++    Palette-indexed images (modes ``P`` and ``PA``) keep their colours in a
++    lookup table that is separate from the pixel bytes returned by
++    ``tobytes()``. Palette-with-alpha images can additionally carry alpha in
++    the table, so encode those entries as RGBA rather than dropping the alpha
++    channel.
++    """
++    palette = image.getpalette()
++    if palette is None:
++        return None
++
++    if image.mode in ("PA", "RGBA"):
++        try:
++            rgba_palette = image.getpalette(rawmode="RGBA")
++        except (TypeError, ValueError):
++            rgba_palette = None
++        if rgba_palette is not None:
++            palette = rgba_palette
++
++    return bytes(palette)
++
++
+ HashFuncsDict: TypeAlias = dict[str | type[Any], Callable[[Any], Any]]
+ 
+ # Arbitrary item to denote where we found a cycle in a hashed object.
+@@ -536,25 +564,37 @@
+             self.update(h, np_obj.tobytes())
+             return h.digest()
+ 
+-        elif type_util.is_type(obj, re.compile(r"^PIL\..*ImageFile$")):
++        elif type_util.is_type(obj, "PIL.Image.Image") or type_util.is_type(
++            obj, _PIL_IMAGEFILE_TYPE
++        ):
+             import numpy as np
+ 
+             # Images opened from a file are instances of PIL's format-specific
+-            # plugin classes rather than PIL.Image.Image itself, so the branch
+-            # below does not match them. Hash their pixel buffer so that they
+-            # can be used with the cache decorators.
+-            np_array = np.frombuffer(obj.tobytes(), dtype="uint8")
+-            return self.to_bytes(np_array)
++            # plugin classes rather than PIL.Image.Image itself, so both kinds
++            # are handled here. Hash the mode, the colour table and the pixel
++            # buffer so that every rendering-relevant byte reaches the hash.
++            pil_obj: Image = cast("Image", obj)
+ 
+-        elif type_util.is_type(obj, "PIL.Image.Image"):
+-            import numpy as np
++            self.update(h, pil_obj.mode.encode())
+ 
+-            pil_obj: Image = cast("Image", obj)
++            palette = _pil_colour_table(pil_obj)
++            if palette is not None:
++                # A palette lives outside ``tobytes()``, so two images with
++                # identical pixels can render differently. Hash the whole
++                # table on its own: the pixel buffer below is sampled when it
++                # is large, and a sample cannot be trusted to cover every
++                # table byte.
++                self.update(h, palette)
++
++            transparency = pil_obj.info.get("transparency")
++            if transparency is not None:
++                self.update(h, repr(transparency).encode())
+ 
+             # we don't just hash the results of obj.tobytes() because we want to use
+             # the sampling logic for numpy data
+             np_array = np.frombuffer(pil_obj.tobytes(), dtype="uint8")
+-            return self.to_bytes(np_array)
++            self.update(h, np_array)
++            return h.digest()
+ 
+         elif inspect.isbuiltin(obj):
+             return bytes(obj.__name__.encode())

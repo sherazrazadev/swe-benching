@@ -1,0 +1,142 @@
+--- a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java
++++ b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientConnect.java
+@@ -557,6 +557,9 @@
+ 
+ 				UriEndpoint uri = toURI;
+ 				ch.uriEndpoint = uri;
++				// The destination the application supplied its values for; stays the original
++				// request's endpoint for the whole redirect chain.
++				ch.credentialsOrigin = fromURI;
+ 				HttpHeaders headers = ch.getNettyRequest()
+ 				                        .setUri(uri.getPathAndQuery())
+ 				                        .setMethod(method)
+@@ -614,26 +617,7 @@
+ 					return result;
+ 				}
+ 
+-				Consumer<HttpClientRequest> consumer = null;
+-				if (fromURI != null && !toURI.equals(fromURI)) {
+-					if (handler instanceof RedirectSendHandler) {
+-						headers.remove(HttpHeaderNames.EXPECT)
+-						       .remove(HttpHeaderNames.COOKIE)
+-						       .remove(HttpHeaderNames.AUTHORIZATION)
+-						       .remove(HttpHeaderNames.PROXY_AUTHORIZATION);
+-					}
+-					else {
+-						consumer = request ->
+-						        request.requestHeaders()
+-						               .remove(HttpHeaderNames.EXPECT)
+-						               .remove(HttpHeaderNames.COOKIE)
+-						               .remove(HttpHeaderNames.AUTHORIZATION)
+-						               .remove(HttpHeaderNames.PROXY_AUTHORIZATION);
+-					}
+-				}
+-				if (this.redirectRequestConsumer != null) {
+-					consumer = consumer != null ? consumer.andThen(this.redirectRequestConsumer) : this.redirectRequestConsumer;
+-				}
++				Consumer<HttpClientRequest> consumer = this.redirectRequestConsumer;
+ 
+ 				if (redirectRequestBiConsumer != null) {
+ 					ch.previousRequestHeaders = previousRequestHeaders;
+@@ -691,20 +675,9 @@
+ 				toURITemp = UriEndpointFactory.createUriEndpoint(from, to, address);
+ 			}
+ 			toURI = toURITemp;
+-			if (isSameSite(from, toURITemp)) {
+-				fromURI = toURITemp;
+-			}
+ 			this.redirectedFrom = addToRedirectedFromArray(redirectedFrom, from);
+ 		}
+ 
+-		/**
+-		 * Returns true when the redirect target stays within the same site as the request
+-		 * it redirects from.
+-		 */
+-		static boolean isSameSite(UriEndpoint from, UriEndpoint to) {
+-			return from.host.equals(to.host) && from.scheme.equals(to.scheme);
+-		}
+-
+ 		@SuppressWarnings({"unchecked", "rawtypes"})
+ 		static Supplier<String>[] addToRedirectedFromArray(@Nullable Supplier<String>[] redirectedFrom, UriEndpoint from) {
+ 			Supplier<String> fromUrlSupplier = from::toExternalForm;
+--- a/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java
++++ b/reactor-netty-http/src/main/java/reactor/netty/http/client/HttpClientOperations.java
+@@ -120,6 +120,12 @@
+ 
+ 	Supplier<String>[]          redirectedFrom = EMPTY_REDIRECTIONS;
+ 	UriEndpoint                 uriEndpoint;
++	/**
++	 * The destination the application supplied its credentials for. Established from the
++	 * original request and kept stable across every redirect hop so each hop can be compared
++	 * against the destination the values were actually supplied for.
++	 */
++	@Nullable UriEndpoint       credentialsOrigin;
+ 	String                      path;
+ 	Duration                    responseTimeout;
+ 
+@@ -157,6 +163,7 @@
+ 		this.configuredCookies = replaced.configuredCookies;
+ 		this.cookieList = replaced.cookieList;
+ 		this.uriEndpoint = replaced.uriEndpoint;
++		this.credentialsOrigin = replaced.credentialsOrigin;
+ 		this.path = replaced.path;
+ 		this.responseTimeout = replaced.responseTimeout;
+ 		this.is100Continue = replaced.is100Continue;
+@@ -187,6 +194,7 @@
+ 		this.configuredCookies = replaced.configuredCookies;
+ 		this.cookieList = replaced.cookieList;
+ 		this.uriEndpoint = replaced.uriEndpoint;
++		this.credentialsOrigin = replaced.credentialsOrigin;
+ 		this.path = replaced.path;
+ 		this.responseTimeout = replaced.responseTimeout;
+ 		this.is100Continue = replaced.is100Continue;
+@@ -694,6 +702,17 @@
+ 
+ 	@Override
+ 	protected void beforeMarkSentHeaders() {
++		// Decided here, at the single point where every request (including the WebSocket
++		// handshake and redirect-handler send paths) finalizes its headers, so no supplied
++		// value can bypass the check by taking a different send route.
++		boolean stripSuppliedValues = redirectedFrom.length > 0 && isLessProtectedDestination();
++		if (stripSuppliedValues) {
++			requestHeaders.remove(HttpHeaderNames.EXPECT)
++			             .remove(HttpHeaderNames.COOKIE)
++			             .remove(HttpHeaderNames.AUTHORIZATION)
++			             .remove(HttpHeaderNames.PROXY_AUTHORIZATION);
++		}
++
+ 		if (redirectedFrom.length > 0) {
+ 			if (redirectRequestConsumer != null) {
+ 				redirectRequestConsumer.accept(this);
+@@ -704,7 +723,8 @@
+ 			}
+ 		}
+ 
+-		if (redirectedFrom.length > 0 && !configuredCookies.isEmpty() && !requestHeaders.contains(HttpHeaderNames.COOKIE)) {
++		if (!stripSuppliedValues && redirectedFrom.length > 0 && !configuredCookies.isEmpty()
++				&& !requestHeaders.contains(HttpHeaderNames.COOKIE)) {
+ 			requestHeaders.set(HttpHeaderNames.COOKIE, configuredCookies);
+ 		}
+ 
+@@ -713,6 +733,21 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Returns true when the current hop targets a destination that is less protected than the
++	 * destination the supplied values were meant for. A different host or port is a different
++	 * destination, and an unencrypted destination is less protected than an encrypted one.
++	 */
++	private boolean isLessProtectedDestination() {
++		UriEndpoint origin = credentialsOrigin;
++		UriEndpoint target = uriEndpoint;
++		if (origin == null || target == null) {
++			return false;
++		}
++		return !target.getRemoteAddress().equals(origin.getRemoteAddress()) ||
++				(origin.isSecure() && !target.isSecure());
++	}
++
+ 	@Override
+ 	protected boolean isContentAlwaysEmpty() {
+ 		return false;

@@ -1,0 +1,199 @@
+--- a/crates/tui/src/tools/git.rs	2026-10-30 11:57:02.000000000 +0000
++++ b/crates/tui/src/tools/git.rs	2026-10-30 12:59:37.920056474 +0000
+@@ -11,6 +11,7 @@
+ 
+ use crate::dependencies::ExternalTool;
+ 
++use super::revision_arg::RevisionArg;
+ use super::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+     optional_bool, optional_str, optional_u64,
+@@ -160,6 +161,13 @@
+         let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
+         let cached = optional_bool(&input, "cached", false);
+         let base = optional_str(&input, "base");
++        // A blank base is not a revision: it has always meant the bare
++        // `...HEAD` expression, so only a non-blank base is checked.
++        if let Some(raw) = base
++            && !raw.trim().is_empty()
++        {
++            RevisionArg::new("base", raw)?;
++        }
+         let unified = optional_u64(&input, "unified", DEFAULT_UNIFIED).min(MAX_UNIFIED);
+ 
+         let mut args = vec![
+--- a/crates/tui/src/tools/git_history.rs	2026-10-30 11:57:02.000000000 +0000
++++ b/crates/tui/src/tools/git_history.rs	2026-10-30 12:53:09.690157212 +0000
+@@ -10,6 +10,7 @@
+ use async_trait::async_trait;
+ use serde_json::{Value, json};
+ 
++use super::revision_arg::RevisionArg;
+ use super::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+     optional_bool, optional_str, optional_u64, required_str,
+@@ -115,7 +116,10 @@
+         if let Some(revs) = revs {
+             for rev in revs {
+                 if let Some(rev) = rev.as_str() {
+-                    args.push(rev.to_string());
++                    // Every entry is a positional git argument of its own, so
++                    // each one is checked, not just the first.
++                    let rev = RevisionArg::new("revs entry", rev)?;
++                    args.push(rev.as_str().to_string());
+                 }
+             }
+         }
+@@ -218,6 +222,7 @@
+ 
+     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+         let rev = required_str(&input, "rev")?;
++        let rev_arg = RevisionArg::new("rev", rev)?;
+         let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
+         let patch = optional_bool(&input, "patch", true);
+         let stat = optional_bool(&input, "stat", true);
+@@ -236,7 +241,7 @@
+         if stat {
+             args.push("--stat".to_string());
+         }
+-        args.push(rev.to_string());
++        args.push(rev_arg.as_str().to_string());
+         if let Some(pathspec) = &git_ctx.pathspec {
+             args.push("--".to_string());
+             args.push(pathspec.display().to_string());
+@@ -353,6 +358,7 @@
+         })?;
+         let pathspec = pathspec_from(working_dir, &resolved_path);
+         let rev = optional_str(&input, "rev").unwrap_or("HEAD");
++        let rev_arg = RevisionArg::new("rev", rev)?;
+         let start_line = optional_u64(&input, "start_line", DEFAULT_BLAME_START_LINE).max(1);
+         let max_lines = optional_u64(&input, "max_lines", DEFAULT_BLAME_MAX_LINES)
+             .clamp(1, MAX_BLAME_MAX_LINES);
+@@ -367,7 +373,7 @@
+         if porcelain {
+             args.push("--line-porcelain".to_string());
+         }
+-        args.push(rev.to_string());
++        args.push(rev_arg.as_str().to_string());
+         args.push("--".to_string());
+         args.push(pathspec.display().to_string());
+ 
+--- a/crates/tui/src/tools/mod.rs	2026-10-30 11:57:00.000000000 +0000
++++ b/crates/tui/src/tools/mod.rs	2026-10-30 13:08:07.654153441 +0000
+@@ -38,6 +38,7 @@
+ pub mod project;
+ pub mod registry;
+ pub mod remember;
++pub mod revision_arg;
+ pub mod revert_turn;
+ pub mod review;
+ pub mod rlm;
+--- a/crates/tui/src/tools/review.rs	2026-10-30 11:57:00.000000000 +0000
++++ b/crates/tui/src/tools/review.rs	2026-10-30 12:53:13.238187397 +0000
+@@ -13,6 +13,7 @@
+ use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
+ use crate::utils::truncate_with_ellipsis;
+ 
++use super::revision_arg::RevisionArg;
+ use super::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+     optional_bool, optional_str, optional_u64, required_str,
+@@ -216,6 +217,11 @@
+ 
+         let kind = optional_str(&input, "kind").map(|s| s.trim().to_ascii_lowercase());
+         let base = optional_str(&input, "base").map(|s| s.trim().to_string());
++        // A blank base already means "review the working tree with no base", so
++        // only a non-blank base is a revision that has to be checked.
++        if let Some(base_ref) = base.as_deref().filter(|value| !value.is_empty()) {
++            RevisionArg::new("base", base_ref)?;
++        }
+         let staged = optional_bool(&input, "staged", false);
+         let max_chars =
+             usize::try_from(optional_u64(&input, "max_chars", DEFAULT_MAX_CHARS as u64))
+--- a/crates/tui/src/tools/revision_arg.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/tui/src/tools/revision_arg.rs	2026-10-30 12:52:55.589051057 +0000
+@@ -0,0 +1,55 @@
++//! Values that git reads in revision position.
++//!
++//! Git decides whether an argument is a command-line option from that argument
++//! alone. A caller-supplied value that the product forwards to git as a
++//! revision, range or comparison base is therefore data: it must never begin
++//! with an option marker, and it must be refused before any git process is
++//! spawned when it does. Checking never rewrites the value, so an accepted
++//! revision reaches git exactly as the caller supplied it.
++
++use super::spec::ToolError;
++
++/// A caller-supplied string checked to be usable where git expects a revision
++/// expression (a revision, a range, a comparison base, or one start point in a
++/// list of them).
++///
++/// The value is kept verbatim; only the checked view is exposed.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct RevisionArg<'a> {
++    raw: &'a str,
++}
++
++impl<'a> RevisionArg<'a> {
++    /// Check `raw`, supplied as `field`, for revision position.
++    ///
++    /// A value is refused when, after trimming surrounding whitespace, it is
++    /// empty or begins with `-`: git would read a leading `-` as an option and
++    /// act on it (for example `--output=<path>`) instead of treating the value
++    /// as a revision. Values containing control characters are refused too;
++    /// they cannot occur in a revision expression. Refusal is a client error,
++    /// so the caller gets it without a git process having been started.
++    pub(crate) fn new(field: &str, raw: &'a str) -> Result<Self, ToolError> {
++        let probe = raw.trim();
++        if probe.is_empty() {
++            return Err(ToolError::invalid_input(format!(
++                "{field} must not be empty"
++            )));
++        }
++        if probe.starts_with('-') {
++            return Err(ToolError::invalid_input(format!(
++                "{field} must not start with '-'"
++            )));
++        }
++        if probe.chars().any(|ch| ch == '\0' || ch.is_ascii_control()) {
++            return Err(ToolError::invalid_input(format!(
++                "{field} must not contain control characters"
++            )));
++        }
++        Ok(Self { raw })
++    }
++
++    /// The value to hand to git, byte for byte as the caller supplied it.
++    pub(crate) fn as_str(self) -> &'a str {
++        self.raw
++    }
++}
+--- a/crates/tui/src/tools/subagent/mod.rs	2026-10-30 11:57:00.000000000 +0000
++++ b/crates/tui/src/tools/subagent/mod.rs	2026-10-30 12:53:14.746200186 +0000
+@@ -36,6 +36,7 @@
+ use crate::tools::handle::VarHandle;
+ use crate::tools::plan::{PlanState, SharedPlanState};
+ use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
++use crate::tools::revision_arg::RevisionArg;
+ use crate::tools::spec::{
+     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+ };
+@@ -5838,6 +5839,9 @@
+         .filter(|value| !value.is_empty())
+         .unwrap_or("HEAD")
+         .to_string();
++    // `git worktree add` parses options anywhere, so an option-shaped base
++    // would change how the checkout is created rather than name a revision.
++    let base_arg = RevisionArg::new("worktree_base", &base_ref)?;
+     let worktree_path = resolve_worktree_path(&repo_root, &branch, request.path.as_ref())?;
+     if let Some(parent) = worktree_path.parent() {
+         fs::create_dir_all(parent).map_err(|err| {
+@@ -5855,7 +5859,7 @@
+         "-b".to_string(),
+         branch,
+         path_arg,
+-        base_ref,
++        base_arg.as_str().to_string(),
+     ];
+     run_git_checked(&repo_root, &args, "create sub-agent worktree")?;
+     worktree_path.canonicalize().map_err(|err| {
