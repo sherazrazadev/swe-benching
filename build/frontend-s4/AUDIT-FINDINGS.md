@@ -5,3 +5,6 @@ Required: delete these three test files/cases (and any manifest traps, leak term
 
 ## Owner rule (instruction tone)
 instruction.md reads as an issue report: in this codebase, this is the exact bug and its impact, please fix it. Keep every sentence that states WHAT the bug is and WHAT must keep working, word for word. Remove only WHERE: file, path, module, class, function, method, variable, test names, line numbers.
+
+## HARD RULE for this repair: do not edit instruction.md at all
+This repair is TEST-ONLY. tasks/frontend-s4/instruction.md must stay byte-for-byte unchanged (a previous attempt rewrote it, collapsing the keep-list "bold labels, headings, line breaks, value layout and colour indicators" and removing the bug's source and example — not allowed). Only delete the three tests named above (and manifest entries/check patches that exist only for them), then re-gate.
