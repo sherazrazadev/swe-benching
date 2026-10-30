@@ -1,0 +1,256 @@
+{
+ "slug": "klever-go-s4",
+ "candidate": {
+  "repo": "klever-io/klever-go",
+  "advisory_ids": [
+   "GHSA-CGC5-V3F2-8M2V",
+   "CVE-2026-54755",
+   "GO-2026-6310"
+  ],
+  "pinned_commit": "085a5d1c9956b71efa8546b7b66314237324c80c",
+  "fix_commits": [
+   "8bcc600b0ac88070740c63c7ce1c8a968dd85251"
+  ],
+  "cwe": "CWE-190",
+  "entry_id": "17144"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "track": "injected",
+ "verified": {
+  "exploit_entry_point": "The node's transaction processor (ProcessTransaction) reached from signed transactions submitted to the node: asset creation and the UpdateRoyalties asset trigger, token transfers, marketplace BuyItNow purchases and token-offering (ITO) purchases. The hidden suites drive ProcessTransaction end to end with the project's own in-memory trie/accounts fixtures (core/process/transaction NewController and its helpers), exactly as the repository's own royalty and ITO tests do; nothing in the settlement path is stubbed. The attacker input is a royalty split configuration carried in the transaction, or an equivalent configuration already written into asset state.",
+  "variants": [
+   "base (published fix, pattern A, reported): split shares above 100% are accepted at asset creation because the per-field values are summed into uint32 and wrap; the stored configuration is then paid out (core/kapp/kda/create.go, trigger.go).",
+   "base (published fix, pattern A): the transfer payout loop has no bound against the royalty pool, so a stored share above 100% or shares whose sum exceeds 100% credit more than the royalty taken from the payer (core/kapp/accounts/accounts.go).",
+   "base (published fix, pattern A, how-type): when the split shares consume the whole royalty, the remainder is zero, the early return is taken and the payer is never debited, so the credited royalty is created from nothing (core/kapp/accounts/accounts.go).",
+   "far site (published fix, pattern A): the marketplace purchase distributes the same stored configuration through its own payout implementation and has no pool bound (core/kapp/market/market.go).",
+   "far site (published fix, pattern A): the token-offering purchase distributes the same stored configuration through its own payout implementation and has no pool bound (core/kapp/ito/ito.go).",
+   "injected sibling: the fixed-royalty transfer uses a second payout implementation whose only bound compares each split against the original fixed amount, so shares that each stay below 100% but exceed the pool together are paid out (core/kapp/accounts/accounts.go computeFixedSplitRoyalties, injected into our copy only).",
+   "injected sibling: the fixed token-offering royalty uses a second payout implementation with no pool bound after the owner has been debited (core/kapp/ito/ito.go computeFixedSplitRoyalties, injected into our copy only)."
+  ],
+  "services": [],
+  "project_tests_run": "At pinned+injected: go test ./core/process/transaction/ ./core/kapp/accounts/ ./core/kapp/kda/ ./core/kapp/ito/ ./core/kapp/market/ with CGO_ENABLED=0 passes in full. On the oracle the same packages pass except accounts' Test_ComputeSplitRoyalties, an isolated unit test that calls the internal split helper with an already-exhausted pool (royaltiesToPay=0) and therefore encodes the old helper contract; the upstream fix updates it. The functional graded group excludes exactly that test (-skip '^Test_ComputeSplitRoyalties$') so a correct fix is not punished for it; every other project test in the affected packages is graded. Hidden suites: 10 security tests fail on pinned+injected and pass on the oracle; 8 dedicated functional tests plus 702 project test cases pass on both.",
+  "injected_sites": [
+   "core/kapp/accounts/accounts.go computeFixedSplitRoyalties (new function) and the fixed-royalty transfer call site",
+   "core/kapp/ito/ito.go computeFixedSplitRoyalties (new function) and the ComputeITOFixedBuyRoyalties call site"
+  ],
+  "route_register": "build/audit/uncovered-routes.tsv rows for klever-go-s4 (two injected siblings plus the investigated no-real-Pattern-B-route result)."
+ },
+ "traps": [
+  {
+   "id": "create_wrapped_shares",
+   "pattern": "A",
+   "shape": "two split shares, each above 100%, chosen so their uint32 sum wraps to zero and the aggregate 100% check passes; the configuration is stored and later paid out",
+   "where": "core/kapp/kda/create.go:367 (createFungible sum accumulation) and core/kapp/kda/create.go:253 (nftSetRoyalties sum accumulation)",
+   "reason_to_dismiss": "the aggregate 100% check already validates the whole split map, so creation reads as covered",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_Create_WrappedSplitSharesRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_Create_ValidSplitSharesAccepted"
+   ],
+   "security_fail_patch": "sec_miss_create.patch"
+  },
+  {
+   "id": "trigger_wrapped_shares",
+   "pattern": "A",
+   "shape": "the same wrapped share values submitted through the royalty-update trigger on an existing asset",
+   "where": "core/kapp/kda/trigger.go:712-745 (processSplitRoyalties via updateRoyalties)",
+   "reason_to_dismiss": "the update path reuses the same aggregate check as creation, so it reads as already protected",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_Trigger_WrappedSplitSharesRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_Trigger_ValidSplitSharesStored"
+   ],
+   "security_fail_patch": "sec_miss_trigger.patch"
+  },
+  {
+   "id": "transfer_pool_bound",
+   "pattern": "A",
+   "shape": "a stored split share above the royalty pool, or shares that together exceed it, paid out by the transfer settlement loop with no bound",
+   "where": "core/kapp/accounts/accounts.go:276-300 (computeSplitRoyalties) reached from accounts.go:457 (processPercentageRoyaltiesTransfer)",
+   "reason_to_dismiss": "a stored configuration read from asset state can seem trusted once creation validates new submissions; the payout loop itself has no bound",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_Transfer_SplitShareAbovePoolRefused",
+    "security/zz_sec_royalty_test.go::TestSec_Transfer_SplitSharesSumAbovePoolRefused",
+    "security/zz_sec_royalty_test.go::TestSec_Transfer_SplitSharesEachAtWholePoolRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_Transfer_SplitSharesWithinPoolSettle"
+   ],
+   "security_fail_patch": "sec_miss_transfer_bound.patch"
+  },
+  {
+   "id": "whole_pool_conservation",
+   "pattern": "A",
+   "shape": "shares that consume exactly the whole royalty make the remainder zero, so the early return skips the payer debit while the split recipients keep the credit (how-type: value conservation)",
+   "where": "core/kapp/accounts/accounts.go:474-506 (processPercentageRoyaltiesTransfer early return before the payer debit)",
+   "reason_to_dismiss": "a share at exactly 100% is a legitimate value, not an overflow, so it reads as out of the reported bug; the missing debit is an ordering consequence",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_Transfer_WholeRoyaltySplitConservesValue"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_Transfer_WholeRoyaltyToSingleSplitSettles"
+   ],
+   "security_fail_patch": "sec_miss_conservation.patch"
+  },
+  {
+   "id": "fixed_pool_bound",
+   "pattern": "injected",
+   "shape": "the fixed-royalty transfer uses a second payout implementation whose per-split bound compares each share to the original fixed amount, so two 60% shares each pass while together paying 120% of the pool (how-type: pool accounting)",
+   "where": "core/kapp/accounts/accounts.go:316-356 (computeFixedSplitRoyalties, injected) reached from the fixed-royalty transfer",
+   "reason_to_dismiss": "this path already checks every split and debits the payer before paying out, so it reads as guarded",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_Transfer_FixedSplitSharesSumAbovePoolRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_Transfer_FixedSplitWithinPoolSettles"
+   ],
+   "security_fail_patch": "sec_miss_fixed_accounts.patch",
+   "realistic_because": "the fixed-royalty mode has its own pool and a maintainer maintaining it separately from the percentage mode would plausibly write a per-split sanity check against the original fixed amount; INJECTED into our copy only, the published fix never touches this function"
+  },
+  {
+   "id": "market_pool_bound",
+   "pattern": "A",
+   "shape": "a marketplace purchase pays the stored market split configuration through its own settlement loop, which has no bound against the royalty carved from the bid",
+   "where": "core/kapp/market/market.go:401-440 (computeSplitRoyalties) reached from market.go:490 (computeRoyaltiesAmount) and market.go:443 (computeRoyaltiesFixedDeposit)",
+   "reason_to_dismiss": "the marketplace escrow already carves the royalty out of the bid before paying out, so the pool looks bounded",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_MarketBuy_SplitShareAbovePoolRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_MarketBuy_SplitWithinPoolSettles"
+   ],
+   "security_fail_patch": "sec_miss_market.patch"
+  },
+  {
+   "id": "ito_pool_bound",
+   "pattern": "A",
+   "shape": "a token-offering purchase pays the stored offering split configuration through its own settlement loop, which has no bound against the royalty carved from the purchase value",
+   "where": "core/kapp/ito/ito.go:581-620 (computeSplitRoyalties) reached from ito.go:415 (ComputeITOPercentBuyRoyalties)",
+   "reason_to_dismiss": "the buyer is debited the full purchase value, so the payout reads as already funded",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_ITOBuy_PercentSplitShareAbovePoolRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_ITOBuy_PercentSplitWithinPoolSettles"
+   ],
+   "security_fail_patch": "sec_miss_ito.patch"
+  },
+  {
+   "id": "ito_fixed_pool_bound",
+   "pattern": "injected",
+   "shape": "the fixed token-offering royalty is split through a second settlement implementation with no pool bound, after the buyer has already paid the fixed royalty",
+   "where": "core/kapp/ito/ito.go:533-578 (computeFixedSplitRoyalties, injected) reached from ito.go:471 (ComputeITOFixedBuyRoyalties)",
+   "reason_to_dismiss": "the fixed royalty is taken from the payer before the splits are paid, so value looks conserved",
+   "security_tests": [
+    "security/zz_sec_royalty_test.go::TestSec_ITOBuy_FixedSplitShareAbovePoolRefused"
+   ],
+   "coupled_functional_tests": [
+    "functional/zz_func_royalty_test.go::TestFunc_ITOBuy_FixedSplitWithinPoolSettles"
+   ],
+   "security_fail_patch": "sec_miss_ito_fixed.patch",
+   "realistic_because": "the offering's fixed-royalty mode keeps its own split loop; a maintainer adding it separately from the percentage mode would not route it through the shared helper; INJECTED into our copy only, the published fix never touches this function"
+  }
+ ],
+ "leak_terms": [
+  "computeSplitRoyalties",
+  "computeFixedSplitRoyalties",
+  "validateSplitRoyaltyPercentages",
+  "processPercentageRoyaltiesTransfer",
+  "processFixedRoyaltiesTransfer",
+  "createFungible",
+  "nftSetRoyalties",
+  "processSplitRoyalties",
+  "computeRoyaltiesAmount",
+  "computeRoyaltiesFixedDeposit",
+  "ComputeITOPercentBuyRoyalties",
+  "ComputeITOFixedBuyRoyalties",
+  "SplitRoyalties",
+  "RoyaltySplitData",
+  "RoyaltiesData",
+  "royaltiesInfo",
+  "PercentTransferPercentage",
+  "PercentTransferFixed",
+  "PercentMarketPercentage",
+  "PercentMarketFixed",
+  "PercentITOPercentage",
+  "PercentITOFixed",
+  "HundredPercent",
+  "CheckValid100Params",
+  "AddToBalance",
+  "SubFromBalance",
+  "kapp",
+  "ITO",
+  "marketplace",
+  "second implementation"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sec_miss_create.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_trigger.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_transfer_bound.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_conservation.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_fixed_accounts.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_market.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_ito.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sec_miss_ito_fixed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "func_overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt_fix.patch",
+   "expect": "pass"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "func_overbroad.patch",
+  "crash_as_refusal": "n/a: a panic or crash fails every Go test in the package, so the graded suites catch it without a separate patch",
+  "wrong_resource": "n/a: each settlement pays the royalty configuration of the asset the transaction settles; there is no proxy or neighbouring object to authorise",
+  "one_role_or_direction": "n/a: the royalty flows are not role- or direction-paired; the per-flow misses are covered as unlisted_route patches",
+  "reads_only": "n/a: every protection is on settlement writes; there is no read-only variant of the sink",
+  "check_after_adjustment": "sec_miss_conservation.patch",
+  "unlisted_route": "sec_miss_market.patch",
+  "malformed_identity": "n/a: no parser or identity field is involved; shares are plain integer fields",
+  "missing_authority": "n/a: no authority or role lookup gates the settlement, so none can fail open",
+  "adjacent_api": "func_overbroad.patch"
+ },
+ "status": "built; gate passed (static, nop, oracle x3, patches x11). blind.patch and FAIRNESS.md are left for the blindfix and fairness steps."
+}

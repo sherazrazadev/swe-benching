@@ -1,0 +1,221 @@
+{
+ "slug": "coraza-s4",
+ "candidate": "15535",
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-3WR7-993Q-JRFF"
+ ],
+ "repo": "https://github.com/corazawaf/coraza",
+ "vulnerable_commit": "146c2f79f39ad16f13787e7d67ad400f8d8cb9a3",
+ "fix_commit": "5427c501b2fea6ae1305903efef01b3049224a58",
+ "entry_point": "The public request-processing API downstream users call: coraza.NewWAF(NewWAFConfig().WithDirectives(...)), WAF.NewTransaction(), Transaction.ProcessURI/AddRequestHeader/ProcessRequestHeaders/WriteRequestBody/ProcessRequestBody, with rules on FILES, FILES_SIZES, FILES_NAMES, FILES_COMBINED_SIZE, MULTIPART_FILENAME, ARGS_POST and MULTIPART_STRICT_ERROR (the same path http.WrapHandler drives).",
+ "verified": {
+  "entry_point": "Reproduced on the pinned+injected tree with the hidden suites: 14/14 security tests fail (the decoy plain name is the only reading rules see; an extended-only part is misclassified as a form field; a container-carried part's names never reach rules; a form-field name under a non-UTF-8 extended parameter is keyed by the plain name) while 10/10 functional tests pass. With the reference fix applied, 14/14 security and 10/10 functional pass.",
+  "sites": [
+   "internal/bodyprocessors/multipart.go:140-148 (pinned) originFileName returns only mime.ParseMediaType's plain filename; the stdlib decodes filename* only for us-ascii/utf-8",
+   "internal/bodyprocessors/multipart.go:58-59 (pinned) file-vs-field classification is driven by that single reading, so an extended-only part falls into ARGS_POST",
+   "internal/bodyprocessors/multipart.go:99-102 (pinned) FILES/FILES_SIZES/FILES_NAMES are populated from that single reading",
+   "internal/bodyprocessors/multipart.go:51,101,117 (pinned) the part's form-field name comes from p.FormName(), which goes through the same charset-restricted stdlib parser (real, unmodified upstream; the published fix left it)",
+   "internal/variables/variables.go:403-412 and internal/corazawaf/transaction.go:246-248 (pinned) MULTIPART_FILENAME is declared and has a collection but is never populated",
+   "internal/bodyprocessors/multipart_nested.go (injected) a container part (Content-Type multipart/*) is parsed by a second implementation with its own stdlib-only nestedOriginFileName",
+   "internal/corazawaf/waf.go, internal/corazawaf/rule_multiphase.go, experimental/plugins/plugintypes/transaction.go, types/variables/variables.go, internal/variables/variablesmap.gen.go, coraza.conf-recommended: published-fix plumbing for the new multipart variables"
+  ],
+  "routes": "One pattern-B route (T3): the part's form-field name is parsed through the same charset-restricted stdlib path in unmodified upstream code that the published fix never touched; confirmed to still be present in upstream main on 2026-10-29 (08aa5114). T4 is the injected sibling.",
+  "injected_siblings": [
+   "internal/bodyprocessors/multipart_nested.go plus a call at the start of the field branch in internal/bodyprocessors/multipart.go: a container part whose Content-Type is multipart/* is read with a nested multipart.Reader and its parts are recorded in FILES/FILES_SIZES/FILES_NAMES/ARGS_POST using a private copy of the name extraction (nestedOriginFileName)."
+  ],
+  "services": "none; offline after build (Go module and build caches warmed in both images)",
+  "project_tests_run": "go test ./internal/bodyprocessors ./http (all tests) - pass on pinned+injected, on the reference fix and on the alternative fix; pristine copies are restored at grading time."
+ },
+ "leak_terms": [
+  "originFileName",
+  "findFilenameStar",
+  "findParam",
+  "percentDecodeLenient",
+  "forEachParam",
+  "unquoteIfQuoted",
+  "extendedPartName",
+  "filenameFields",
+  "hasDuplicateParam",
+  "hasFilenameContinuation",
+  "multipart_nested",
+  "multipart_nested.go",
+  "processNestedPart",
+  "nestedOriginFileName",
+  "FormName",
+  "p.FormName",
+  "ParseMediaType",
+  "mime",
+  "RFC 5987",
+  "RFC 2231",
+  "RFC 7578",
+  "filename*",
+  "name*",
+  "iso-8859-1",
+  "charset",
+  "parser differential",
+  "multipart.go",
+  "GHSA-3WR7-993Q-JRFF",
+  "CWE-436",
+  "146c2f79f39ad16f13787e7d67ad400f8d8cb9a3",
+  "5427c501b2fea6ae1305903efef01b3049224a58",
+  "b2a9264437116bdd98a86fe345b2aec1152d3d7c"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-miss-dual-reading.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-target.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-fieldname.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-nested.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "sf-miss-malformed.patch",
+   "expect": "security_fail"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "ff-overbroad.patch",
+   "expect": "functional_fail"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "n/a: a panic aborts the Go test binary instead of producing the clean client-side refusal the invariant requires, so it cannot score as a pass",
+  "wrong_resource": "sf-miss-fieldname.patch",
+  "one_role_or_direction": "n/a: an upload has no role, peer or direction dimension; every part is parsed by the same path and read by the same rule targets",
+  "reads_only": "n/a: the engine has one parse path; rules only read the values it produces, so there is no write or second-verb surface to leave unguarded",
+  "check_after_adjustment": "n/a: each reading is exposed as parsed; there is no normalising or adjusting step between the header and the collections where a guard could be misplaced",
+  "unlisted_route": "sf-miss-nested.patch",
+  "malformed_identity": "sf-miss-malformed.patch",
+  "missing_authority": "n/a: no external authority or lookup can return nothing and make the protection fail open",
+  "adjacent_api": "ff-overbroad.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "lever": "main, how-type: every plausible reading of an uploaded file's name must be visible; choosing one side relocates the bypass",
+   "shape": "plain decoy + extended name under a non-UTF-8 charset; extended name alone; extended name decoding to empty; percent-encoded extended value",
+   "where": "internal/bodyprocessors/multipart.go:140-148 and :58-59, :99-102 (pinned)",
+   "reason_to_dismiss": "RFC 7578 makes the extended name authoritative, so a fix that simply prefers it looks complete; it instead hides the plain reading a differently-implemented backend resolves",
+   "security_tests": [
+    "sec_filename_test.go::TestSec_Filename_DecoyPlainRealExtended",
+    "sec_filename_test.go::TestSec_Filename_ExtendedOnly",
+    "sec_filename_test.go::TestSec_Filename_EmptyExtendedFallsBackToPlain",
+    "sec_filename_test.go::TestSec_Filename_PercentEncodedExtended"
+   ],
+   "coupled_functional_tests": [
+    "func_upload_test.go::TestFunc_PlainUpload_SingleReadingAndSize",
+    "func_upload_test.go::TestFunc_UTF8ExtendedName_SingleReading",
+    "func_upload_test.go::TestFunc_SwappedOrder_PlainNameStaysVisible",
+    "func_upload_test.go::TestFunc_EqualReadings_OneEntry",
+    "func_upload_test.go::TestFunc_MultiFile_SameFormName"
+   ],
+   "security_fail_patch": "sf-miss-dual-reading.patch",
+   "realistic_because": "real, unmodified upstream code (the advisory's own path)"
+  },
+  {
+   "id": "T2",
+   "lever": "published-fix far site, where-type: the multipart-specific uploaded-name rule target is declared but never populated at the pinned commit",
+   "shape": "a policy written against the multipart-specific collection instead of the general uploaded-file collection",
+   "where": "internal/variables/variables.go:403-412 and internal/corazawaf/transaction.go:246-248 (pinned)",
+   "reason_to_dismiss": "the variable's own documentation says it is not implemented, so it reads as a separate feature request rather than part of the reported protection",
+   "security_tests": [
+    "sec_target_test.go::TestSec_MultipartFilenameTarget_DecoyPlainRealExtended",
+    "sec_target_test.go::TestSec_MultipartFilenameTarget_ExtendedOnly"
+   ],
+   "coupled_functional_tests": [
+    "func_upload_test.go::TestFunc_PlainUpload_SingleReadingAndSize",
+    "func_upload_test.go::TestFunc_EqualReadings_OneEntry"
+   ],
+   "security_fail_patch": "sf-miss-target.patch",
+   "realistic_because": "real, unmodified upstream code (a variable declared for compatibility and never populated)"
+  },
+  {
+   "id": "T3",
+   "lever": "pattern B, how-type: the name a part is submitted under goes through the same charset-restricted parser; the published fix never touched it",
+   "shape": "form field and file part whose plain name is accompanied by an extended name under a non-UTF-8 charset",
+   "where": "internal/bodyprocessors/multipart.go:51,101,117 (pinned); still unmodified in upstream main 08aa5114",
+   "reason_to_dismiss": "the report is about the uploaded file's name; the field name reads as a grouping key whose value is still matched by content rules",
+   "security_tests": [
+    "sec_fieldname_test.go::TestSec_FieldName_FormField",
+    "sec_fieldname_test.go::TestSec_FieldName_FilePart"
+   ],
+   "coupled_functional_tests": [
+    "func_upload_test.go::TestFunc_PlainFormField",
+    "func_upload_test.go::TestFunc_UTF8ExtendedFieldName",
+    "func_upload_test.go::TestFunc_MultiFile_SameFormName"
+   ],
+   "security_fail_patch": "sf-miss-fieldname.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "T4",
+   "lever": "injected sibling, how-type, route where the protection never existed: parts carried inside a container part are parsed by a second implementation with its own name extraction",
+   "shape": "a multipart/mixed container part holding a file whose plain name is accompanied by an extended name; the same with a numbered continuation",
+   "where": "internal/bodyprocessors/multipart_nested.go (injected) called from internal/bodyprocessors/multipart.go:106-113 (pinned field branch)",
+   "reason_to_dismiss": "container-carried uploads are an uncommon client shape and the reported example is a flat part, so the second parse path reads as unrelated to the report",
+   "security_tests": [
+    "sec_nested_test.go::TestSec_NestedPart_DecoyPlainRealExtended",
+    "sec_nested_test.go::TestSec_NestedPart_ContinuationOnly"
+   ],
+   "coupled_functional_tests": [
+    "func_nested_test.go::TestFunc_NestedContainer_PlainFile",
+    "func_nested_test.go::TestFunc_NestedContainer_PlainField"
+   ],
+   "security_fail_patch": "sf-miss-nested.patch",
+   "realistic_because": "injected, written as a plausible container-part feature a maintainer could have added"
+  },
+  {
+   "id": "T5",
+   "lever": "how-type: a declaration that cannot be resolved consistently must surface as malformed instead of silently falling back",
+   "shape": "RFC 2231 numbered continuation (with and without a bare extended name), an extended name of the wrong shape, two plain names for one part",
+   "where": "internal/bodyprocessors/multipart.go:140-148 (pinned): mime.ParseMediaType's error is swallowed and the part is silently treated as a field",
+   "reason_to_dismiss": "these look like parser edge cases a real browser never sends, not the reported decoy value",
+   "security_tests": [
+    "sec_filename_test.go::TestSec_Filename_ContinuationAlongsideExtended",
+    "sec_filename_test.go::TestSec_Filename_ContinuationOnly",
+    "sec_filename_test.go::TestSec_Filename_MalformedExtended",
+    "sec_filename_test.go::TestSec_Filename_DuplicatePlain"
+   ],
+   "coupled_functional_tests": [
+    "func_upload_test.go::TestFunc_PlainFormField",
+    "func_nested_test.go::TestFunc_NestedContainer_PlainFile"
+   ],
+   "security_fail_patch": "sf-miss-malformed.patch",
+   "realistic_because": "real, unmodified upstream code (the stdlib parse error is swallowed)"
+  }
+ ],
+ "status": "built; gate PASSED 2026-10-30: static clean (only the downstream blind pass patch and FAIRNESS.md remain); nop 14/14 security tests fail on the pinned+injected tree and 163/163 functional tests pass; oracle 3/3 runs reward 1.0 with identical results; patches 9/9 as declared (5 security_fail each leaving only its own lever failing with functional all passing, ff-refuse-all and ff-overbroad functional_fail, hardening and alternative pass at 1.0)."
+}

@@ -1,0 +1,98 @@
+diff -ruN repo/lib/handler/cache-handler.js variants/sf-304-background/lib/handler/cache-handler.js
+--- repo/lib/handler/cache-handler.js	2026-10-30 15:12:50.437335167 +0000
++++ variants/sf-304-background/lib/handler/cache-handler.js	2026-10-30 15:18:55.142025179 +0000
+@@ -204,6 +204,11 @@
+     // A background refresh replaces a representation this cache already holds.
+     //  Persist what the origin sent without repeating the admission checks.
+     if (this.#refresh && statusCode === 200) {
++      if (this.#cacheType === 'shared' && Object.hasOwn(resHeaders, 'set-cookie')) {
++        deleteCachedValue(this.#store, this.#cacheKey)
++        return downstreamOnHeaders()
++      }
++
+       const directives = resHeaders['cache-control'] ? parseCacheControlHeader(resHeaders['cache-control']) : {}
+       const now = Date.now()
+       const lifetime = determineStaleAt(this.#cacheType, now, undefined, resHeaders, undefined, directives) ?? 60000
+@@ -234,6 +239,13 @@
+     }
+ 
+     const cacheControlHeader = resHeaders['cache-control']
++    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
++
++    if (revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives)) {
++      deleteCachedValue(this.#store, this.#cacheKey)
++      return downstreamOnHeaders()
++    }
++
+     const heuristicallyCacheable = resHeaders['last-modified'] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode)
+     if (
+       !cacheControlHeader &&
+@@ -250,7 +262,6 @@
+       return downstreamOnHeaders()
+     }
+ 
+-    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
+     if (!canCacheResponse(this.#cacheType, this.#cacheKey.method, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
+       if (statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives))) {
+         deleteCachedValue(this.#store, this.#cacheKey)
+@@ -530,7 +541,10 @@
+     return false
+   }
+ 
+-  if (cacheType === 'shared' && cacheControlDirectives.private === true) {
++  if (cacheType === 'shared' && (
++    cacheControlDirectives.private === true ||
++    Object.hasOwn(resHeaders, 'set-cookie')
++  )) {
+     return false
+   }
+ 
+diff -ruN repo/lib/interceptor/cache.js variants/sf-304-background/lib/interceptor/cache.js
+--- repo/lib/interceptor/cache.js	2026-10-30 15:12:53.504328500 +0000
++++ variants/sf-304-background/lib/interceptor/cache.js	2026-10-30 15:17:30.314045327 +0000
+@@ -117,7 +117,10 @@
+  * @returns {boolean}
+  */
+ function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
+-  if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) {
++  if (
++    (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) ||
++    (cacheType === 'shared' && Object.hasOwn(headers, 'set-cookie'))
++  ) {
+     return true
+   }
+ 
+@@ -376,6 +379,17 @@
+     return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
+   }
+ 
++  // Shared stores may outlive the Undici version that wrote them. Do not
++  // re-serve a Set-Cookie header from an existing shared-cache entry.
++  if (globalOpts.type === 'shared' && Object.hasOwn(result.headers, 'set-cookie')) {
++    if (util.isStream(result.body)) {
++      result.body.on('error', nop).destroy()
++    }
++
++    deleteCachedValue(globalOpts.store, cacheKey)
++    return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
++  }
++
+   const now = Date.now()
+   if (now > result.deleteAt) {
+     // Response is expired, cache store shouldn't have given this to us
+@@ -595,6 +609,15 @@
+         // A request that forbids network use can be answered from the store
+         //  without going through the revalidation machinery.
+         if (result && reqCacheControl?.['only-if-cached']) {
++          if (globalOpts.type === 'shared' && Object.hasOwn(result.headers, 'set-cookie')) {
++            if (util.isStream(result.body)) {
++              result.body.on('error', nop).destroy()
++            }
++
++            deleteCachedValue(globalOpts.store, cacheKey)
++            return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
++          }
++
+           const age = Math.round((Date.now() - result.cachedAt) / 1000)
+           sendCachedValue(handler, opts, result, age, null, false)
+           return

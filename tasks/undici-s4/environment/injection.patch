@@ -1,0 +1,85 @@
+diff --git a/lib/handler/cache-handler.js b/lib/handler/cache-handler.js
+index 80d90b81..509e327c 100644
+--- a/lib/handler/cache-handler.js
++++ b/lib/handler/cache-handler.js
+@@ -136,6 +136,11 @@ class CacheHandler {
+    */
+   #cacheByDefault
+ 
++  /**
++   * @type {boolean}
++   */
++  #refresh
++
+   /**
+    * @type {import('../../types/cache-interceptor.d.ts').default.CacheStore}
+    */
+@@ -156,10 +161,11 @@ class CacheHandler {
+    * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} cacheKey
+    * @param {import('../../types/dispatcher.d.ts').default.DispatchHandler} handler
+    */
+-  constructor ({ store, type, cacheByDefault }, cacheKey, handler) {
++  constructor ({ store, type, cacheByDefault, refresh }, cacheKey, handler) {
+     this.#store = store
+     this.#cacheType = type
+     this.#cacheByDefault = cacheByDefault
++    this.#refresh = refresh === true
+     this.#cacheKey = cacheKey
+     this.#handler = handler
+   }
+@@ -195,6 +201,27 @@ class CacheHandler {
+       )
+     const handler = this
+ 
++    // A background refresh replaces a representation this cache already holds.
++    //  Persist what the origin sent without repeating the admission checks.
++    if (this.#refresh && statusCode === 200) {
++      const directives = resHeaders['cache-control'] ? parseCacheControlHeader(resHeaders['cache-control']) : {}
++      const now = Date.now()
++      const lifetime = determineStaleAt(this.#cacheType, now, undefined, resHeaders, undefined, directives) ?? 60000
++      const value = {
++        statusCode,
++        statusMessage,
++        headers: stripNecessaryHeaders(resHeaders, directives),
++        cacheControlDirectives: directives,
++        cachedAt: now,
++        staleAt: now + lifetime,
++        deleteAt: now + (2 * lifetime)
++      }
++
++      this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value)
++      downstreamOnHeaders()
++      return
++    }
++
+     if (
+       !arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) &&
+       statusCode >= 200 &&
+diff --git a/lib/interceptor/cache.js b/lib/interceptor/cache.js
+index 83835bb6..9b2adc39 100644
+--- a/lib/interceptor/cache.js
++++ b/lib/interceptor/cache.js
+@@ -412,7 +412,7 @@ function handleResult (
+             ...opts,
+             headers
+           },
+-          new CacheHandler(globalOpts, cacheKey, {
++          new CacheHandler({ ...globalOpts, refresh: true }, cacheKey, {
+             // Silent handler that just updates the cache
+             onRequestStart () {},
+             onRequestUpgrade () {},
+@@ -592,6 +592,14 @@ module.exports = (opts = {}) => {
+             result
+           ))
+       } else {
++        // A request that forbids network use can be answered from the store
++        //  without going through the revalidation machinery.
++        if (result && reqCacheControl?.['only-if-cached']) {
++          const age = Math.round((Date.now() - result.cachedAt) / 1000)
++          sendCachedValue(handler, opts, result, age, null, false)
++          return
++        }
++
+         return handleResult(
+           dispatch,
+           globalOpts,

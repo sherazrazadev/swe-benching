@@ -1,0 +1,179 @@
+{
+ "slug": "mediasoup-s4",
+ "candidate": "GHSA-P7X2-G5CQ-FHMQ / CVE-2026-55663 (screener entry 12873, versatica/mediasoup)",
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "entry_point": "RTC::SCTP::Association::ReceiveSctpData (worker built-in SCTP stack); COOKIE-ECHO and INIT chunks reach the association exactly as a plain/pipe transport delivers them",
+  "sites": [
+   "worker/src/RTC/SCTP/association/StateCookie.cpp:133 (IsMediasoupStateCookie: pinned code checks length + magic only)",
+   "worker/src/RTC/SCTP/association/StateCookie.cpp:158 (VerifyMac: reference authentication)",
+   "worker/src/RTC/SCTP/association/Association.cpp:1698 (HandleReceivedCookieEchoChunk: the sink)",
+   "worker/src/RTC/SCTP/association/Association.cpp:1803 (HandleReceivedCookieEchoChunkWithTcb: existing-association route)",
+   "worker/src/RTC/SCTP/association/Association.cpp:2492 (VerifyReceivedStateCookie: MAC + freshness)",
+   "worker/src/RTC/SCTP/association/Association.cpp:1536 (injected sibling: fast restart in HandleReceivedInitChunk)"
+  ],
+  "routes": [
+   "COOKIE-ECHO with no transmission control block (forged or modified cookie)",
+   "COOKIE-ECHO with an existing transmission control block (condition A/B rebuilds it)",
+   "genuine cookie presented after its valid lifetime",
+   "INIT from the peer while the association is established (injected sibling) followed by DATA"
+  ],
+  "services": [],
+  "project_tests_run": "worker Catch2 binary filtered by [sctp]: TestAssociation, TestStateCookie, TestStateCookieParameter, TestStaleCookieErrorCause, TestCookieEchoChunk and the rest of the SCTP codec/association suites (71 cases / 497 JUnit testcases, restored pristine at grade time; all pass on the pinned+injected and reference trees)",
+  "verifier_rehearsal": "tests/test.sh ran in the real verifier image against the pinned+injected workspace: security 0/5, functional 501/501, reward 0.0, ccache-warmed build under a minute"
+ },
+ "leak_terms": [
+  "StateCookie",
+  "IsMediasoupStateCookie",
+  "VerifyMac",
+  "VerifyReceivedStateCookie",
+  "requireAuthenticatedCookie",
+  "HandleReceivedCookieEchoChunk",
+  "HandleReceivedInitChunk",
+  "CreateTransmissionControlBlock",
+  "StateCookieParameter",
+  "SctpOptions",
+  "HMAC",
+  "HMAC-SHA1",
+  "MAC",
+  "magic2",
+  "msworker",
+  "0xAD81",
+  "TransmissionControlBlock"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-length-only.patch",
+   "expect": "security_fail",
+   "kind": "security"
+  },
+  {
+   "patch": "sf-no-freshness.patch",
+   "expect": "security_fail",
+   "kind": "security"
+  },
+  {
+   "patch": "sf-no-tcb-only.patch",
+   "expect": "security_fail",
+   "kind": "security"
+  },
+  {
+   "patch": "sf-init-fast-restart.patch",
+   "expect": "security_fail",
+   "kind": "security"
+  },
+  {
+   "patch": "sf-not-enabled.patch",
+   "expect": "security_fail",
+   "kind": "security"
+  },
+  {
+   "patch": "ff-reject-all-cookie-echo.patch",
+   "expect": "functional_fail",
+   "kind": "functional"
+  },
+  {
+   "patch": "ff-reject-plain.patch",
+   "expect": "functional_fail",
+   "kind": "functional"
+  },
+  {
+   "patch": "pass-hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "pass-alt-unconditional.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "pass-blind.patch",
+   "expect": "pass",
+   "kind": "blind"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-reject-all-cookie-echo.patch",
+  "crash_as_refusal": "n/a: a crash aborts the Catch2 process instead of yielding a per-test result; a behaviour assertion cannot treat it as a refusal, and the tests never require a callback so a crash is never counted as a pass",
+  "wrong_resource": "n/a: the association has a single transmission-control object; there is no neighbouring or proxy resource whose identity could be checked instead",
+  "one_role_or_direction": "n/a: only the passive side verifies a cookie it generated; the active side has no cookie of its own to check, so there is no second role or direction to fix",
+  "reads_only": "n/a: SCTP establishment is control-plane state, not a read/write pair over a stored resource",
+  "check_after_adjustment": "sf-no-tcb-only.patch",
+  "unlisted_route": "sf-init-fast-restart.patch",
+  "malformed_identity": "n/a: the tests feed a structurally valid cookie with the wrong proof, not a parser spelling; the parser is exercised through the real chunk path only",
+  "missing_authority": "sf-not-enabled.patch",
+  "adjacent_api": "ff-reject-plain.patch"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "name": "authenticity of the whole cookie",
+   "shape": "a genuine cookie taken from a real handshake with one byte of its pre-existing body modified; a length-only or partial-MAC check accepts it and builds association state from it",
+   "where": "worker/src/RTC/SCTP/association/StateCookie.cpp:158",
+   "security_tests": [
+    "state cookie: a modified genuine cookie is rejected"
+   ],
+   "coupled_functional_tests": [
+    "state cookie: two peers establish and exchange messages",
+    "project [sctp]: TestStateCookie (plain State Cookie format still parses and serializes)"
+   ],
+   "security_fail_patch": "sf-length-only.patch",
+   "realistic_because": "rejecting the plain/44-byte cookie form looks like it closes forgery; a MAC that covers only some fields or a length-only guard is a common half-fix"
+  },
+  {
+   "id": "T2",
+   "name": "freshness of a genuine cookie",
+   "shape": "a cookie genuinely generated by the endpoint, but presented one hour after creation; authentication alone accepts it",
+   "where": "worker/src/RTC/SCTP/association/Association.cpp:2492",
+   "security_tests": [
+    "state cookie: an expired genuine cookie is rejected"
+   ],
+   "coupled_functional_tests": [
+    "state cookie: a promptly used cookie is accepted",
+    "state cookie: a small backward clock adjustment does not expire a cookie"
+   ],
+   "security_fail_patch": "sf-no-freshness.patch",
+   "realistic_because": "the report is about forgery, so a MAC feels like the complete fix; a replay window is easy to leave out, and naive unsigned time subtraction also breaks clock skew"
+  },
+  {
+   "id": "T3",
+   "name": "existing-association route",
+   "shape": "a forged cookie delivered while a transmission control block already exists; RFC 9260 5.2.4 conditions A/B drop the TCB and rebuild it from the cookie",
+   "where": "worker/src/RTC/SCTP/association/Association.cpp:1803",
+   "security_tests": [
+    "state cookie: a forged cookie cannot restart an existing association"
+   ],
+   "coupled_functional_tests": [
+    "state cookie: a retransmitted handshake message does not break the association",
+    "state cookie: a peer restart re-establishes the association"
+   ],
+   "security_fail_patch": "sf-no-tcb-only.patch",
+   "realistic_because": "when a TCB exists the peer is already connected, so the path reads as a duplicate/retransmission path and the check is placed only where there is no TCB"
+  },
+  {
+   "id": "T4",
+   "name": "injected sibling: INIT-triggered fast restart",
+   "shape": "an INIT received while the association is established rebuilds the transmission control block from the INIT (new local tag, attacker initiate tag/TSN/a_rwnd), after which DATA using the freshly learned tag is accepted",
+   "where": "worker/src/RTC/SCTP/association/Association.cpp:1536",
+   "security_tests": [
+    "state cookie: an unsigned restart cannot take over an association"
+   ],
+   "coupled_functional_tests": [
+    "state cookie: a peer restart re-establishes the association",
+    "state cookie: two peers establish and exchange messages"
+   ],
+   "security_fail_patch": "sf-init-fast-restart.patch",
+   "realistic_because": "injected code a maintainer could plausibly write as a restart-latency optimisation; it is absent from the published fix, lives in the INIT handler rather than the COOKIE-ECHO handler, and the property ('created, continued, restarted or replaced') covers it literally"
+  }
+ ],
+ "status": "built + gate PASSED (2026-10-30): static PASS; nop PASS (security 5, all failing on the pinned+injected tree; functional 501, all passing); oracle PASS (3 trials, reward 1.0 each, identical); patches PASS (all 9 declared checks behave as declared: 5 security_fail, 2 functional_fail, hardening and alternative pass at 1.0). Local matrix and two end-to-end verifier rehearsals documented in notes.md. The blind pass patch is declared and is written downstream."
+}

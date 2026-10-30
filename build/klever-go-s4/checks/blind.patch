@@ -1,0 +1,191 @@
+diff -ruN pristine/core/kapp/accounts/accounts.go app/core/kapp/accounts/accounts.go
+--- a/core/kapp/accounts/accounts.go	2026-10-30 15:25:08.000000000 +0000
++++ b/core/kapp/accounts/accounts.go	2026-10-30 15:46:21.876381081 +0000
+@@ -288,6 +288,14 @@
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++
++	// never pay a recipient more than what is still left of the royalty pool: doing so
++	// credits value that was never taken from the payer
++	if splitToPay > *royaltiesToPay {
++		ctx := a.KAppController.GetCurrentKAppContext()
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, assetID, a.forkController.EnableSmartContracts())
+@@ -328,7 +336,9 @@
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+-	if splitToPay > fixedValue {
++	// bound against the still-unspent part of the fixed royalty, not against its
++	// original amount, so several recipients cannot jointly overdraw the pool
++	if splitToPay > *royaltiesToPay {
+ 		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+ 	}
+ 	*royaltiesToPay -= splitToPay
+@@ -476,6 +486,13 @@
+ 		}
+ 	}
+ 
++	// the payer owes the whole royalty whether or not every unit of it goes to a split
++	// recipient; charging it only when a remainder is left would mint the split payout
++	err = acntSrc.SubFromBalance(royaltyAmount, assetID, a.forkController.EnableSmartContracts())
++	if err != nil {
++		return transaction.Transaction_BalanceError, err
++	}
++
+ 	if royaltiesToPay <= 0 {
+ 		return transaction.Transaction_Ok, nil
+ 	}
+@@ -485,11 +502,6 @@
+ 		return transaction.Transaction_LoadAccountError, err
+ 	}
+ 
+-	err = acntSrc.SubFromBalance(royaltyAmount, assetID, a.forkController.EnableSmartContracts())
+-	if err != nil {
+-		return transaction.Transaction_BalanceError, err
+-	}
+-
+ 	err = royaltyReceiver.AddToBalance(royaltiesToPay, assetID, a.forkController.EnableSmartContracts())
+ 	if err != nil {
+ 		return transaction.Transaction_BalanceError, err
+diff -ruN pristine/core/kapp/ito/ito.go app/core/kapp/ito/ito.go
+--- a/core/kapp/ito/ito.go	2026-10-30 15:25:08.000000000 +0000
++++ b/core/kapp/ito/ito.go	2026-10-30 15:46:27.027501078 +0000
+@@ -551,6 +551,13 @@
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++
++	// the fixed offering royalty has already been taken from the buyer; a stored share
++	// may only consume what is still unspent from it
++	if splitToPay > *royaltiesToPay {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, kdautils.KLVIdentifier, i.forkController.EnableSmartContracts())
+@@ -601,6 +608,13 @@
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++
++	// the percentage royalty is the pool for this payout; never credit a recipient
++	// more than the pool still holds
++	if splitToPay > *royaltiesToPay {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, assetID, i.forkController.EnableSmartContracts())
+diff -ruN pristine/core/kapp/kda/create.go app/core/kapp/kda/create.go
+--- a/core/kapp/kda/create.go	2026-10-30 15:25:04.000000000 +0000
++++ b/core/kapp/kda/create.go	2026-10-30 15:46:15.599234882 +0000
+@@ -83,6 +83,13 @@
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+ 
++	// a split recipient, or all recipients of one royalty dimension together, may not
++	// claim more than the whole royalty that funds their payout
++	if err := kda.ValidateSplitRoyaltyShares(tc.GetRoyalties()); err != nil {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, err.Error())
++		return transaction.Transaction_ParameterInvalid, err
++	}
++
+ 	switch asset.AssetType {
+ 	case kapps.KDAData_NonFungible,
+ 		kapps.KDAData_SemiFungible:
+diff -ruN pristine/core/kapp/kda/trigger.go app/core/kapp/kda/trigger.go
+--- a/core/kapp/kda/trigger.go	2026-10-30 15:25:04.000000000 +0000
++++ b/core/kapp/kda/trigger.go	2026-10-30 15:46:16.508256052 +0000
+@@ -589,6 +589,13 @@
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+ 
++	// the stored configuration is applied to later payouts, so it carries the same
++	// bound as a fresh creation: no share, and no dimension total, above the royalty
++	if err := pkda.ValidateSplitRoyaltyShares(tc.GetRoyalties()); err != nil {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, err.Error())
++		return transaction.Transaction_ParameterInvalid, err
++	}
++
+ 	switch asset.AssetType {
+ 	case kapps.KDAData_NonFungible,
+ 		kapps.KDAData_SemiFungible:
+diff -ruN pristine/core/kapp/market/market.go app/core/kapp/market/market.go
+--- a/core/kapp/market/market.go	2026-10-30 15:25:04.000000000 +0000
++++ b/core/kapp/market/market.go	2026-10-30 15:46:24.912451807 +0000
+@@ -413,6 +413,13 @@
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++
++	// the royalty carved from the sale is the only source for this payout; a stored
++	// share that exceeds what is left of it would create tokens
++	if splitToPay > *royaltiesToPay {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, currencyID, m.forkController.EnableSmartContracts())
+diff -ruN pristine/core/process/kda/assetHelper.go app/core/process/kda/assetHelper.go
+--- a/core/process/kda/assetHelper.go	2026-10-30 15:25:04.000000000 +0000
++++ b/core/process/kda/assetHelper.go	2026-10-30 15:46:14.890218369 +0000
+@@ -107,6 +107,50 @@
+ 	return true
+ }
+ 
++// ValidateSplitRoyaltyShares rejects a split-royalty configuration that could pay
++// recipients more than the royalty it is carved from. Two properties are enforced
++// for every royalty dimension (transfer percentage/fixed, market percentage/fixed,
++// ITO percentage/fixed):
++//
++//   - no single recipient may claim more than one whole royalty, and
++//   - the recipients of the same dimension may not jointly claim more than one
++//     whole royalty.
++//
++// Totals are accumulated in uint64 rather than uint32 so an overflowing sum cannot
++// wrap around and slip past the aggregate limit.
++func ValidateSplitRoyaltyShares(royaltiesInfo *transaction.RoyaltiesInfo) error {
++	if royaltiesInfo == nil {
++		return nil
++	}
++
++	var totals [6]uint64
++	for _, split := range royaltiesInfo.GetSplitRoyalties() {
++		shares := [6]uint32{
++			split.GetPercentTransferPercentage(),
++			split.GetPercentTransferFixed(),
++			split.GetPercentMarketPercentage(),
++			split.GetPercentMarketFixed(),
++			split.GetPercentITOPercentage(),
++			split.GetPercentITOFixed(),
++		}
++
++		for i, share := range shares {
++			if share > core.HundredPercent {
++				return common.ErrInvalidValue
++			}
++			totals[i] += uint64(share)
++		}
++	}
++
++	for _, total := range totals {
++		if total > uint64(core.HundredPercent) {
++			return common.ErrInvalidValue
++		}
++	}
++
++	return nil
++}
++
+ // CreateNewAssetIdentifier Create a random asset identifier for the asset
+ func CreateNewAssetIdentifier(hasher hashing.Hasher, randSeed []byte, caller []byte, nonce uint64, ticker []byte, contractID int) []byte {
+ 	nonceBuffer := make([]byte, 8)

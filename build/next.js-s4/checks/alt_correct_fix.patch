@@ -1,0 +1,2536 @@
+diff --git a/packages/next/package.json b/packages/next/package.json
+index e586f18..5e62f10 100644
+--- a/packages/next/package.json
++++ b/packages/next/package.json
+@@ -267,6 +267,7 @@
+     "fresh": "0.5.2",
+     "glob": "7.1.7",
+     "gzip-size": "5.1.1",
++    "hash.js": "1.1.7",
+     "http-proxy-agent": "5.0.0",
+     "https-browserify": "1.0.0",
+     "https-proxy-agent": "5.0.1",
+diff --git a/packages/next/src/build/adapter/build-complete.ts b/packages/next/src/build/adapter/build-complete.ts
+index 13aeda0..92247b5 100644
+--- a/packages/next/src/build/adapter/build-complete.ts
++++ b/packages/next/src/build/adapter/build-complete.ts
+@@ -11,7 +11,11 @@ import { recursiveReadDir } from '../../lib/recursive-readdir'
+ import { isDynamicRoute } from '../../shared/lib/router/utils'
+ import type { Revalidate } from '../../server/lib/cache-control'
+ import type { NextConfigComplete } from '../../server/config-shared'
+-import { normalizeAppPath } from '../../shared/lib/router/utils/app-paths'
++import {
++  normalizeAppPath,
++  selectAppPageEntry,
++  compareAppPaths,
++} from '../../shared/lib/router/utils/app-paths'
+ import { AdapterOutputType, type PHASE_TYPE } from '../../shared/lib/constants'
+ import { normalizePagePath } from '../../shared/lib/page-path/normalize-page-path'
+ import {
+@@ -56,6 +60,8 @@ import { generateRoutesManifest } from '../generate-routes-manifest'
+ import { Bundler } from '../../lib/bundler'
+ import { resolveCacheHandlerPathToFilesystem } from '../../lib/format-dynamic-import-path'
+ import { InvariantError } from '../../shared/lib/invariant-error'
++import { getRouteCacheKey } from '../../server/lib/route-cache-key'
++import { RouteKind } from '../../server/route-kind'
+ 
+ interface SharedRouteFields {
+   /**
+@@ -1092,7 +1098,11 @@ export async function handleBuildComplete({
+       const appDistDir = path.join(distDir, 'server', 'app')
+ 
+       if (appPageKeys) {
+-        for (const page of appPageKeys) {
++        // Select the same children/root entry as export and request rendering.
++        // Other parallel entries only contribute assets to that output.
++        for (const page of [...appPageKeys].sort((a, b) =>
++          compareAppPaths(b, a)
++        )) {
+           if (middlewareManifest.functions.hasOwnProperty(page)) {
+             continue
+           }
+@@ -1216,6 +1226,57 @@ export async function handleBuildComplete({
+         contentTypeHeader: rscContentTypeHeader,
+       } = routesManifest.rsc
+ 
++      const appSourcePages = new Map<string, string>()
++      const getPrerenderFilePath = (
++        route: string,
++        isAppPage: boolean,
++        extension: string
++      ) => {
++        if (config.output !== 'export') {
++          route = path.posix.join('/', route)
++          const pathname = isAppPage
++            ? route
++            : normalizeLocalePath(route, config.i18n?.locales).pathname
++          const prerender = prerenderManifest.routes[route]
++          const dynamicPrerender = prerenderManifest.dynamicRoutes[pathname]
++
++          // Auto-static Pages and generated error documents are not response
++          // cache entries and retain their public filenames.
++          if (!isAppPage && !prerender && !dynamicPrerender) {
++            return path.join(
++              pagesDistDir,
++              `${normalizePagePath(route)}${extension}`
++            )
++          }
++
++          const source =
++            prerender?.srcRoute ??
++            dynamicPrerender?.fallbackSourceRoute ??
++            pathname
++          let page = source
++          let kind = RouteKind.PAGES
++          if (isAppPage) {
++            page =
++              appSourcePages.get(source) ??
++              selectAppPageEntry(source, appPageKeys ?? [])
++            appSourcePages.set(source, page)
++            kind = page.endsWith('/route')
++              ? RouteKind.APP_ROUTE
++              : RouteKind.APP_PAGE
++          }
++          return path.join(
++            distDir,
++            'server',
++            `${getRouteCacheKey(route, { kind, sourceRoute: page })}${extension}`
++          )
++        }
++
++        return path.join(
++          isAppPage ? appDistDir : pagesDistDir,
++          `${normalizePagePath(route)}${extension}`
++        )
++      }
++
+       const handleAppMeta = async (
+         route: string,
+         initialOutput: AdapterOutput['PRERENDER'],
+@@ -1231,9 +1292,10 @@ export async function handleBuildComplete({
+ 
+         if (meta?.segmentPaths) {
+           const normalizedRoute = normalizePagePath(route)
+-          const segmentsDir = path.join(
+-            appDistDir,
+-            `${normalizedRoute}${prefetchSegmentDirSuffix}`
++          const segmentsDir = getPrerenderFilePath(
++            route,
++            true,
++            prefetchSegmentDirSuffix
+           )
+ 
+           // If client param parsing is enabled, we follow the same logic as
+@@ -1317,11 +1379,10 @@ export async function handleBuildComplete({
+         route: string,
+         isAppPage: boolean
+       ): Promise<AppRouteMeta> => {
+-        const basename = route.endsWith('/') ? `${route}index` : route
+         const meta: AppRouteMeta = isAppPage
+           ? JSON.parse(
+               await fs
+-                .readFile(path.join(appDistDir, `${basename}.meta`), 'utf8')
++                .readFile(getPrerenderFilePath(route, true, '.meta'), 'utf8')
+                 .catch(() => '{}')
+             )
+           : {}
+@@ -1370,7 +1431,6 @@ export async function handleBuildComplete({
+           initialHeaders,
+           initialStatus,
+           dataRoute,
+-          prefetchDataRoute,
+           renderingMode,
+           routeType,
+           response,
+@@ -1406,18 +1466,20 @@ export async function handleBuildComplete({
+           allowQuery = Object.values(routeKeys)
+         }
+ 
+-        let filePath = path.join(
+-          isAppPage ? appDistDir : pagesDistDir,
+-          `${normalizePagePath(route)}.${isAppPage && !dataRoute ? 'body' : 'html'}`
++        let filePath = getPrerenderFilePath(
++          route,
++          isAppPage,
++          isAppPage && !dataRoute ? '.body' : '.html'
+         )
+ 
+         // Check if this is a static metadata route (e.g., /favicon.ico, /icon.png, /opengraph-image.png)
+         // These should be output as static files, not prerenders.
+         if (isStaticMetadataFile(route)) {
+           // For static metadata from app router, check if the .body file exists
+-          const staticMetadataFilePath = path.join(
+-            appDistDir,
+-            `${normalizePagePath(route)}.body`
++          const staticMetadataFilePath = getPrerenderFilePath(
++            route,
++            true,
++            '.body'
+           )
+           if (await cachedFilePathCheck(staticMetadataFilePath)) {
+             outputs.staticFiles.push({
+@@ -1439,8 +1501,12 @@ export async function handleBuildComplete({
+             normalizeLocalePath(route, config.i18n?.locales).detectedLocale
+ 
+           for (const currentFilePath of [
+-            path.join(pagesDistDir, locale || '', '404.html'),
+-            path.join(pagesDistDir, '404.html'),
++            getPrerenderFilePath(
++              path.posix.join('/', locale || '', '404'),
++              false,
++              '.html'
++            ),
++            getPrerenderFilePath('/404', false, '.html'),
+           ]) {
+             if (await cachedFilePathCheck(currentFilePath)) {
+               filePath = currentFilePath
+@@ -1576,30 +1642,13 @@ export async function handleBuildComplete({
+         }
+ 
+         if (dataRoute) {
+-          let dataFilePath: string | undefined = path.join(
+-            pagesDistDir,
+-            `${normalizePagePath(route)}.json`
++          const dataFilePath = getPrerenderFilePath(
++            route,
++            isAppPage,
++            isAppPage ? '.rsc' : '.json'
+           )
+           let postponed = meta.postponed
+ 
+-          const dataRouteToUse =
+-            renderingMode === RenderingMode.PARTIALLY_STATIC &&
+-            prefetchDataRoute
+-              ? prefetchDataRoute
+-              : dataRoute
+-
+-          if (isAppPage) {
+-            // When experimental PPR is enabled, we expect that the data
+-            // that should be served as a part of the prerender should
+-            // be from the prefetch data route. If this isn't enabled
+-            // for ppr, the only way to get the data is from the data
+-            // route.
+-            dataFilePath = path.join(
+-              appDistDir,
+-              (dataRouteToUse ?? dataRoute)?.replace(/^\//, '')
+-            )
+-          }
+-
+           if (
+             renderingMode === RenderingMode.PARTIALLY_STATIC &&
+             !(await cachedFilePathCheck(dataFilePath))
+@@ -1776,7 +1825,11 @@ export async function handleBuildComplete({
+ 
+         const fallbackHtmlPath =
+           fallbackHtmlFile !== undefined
+-            ? path.join(isAppPage ? appDistDir : pagesDistDir, fallbackHtmlFile)
++            ? getPrerenderFilePath(
++                fallbackHtmlFile.replace(/\.html$/, ''),
++                isAppPage,
++                '.html'
++              )
+             : undefined
+ 
+         const classification = getPrerenderClassification(
+@@ -1942,10 +1995,14 @@ export async function handleBuildComplete({
+                       ...initialOutput.fallback,
+                       initialStatus: undefined,
+                       postponedState: undefined,
+-                      filePath: path.join(
+-                        pagesDistDir,
+-                        locale,
+-                        fallbackHtmlFile
++                      filePath: getPrerenderFilePath(
++                        path.posix.join(
++                          '/',
++                          locale,
++                          fallbackHtmlFile.replace(/\.html$/, '')
++                        ),
++                        false,
++                        '.html'
+                       ),
+                     }
+                   : undefined,
+diff --git a/packages/next/src/build/collect-build-traces.ts b/packages/next/src/build/collect-build-traces.ts
+index fca0eec..ebc04d6 100644
+--- a/packages/next/src/build/collect-build-traces.ts
++++ b/packages/next/src/build/collect-build-traces.ts
+@@ -19,7 +19,10 @@ import picomatch from 'next/dist/compiled/picomatch'
+ import { defaultOverrides } from '../server/require-hook'
+ import { nodeFileTrace } from 'next/dist/compiled/@vercel/nft'
+ import { normalizePagePath } from '../shared/lib/page-path/normalize-page-path'
+-import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
++import {
++  normalizeAppPath,
++  selectAppPageEntry,
++} from '../shared/lib/router/utils/app-paths'
+ import isError from '../lib/is-error'
+ import type { NodeFileTraceReasons } from '@vercel/nft'
+ import type { RoutesUsingEdgeRuntime } from './utils'
+@@ -497,6 +500,74 @@ export async function collectBuildTraces({
+             )
+           })
+         )
++
++        // A platform may package any one of the entries for a pathname into
++        // its route function. The runtime selects the children/root entry, so
++        // that entry and its dependencies must be present even when the
++        // platform packages a parallel slot entry instead.
++        const appEntriesByRoute = new Map<string, string[]>()
++        for (const entryName of Object.keys(entryNameFilesMap || {})) {
++          if (!entryName.startsWith('app/') || !entryName.endsWith('/page')) {
++            continue
++          }
++          const route = normalizeAppPath(entryName.slice('app'.length))
++          if (staticPages.includes(route)) continue
++          const entries = appEntriesByRoute.get(route) || []
++          entries.push(entryName)
++          appEntriesByRoute.set(route, entries)
++        }
++
++        await Promise.all(
++          [...appEntriesByRoute].map(async ([route, entries]) => {
++            if (entries.length < 2) return
++
++            const selectedEntry = `app${selectAppPageEntry(
++              route,
++              entries.map((entry) => entry.slice('app'.length)),
++              normalizeAppPath
++            )}`
++            const selectedOutputPath = path.join(
++              distDir,
++              'server',
++              `${selectedEntry}.js`
++            )
++            const selectedTracePath = `${selectedOutputPath}.nft.json`
++            const selectedTrace = JSON.parse(
++              await fs.readFile(selectedTracePath, 'utf8')
++            ) as { files: string[] }
++            const selectedTraceDir = path.dirname(selectedTracePath)
++            const selectedFiles = [
++              selectedOutputPath,
++              ...selectedTrace.files.map((file) =>
++                path.resolve(selectedTraceDir, file)
++              ),
++            ]
++
++            await Promise.all(
++              entries
++                .filter((entry) => entry !== selectedEntry)
++                .map(async (entry) => {
++                  const tracePath = path.join(
++                    distDir,
++                    'server',
++                    `${entry}.js.nft.json`
++                  )
++                  const traceDir = path.dirname(tracePath)
++                  const trace = JSON.parse(
++                    await fs.readFile(tracePath, 'utf8')
++                  ) as { files: string[] }
++                  const files = new Set(trace.files)
++                  for (const file of selectedFiles) {
++                    files.add(path.relative(traceDir, file).replace(/\\/g, '/'))
++                  }
++                  await fs.writeFile(
++                    tracePath,
++                    JSON.stringify({ ...trace, files: [...files].sort() })
++                  )
++                })
++            )
++          })
++        )
+       }
+ 
+       const moduleTypes = ['app-page', 'pages']
+diff --git a/packages/next/src/build/index.ts b/packages/next/src/build/index.ts
+index b4e175c..b1dcbda 100644
+--- a/packages/next/src/build/index.ts
++++ b/packages/next/src/build/index.ts
+@@ -1,3 +1,8 @@
++import {
++  getRouteCacheKey,
++  ROUTE_CACHE_DIRECTORY,
++} from '../server/lib/route-cache-key'
++import { RouteKind } from '../server/route-kind'
+ import type { PagesManifest } from './webpack/plugins/pages-manifest-plugin'
+ import type {
+   ExportPathMap,
+@@ -87,6 +92,7 @@ import {
+ import {
+   UNDERSCORE_NOT_FOUND_ROUTE,
+   UNDERSCORE_NOT_FOUND_ROUTE_ENTRY,
++  UNDERSCORE_GLOBAL_ERROR_ROUTE,
+   UNDERSCORE_GLOBAL_ERROR_ROUTE_ENTRY,
+ } from '../shared/lib/entry-constants'
+ import { isDynamicRoute } from '../shared/lib/router/utils'
+@@ -151,7 +157,10 @@ import { installBindings } from './swc/install-bindings'
+ import { getNamedRouteRegex } from '../shared/lib/router/utils/route-regex'
+ import { getFilesInDir } from '../lib/get-files-in-dir'
+ import { eventSwcPlugins } from '../telemetry/events/swc-plugins'
+-import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
++import {
++  normalizeAppPath,
++  selectAppPageEntry,
++} from '../shared/lib/router/utils/app-paths'
+ import {
+   ACTION_HEADER,
+   type NEXT_ROUTER_PREFETCH_HEADER,
+@@ -882,6 +891,25 @@ async function writeStandaloneDirectory(
+         )
+       }
+ 
++      const responseCacheDir = path.join(
++        distDir,
++        SERVER_DIRECTORY,
++        ROUTE_CACHE_DIRECTORY
++      )
++      if (existsSync(responseCacheDir)) {
++        await recursiveCopy(
++          responseCacheDir,
++          path.join(
++            distDir,
++            STANDALONE_DIRECTORY,
++            path.relative(outputFileTracingRoot, distDir),
++            SERVER_DIRECTORY,
++            ROUTE_CACHE_DIRECTORY
++          ),
++          { overwrite: true }
++        )
++      }
++
+       if (appDir) {
+         const originalServerApp = path.join(distDir, SERVER_DIRECTORY, 'app')
+         if (existsSync(originalServerApp)) {
+@@ -2366,21 +2394,17 @@ export default async function build(
+                 let originalAppPath: string | undefined
+ 
+                 if (pageType === 'app' && mappedAppPages) {
+-                  for (const [originalPath, normalizedPath] of Object.entries(
+-                    appPathRoutes
+-                  )) {
+-                    if (
+-                      normalizedPath === page &&
+-                      mappedAppPages[originalPath]
+-                    ) {
+-                      pagePath = mappedAppPages[originalPath].replace(
+-                        /^private-next-app-dir/,
+-                        ''
+-                      )
+-                      originalAppPath = originalPath
+-                      break
+-                    }
+-                  }
++                  originalAppPath = selectAppPageEntry(
++                    page,
++                    Object.keys(appPathRoutes).filter(
++                      (entry) => mappedAppPages[entry]
++                    ),
++                    (entry) => appPathRoutes[entry]
++                  )
++                  pagePath = mappedAppPages[originalAppPath].replace(
++                    /^private-next-app-dir/,
++                    ''
++                  )
+                 }
+ 
+                 const pageFilePath = isAppBuiltinPage(pagePath)
+@@ -3854,29 +3878,31 @@ export default async function build(
+             }
+           }
+ 
+-          // The export worker writes files directly to server/pages/,
+-          // so we must delete files for notFound routes that shouldn't be served.
+-          const deleteNotFoundPageFiles = (normalizedPath: string) =>
+-            Promise.all([
+-              fs.rm(
+-                path.join(
+-                  distDir,
+-                  SERVER_DIRECTORY,
+-                  'pages',
+-                  `${normalizedPath}.html`
+-                ),
+-                { force: true }
+-              ),
+-              fs.rm(
+-                path.join(
+-                  distDir,
+-                  SERVER_DIRECTORY,
+-                  'pages',
+-                  `${normalizedPath}.json`
+-                ),
+-                { force: true }
+-              ),
+-            ])
++          // Remove files for Pages Router paths that returned notFound during export.
++          const deleteNotFoundPagesRouterFiles = (
++            pathname: string,
++            page: string
++          ) => {
++            const filename =
++              config.adapterPath && config.output !== 'export'
++                ? getRouteCacheKey(pathname, {
++                    kind: RouteKind.PAGES,
++                    sourceRoute: page,
++                  })
++                : `pages${normalizePagePath(pathname)}`
++            return Promise.all(
++              ['.html', '.json', '.meta'].map((extension) =>
++                fs.rm(
++                  path.join(
++                    distDir,
++                    SERVER_DIRECTORY,
++                    `${filename}${extension}`
++                  ),
++                  { force: true }
++                )
++              )
++            )
++          }
+ 
+           async function moveExportedAppNotFoundTo404() {
+             return staticGenerationSpan
+@@ -3885,8 +3911,12 @@ export default async function build(
+                 const orig = path.join(
+                   distDir,
+                   'server',
+-                  'app',
+-                  '_not-found.html'
++                  config.adapterPath && config.output !== 'export'
++                    ? `${getRouteCacheKey(UNDERSCORE_NOT_FOUND_ROUTE, {
++                        kind: RouteKind.APP_PAGE,
++                        sourceRoute: UNDERSCORE_NOT_FOUND_ROUTE_ENTRY,
++                      })}.html`
++                    : 'app/_not-found.html'
+                 )
+                 const updatedRelativeDest = path
+                   .join('pages', '404.html')
+@@ -3934,8 +3964,12 @@ export default async function build(
+                 const orig = path.join(
+                   distDir,
+                   'server',
+-                  'app',
+-                  '_global-error.html'
++                  config.adapterPath && config.output !== 'export'
++                    ? `${getRouteCacheKey(UNDERSCORE_GLOBAL_ERROR_ROUTE, {
++                        kind: RouteKind.APP_PAGE,
++                        sourceRoute: UNDERSCORE_GLOBAL_ERROR_ROUTE_ENTRY,
++                      })}.html`
++                    : 'app/_global-error.html'
+                 )
+                 if (existsSync(orig)) {
+                   const error500Html = path.join(
+@@ -4037,9 +4071,7 @@ export default async function build(
+                       prerenderManifest.notFoundRoutes.includes(localePage)
+ 
+                     if (isNotFoundTrue) {
+-                      await deleteNotFoundPageFiles(
+-                        normalizePagePath(localePage)
+-                      )
++                      await deleteNotFoundPagesRouterFiles(localePage, page)
+                     }
+ 
+                     const cacheControl = getCacheControl(localePage)
+@@ -4068,7 +4100,7 @@ export default async function build(
+                   const isNotFoundTrue =
+                     prerenderManifest.notFoundRoutes.includes(page)
+                   if (isNotFoundTrue) {
+-                    await deleteNotFoundPageFiles(file)
++                    await deleteNotFoundPagesRouterFiles(page, page)
+                   }
+ 
+                   const cacheControl = getCacheControl(page)
+@@ -4105,9 +4137,7 @@ export default async function build(
+                   const isNotFoundTrue =
+                     prerenderManifest.notFoundRoutes.includes(route.pathname)
+                   if (isNotFoundTrue) {
+-                    await deleteNotFoundPageFiles(
+-                      normalizePagePath(route.pathname)
+-                    )
++                    await deleteNotFoundPagesRouterFiles(route.pathname, page)
+                   }
+ 
+                   const cacheControl = getCacheControl(route.pathname)
+diff --git a/packages/next/src/build/templates/app-page-runtime.ts b/packages/next/src/build/templates/app-page-runtime.ts
+index 0a94132..da491c1 100644
+--- a/packages/next/src/build/templates/app-page-runtime.ts
++++ b/packages/next/src/build/templates/app-page-runtime.ts
+@@ -78,6 +78,7 @@ import type { CacheControl } from '../../server/lib/cache-control'
+ import { ENCODED_TAGS } from '../../server/stream-utils/encoded-tags' with { 'turbopack-transition': 'next-server-utility' }
+ import { sendRenderResult } from '../../server/send-payload' with { 'turbopack-transition': 'next-server-utility' }
+ import { NoFallbackError } from '../../shared/lib/no-fallback-error.external' with { 'turbopack-transition': 'next-server-utility' }
++import { isRouteCacheOwner } from '../../server/lib/route-cache-key' with { 'turbopack-transition': 'next-server-utility' }
+ import { parseMaxPostponedStateSize } from '../../shared/lib/size-limit' with { 'turbopack-transition': 'next-server-utility' }
+ import {
+   getMaxPostponedStateSize,
+@@ -277,7 +278,18 @@ export function createAppPageEntrypoint({
+         : routeModule.match(resolvedPathname, prerenderManifest)
+     const prerenderInfo = prerenderMatch?.route ?? null
+ 
+-    const isPrerendered = !!prerenderManifest.routes[resolvedPathname]
++    // A sibling's prerender must not change this route's rendering mode or
++    // supply prefetch metadata for its response.
++    const prerenderedRoute =
++      routeModule.isDev ||
++      isRouteCacheOwner(
++        resolvedPathname,
++        routeModule.cacheOwner,
++        prerenderManifest.routes[resolvedPathname]
++      )
++        ? prerenderManifest.routes[resolvedPathname]
++        : undefined
++    const isPrerendered = Boolean(prerenderedRoute)
+ 
+     const userAgent = req.headers['user-agent'] || ''
+     const botType = getBotType(userAgent)
+@@ -493,8 +505,7 @@ export function createAppPageEntrypoint({
+     // If PPR is enabled, and this is a RSC request (but not a prefetch), then
+     // we can use this fact to only generate the flight data for the request
+     // because we can't cache the HTML (as it's also dynamic).
+-    const staticPrefetchDataRoute =
+-      prerenderManifest.routes[resolvedPathname]?.prefetchDataRoute
++    const staticPrefetchDataRoute = prerenderedRoute?.prefetchDataRoute
+ 
+     let isDynamicRSCRequest =
+       isRoutePPREnabled &&
+@@ -1384,6 +1395,7 @@ export function createAppPageEntrypoint({
+               resolvedPathname,
+               {
+                 kind: IncrementalCacheKind.APP_PAGE,
++                route: routeModule.cacheOwner,
+                 isRoutePPREnabled: true,
+                 isFallback: false,
+               }
+diff --git a/packages/next/src/build/templates/app-route.ts b/packages/next/src/build/templates/app-route.ts
+index ecf0f58..f1ded8d 100644
+--- a/packages/next/src/build/templates/app-route.ts
++++ b/packages/next/src/build/templates/app-route.ts
+@@ -35,6 +35,7 @@ import {
+ import { getCacheControlHeader } from '../../server/lib/cache-control'
+ import { INFINITE_CACHE, NEXT_CACHE_TAGS_HEADER } from '../../lib/constants'
+ import { NoFallbackError } from '../../shared/lib/no-fallback-error.external'
++import { isRouteCacheOwner } from '../../server/lib/route-cache-key'
+ import {
+   CachedRouteKind,
+   type ResponseCacheEntry,
+@@ -160,9 +161,18 @@ export async function handler(
+ 
+   const normalizedSrcPage = normalizeAppPath(srcPage)
+ 
++  // Only this route's prerenders can establish ISR or admit generated params.
++  const isPrerendered =
++    Boolean(prerenderManifest.routes[resolvedPathname]) &&
++    (routeModule.isDev ||
++      isRouteCacheOwner(
++        resolvedPathname,
++        routeModule.cacheOwner,
++        prerenderManifest.routes[resolvedPathname]
++      ))
++
+   let isIsr = Boolean(
+-    prerenderManifest.dynamicRoutes[normalizedSrcPage] ||
+-      prerenderManifest.routes[resolvedPathname]
++    prerenderManifest.dynamicRoutes[normalizedSrcPage] || isPrerendered
+   )
+ 
+   const render404 = async () => {
+@@ -176,7 +186,6 @@ export async function handler(
+   }
+ 
+   if (isIsr && !isDraftMode) {
+-    const isPrerendered = Boolean(prerenderManifest.routes[resolvedPathname])
+     const prerenderInfo = prerenderManifest.dynamicRoutes[normalizedSrcPage]
+ 
+     if (prerenderInfo) {
+diff --git a/packages/next/src/compiled/hash.js/sha256/256.js b/packages/next/src/compiled/hash.js/sha256/256.js
+new file mode 100644
+index 0000000..cfaf295
+--- /dev/null
++++ b/packages/next/src/compiled/hash.js/sha256/256.js
+@@ -0,0 +1 @@
++(()=>{var t={226:(t,r,e)=>{"use strict";var n=e(302);var i=e(551);function BlockHash(){this.pending=null;this.pendingTotal=0;this.blockSize=this.constructor.blockSize;this.outSize=this.constructor.outSize;this.hmacStrength=this.constructor.hmacStrength;this.padLength=this.constructor.padLength/8;this.endian="big";this._delta8=this.blockSize/8;this._delta32=this.blockSize/32}r.BlockHash=BlockHash;BlockHash.prototype.update=function update(t,r){t=n.toArray(t,r);if(!this.pending)this.pending=t;else this.pending=this.pending.concat(t);this.pendingTotal+=t.length;if(this.pending.length>=this._delta8){t=this.pending;var e=t.length%this._delta8;this.pending=t.slice(t.length-e,t.length);if(this.pending.length===0)this.pending=null;t=n.join32(t,0,t.length-e,this.endian);for(var i=0;i<t.length;i+=this._delta32)this._update(t,i,i+this._delta32)}return this};BlockHash.prototype.digest=function digest(t){this.update(this._pad());i(this.pending===null);return this._digest(t)};BlockHash.prototype._pad=function pad(){var t=this.pendingTotal;var r=this._delta8;var e=r-(t+this.padLength)%r;var n=new Array(e+this.padLength);n[0]=128;for(var i=1;i<e;i++)n[i]=0;t<<=3;if(this.endian==="big"){for(var s=8;s<this.padLength;s++)n[i++]=0;n[i++]=0;n[i++]=0;n[i++]=0;n[i++]=0;n[i++]=t>>>24&255;n[i++]=t>>>16&255;n[i++]=t>>>8&255;n[i++]=t&255}else{n[i++]=t&255;n[i++]=t>>>8&255;n[i++]=t>>>16&255;n[i++]=t>>>24&255;n[i++]=0;n[i++]=0;n[i++]=0;n[i++]=0;for(s=8;s<this.padLength;s++)n[i++]=0}return n}},563:(t,r,e)=>{"use strict";var n=e(302);var i=e(226);var s=e(101);var o=e(551);var h=n.sum32;var u=n.sum32_4;var a=n.sum32_5;var l=s.ch32;var f=s.maj32;var _=s.s0_256;var c=s.s1_256;var v=s.g0_256;var p=s.g1_256;var g=i.BlockHash;var d=[1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298];function SHA256(){if(!(this instanceof SHA256))return new SHA256;g.call(this);this.h=[1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225];this.k=d;this.W=new Array(64)}n.inherits(SHA256,g);t.exports=SHA256;SHA256.blockSize=512;SHA256.outSize=256;SHA256.hmacStrength=192;SHA256.padLength=64;SHA256.prototype._update=function _update(t,r){var e=this.W;for(var n=0;n<16;n++)e[n]=t[r+n];for(;n<e.length;n++)e[n]=u(p(e[n-2]),e[n-7],v(e[n-15]),e[n-16]);var i=this.h[0];var s=this.h[1];var g=this.h[2];var d=this.h[3];var m=this.h[4];var A=this.h[5];var y=this.h[6];var S=this.h[7];o(this.k.length===e.length);for(n=0;n<e.length;n++){var H=a(S,c(m),l(m,A,y),this.k[n],e[n]);var b=h(_(i),f(i,s,g));S=y;y=A;A=m;m=h(d,H);d=g;g=s;s=i;i=h(H,b)}this.h[0]=h(this.h[0],i);this.h[1]=h(this.h[1],s);this.h[2]=h(this.h[2],g);this.h[3]=h(this.h[3],d);this.h[4]=h(this.h[4],m);this.h[5]=h(this.h[5],A);this.h[6]=h(this.h[6],y);this.h[7]=h(this.h[7],S)};SHA256.prototype._digest=function digest(t){if(t==="hex")return n.toHex32(this.h,"big");else return n.split32(this.h,"big")}},101:(t,r,e)=>{"use strict";var n=e(302);var i=n.rotr32;function ft_1(t,r,e,n){if(t===0)return ch32(r,e,n);if(t===1||t===3)return p32(r,e,n);if(t===2)return maj32(r,e,n)}r.ft_1=ft_1;function ch32(t,r,e){return t&r^~t&e}r.ch32=ch32;function maj32(t,r,e){return t&r^t&e^r&e}r.maj32=maj32;function p32(t,r,e){return t^r^e}r.p32=p32;function s0_256(t){return i(t,2)^i(t,13)^i(t,22)}r.s0_256=s0_256;function s1_256(t){return i(t,6)^i(t,11)^i(t,25)}r.s1_256=s1_256;function g0_256(t){return i(t,7)^i(t,18)^t>>>3}r.g0_256=g0_256;function g1_256(t){return i(t,17)^i(t,19)^t>>>10}r.g1_256=g1_256},302:(t,r,e)=>{"use strict";var n=e(551);var i=e(638);r.inherits=i;function isSurrogatePair(t,r){if((t.charCodeAt(r)&64512)!==55296){return false}if(r<0||r+1>=t.length){return false}return(t.charCodeAt(r+1)&64512)===56320}function toArray(t,r){if(Array.isArray(t))return t.slice();if(!t)return[];var e=[];if(typeof t==="string"){if(!r){var n=0;for(var i=0;i<t.length;i++){var s=t.charCodeAt(i);if(s<128){e[n++]=s}else if(s<2048){e[n++]=s>>6|192;e[n++]=s&63|128}else if(isSurrogatePair(t,i)){s=65536+((s&1023)<<10)+(t.charCodeAt(++i)&1023);e[n++]=s>>18|240;e[n++]=s>>12&63|128;e[n++]=s>>6&63|128;e[n++]=s&63|128}else{e[n++]=s>>12|224;e[n++]=s>>6&63|128;e[n++]=s&63|128}}}else if(r==="hex"){t=t.replace(/[^a-z0-9]+/gi,"");if(t.length%2!==0)t="0"+t;for(i=0;i<t.length;i+=2)e.push(parseInt(t[i]+t[i+1],16))}}else{for(i=0;i<t.length;i++)e[i]=t[i]|0}return e}r.toArray=toArray;function toHex(t){var r="";for(var e=0;e<t.length;e++)r+=zero2(t[e].toString(16));return r}r.toHex=toHex;function htonl(t){var r=t>>>24|t>>>8&65280|t<<8&16711680|(t&255)<<24;return r>>>0}r.htonl=htonl;function toHex32(t,r){var e="";for(var n=0;n<t.length;n++){var i=t[n];if(r==="little")i=htonl(i);e+=zero8(i.toString(16))}return e}r.toHex32=toHex32;function zero2(t){if(t.length===1)return"0"+t;else return t}r.zero2=zero2;function zero8(t){if(t.length===7)return"0"+t;else if(t.length===6)return"00"+t;else if(t.length===5)return"000"+t;else if(t.length===4)return"0000"+t;else if(t.length===3)return"00000"+t;else if(t.length===2)return"000000"+t;else if(t.length===1)return"0000000"+t;else return t}r.zero8=zero8;function join32(t,r,e,i){var s=e-r;n(s%4===0);var o=new Array(s/4);for(var h=0,u=r;h<o.length;h++,u+=4){var a;if(i==="big")a=t[u]<<24|t[u+1]<<16|t[u+2]<<8|t[u+3];else a=t[u+3]<<24|t[u+2]<<16|t[u+1]<<8|t[u];o[h]=a>>>0}return o}r.join32=join32;function split32(t,r){var e=new Array(t.length*4);for(var n=0,i=0;n<t.length;n++,i+=4){var s=t[n];if(r==="big"){e[i]=s>>>24;e[i+1]=s>>>16&255;e[i+2]=s>>>8&255;e[i+3]=s&255}else{e[i+3]=s>>>24;e[i+2]=s>>>16&255;e[i+1]=s>>>8&255;e[i]=s&255}}return e}r.split32=split32;function rotr32(t,r){return t>>>r|t<<32-r}r.rotr32=rotr32;function rotl32(t,r){return t<<r|t>>>32-r}r.rotl32=rotl32;function sum32(t,r){return t+r>>>0}r.sum32=sum32;function sum32_3(t,r,e){return t+r+e>>>0}r.sum32_3=sum32_3;function sum32_4(t,r,e,n){return t+r+e+n>>>0}r.sum32_4=sum32_4;function sum32_5(t,r,e,n,i){return t+r+e+n+i>>>0}r.sum32_5=sum32_5;function sum64(t,r,e,n){var i=t[r];var s=t[r+1];var o=n+s>>>0;var h=(o<n?1:0)+e+i;t[r]=h>>>0;t[r+1]=o}r.sum64=sum64;function sum64_hi(t,r,e,n){var i=r+n>>>0;var s=(i<r?1:0)+t+e;return s>>>0}r.sum64_hi=sum64_hi;function sum64_lo(t,r,e,n){var i=r+n;return i>>>0}r.sum64_lo=sum64_lo;function sum64_4_hi(t,r,e,n,i,s,o,h){var u=0;var a=r;a=a+n>>>0;u+=a<r?1:0;a=a+s>>>0;u+=a<s?1:0;a=a+h>>>0;u+=a<h?1:0;var l=t+e+i+o+u;return l>>>0}r.sum64_4_hi=sum64_4_hi;function sum64_4_lo(t,r,e,n,i,s,o,h){var u=r+n+s+h;return u>>>0}r.sum64_4_lo=sum64_4_lo;function sum64_5_hi(t,r,e,n,i,s,o,h,u,a){var l=0;var f=r;f=f+n>>>0;l+=f<r?1:0;f=f+s>>>0;l+=f<s?1:0;f=f+h>>>0;l+=f<h?1:0;f=f+a>>>0;l+=f<a?1:0;var _=t+e+i+o+u+l;return _>>>0}r.sum64_5_hi=sum64_5_hi;function sum64_5_lo(t,r,e,n,i,s,o,h,u,a){var l=r+n+s+h+a;return l>>>0}r.sum64_5_lo=sum64_5_lo;function rotr64_hi(t,r,e){var n=r<<32-e|t>>>e;return n>>>0}r.rotr64_hi=rotr64_hi;function rotr64_lo(t,r,e){var n=t<<32-e|r>>>e;return n>>>0}r.rotr64_lo=rotr64_lo;function shr64_hi(t,r,e){return t>>>e}r.shr64_hi=shr64_hi;function shr64_lo(t,r,e){var n=t<<32-e|r>>>e;return n>>>0}r.shr64_lo=shr64_lo},638:t=>{if(typeof Object.create==="function"){t.exports=function inherits(t,r){if(r){t.super_=r;t.prototype=Object.create(r.prototype,{constructor:{value:t,enumerable:false,writable:true,configurable:true}})}}}else{t.exports=function inherits(t,r){if(r){t.super_=r;var TempCtor=function(){};TempCtor.prototype=r.prototype;t.prototype=new TempCtor;t.prototype.constructor=t}}}},551:t=>{t.exports=assert;function assert(t,r){if(!t)throw new Error(r||"Assertion failed")}assert.equal=function assertEqual(t,r,e){if(t!=r)throw new Error(e||"Assertion failed: "+t+" != "+r)}}};var r={};function __nccwpck_require__(e){var n=r[e];if(n!==undefined){return n.exports}var i=r[e]={exports:{}};var s=true;try{t[e](i,i.exports,__nccwpck_require__);s=false}finally{if(s)delete r[e]}return i.exports}if(typeof __nccwpck_require__!=="undefined")__nccwpck_require__.ab=__dirname+"/";var e=__nccwpck_require__(563);module.exports=e})();
+\ No newline at end of file
+diff --git a/packages/next/src/compiled/hash.js/sha256/LICENSE b/packages/next/src/compiled/hash.js/sha256/LICENSE
+new file mode 100644
+index 0000000..46a47c9
+--- /dev/null
++++ b/packages/next/src/compiled/hash.js/sha256/LICENSE
+@@ -0,0 +1,22 @@
++This software is licensed under the MIT License.
++
++Copyright Fedor Indutny, 2014.
++
++Permission is hereby granted, free of charge, to any person obtaining a
++copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to permit
++persons to whom the Software is furnished to do so, subject to the
++following conditions:
++
++The above copyright notice and this permission notice shall be included
++in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
++NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
++DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++USE OR OTHER DEALINGS IN THE SOFTWARE.
+diff --git a/packages/next/src/compiled/hash.js/sha256/package.json b/packages/next/src/compiled/hash.js/sha256/package.json
+new file mode 100644
+index 0000000..4e6903f
+--- /dev/null
++++ b/packages/next/src/compiled/hash.js/sha256/package.json
+@@ -0,0 +1 @@
++{"name":"hash.js","main":"256.js","author":"Fedor Indutny <fedor@indutny.com>","license":"MIT"}
+diff --git a/packages/next/src/export/routes/app-page.ts b/packages/next/src/export/routes/app-page.ts
+index 51dd184..a85a134 100644
+--- a/packages/next/src/export/routes/app-page.ts
++++ b/packages/next/src/export/routes/app-page.ts
+@@ -2,7 +2,7 @@ import type { OutgoingHttpHeaders } from 'node:http'
+ import type { ExportRouteResult } from '../types'
+ import type { RenderOpts } from '../../server/app-render/types'
+ import type { NextParsedUrlQuery } from '../../server/request-meta'
+-import type { RouteMetadata } from './types'
++import type { RouteCacheMetadata, RouteMetadata } from './types'
+ 
+ import type {
+   MockedRequest,
+@@ -50,7 +50,8 @@ export async function exportAppPage(
+   debugOutput: boolean,
+   isDynamicError: boolean,
+   fileWriter: MultiFileWriter,
+-  sharedContext: AppSharedContext
++  sharedContext: AppSharedContext,
++  routeCache?: RouteCacheMetadata
+ ): Promise<ExportRouteResult> {
+   const afterRunner = new AfterRunner()
+ 
+@@ -221,6 +222,7 @@ export async function exportAppPage(
+       postponed,
+       segmentPaths,
+       prefetchHints,
++      routeCache,
+     }
+ 
+     fileWriter.append(
+diff --git a/packages/next/src/export/routes/app-route.ts b/packages/next/src/export/routes/app-route.ts
+index 49c884b..4f0e0b3 100644
+--- a/packages/next/src/export/routes/app-route.ts
++++ b/packages/next/src/export/routes/app-route.ts
+@@ -1,4 +1,5 @@
+ import type { ExportRouteResult } from '../types'
++import type { RouteCacheMetadata } from './types'
+ import type AppRouteRouteModule from '../../server/route-modules/app-route/module'
+ import type { AppRouteRouteHandlerContext } from '../../server/route-modules/app-route/module'
+ import type { IncrementalCache } from '../../server/lib/incremental-cache'
+@@ -49,7 +50,8 @@ export async function exportAppRoute(
+     Pick<ExperimentalConfig, 'authInterrupts' | 'useCacheTimeout'>
+   >,
+   buildId: string,
+-  deploymentId: string
++  deploymentId: string,
++  routeCache?: RouteCacheMetadata
+ ): Promise<ExportRouteResult> {
+   // Ensure that the URL is absolute.
+   req.url = `http://localhost:3000${req.url}`
+@@ -156,7 +158,7 @@ export async function exportAppRoute(
+     fileWriter.append(htmlFilepath.replace(/\.html$/, NEXT_BODY_SUFFIX), body)
+ 
+     // Write the request metadata to a file.
+-    const meta = { status: response.status, headers }
++    const meta = { status: response.status, headers, routeCache }
+     fileWriter.append(
+       htmlFilepath.replace(/\.html$/, NEXT_META_SUFFIX),
+       JSON.stringify(meta)
+diff --git a/packages/next/src/export/routes/pages.ts b/packages/next/src/export/routes/pages.ts
+index 34e8ff4..826b615 100644
+--- a/packages/next/src/export/routes/pages.ts
++++ b/packages/next/src/export/routes/pages.ts
+@@ -1,4 +1,5 @@
+ import type { ExportRouteResult } from '../types'
++import type { RouteCacheMetadata } from './types'
+ import type {
+   PagesRenderContext,
+   PagesSharedContext,
+@@ -43,7 +44,8 @@ export async function exportPagesPage(
+   hasOrigQueryValues: boolean,
+   renderOpts: RenderOpts,
+   components: LoadComponentsReturnType,
+-  fileWriter: MultiFileWriter
++  fileWriter: MultiFileWriter,
++  routeCache?: RouteCacheMetadata
+ ): Promise<ExportRouteResult | undefined> {
+   if (components.getServerSideProps) {
+     throw new Error(`Error for page ${page}: ${SERVER_PROPS_EXPORT_ERROR}`)
+@@ -125,6 +127,12 @@ export async function exportPagesPage(
+   if (!ssgNotFound) {
+     // don't attempt writing to disk if getStaticProps returned not found
+     fileWriter.append(htmlFilepath, html)
++    if (routeCache) {
++      fileWriter.append(
++        htmlFilepath.replace(/\.html$/, '.meta'),
++        JSON.stringify({ routeCache })
++      )
++    }
+   }
+ 
+   return {
+diff --git a/packages/next/src/export/routes/types.ts b/packages/next/src/export/routes/types.ts
+index f54e9f2..9bf21a0 100644
+--- a/packages/next/src/export/routes/types.ts
++++ b/packages/next/src/export/routes/types.ts
+@@ -1,5 +1,12 @@
+ import type { OutgoingHttpHeaders } from 'node:http'
+ import type { PrefetchHints } from '../../shared/lib/app-router-types'
++import type { ResponseCacheOwner } from '../../server/lib/route-cache-key'
++
++export type RouteCacheMetadata = {
++  key: string
++  owner: ResponseCacheOwner
++  isFallback: boolean
++}
+ 
+ export type RouteMetadata = {
+   status: number | undefined
+@@ -7,4 +14,8 @@ export type RouteMetadata = {
+   postponed: string | undefined
+   segmentPaths: Array<string> | undefined
+   prefetchHints: PrefetchHints | undefined
++  /** Identifies the response-cache entry represented by this build artifact. */
++  routeCache?: RouteCacheMetadata
++  /** Original payload mtime retained when a build seed is promoted. */
++  routeCacheLastModified?: number
+ }
+diff --git a/packages/next/src/export/types.ts b/packages/next/src/export/types.ts
+index d077562..3e0b5ca 100644
+--- a/packages/next/src/export/types.ts
++++ b/packages/next/src/export/types.ts
+@@ -60,6 +60,8 @@ export interface ExportPageInput {
+   httpAgentOptions: NextConfigComplete['httpAgentOptions']
+   debugOutput?: boolean
+   nextConfigOutput?: NextConfigComplete['output']
++  /** Write build-time response artifacts to their route-scoped cache keys. */
++  useScopedBuildArtifacts: boolean
+   enableExperimentalReact?: boolean
+   sriEnabled: boolean
+   renderResumeDataCache: RenderResumeDataCache | undefined
+diff --git a/packages/next/src/export/worker.ts b/packages/next/src/export/worker.ts
+index a222494..7394359 100644
+--- a/packages/next/src/export/worker.ts
++++ b/packages/next/src/export/worker.ts
+@@ -1,3 +1,5 @@
++import { getRouteCacheKey } from '../server/lib/route-cache-key'
++import type { RouteCacheMetadata } from './routes/types'
+ import type {
+   ExportPagesInput,
+   ExportPageInput,
+@@ -90,6 +92,7 @@ async function exportPageImpl(
+     deploymentId,
+     clientAssetToken,
+     renderResumeDataCache,
++    useScopedBuildArtifacts,
+   } = input
+ 
+   if (enableExperimentalReact) {
+@@ -230,11 +233,6 @@ async function exportPageImpl(
+     htmlFilename = 'index.html'
+   }
+ 
+-  const baseDir = join(outDir, dirname(htmlFilename))
+-  let htmlFilepath = join(outDir, htmlFilename)
+-
+-  await fs.mkdir(baseDir, { recursive: true })
+-
+   const components = await loadComponents({
+     distDir,
+     page,
+@@ -244,6 +242,31 @@ async function exportPageImpl(
+     needsManifestsForLegacyReasons: true,
+   })
+ 
++  const routeCache: RouteCacheMetadata | undefined =
++    buildExport &&
++    commonRenderOpts.nextConfigOutput !== 'export' &&
++    (isAppDir || components.getStaticProps)
++      ? {
++          key: getRouteCacheKey(path, components.routeModule.cacheOwner),
++          owner: components.routeModule.cacheOwner,
++          isFallback: isAppDir
++            ? fallbackRouteParams != null && fallbackRouteParams.size > 0
++            : (exportPath._pagesFallback ?? false),
++        }
++      : undefined
++  const htmlFilepath =
++    useScopedBuildArtifacts && routeCache
++      ? join(distDir, 'server', `${routeCache.key}.html`)
++      : join(outDir, htmlFilename)
++  const routePagesDataDir =
++    useScopedBuildArtifacts && routeCache
++      ? join(distDir, 'server')
++      : pagesDataDir
++  if (useScopedBuildArtifacts && routeCache) {
++    htmlFilename = `${routeCache.key}.html`
++  }
++  await fs.mkdir(dirname(htmlFilepath), { recursive: true })
++
+   // Handle App Routes.
+   if (isAppDir && isAppRouteRoute(page)) {
+     return exportAppRoute(
+@@ -260,7 +283,8 @@ async function exportPageImpl(
+       commonRenderOpts.staticPageGenerationTimeout,
+       commonRenderOpts.experimental,
+       buildId,
+-      deploymentId
++      deploymentId,
++      routeCache
+     )
+   }
+ 
+@@ -308,7 +332,8 @@ async function exportPageImpl(
+       debugOutput,
+       isDynamicError,
+       fileWriter,
+-      sharedContext
++      sharedContext,
++      routeCache
+     )
+   } else {
+     const sharedContext: PagesSharedContext = {
+@@ -333,7 +358,7 @@ async function exportPageImpl(
+       params,
+       htmlFilepath,
+       htmlFilename,
+-      pagesDataDir,
++      routePagesDataDir,
+       buildExport,
+       isDynamic,
+       sharedContext,
+@@ -341,7 +366,8 @@ async function exportPageImpl(
+       hasOrigQueryValues,
+       renderOpts as WorkerRenderOpts<PagesModule>,
+       components,
+-      fileWriter
++      fileWriter,
++      routeCache
+     )
+   }
+ }
+@@ -444,6 +470,10 @@ export async function exportPages(
+             deploymentId: input.deploymentId,
+             clientAssetToken: input.clientAssetToken,
+             renderResumeDataCache,
++            useScopedBuildArtifacts:
++              Boolean(nextConfig.adapterPath) &&
++              nextConfig.output !== 'export' &&
++              options.buildExport,
+           }),
+           hasDebuggerAttached
+             ? // With a debugger attached, exporting can take infinitely if we paused script execution.
+diff --git a/packages/next/src/lib/multi-file-writer.ts b/packages/next/src/lib/multi-file-writer.ts
+index 2c0553d..a1959ec 100644
+--- a/packages/next/src/lib/multi-file-writer.ts
++++ b/packages/next/src/lib/multi-file-writer.ts
+@@ -21,21 +21,6 @@ type Task = [
+    */
+   writeFile: Promise<unknown>[],
+ ]
+-const ROUTE_CACHE_SEGMENT = '/route-cache/'
+-
+-/**
+- * Map a namespaced response file back to the location older tooling reads.
+- */
+-function legacyResponsePath(filePath: string): string | undefined {
+-  const marker = filePath.indexOf(ROUTE_CACHE_SEGMENT)
+-  if (marker === -1) return undefined
+-  const parts = filePath
+-    .slice(marker + ROUTE_CACHE_SEGMENT.length)
+-    .split('/')
+-  if (parts.length < 4 || parts[3] !== '$') return undefined
+-  return `${filePath.slice(0, marker)}/${parts.slice(4).join('/')}`
+-}
+-
+ /**
+  * MultiFileWriter is a utility for writing multiple files in parallel that
+  * guarantees that all files will be written after their containing directory
+@@ -92,18 +77,6 @@ export class MultiFileWriter {
+    * @param data - The data to write to the file.
+    */
+   public append(filePath: string, data: Buffer | string): void {
+-    this.appendFile(filePath, data)
+-
+-    // Keep a copy at the historical location so external tooling that reads the
+-    // previous layout keeps finding the response payloads. Metadata stays in
+-    // the namespaced directory.
+-    if (!filePath.endsWith('.meta')) {
+-      const legacy = legacyResponsePath(filePath)
+-      if (legacy) this.appendFile(legacy, data)
+-    }
+-  }
+-
+-  private appendFile(filePath: string, data: Buffer | string): void {
+     // Find or create a task for the directory that contains the file.
+     const task = this.findOrCreateTask(path.dirname(filePath))
+ 
+diff --git a/packages/next/src/server/base-server.ts b/packages/next/src/server/base-server.ts
+index 9894503..6c4381a 100644
+--- a/packages/next/src/server/base-server.ts
++++ b/packages/next/src/server/base-server.ts
+@@ -76,7 +76,10 @@ import {
+   setRequestMeta,
+ } from './request-meta'
+ import { removePathPrefix } from '../shared/lib/router/utils/remove-path-prefix'
+-import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
++import {
++  normalizeAppPath,
++  selectAppPageEntry,
++} from '../shared/lib/router/utils/app-paths'
+ import { getHostname } from '../shared/lib/get-hostname'
+ import {
+   parseUrl,
+@@ -2648,8 +2651,7 @@ export default abstract class Server<
+ 
+     let page = pathname
+     if (isAppPath) {
+-      // the last item in the array is the root page, if there are parallel routes
+-      page = appPaths[appPaths.length - 1]
++      page = selectAppPageEntry(pathname, appPaths)
+     }
+ 
+     const result = await this.findPageComponents({
+diff --git a/packages/next/src/server/image-optimizer.ts b/packages/next/src/server/image-optimizer.ts
+index 5103e11..c5deb23 100644
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -706,6 +706,7 @@ export class ImageOptimizerCache {
+           revalidate: effectiveRevalidate,
+         }
+         await this.cacheHandler.set(cacheKey, valueWithRevalidate, {
++          kind: IncrementalCacheKind.IMAGE,
+           cacheControl: {
+             revalidate: effectiveRevalidate,
+             expire: cacheControl?.expire,
+diff --git a/packages/next/src/server/lib/incremental-cache/file-system-cache.ts b/packages/next/src/server/lib/incremental-cache/file-system-cache.ts
+index 67e2fe1..7aa99f8 100644
+--- a/packages/next/src/server/lib/incremental-cache/file-system-cache.ts
++++ b/packages/next/src/server/lib/incremental-cache/file-system-cache.ts
+@@ -1,3 +1,4 @@
++import { getRouteCacheKey, ROUTE_CACHE_DIRECTORY } from '../route-cache-key'
+ import type { RouteMetadata } from '../../../export/routes/types'
+ import type { CacheHandler, CacheHandlerContext, CacheHandlerValue } from '.'
+ import type { CacheFs } from '../../../shared/lib/utils'
+@@ -7,8 +8,9 @@ import {
+   IncrementalCacheKind,
+   type CachedFetchValue,
+   type IncrementalCacheValue,
++  type GetIncrementalResponseCacheHandlerContext,
+   type SetIncrementalFetchCacheContext,
+-  type SetIncrementalResponseCacheContext,
++  type SetIncrementalResponseCacheHandlerContext,
+ } from '../../response-cache'
+ 
+ import type { LRUCache } from '../lru-cache'
+@@ -40,6 +42,10 @@ export default class FileSystemCache implements CacheHandler {
+   private revalidatedTags: string[]
+   private static debug: boolean = !!process.env.NEXT_PRIVATE_DEBUG_CACHE
+   private static memoryCache: LRUCache<CacheHandlerValue> | undefined
++  private static readonly seedReads = new Map<
++    string,
++    { readers: number; version: number; promotion?: Promise<void> }
++  >()
+ 
+   constructor(ctx: FileSystemCacheContext) {
+     this.fs = ctx.fs
+@@ -64,6 +70,31 @@ export default class FileSystemCache implements CacheHandler {
+ 
+   public resetRequestCache(): void {}
+ 
++  private getSeedReadState(key: string) {
++    return FileSystemCache.seedReads.get(`${this.serverDistDir}:${key}`)
++  }
++
++  private beginSeedRead(key: string) {
++    const stateKey = `${this.serverDistDir}:${key}`
++    let state = FileSystemCache.seedReads.get(stateKey)
++    if (!state) {
++      state = { readers: 0, version: 0 }
++      FileSystemCache.seedReads.set(stateKey, state)
++    }
++    state.readers++
++    return { stateKey, state, version: state.version }
++  }
++
++  private finishSeedRead(
++    stateKey: string,
++    state: { readers: number; version: number; promotion?: Promise<void> }
++  ) {
++    state.readers--
++    if (state.readers === 0 && !state.promotion) {
++      FileSystemCache.seedReads.delete(stateKey)
++    }
++  }
++
+   public async revalidateTag(
+     tags: string | string[],
+     durations?: { expire?: number }
+@@ -105,9 +136,17 @@ export default class FileSystemCache implements CacheHandler {
+   public async get(...args: Parameters<CacheHandler['get']>) {
+     const [key, ctx] = args
+     const { kind } = ctx
++    let readKey = key
++    let seedRead: ReturnType<FileSystemCache['beginSeedRead']> | undefined
+ 
+     let data = FileSystemCache.memoryCache?.get(key)
+ 
++    const activePromotion = this.getSeedReadState(key)?.promotion
++    if (!data && activePromotion) {
++      await activePromotion
++      data = FileSystemCache.memoryCache?.get(key)
++    }
++
+     if (FileSystemCache.debug) {
+       if (kind === IncrementalCacheKind.FETCH) {
+         console.log('FileSystemCache: get', key, ctx.tags, kind, !!data)
+@@ -116,12 +155,63 @@ export default class FileSystemCache implements CacheHandler {
+       }
+     }
+ 
+-    // let's check the disk for seed data
++    const isResponse =
++      kind === IncrementalCacheKind.PAGES ||
++      kind === IncrementalCacheKind.APP_PAGE ||
++      kind === IncrementalCacheKind.APP_ROUTE
++
++    if (
++      !data &&
++      isResponse &&
++      key.startsWith(`/${ROUTE_CACHE_DIRECTORY}/`) &&
++      process.env.NEXT_RUNTIME !== 'edge'
++    ) {
++      const primaryPath = this.getFilePath(
++        kind === IncrementalCacheKind.APP_ROUTE ? `${key}.body` : `${key}.html`,
++        kind
++      )
++      if (!this.fs.existsSync(primaryPath)) {
++        const marker = key.indexOf('/$/')
++        if (marker !== -1) {
++          const legacyKey = key.slice(marker + 2)
++          const legacyMetaPath = this.getFilePath(
++            `${legacyKey}${NEXT_META_SUFFIX}`,
++            kind
++          )
++          try {
++            const meta = JSON.parse(
++              this.fs.readFileSync(legacyMetaPath, 'utf8')
++            ) as RouteMetadata
++            const namespaceEnd = key.indexOf('/$/')
++            const ownerKey = meta.routeCache
++              ? getRouteCacheKey('/', meta.routeCache.owner)
++              : undefined
++            if (
++              meta.routeCache?.key === key &&
++              (meta.routeCache.isFallback === Boolean(ctx.isFallback) ||
++                // PPR also reads fallback shells through ordinary response and
++                // navigation resume-data lookups, which set isFallback: false.
++                (kind === IncrementalCacheKind.APP_PAGE &&
++                  ctx.isRoutePPREnabled &&
++                  meta.postponed != null)) &&
++              ownerKey?.slice(0, ownerKey.indexOf('/$/')) ===
++                key.slice(0, namespaceEnd)
++            ) {
++              readKey = legacyKey
++              seedRead = this.beginSeedRead(key)
++            }
++          } catch {}
++        }
++      }
++    }
++
++    // Check the scoped disk entry first, or a verified immutable build seed
++    // only when its scoped primary payload is genuinely absent.
+     if (!data && process.env.NEXT_RUNTIME !== 'edge') {
+       try {
+         if (kind === IncrementalCacheKind.APP_ROUTE) {
+           const filePath = this.getFilePath(
+-            `${key}.body`,
++            `${readKey}.body`,
+             IncrementalCacheKind.APP_ROUTE
+           )
+           const fileData = await this.fs.readFile(filePath)
+@@ -135,7 +225,7 @@ export default class FileSystemCache implements CacheHandler {
+           )
+ 
+           data = {
+-            lastModified: mtime.getTime(),
++            lastModified: meta.routeCacheLastModified ?? mtime.getTime(),
+             value: {
+               kind: CachedRouteKind.APP_ROUTE,
+               body: fileData,
+@@ -145,7 +235,7 @@ export default class FileSystemCache implements CacheHandler {
+           }
+         } else {
+           const filePath = this.getFilePath(
+-            kind === IncrementalCacheKind.FETCH ? key : `${key}.html`,
++            kind === IncrementalCacheKind.FETCH ? readKey : `${readKey}.html`,
+             kind
+           )
+ 
+@@ -187,17 +277,15 @@ export default class FileSystemCache implements CacheHandler {
+               }
+             }
+           } else if (kind === IncrementalCacheKind.APP_PAGE) {
+-            // We try to load the metadata file, but if it fails, we don't
+-            // error. We also don't load it if this is a fallback.
+-            let meta: RouteMetadata | undefined
+-            try {
+-              meta = JSON.parse(
+-                await this.fs.readFile(
+-                  filePath.replace(/\.html$/, NEXT_META_SUFFIX),
+-                  'utf8'
+-                )
++            // Metadata is required for both normal entries and fallback shells.
++            // Promoted entries publish their primary payload last, so a missing
++            // sidecar means the scoped entry is incomplete.
++            const meta: RouteMetadata = JSON.parse(
++              await this.fs.readFile(
++                filePath.replace(/\.html$/, NEXT_META_SUFFIX),
++                'utf8'
+               )
+-            } catch {}
++            )
+ 
+             let maybeSegmentData: Map<string, Buffer> | undefined
+             if (meta?.segmentPaths) {
+@@ -208,7 +296,7 @@ export default class FileSystemCache implements CacheHandler {
+               // identical regardless.
+               const segmentData: Map<string, Buffer> = new Map()
+               maybeSegmentData = segmentData
+-              const segmentsDir = key + RSC_SEGMENTS_DIR_SUFFIX
++              const segmentsDir = readKey + RSC_SEGMENTS_DIR_SUFFIX
+               await Promise.all(
+                 meta.segmentPaths.map(async (segmentPath: string) => {
+                   const segmentDataFilePath = this.getFilePath(
+@@ -236,14 +324,14 @@ export default class FileSystemCache implements CacheHandler {
+             ) {
+               rscData = await this.fs.readFile(
+                 this.getFilePath(
+-                  `${key}${RSC_SUFFIX}`,
++                  `${readKey}${RSC_SUFFIX}`,
+                   IncrementalCacheKind.APP_PAGE
+                 )
+               )
+             }
+ 
+             data = {
+-              lastModified: mtime.getTime(),
++              lastModified: meta.routeCacheLastModified ?? mtime.getTime(),
+               value: {
+                 kind: CachedRouteKind.APP_PAGE,
+                 html: fileData,
+@@ -255,14 +343,19 @@ export default class FileSystemCache implements CacheHandler {
+               },
+             }
+           } else if (kind === IncrementalCacheKind.PAGES) {
+-            let meta: RouteMetadata | undefined
++            const meta: RouteMetadata = JSON.parse(
++              await this.fs.readFile(
++                filePath.replace(/\.html$/, NEXT_META_SUFFIX),
++                'utf8'
++              )
++            )
+             let pageData: string | object = {}
+ 
+             if (!ctx.isFallback) {
+               pageData = JSON.parse(
+                 await this.fs.readFile(
+                   this.getFilePath(
+-                    `${key}${NEXT_DATA_SUFFIX}`,
++                    `${readKey}${NEXT_DATA_SUFFIX}`,
+                     IncrementalCacheKind.PAGES
+                   ),
+                   'utf8'
+@@ -271,7 +364,7 @@ export default class FileSystemCache implements CacheHandler {
+             }
+ 
+             data = {
+-              lastModified: mtime.getTime(),
++              lastModified: meta.routeCacheLastModified ?? mtime.getTime(),
+               value: {
+                 kind: CachedRouteKind.PAGES,
+                 html: fileData,
+@@ -288,9 +381,14 @@ export default class FileSystemCache implements CacheHandler {
+         }
+ 
+         if (data) {
+-          FileSystemCache.memoryCache?.set(key, data)
++          if (!seedRead) {
++            FileSystemCache.memoryCache?.set(key, data)
++          }
+         }
+       } catch {
++        if (seedRead) {
++          this.finishSeedRead(seedRead.stateKey, seedRead.state)
++        }
+         return null
+       }
+     }
+@@ -315,6 +413,9 @@ export default class FileSystemCache implements CacheHandler {
+             console.log('FileSystemCache: expired tags', cacheTags)
+           }
+ 
++          if (seedRead) {
++            this.finishSeedRead(seedRead.stateKey, seedRead.state)
++          }
+           return null
+         }
+       }
+@@ -343,14 +444,176 @@ export default class FileSystemCache implements CacheHandler {
+       }
+     }
+ 
++    if (seedRead && data) {
++      const { stateKey, state, version } = seedRead
++      try {
++        if (state.version === version) {
++          await this.promoteSeed(
++            key,
++            readKey,
++            data,
++            ctx as GetIncrementalResponseCacheHandlerContext,
++            stateKey,
++            state,
++            version
++          )
++          if (
++            state.version === version &&
++            !FileSystemCache.memoryCache?.get(key)
++          ) {
++            FileSystemCache.memoryCache?.set(key, data)
++          }
++        }
++      } finally {
++        this.finishSeedRead(stateKey, state)
++      }
++    }
++
+     return data ?? null
+   }
+ 
++  private async promoteSeed(
++    key: string,
++    seedKey: string,
++    data: CacheHandlerValue,
++    ctx: GetIncrementalResponseCacheHandlerContext,
++    stateKey: string,
++    state: { readers: number; version: number; promotion?: Promise<void> },
++    version: number
++  ) {
++    const writeFileAtomic = this.fs.writeFileAtomic
++    if (!this.flushToDisk || !writeFileAtomic || !data.value) return
++
++    if (state.promotion) {
++      await state.promotion
++      return
++    }
++
++    const promotion = (async () => {
++      const value = data.value
++      if (
++        !value ||
++        state.version !== version ||
++        (value.kind !== CachedRouteKind.PAGES &&
++          value.kind !== CachedRouteKind.APP_PAGE &&
++          value.kind !== CachedRouteKind.APP_ROUTE)
++      ) {
++        return
++      }
++
++      const kind = ctx.kind
++      const primaryPath = this.getFilePath(
++        value.kind === CachedRouteKind.APP_ROUTE
++          ? `${key}.body`
++          : `${key}.html`,
++        kind
++      )
++      if (this.fs.existsSync(primaryPath)) return
++
++      const seedPrimaryPath = this.getFilePath(
++        value.kind === CachedRouteKind.APP_ROUTE
++          ? `${seedKey}.body`
++          : `${seedKey}.html`,
++        kind
++      )
++      const seedMetaPath = seedPrimaryPath.replace(
++        value.kind === CachedRouteKind.APP_ROUTE ? /\.body$/ : /\.html$/,
++        NEXT_META_SUFFIX
++      )
++      const meta = JSON.parse(
++        await this.fs.readFile(seedMetaPath, 'utf8')
++      ) as RouteMetadata
++      meta.routeCacheLastModified = data.lastModified
++
++      // Copy every ancillary seed file first. The scoped primary payload is
++      // the publication marker and is written only after metadata is complete.
++      const ancillaryFiles: Array<{ path: string; data: Buffer | string }> = []
++      if (value.kind === CachedRouteKind.PAGES && !ctx.isFallback) {
++        ancillaryFiles.push({
++          path: this.getFilePath(`${key}${NEXT_DATA_SUFFIX}`, kind),
++          data: await this.fs.readFile(
++            this.getFilePath(`${seedKey}${NEXT_DATA_SUFFIX}`, kind)
++          ),
++        })
++      } else if (value.kind === CachedRouteKind.APP_PAGE) {
++        if (
++          !ctx.isFallback &&
++          (!ctx.isRoutePPREnabled || meta.postponed == null)
++        ) {
++          ancillaryFiles.push({
++            path: this.getFilePath(`${key}${RSC_SUFFIX}`, kind),
++            data: await this.fs.readFile(
++              this.getFilePath(`${seedKey}${RSC_SUFFIX}`, kind)
++            ),
++          })
++        }
++        ancillaryFiles.push(
++          ...(await Promise.all(
++            (meta.segmentPaths ?? []).map(async (segmentPath) => ({
++              path: this.getFilePath(
++                key +
++                  RSC_SEGMENTS_DIR_SUFFIX +
++                  segmentPath +
++                  RSC_SEGMENT_SUFFIX,
++                kind
++              ),
++              data: await this.fs.readFile(
++                this.getFilePath(
++                  seedKey +
++                    RSC_SEGMENTS_DIR_SUFFIX +
++                    segmentPath +
++                    RSC_SEGMENT_SUFFIX,
++                  kind
++                )
++              ),
++            }))
++          ))
++        )
++      }
++
++      const writer = new MultiFileWriter(this.fs)
++      for (const file of ancillaryFiles) writer.append(file.path, file.data)
++      await writer.wait()
++      if (state.version !== version) return
++
++      const metaPath = primaryPath.replace(
++        value.kind === CachedRouteKind.APP_ROUTE ? /\.body$/ : /\.html$/,
++        NEXT_META_SUFFIX
++      )
++      await this.fs.mkdir(path.dirname(metaPath))
++      await this.fs.writeFile(metaPath, JSON.stringify(meta))
++      if (state.version !== version || this.fs.existsSync(primaryPath)) return
++
++      await writeFileAtomic.call(
++        this.fs,
++        primaryPath,
++        await this.fs.readFile(seedPrimaryPath)
++      )
++    })()
++
++    state.promotion = promotion.catch((error) => {
++      if (FileSystemCache.debug) {
++        console.log('FileSystemCache: failed to promote build seed', error)
++      }
++    })
++    try {
++      await state.promotion
++    } finally {
++      if (state.promotion) state.promotion = undefined
++      if (state.readers === 0) FileSystemCache.seedReads.delete(stateKey)
++    }
++  }
++
+   public async set(
+     key: string,
+     data: IncrementalCacheValue | null,
+-    ctx: SetIncrementalFetchCacheContext | SetIncrementalResponseCacheContext
++    ctx:
++      | SetIncrementalFetchCacheContext
++      | SetIncrementalResponseCacheHandlerContext
+   ) {
++    const seedState = this.getSeedReadState(key)
++    if (seedState) seedState.version++
++
+     FileSystemCache.memoryCache?.set(key, {
+       value: data,
+       lastModified: Date.now(),
+@@ -362,6 +625,8 @@ export default class FileSystemCache implements CacheHandler {
+ 
+     if (!this.flushToDisk || !data) return
+ 
++    await seedState?.promotion
++
+     // Create a new writer that will prepare to write all the files to disk
+     // after their containing directory is created.
+     const writer = new MultiFileWriter(this.fs)
+@@ -436,6 +701,18 @@ export default class FileSystemCache implements CacheHandler {
+           prefetchHints: undefined,
+         }
+ 
++        writer.append(
++          htmlPath.replace(/\.html$/, NEXT_META_SUFFIX),
++          JSON.stringify(meta)
++        )
++      } else {
++        const meta: RouteMetadata = {
++          headers: data.headers,
++          status: data.status,
++          postponed: undefined,
++          segmentPaths: undefined,
++          prefetchHints: undefined,
++        }
+         writer.append(
+           htmlPath.replace(/\.html$/, NEXT_META_SUFFIX),
+           JSON.stringify(meta)
+@@ -476,6 +753,16 @@ export default class FileSystemCache implements CacheHandler {
+         throw new Error(`Unexpected file path kind: ${kind}`)
+     }
+ 
++    // Scoped response artifacts live outside the compiled route and ASO files.
++    if (
++      (kind === IncrementalCacheKind.PAGES ||
++        kind === IncrementalCacheKind.APP_PAGE ||
++        kind === IncrementalCacheKind.APP_ROUTE) &&
++      key.startsWith(`/${ROUTE_CACHE_DIRECTORY}/`)
++    ) {
++      rootDir = path.join(this.serverDistDir, '.')
++    }
++
+     const filePath = path.join(rootDir, key)
+     if (!(filePath.startsWith(rootDir + path.sep) || filePath === rootDir)) {
+       throw new Error(`Invalid file path: ${filePath}`)
+diff --git a/packages/next/src/server/lib/incremental-cache/index.ts b/packages/next/src/server/lib/incremental-cache/index.ts
+index 31f100b..ca23071 100644
+--- a/packages/next/src/server/lib/incremental-cache/index.ts
++++ b/packages/next/src/server/lib/incremental-cache/index.ts
+@@ -1,3 +1,4 @@
++import { getRouteCacheKey, isRouteCacheOwner } from '../route-cache-key'
+ import type { CacheFs } from '../../../shared/lib/utils'
+ import type { PrerenderManifest } from '../../../build'
+ import {
+@@ -10,27 +11,29 @@ import {
+   type IncrementalFetchCacheEntry,
+   type GetIncrementalFetchCacheContext,
+   type GetIncrementalResponseCacheContext,
++  type GetIncrementalResponseCacheHandlerContext,
++  type GetIncrementalImageCacheContext,
+   type CachedFetchValue,
+   type SetIncrementalFetchCacheContext,
+   type SetIncrementalResponseCacheContext,
++  type SetIncrementalResponseCacheHandlerContext,
++  type SetIncrementalImageCacheContext,
+ } from '../../response-cache'
+ import type { DeepReadonly } from '../../../shared/lib/deep-readonly'
+ import FileSystemCache from './file-system-cache'
+-import { normalizePagePath } from '../../../shared/lib/page-path/normalize-page-path'
+ 
+ import {
+   CACHE_ONE_YEAR_SECONDS,
+   NEXT_CACHE_TAGS_HEADER,
+   PRERENDER_REVALIDATE_HEADER,
+ } from '../../../lib/constants'
+-import { toRoute } from '../to-route'
+ import { SharedCacheControls } from './shared-cache-controls.external'
+ import {
+   getResumeDataCache,
+   workUnitAsyncStorage,
+ } from '../../app-render/work-unit-async-storage.external'
+ import { InvariantError } from '../../../shared/lib/invariant-error'
+-import type { Revalidate } from '../cache-control'
++import type { CacheControl, Revalidate } from '../cache-control'
+ import { getPreviouslyRevalidatedTags } from '../../server-utils'
+ import { workAsyncStorage } from '../../app-render/work-async-storage.external'
+ import { DetachedPromise } from '../../../lib/detached-promise'
+@@ -105,7 +108,10 @@ export class CacheHandler {
+ 
+   public async get(
+     _cacheKey: string,
+-    _ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
++    _ctx:
++      | GetIncrementalFetchCacheContext
++      | GetIncrementalResponseCacheHandlerContext
++      | GetIncrementalImageCacheContext
+   ): Promise<CacheHandlerValue | null> {
+     return {} as any
+   }
+@@ -113,7 +119,10 @@ export class CacheHandler {
+   public async set(
+     _cacheKey: string,
+     _data: IncrementalCacheValue | null,
+-    _ctx: SetIncrementalFetchCacheContext | SetIncrementalResponseCacheContext
++    _ctx:
++      | SetIncrementalFetchCacheContext
++      | SetIncrementalResponseCacheHandlerContext
++      | SetIncrementalImageCacheContext
+   ): Promise<void> {}
+ 
+   public async revalidateTag(
+@@ -161,6 +170,7 @@ export class IncrementalCache implements IncrementalCacheType {
+    * prerender manifest until the in-memory cache is updated with new values.
+    */
+   private readonly cacheControls: SharedCacheControls
++  private readonly locales?: readonly string[]
+ 
+   constructor({
+     fs,
+@@ -174,6 +184,7 @@ export class IncrementalCache implements IncrementalCacheType {
+     fetchCacheKeyPrefix,
+     CurCacheHandler,
+     allowedRevalidateHeaderKeys,
++    locales,
+   }: {
+     fs?: CacheFs
+     dev: boolean
+@@ -181,6 +192,7 @@ export class IncrementalCache implements IncrementalCacheType {
+     serverDistDir?: string
+     flushToDisk?: boolean
+     allowedRevalidateHeaderKeys?: string[]
++    locales?: readonly string[]
+     requestHeaders: IncrementalCache['requestHeaders']
+     maxMemoryCacheSize?: number
+     getPrerenderManifest: () => DeepReadonly<PrerenderManifest>
+@@ -233,7 +245,11 @@ export class IncrementalCache implements IncrementalCacheType {
+     this.requestHeaders = requestHeaders
+     this.allowedRevalidateHeaderKeys = allowedRevalidateHeaderKeys
+     this.prerenderManifest = getPrerenderManifest()
+-    this.cacheControls = new SharedCacheControls(this.prerenderManifest)
++    this.locales = locales
++    this.cacheControls = new SharedCacheControls(
++      this.prerenderManifest,
++      locales
++    )
+     this.fetchCacheKeyPrefix = fetchCacheKeyPrefix
+     let revalidatedTags: string[] = []
+ 
+@@ -266,7 +282,7 @@ export class IncrementalCache implements IncrementalCacheType {
+   }
+ 
+   private calculateRevalidate(
+-    pathname: string,
++    cacheControl: CacheControl | undefined,
+     fromTime: number,
+     dev: boolean,
+     isFallback: boolean | undefined
+@@ -276,8 +292,6 @@ export class IncrementalCache implements IncrementalCacheType {
+     if (dev)
+       return Math.floor(performance.timeOrigin + performance.now() - 1000)
+ 
+-    const cacheControl = this.cacheControls.get(toRoute(pathname))
+-
+     // if an entry isn't present in routes we fallback to a default
+     // of revalidating after 1 second unless it's a fallback request.
+     const initialRevalidateSeconds = cacheControl
+@@ -294,10 +308,6 @@ export class IncrementalCache implements IncrementalCacheType {
+     return revalidateAfter
+   }
+ 
+-  _getPathname(pathname: string, fetchCache?: boolean) {
+-    return fetchCache ? pathname : normalizePagePath(pathname)
+-  }
+-
+   resetRequestCache() {
+     this.cacheHandler?.resetRequestCache?.()
+   }
+@@ -482,12 +492,18 @@ export class IncrementalCache implements IncrementalCacheType {
+   ): Promise<IncrementalFetchCacheEntry | null>
+   async get(
+     cacheKey: string,
+-    ctx: GetIncrementalResponseCacheContext
++    ctx: GetIncrementalResponseCacheContext | GetIncrementalImageCacheContext
+   ): Promise<IncrementalResponseCacheEntry | null>
+   async get(
+     cacheKey: string,
+-    ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
++    ctx:
++      | GetIncrementalFetchCacheContext
++      | GetIncrementalResponseCacheContext
++      | GetIncrementalImageCacheContext
+   ): Promise<IncrementalCacheEntry | null> {
++    if (ctx.kind === IncrementalCacheKind.IMAGE) {
++      throw new InvariantError('Images must use the image optimizer cache')
++    }
+     // Unlike other caches if we have a resume data cache, we use it even if
+     // testmode would normally disable it or if requestHeaders say 'no-cache'.
+     if (ctx.kind === IncrementalCacheKind.FETCH) {
+@@ -544,12 +560,16 @@ export class IncrementalCache implements IncrementalCacheType {
+       return null
+     }
+ 
+-    cacheKey = this._getPathname(
+-      cacheKey,
+-      ctx.kind === IncrementalCacheKind.FETCH
+-    )
+-
+-    const cacheData = await this.cacheHandler?.get(cacheKey, ctx)
++    let storageKey = cacheKey
++    let handlerContext: Parameters<CacheHandler['get']>[1] = ctx
++    if (ctx.kind !== IncrementalCacheKind.FETCH) {
++      // Ownership scopes the key and metadata inside Next.js. Storage handlers
++      // only need the resulting key and the existing cache options.
++      const { route, ...responseContext } = ctx
++      storageKey = getRouteCacheKey(cacheKey, route)
++      handlerContext = responseContext
++    }
++    const cacheData = await this.cacheHandler?.get(storageKey, handlerContext)
+ 
+     if (ctx.kind === IncrementalCacheKind.FETCH) {
+       if (!cacheData) {
+@@ -627,7 +647,7 @@ export class IncrementalCache implements IncrementalCacheType {
+ 
+     let entry: IncrementalResponseCacheEntry | null = null
+     const { isFallback } = ctx
+-    const cacheControl = this.cacheControls.get(toRoute(cacheKey))
++    const cacheControl = this.cacheControls.get(cacheKey, ctx.route)
+ 
+     let isStale: boolean | -1 | undefined
+     let revalidateAfter: Revalidate
+@@ -640,7 +660,7 @@ export class IncrementalCache implements IncrementalCacheType {
+       const lastModified = cacheData?.lastModified || now
+ 
+       revalidateAfter = this.calculateRevalidate(
+-        cacheKey,
++        cacheControl,
+         lastModified,
+         this.dev ?? false,
+         ctx.isFallback
+@@ -697,7 +717,13 @@ export class IncrementalCache implements IncrementalCacheType {
+ 
+     if (
+       !cacheData &&
+-      this.prerenderManifest.notFoundRoutes.includes(cacheKey)
++      this.prerenderManifest.notFoundRoutes.includes(cacheKey) &&
++      isRouteCacheOwner(
++        cacheKey,
++        ctx.route,
++        this.prerenderManifest.routes[cacheKey],
++        this.locales
++      )
+     ) {
+       // for the first hit after starting the server the cache
+       // may not have a way to save notFound: true so if
+@@ -724,13 +750,19 @@ export class IncrementalCache implements IncrementalCacheType {
+   async set(
+     pathname: string,
+     data: Exclude<IncrementalCacheValue, CachedFetchValue> | null,
+-    ctx: SetIncrementalResponseCacheContext
++    ctx: SetIncrementalResponseCacheContext | SetIncrementalImageCacheContext
+   ): Promise<void>
+   async set(
+     pathname: string,
+     data: IncrementalCacheValue | null,
+-    ctx: SetIncrementalFetchCacheContext | SetIncrementalResponseCacheContext
++    ctx:
++      | SetIncrementalFetchCacheContext
++      | SetIncrementalResponseCacheContext
++      | SetIncrementalImageCacheContext
+   ): Promise<void> {
++    if ('kind' in ctx && ctx.kind === IncrementalCacheKind.IMAGE) {
++      throw new InvariantError('Images must use the image optimizer cache')
++    }
+     // Even if we otherwise disable caching for testMode or if no fetchCache is
+     // configured we still always stash results in the resume data cache if one
+     // exists. This is because this is a transient in memory cache that
+@@ -752,7 +784,16 @@ export class IncrementalCache implements IncrementalCacheType {
+ 
+     if (this.disableForTestmode || (this.dev && !ctx.fetchCache)) return
+ 
+-    pathname = this._getPathname(pathname, ctx.fetchCache)
++    let storageKey = pathname
++    let handlerContext: Parameters<CacheHandler['set']>[2] = ctx
++    if (!ctx.fetchCache) {
++      const { route, ...responseContext } = ctx
++      if (!route) {
++        throw new InvariantError('Response cache requires a source route')
++      }
++      storageKey = getRouteCacheKey(pathname, route)
++      handlerContext = responseContext
++    }
+ 
+     // FetchCache has upper limit of 2MB per-entry currently
+     const itemSize = JSON.stringify(data).length
+@@ -777,10 +818,10 @@ export class IncrementalCache implements IncrementalCacheType {
+ 
+     try {
+       if (!ctx.fetchCache && ctx.cacheControl) {
+-        this.cacheControls.set(toRoute(pathname), ctx.cacheControl)
++        this.cacheControls.set(storageKey, ctx.cacheControl)
+       }
+ 
+-      await this.cacheHandler?.set(pathname, data, ctx)
++      await this.cacheHandler?.set(storageKey, data, handlerContext)
+     } catch (error) {
+       console.warn('Failed to update prerender cache for', pathname, error)
+     }
+diff --git a/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts b/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
+index 5c97677..d9f66ba 100644
+--- a/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
++++ b/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
+@@ -22,28 +22,9 @@ function getSegmentDataSize(segmentData: Map<string, Buffer> | undefined) {
+   return size
+ }
+ 
+-/**
+- * The same page is requested both as HTML and as data. Keep one in-memory copy
+- * per request path so those variants do not each occupy the memory budget.
+- */
+-class RequestMemoryCache extends LRUCache<CacheHandlerValue> {
+-  private requestPath(cacheKey: string): string {
+-    const separator = cacheKey.lastIndexOf('/$/')
+-    return separator === -1 ? cacheKey : cacheKey.slice(separator + 3)
+-  }
+-
+-  public get(key: string): CacheHandlerValue | undefined {
+-    return super.get(key) ?? super.get(this.requestPath(key))
+-  }
+-
+-  public set(key: string, value: CacheHandlerValue): boolean {
+-    return super.set(this.requestPath(key), value)
+-  }
+-}
+-
+ export function getMemoryCache(maxMemoryCacheSize: number) {
+   if (!memoryCache) {
+-    memoryCache = new RequestMemoryCache(maxMemoryCacheSize, function length(
++    memoryCache = new LRUCache(maxMemoryCacheSize, function length(
+       { value },
+       cacheKey
+     ) {
+diff --git a/packages/next/src/server/lib/incremental-cache/shared-cache-controls.external.ts b/packages/next/src/server/lib/incremental-cache/shared-cache-controls.external.ts
+index 5239467..0f85397 100644
+--- a/packages/next/src/server/lib/incremental-cache/shared-cache-controls.external.ts
++++ b/packages/next/src/server/lib/incremental-cache/shared-cache-controls.external.ts
+@@ -1,6 +1,13 @@
+ import type { PrerenderManifest } from '../../../build'
+ import type { DeepReadonly } from '../../../shared/lib/deep-readonly'
+ import type { CacheControl } from '../cache-control'
++import {
++  getRouteCacheKey,
++  isRouteCacheOwner,
++  type ResponseCacheOwner,
++} from '../route-cache-key'
++import { normalizeLocalePath } from '../../../shared/lib/i18n/normalize-locale-path'
++import { RouteKind } from '../../route-kind'
+ 
+ /**
+  * A shared cache of cache controls for routes. This cache is used so we don't
+@@ -21,7 +28,8 @@ export class SharedCacheControls {
+      */
+     private readonly prerenderManifest: DeepReadonly<
+       Pick<PrerenderManifest, 'routes' | 'dynamicRoutes'>
+-    >
++    >,
++    private readonly locales?: readonly string[]
+   ) {}
+ 
+   /**
+@@ -30,19 +38,28 @@ export class SharedCacheControls {
+    * in-memory cache, it will be sourced from the prerender manifest.
+    *
+    * @param route the route to get the cache control for
++   * @param owner the source route that owns the response
+    * @returns the cache control for the route, or undefined if the values
+    *          are not present in the in-memory cache or the prerender manifest
+    */
+-  public get(route: string): CacheControl | undefined {
++  public get(
++    route: string,
++    owner: ResponseCacheOwner
++  ): CacheControl | undefined {
+     // This is a copy on write cache that is updated when the cache is updated.
+     // If the cache is never written to, then the values will be sourced from
+     // the prerender manifest.
+-    let cacheControl = SharedCacheControls.cacheControls.get(route)
++    let cacheControl = SharedCacheControls.cacheControls.get(
++      getRouteCacheKey(route, owner)
++    )
+     if (cacheControl) return cacheControl
+ 
+     let prerenderData = this.prerenderManifest.routes[route]
+ 
+-    if (prerenderData) {
++    if (
++      prerenderData &&
++      isRouteCacheOwner(route, owner, prerenderData, this.locales)
++    ) {
+       const { initialRevalidateSeconds, initialExpireSeconds } = prerenderData
+ 
+       if (typeof initialRevalidateSeconds !== 'undefined') {
+@@ -53,9 +70,17 @@ export class SharedCacheControls {
+       }
+     }
+ 
+-    const dynamicPrerenderData = this.prerenderManifest.dynamicRoutes[route]
++    const dynamicPathname =
++      owner.kind === RouteKind.PAGES
++        ? normalizeLocalePath(route, this.locales).pathname
++        : route
++    const dynamicPrerenderData =
++      this.prerenderManifest.dynamicRoutes[dynamicPathname]
+ 
+-    if (dynamicPrerenderData) {
++    if (
++      dynamicPrerenderData &&
++      isRouteCacheOwner(route, owner, dynamicPrerenderData, this.locales)
++    ) {
+       const { fallbackRevalidate, fallbackExpire } = dynamicPrerenderData
+ 
+       if (typeof fallbackRevalidate !== 'undefined') {
+@@ -63,6 +88,8 @@ export class SharedCacheControls {
+       }
+     }
+ 
++    // A new runtime pathname has no initial lifetime. Its own render supplies
++    // one instead of borrowing a sibling route's build-time metadata.
+     return undefined
+   }
+ 
+diff --git a/packages/next/src/server/lib/node-fs-methods.ts b/packages/next/src/server/lib/node-fs-methods.ts
+index b98e42e..8618389 100644
+--- a/packages/next/src/server/lib/node-fs-methods.ts
++++ b/packages/next/src/server/lib/node-fs-methods.ts
+@@ -1,12 +1,26 @@
+ import type { CacheFs } from '../../shared/lib/utils'
+ 
+ import fs from 'fs'
++import { randomUUID } from 'node:crypto'
+ 
+ export const nodeFs: CacheFs = {
+   existsSync: fs.existsSync,
+   readFile: fs.promises.readFile,
+   readFileSync: fs.readFileSync,
+   writeFile: (f, d) => fs.promises.writeFile(f, d),
++  writeFileAtomic: async (f, d) => {
++    const temporary = `${f}.${randomUUID()}.tmp`
++    try {
++      await fs.promises.writeFile(temporary, d)
++      await fs.promises.link(temporary, f)
++      return true
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
++      throw error
++    } finally {
++      await fs.promises.unlink(temporary).catch(() => {})
++    }
++  },
+   mkdir: (dir) => fs.promises.mkdir(dir, { recursive: true }),
+   stat: (f) => fs.promises.stat(f),
+ }
+diff --git a/packages/next/src/server/lib/route-cache-key.ts b/packages/next/src/server/lib/route-cache-key.ts
+new file mode 100644
+index 0000000..6200fc9
+--- /dev/null
++++ b/packages/next/src/server/lib/route-cache-key.ts
+@@ -0,0 +1,103 @@
++import type { RouteDefinition } from '../route-definitions/route-definition'
++import type {
++  DynamicPrerenderManifestRoute,
++  PrerenderManifestRoute,
++} from '../../build'
++import { normalizePagePath } from '../../shared/lib/page-path/normalize-page-path'
++import { normalizeLocalePath } from '../../shared/lib/i18n/normalize-locale-path'
++import { InvariantError } from '../../shared/lib/invariant-error'
++import { AppPathnameNormalizer } from '../normalizers/built/app/app-pathname-normalizer'
++import { RouteKind } from '../route-kind'
++
++export const ROUTE_CACHE_DIRECTORY = 'route-cache'
++
++export type ResponseCacheOwner = {
++  readonly kind: RouteKind
++  /** Canonical Pages pathname or full App module name, including groups and slots. */
++  readonly sourceRoute: string
++}
++
++const appPathnameNormalizer = new AppPathnameNormalizer()
++
++/** Convert a runtime route definition to the identity used by response caches. */
++export function getResponseCacheOwner(
++  definition: Pick<RouteDefinition, 'kind' | 'page' | 'pathname'>
++): ResponseCacheOwner {
++  return {
++    kind: definition.kind,
++    // Pages module names can include a trailing /index in Turbopack. Their
++    // pathname matches the manifest's source in both bundlers. App modules
++    // retain groups and parallel slots in their cache identity.
++    sourceRoute:
++      definition.kind === RouteKind.PAGES
++        ? definition.pathname
++        : definition.page,
++  }
++}
++
++/**
++ * Prerender metadata already identifies its source route. Compare that source
++ * with the selected module before using its metadata, including negative
++ * entries and partially specialized fallback shells. Cache storage continues
++ * to use the full module identity, including groups and parallel slots.
++ */
++export function isRouteCacheOwner(
++  pathname: string,
++  owner: ResponseCacheOwner,
++  prerender:
++    | Pick<PrerenderManifestRoute, 'srcRoute' | 'dataRoute'>
++    | Pick<DynamicPrerenderManifestRoute, 'fallbackSourceRoute' | 'dataRoute'>
++    | undefined,
++  locales?: readonly string[]
++): boolean {
++  if (!prerender) {
++    return false
++  }
++
++  // Pages have JSON data routes, App Pages have RSC data routes, and App
++  // Route Handlers have no separate data route.
++  const kind =
++    prerender.dataRoute === null
++      ? RouteKind.APP_ROUTE
++      : prerender.dataRoute.endsWith('.json')
++        ? RouteKind.PAGES
++        : prerender.dataRoute.endsWith('.rsc')
++          ? RouteKind.APP_PAGE
++          : undefined
++  if (kind !== owner.kind) {
++    return false
++  }
++
++  const source =
++    'srcRoute' in prerender ? prerender.srcRoute : prerender.fallbackSourceRoute
++  const prerenderOwner =
++    source ??
++    (kind === RouteKind.PAGES
++      ? normalizeLocalePath(pathname, locales).pathname
++      : pathname)
++
++  return (
++    prerenderOwner ===
++    (kind === RouteKind.PAGES
++      ? owner.sourceRoute
++      : appPathnameNormalizer.normalize(owner.sourceRoute))
++  )
++}
++
++/**
++ * Response keys are opaque to cache handlers. Hash the source route into one
++ * fixed-length directory, preserving App groups and slots without expanding
++ * Unicode names or repeating the source directory hierarchy on disk. The
++ * pathname stays readable and is normalized exactly once before namespacing.
++ */
++export function getRouteCacheKey(
++  pathname: string,
++  owner: ResponseCacheOwner
++): string {
++  if (!owner) {
++    throw new InvariantError('Response cache requires a source route')
++  }
++  const { sourceRoute } = owner
++  const source = encodeURIComponent(sourceRoute)
++  return `/${ROUTE_CACHE_DIRECTORY}/${owner.kind}/${source}/$${normalizePagePath(pathname)}`
++}
+diff --git a/packages/next/src/server/next-server.ts b/packages/next/src/server/next-server.ts
+index 66ede96..ebde9b4 100644
+--- a/packages/next/src/server/next-server.ts
++++ b/packages/next/src/server/next-server.ts
+@@ -89,7 +89,10 @@ import {
+   IncrementalCache,
+   type CacheHandler as ICacheHandler,
+ } from './lib/incremental-cache'
+-import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
++import {
++  normalizeAppPath,
++  selectAppPageEntry,
++} from '../shared/lib/router/utils/app-paths'
+ 
+ import { setHttpClientAndAgentOptions } from './setup-http-agent-env'
+ 
+@@ -232,7 +235,10 @@ export default class NextNodeServer extends BaseServer<
+     }
+ 
+     if (!this.minimalMode) {
+-      this.imageResponseCache = new ResponseCache(this.minimalMode)
++      this.imageResponseCache = new ResponseCache({
++        minimalMode: this.minimalMode,
++        route: 'image',
++      })
+     }
+ 
+     if (
+@@ -455,6 +461,7 @@ export default class NextNodeServer extends BaseServer<
+       flushToDisk:
+         !this.minimalMode && this.nextConfig.experimental.isrFlushToDisk,
+       getPrerenderManifest: () => this.getPrerenderManifest(),
++      locales: this.nextConfig.i18n?.locales,
+       CurCacheHandler: CacheHandler,
+     })
+   }
+@@ -789,8 +796,7 @@ export default class NextNodeServer extends BaseServer<
+ 
+       let page = ctx.pathname
+       if (isAppPath) {
+-        // When it's an array, we need to pass all parallel routes to the loader.
+-        page = appPaths[0]
++        page = selectAppPageEntry(ctx.pathname, appPaths)
+       }
+ 
+       for (const edgeFunctionsPage of edgeFunctionsPages) {
+diff --git a/packages/next/src/server/response-cache/index.ts b/packages/next/src/server/response-cache/index.ts
+index ffa818d..03967b0 100644
+--- a/packages/next/src/server/response-cache/index.ts
++++ b/packages/next/src/server/response-cache/index.ts
+@@ -1,10 +1,15 @@
++import type { ResponseCacheOwner } from '../lib/route-cache-key'
+ import type {
+   ResponseCacheEntry,
+   ResponseGenerator,
+   ResponseCacheBase,
+   IncrementalResponseCacheEntry,
+   IncrementalResponseCache,
++  GetIncrementalResponseCacheContext,
++  GetIncrementalImageCacheContext,
+ } from './types'
++import { IncrementalCacheKind } from './types'
++import { InvariantError } from '../../shared/lib/invariant-error'
+ 
+ import { Batcher } from '../../lib/batcher'
+ import { LRUCache } from '../lib/lru-cache'
+@@ -159,12 +164,24 @@ export default class ResponseCache implements ResponseCacheBase {
+   // be dynamic here
+   private minimal_mode?: boolean
+ 
+-  constructor(
+-    minimal_mode: boolean,
+-    maxSize: number = DEFAULT_MAX_SIZE,
+-    ttl: number = DEFAULT_TTL_MS
+-  ) {
+-    this.minimal_mode = minimal_mode
++  private readonly route: ResponseCacheOwner | 'image'
++
++  constructor({
++    minimalMode,
++    route,
++    maxSize = DEFAULT_MAX_SIZE,
++    ttl = DEFAULT_TTL_MS,
++  }: {
++    minimalMode: boolean
++    route: ResponseCacheOwner | 'image'
++    maxSize?: number
++    ttl?: number
++  }) {
++    if (!route) {
++      throw new InvariantError('Response cache requires a source route')
++    }
++    this.route = route
++    this.minimal_mode = minimalMode
+     this.maxSize = maxSize
+     this.ttl = ttl
+ 
+@@ -266,7 +283,6 @@ export default class ResponseCache implements ResponseCacheBase {
+       isRoutePPREnabled = false,
+       isPrefetch = false,
+       waitUntil,
+-      routeKind,
+       invocationID,
+     } = context
+ 
+@@ -282,7 +298,6 @@ export default class ResponseCache implements ResponseCacheBase {
+             isFallback,
+             isRoutePPREnabled,
+             isPrefetch,
+-            routeKind,
+             invocationID,
+           },
+           resolve
+@@ -324,7 +339,6 @@ export default class ResponseCache implements ResponseCacheBase {
+       isFallback: boolean
+       isRoutePPREnabled: boolean
+       isPrefetch: boolean
+-      routeKind: RouteKind
+       invocationID: string | undefined
+     },
+     resolve: (value: IncrementalResponseCacheEntry | null) => void
+@@ -336,11 +350,10 @@ export default class ResponseCache implements ResponseCacheBase {
+     try {
+       // Get the previous cache entry if not in minimal mode
+       previousIncrementalCacheEntry = !this.minimal_mode
+-        ? await context.incrementalCache.get(key, {
+-            kind: routeKindToIncrementalCacheKind(context.routeKind),
+-            isRoutePPREnabled: context.isRoutePPREnabled,
+-            isFallback: context.isFallback,
+-          })
++        ? await context.incrementalCache.get(
++            key,
++            this.getCacheContext(context.isRoutePPREnabled, context.isFallback)
++          )
+         : null
+ 
+       // `isStale === -1` signals that the entry is past its `expire` (either
+@@ -495,9 +508,8 @@ export default class ResponseCache implements ResponseCacheBase {
+       // every caller — including batched invocations — populates the cache.
+       if (incrementalResponseCacheEntry.cacheControl && !this.minimal_mode) {
+         await incrementalCache.set(key, incrementalResponseCacheEntry.value, {
++          ...this.getCacheContext(isRoutePPREnabled, isFallback),
+           cacheControl: incrementalResponseCacheEntry.cacheControl,
+-          isRoutePPREnabled,
+-          isFallback,
+         })
+       }
+ 
+@@ -522,9 +534,8 @@ export default class ResponseCache implements ResponseCacheBase {
+               )
+ 
+         await incrementalCache.set(key, previousIncrementalCacheEntry.value, {
++          ...this.getCacheContext(isRoutePPREnabled, isFallback),
+           cacheControl: { revalidate: revalidate, expire: expire },
+-          isRoutePPREnabled,
+-          isFallback,
+         })
+       }
+ 
+@@ -532,4 +543,18 @@ export default class ResponseCache implements ResponseCacheBase {
+       throw err
+     }
+   }
++
++  private getCacheContext(
++    isRoutePPREnabled: boolean,
++    isFallback: boolean
++  ): GetIncrementalResponseCacheContext | GetIncrementalImageCacheContext {
++    if (this.route === 'image') {
++      return { kind: IncrementalCacheKind.IMAGE, isFallback: false }
++    }
++    const kind = routeKindToIncrementalCacheKind(this.route.kind)
++    if (kind === IncrementalCacheKind.IMAGE) {
++      throw new InvariantError('Images must use the image response cache')
++    }
++    return { route: this.route, kind, isRoutePPREnabled, isFallback }
++  }
+ }
+diff --git a/packages/next/src/server/response-cache/types.ts b/packages/next/src/server/response-cache/types.ts
+index 25c129e..fee08f7 100644
+--- a/packages/next/src/server/response-cache/types.ts
++++ b/packages/next/src/server/response-cache/types.ts
+@@ -1,3 +1,4 @@
++import type { ResponseCacheOwner } from '../lib/route-cache-key'
+ import type { OutgoingHttpHeaders } from 'http'
+ import type RenderResult from '../render-result'
+ import type { CacheControl, Revalidate } from '../lib/cache-control'
+@@ -219,8 +220,11 @@ export interface GetIncrementalFetchCacheContext {
+   softTags?: string[]
+ }
+ 
+-export interface GetIncrementalResponseCacheContext {
+-  kind: Exclude<IncrementalCacheKind, IncrementalCacheKind.FETCH>
++export interface GetIncrementalResponseCacheHandlerContext {
++  kind: Exclude<
++    IncrementalCacheKind,
++    IncrementalCacheKind.FETCH | IncrementalCacheKind.IMAGE
++  >
+ 
+   /**
+    * True if the route is enabled for PPR.
+@@ -233,6 +237,12 @@ export interface GetIncrementalResponseCacheContext {
+   isFallback: boolean
+ }
+ 
++export interface GetIncrementalResponseCacheContext
++  extends GetIncrementalResponseCacheHandlerContext {
++  /** Internal ownership used before invoking the storage handler. */
++  route: ResponseCacheOwner
++}
++
+ export interface SetIncrementalFetchCacheContext {
+   fetchCache: true
+   fetchUrl?: string
+@@ -241,7 +251,7 @@ export interface SetIncrementalFetchCacheContext {
+   isImplicitBuildTimeCache?: boolean
+ }
+ 
+-export interface SetIncrementalResponseCacheContext {
++export interface SetIncrementalResponseCacheHandlerContext {
+   fetchCache?: false
+   cacheControl?: CacheControl
+ 
+@@ -256,15 +266,35 @@ export interface SetIncrementalResponseCacheContext {
+   isFallback?: boolean
+ }
+ 
++export interface SetIncrementalResponseCacheContext
++  extends SetIncrementalResponseCacheHandlerContext {
++  /** Internal ownership used before invoking the storage handler. */
++  route: ResponseCacheOwner
++}
++
++export interface GetIncrementalImageCacheContext {
++  kind: IncrementalCacheKind.IMAGE
++  route?: never
++  isFallback: false
++  isRoutePPREnabled?: false
++}
++
++export interface SetIncrementalImageCacheContext {
++  kind: IncrementalCacheKind.IMAGE
++  route?: never
++  fetchCache?: false
++  cacheControl?: CacheControl
++}
++
+ export interface IncrementalResponseCache {
+   get(
+     cacheKey: string,
+-    ctx: GetIncrementalResponseCacheContext
++    ctx: GetIncrementalResponseCacheContext | GetIncrementalImageCacheContext
+   ): Promise<IncrementalResponseCacheEntry | null>
+   set(
+     key: string,
+     data: Exclude<IncrementalCacheValue, CachedFetchValue> | null,
+-    ctx: SetIncrementalResponseCacheContext
++    ctx: SetIncrementalResponseCacheContext | SetIncrementalImageCacheContext
+   ): Promise<void>
+ }
+ 
+@@ -275,7 +305,7 @@ export interface IncrementalCache extends IncrementalResponseCache {
+   ): Promise<IncrementalFetchCacheEntry | null>
+   get(
+     cacheKey: string,
+-    ctx: GetIncrementalResponseCacheContext
++    ctx: GetIncrementalResponseCacheContext | GetIncrementalImageCacheContext
+   ): Promise<IncrementalResponseCacheEntry | null>
+   set(
+     key: string,
+@@ -285,7 +315,7 @@ export interface IncrementalCache extends IncrementalResponseCache {
+   set(
+     key: string,
+     data: Exclude<IncrementalCacheValue, CachedFetchValue> | null,
+-    ctx: SetIncrementalResponseCacheContext
++    ctx: SetIncrementalResponseCacheContext | SetIncrementalImageCacheContext
+   ): Promise<void>
+   revalidateTag(
+     tags: string | string[],
+diff --git a/packages/next/src/server/route-matcher-providers/app-page-route-matcher-provider.ts b/packages/next/src/server/route-matcher-providers/app-page-route-matcher-provider.ts
+index 2186c6f..5e14265 100644
+--- a/packages/next/src/server/route-matcher-providers/app-page-route-matcher-provider.ts
++++ b/packages/next/src/server/route-matcher-providers/app-page-route-matcher-provider.ts
+@@ -1,3 +1,4 @@
++import { selectAppPageEntry } from '../../shared/lib/router/utils/app-paths'
+ import { isAppPageRoute } from '../../lib/is-app-page-route'
+ 
+ import { APP_PATHS_MANIFEST } from '../../shared/lib/constants'
+@@ -37,8 +38,9 @@ export class AppPageRouteMatcherProvider extends ManifestRouteMatcherProvider<Ap
+     // Format the routes.
+     const matchers: Array<AppPageRouteMatcher> = []
+     for (const [pathname, appPaths] of Object.entries(allAppPaths)) {
+-      // TODO-APP: (wyattjoh) this is a hack right now, should be more deterministic
+-      const page = appPaths[0]
++      const page = selectAppPageEntry(pathname, appPaths, (appPath) =>
++        this.normalizers.pathname.normalize(appPath)
++      )
+ 
+       const filename = this.normalizers.filename.normalize(manifest[page])
+       const bundlePath = this.normalizers.bundlePath.normalize(page)
+diff --git a/packages/next/src/server/route-modules/pages/pages-handler.ts b/packages/next/src/server/route-modules/pages/pages-handler.ts
+index 627c574..b6e2bf1 100644
+--- a/packages/next/src/server/route-modules/pages/pages-handler.ts
++++ b/packages/next/src/server/route-modules/pages/pages-handler.ts
+@@ -42,6 +42,7 @@ import { RedirectStatusCode } from '../../../client/components/redirect-status-c
+ import { isBot } from '../../../shared/lib/router/utils/is-bot'
+ import { addPathPrefix } from '../../../shared/lib/router/utils/add-path-prefix'
+ import { removeTrailingSlash } from '../../../shared/lib/router/utils/remove-trailing-slash'
++import { isRouteCacheOwner } from '../../lib/route-cache-key'
+ import type { PagesRouteModule } from './module.compiled'
+ import type {
+   GetServerSideProps,
+@@ -204,8 +205,18 @@ export const getHandler = ({
+           : resolvedPathname
+       )
+       const isPrerendered =
+-        Boolean(prerenderManifest.routes[decodedPathname]) ||
+-        prerenderManifest.notFoundRoutes.includes(decodedPathname)
++        (Boolean(prerenderManifest.routes[decodedPathname]) ||
++          prerenderManifest.notFoundRoutes.includes(decodedPathname)) &&
++        // A sibling's positive or negative prerender cannot admit parameters
++        // that this route excluded. Development computes static paths on demand
++        // instead of reading build-time prerender metadata.
++        (routeModule.isDev ||
++          isRouteCacheOwner(
++            decodedPathname,
++            routeModule.cacheOwner,
++            prerenderManifest.routes[decodedPathname],
++            nextConfig.i18n?.locales
++          ))
+ 
+       const prerenderInfo = prerenderManifest.dynamicRoutes[srcPage]
+ 
+diff --git a/packages/next/src/server/route-modules/route-module.ts b/packages/next/src/server/route-modules/route-module.ts
+index 7cd236c..27e26d7 100644
+--- a/packages/next/src/server/route-modules/route-module.ts
++++ b/packages/next/src/server/route-modules/route-module.ts
+@@ -56,6 +56,10 @@ import { IncrementalCache } from '../lib/incremental-cache'
+ import { initializeCacheHandlers, setCacheHandler } from '../use-cache/handlers'
+ import { interopDefault } from '../app-render/interop-default'
+ import { RouteKind } from '../route-kind'
++import {
++  getResponseCacheOwner,
++  type ResponseCacheOwner,
++} from '../lib/route-cache-key'
+ import type { BaseNextRequest } from '../base-http'
+ import type { I18NConfig, NextConfigRuntime } from '../config-shared'
+ import ResponseCache, { type ResponseGenerator } from '../response-cache'
+@@ -123,6 +127,9 @@ export abstract class RouteModule<
+    */
+   public readonly definition: Readonly<D>
+ 
++  /** The canonical source identity shared by cache reads, writes, and metadata. */
++  public readonly cacheOwner: ResponseCacheOwner
++
+   /**
+    * The shared modules that are exposed and required for the route module.
+    */
+@@ -142,6 +149,7 @@ export abstract class RouteModule<
+   }: RouteModuleOptions<D, U>) {
+     this._userland = userland
+     this.definition = definition
++    this.cacheOwner = getResponseCacheOwner(definition)
+     this.isDev = !!process.env.__NEXT_DEV_SERVER
+     this.distDir = distDir
+     this.relativeProjectDir = relativeProjectDir
+@@ -519,6 +527,7 @@ export abstract class RouteModule<
+         flushToDisk: !isMinimalMode && nextConfig.experimental.isrFlushToDisk,
+         getPrerenderManifest: () => prerenderManifest,
+         CurCacheHandler: CacheHandler,
++        locales: nextConfig.i18n?.locales,
+       })
+ 
+       // we need to expose this on globalThis as the app-render
+@@ -1101,7 +1110,10 @@ export abstract class RouteModule<
+   public getResponseCache(req: IncomingMessage | BaseNextRequest) {
+     if (!this.responseCache) {
+       const minimalMode = getRequestMeta(req, 'minimalMode') ?? false
+-      this.responseCache = new ResponseCache(minimalMode)
++      this.responseCache = new ResponseCache({
++        minimalMode,
++        route: this.cacheOwner,
++      })
+     }
+     return this.responseCache
+   }
+diff --git a/packages/next/src/shared/lib/router/utils/app-paths.ts b/packages/next/src/shared/lib/router/utils/app-paths.ts
+index 36232fe..af01883 100644
+--- a/packages/next/src/shared/lib/router/utils/app-paths.ts
++++ b/packages/next/src/shared/lib/router/utils/app-paths.ts
+@@ -69,6 +69,26 @@ export function compareAppPaths(a: string, b: string): number {
+   return a.localeCompare(b)
+ }
+ 
++/** Select the direct children/root entry used to serve an App pathname. */
++export function selectAppPageEntry(
++  pathname: string,
++  appPaths: readonly string[],
++  normalizePathname: (appPath: string) => string = (appPath) =>
++    normalizeAppPath(appPath).replace(/%5F/g, '_')
++): string {
++  let entry: string | undefined
++  for (const appPath of appPaths) {
++    if (normalizePathname(appPath) !== pathname) continue
++    if (entry === undefined || compareAppPaths(entry, appPath) < 0) {
++      entry = appPath
++    }
++  }
++  if (entry === undefined) {
++    throw new Error(`Invariant: no direct app page entry found for ${pathname}`)
++  }
++  return entry
++}
++
+ /**
+  * Strips the `.rsc` extension if it's in the pathname.
+  * Since this function is used on full urls it checks `?` for searchParams handling.
+diff --git a/packages/next/src/shared/lib/utils.ts b/packages/next/src/shared/lib/utils.ts
+index 109e5c9..7e008a0 100644
+--- a/packages/next/src/shared/lib/utils.ts
++++ b/packages/next/src/shared/lib/utils.ts
+@@ -464,6 +464,8 @@ export interface CacheFs {
+   readFile: typeof fs.promises.readFile
+   readFileSync: typeof fs.readFileSync
+   writeFile(f: string, d: any): Promise<void>
++  /** Publish a complete file without replacing an existing destination. */
++  writeFileAtomic?(f: string, d: any): Promise<boolean>
+   mkdir(dir: string): Promise<void | string>
+   stat(f: string): Promise<{ mtime: Date }>
+ }
+diff --git a/packages/next/taskfile.js b/packages/next/taskfile.js
+index 7a2e36a..2de79e8 100644
+--- a/packages/next/taskfile.js
++++ b/packages/next/taskfile.js
+@@ -1899,6 +1899,29 @@ export async function ncc_string_hash(task, opts) {
+     .ncc({ packageName: 'string-hash', externals })
+     .target('src/compiled/string-hash')
+ }
++// Bundle only SHA-256, using browser entrypoints so this is safe in Edge.
++export async function ncc_hash_sha256(task, opts) {
++  await task
++    .source(relative(__dirname, require.resolve('hash.js/lib/hash/sha/256')))
++    .ncc({
++      packageName: 'hash.js',
++      bundleName: 'hash.js/sha256',
++      externals,
++      mainFields: ['browser', 'main'],
++    })
++    .target('src/compiled/hash.js/sha256')
++
++  // hash.js publishes its license in the README rather than a LICENSE file.
++  const readme = await fs.readFile(require.resolve('hash.js/README.md'), 'utf8')
++  const license = readme.split('#### LICENSE\n')[1]
++  if (!license) {
++    throw new Error('Missing hash.js license')
++  }
++  await fs.writeFile(
++    join(__dirname, 'src/compiled/hash.js/sha256/LICENSE'),
++    `${license.trim()}\n`
++  )
++}
+ externals['strip-ansi'] = 'next/dist/compiled/strip-ansi'
+ externals['next/dist/compiled/strip-ansi'] = 'next/dist/compiled/strip-ansi'
+ export async function ncc_strip_ansi(task, opts) {
+@@ -2336,6 +2359,7 @@ export async function ncc(task, opts) {
+         'ncc_source_map08',
+         'ncc_serve_handler',
+         'ncc_string_hash',
++        'ncc_hash_sha256',
+         'ncc_strip_ansi',
+         'ncc_superstruct',
+         'ncc_zod',
+diff --git a/packages/next/types/$$compiled.internal.d.ts b/packages/next/types/$$compiled.internal.d.ts
+index 2f9e22e..efcd1a2 100644
+--- a/packages/next/types/$$compiled.internal.d.ts
++++ b/packages/next/types/$$compiled.internal.d.ts
+@@ -742,6 +742,10 @@ declare module 'next/dist/compiled/string-hash' {
+   import m from 'string-hash'
+   export = m
+ }
++declare module 'next/dist/compiled/hash.js/sha256' {
++  import { sha256 } from 'hash.js'
++  export = sha256
++}
+ declare module 'next/dist/compiled/ua-parser-js' {
+   import m from 'ua-parser-js'
+   export = m
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index ebbef2e..4b3948b 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1493,6 +1493,9 @@ importers:
+       gzip-size:
+         specifier: 5.1.1
+         version: 5.1.1
++      hash.js:
++        specifier: 1.1.7
++        version: 1.1.7
+       http-proxy-agent:
+         specifier: 5.0.0
+         version: 5.0.0

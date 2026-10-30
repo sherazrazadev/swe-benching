@@ -1,0 +1,108 @@
+diff --git a/internal/bodyprocessors/multipart.go b/internal/bodyprocessors/multipart.go
+index b14fd7f..fab9075 100644
+--- a/internal/bodyprocessors/multipart.go
++++ b/internal/bodyprocessors/multipart.go
+@@ -105,6 +105,11 @@ func (mbp *multipartBodyProcessor) ProcessRequest(reader io.Reader, v plugintype
+ 			}
+ 		} else {
+ 			// if is a field
++			if nested, err := processNestedPart(p, v); err != nil {
++				return err
++			} else if nested {
++				continue
++			}
+ 			data, err := io.ReadAll(p)
+ 			if err != nil {
+ 				if !errors.Is(err, io.ErrUnexpectedEOF) {
+diff --git a/internal/bodyprocessors/multipart_nested.go b/internal/bodyprocessors/multipart_nested.go
+new file mode 100644
+index 0000000..378e9db
+--- /dev/null
++++ b/internal/bodyprocessors/multipart_nested.go
+@@ -0,0 +1,86 @@
++// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package bodyprocessors
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"mime"
++	"mime/multipart"
++	"strings"
++
++	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
++	"github.com/corazawaf/coraza/v3/internal/collections"
++)
++
++// processNestedPart reports whether p carries a nested multipart body and, if
++// so, records the parts it contains. Some clients wrap uploads in a
++// multipart/mixed container instead of sending every part flat; the inner
++// names are expected to reach rules the same way the flat ones do.
++//
++// The bool result reports that p was a nested multipart body and has been
++// consumed, so the caller must not read p again.
++func processNestedPart(p *multipart.Part, v plugintypes.TransactionVariables) (bool, error) {
++	mediaType, params, err := mime.ParseMediaType(p.Header.Get("Content-Type"))
++	if err != nil || !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {
++		return false, nil
++	}
++
++	mr := multipart.NewReader(p, params["boundary"])
++	filesCol := v.Files()
++	fileSizesCol := v.FilesSizes()
++	postCol := v.ArgsPost()
++	filesCombinedSizeCol := v.FilesCombinedSize()
++	filesNamesCol := v.FilesNames()
++
++	totalSize := int64(0)
++	for {
++		np, err := mr.NextPart()
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			v.MultipartStrictError().(*collections.Single).Set("1")
++			return true, err
++		}
++		partName := np.FormName()
++		filename := nestedOriginFileName(np)
++		data, err := io.ReadAll(np)
++		if err != nil {
++			if !errors.Is(err, io.ErrUnexpectedEOF) {
++				v.MultipartStrictError().(*collections.Single).Set("1")
++				return true, err
++			}
++			v.MultipartStrictError().(*collections.Single).Set("1")
++		}
++		totalSize += int64(len(data))
++		if filename != "" {
++			filesCol.Add("", filename)
++			fileSizesCol.SetIndex(filename, 0, fmt.Sprintf("%d", len(data)))
++			filesNamesCol.Add("", partName)
++		} else {
++			postCol.Add(partName, string(data))
++		}
++		if errors.Is(err, io.ErrUnexpectedEOF) {
++			break
++		}
++	}
++	if totalSize > 0 {
++		prev := int64(0)
++		_, _ = fmt.Sscanf(filesCombinedSizeCol.(*collections.Single).Get(), "%d", &prev)
++		filesCombinedSizeCol.(*collections.Single).Set(fmt.Sprintf("%d", prev+totalSize))
++	}
++	return true, nil
++}
++
++// nestedOriginFileName returns the filename parameter of a nested part's
++// Content-Disposition header.
++func nestedOriginFileName(p *multipart.Part) string {
++	_, dispositionParams, err := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
++	if err != nil {
++		return ""
++	}
++	return dispositionParams["filename"]
++}

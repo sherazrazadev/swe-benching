@@ -1,0 +1,1 @@
+task	manifest.patch_checks has no expect=pass patch with kind='blind' || full evidence: /home/runner/work/swe-benching/swe-benching/build/next.js-s4/evidence/20261030T180019Z-gate-static.txt

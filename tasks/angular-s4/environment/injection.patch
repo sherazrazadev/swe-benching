@@ -1,0 +1,254 @@
+diff --git a/packages/compiler/src/render3/r3_identifiers.ts b/packages/compiler/src/render3/r3_identifiers.ts
+index a0deaeb..15b4adb 100644
+--- a/packages/compiler/src/render3/r3_identifiers.ts
++++ b/packages/compiler/src/render3/r3_identifiers.ts
+@@ -467,6 +467,14 @@ export class Identifiers {
+   // sanitization-related functions
+   static sanitizeHtml: o.ExternalReference = {name: 'ɵɵsanitizeHtml', moduleName: CORE};
+   static sanitizeStyle: o.ExternalReference = {name: 'ɵɵsanitizeStyle', moduleName: CORE};
++  static sanitizeHostBindingHtml: o.ExternalReference = {
++    name: 'ɵɵsanitizeHostBindingHtml',
++    moduleName: CORE,
++  };
++  static validateHostBindingAttribute: o.ExternalReference = {
++    name: 'ɵɵvalidateHostBindingAttribute',
++    moduleName: CORE,
++  };
+   static validateAttribute: o.ExternalReference = {
+     name: 'ɵɵvalidateAttribute',
+     moduleName: CORE,
+diff --git a/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts b/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts
+index c1b9ba3..9aeaa24 100644
+--- a/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts
++++ b/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts
+@@ -70,7 +70,17 @@ export function resolveSanitizers(job: CompilationJob): void {
+             // that is provided while invoking sanitization function.
+             sanitizerFn = Identifiers.sanitizeUrlOrResourceUrl;
+           } else {
+-            sanitizerFn = sanitizerFns.get(getOnlySecurityContext(op.securityContext)) ?? null;
++            const securityContext = getOnlySecurityContext(op.securityContext);
++            if (job.kind === CompilationJobKind.Host && securityContext === SecurityContext.HTML) {
++              sanitizerFn = Identifiers.sanitizeHostBindingHtml;
++            } else if (
++              job.kind === CompilationJobKind.Host &&
++              securityContext === SecurityContext.ATTRIBUTE_NO_BINDING
++            ) {
++              sanitizerFn = Identifiers.validateHostBindingAttribute;
++            } else {
++              sanitizerFn = sanitizerFns.get(securityContext) ?? null;
++            }
+           }
+ 
+           op.sanitizer = sanitizerFn !== null ? o.importExpr(sanitizerFn) : null;
+diff --git a/packages/core/src/core_render3_private_export.ts b/packages/core/src/core_render3_private_export.ts
+index 441c0d4..9ca3649 100644
+--- a/packages/core/src/core_render3_private_export.ts
++++ b/packages/core/src/core_render3_private_export.ts
+@@ -311,6 +311,11 @@ export {
+   bypassSanitizationTrustStyle as ɵbypassSanitizationTrustStyle,
+   bypassSanitizationTrustUrl as ɵbypassSanitizationTrustUrl,
+ } from './sanitization/bypass';
++export {
++  ɵɵsanitizeHostBindingHtml,
++  ɵɵvalidateHostBindingAttribute,
++} from './sanitization/host_binding_security';
++
+ export {
+   ɵɵsanitizeHtml,
+   ɵɵsanitizeResourceUrl,
+diff --git a/packages/core/src/render3/jit/environment.ts b/packages/core/src/render3/jit/environment.ts
+index 4441f25..c676491 100644
+--- a/packages/core/src/render3/jit/environment.ts
++++ b/packages/core/src/render3/jit/environment.ts
+@@ -11,6 +11,7 @@ import {ɵɵinject, ɵɵinvalidFactoryDep} from '../../di/injector_compatibility
+ import {ɵɵdefineInjectable, ɵɵdefineInjector} from '../../di/interface/defs';
+ import {ɵɵdefineService} from '../../di/interface/service';
+ import {registerNgModuleType} from '../../linker/ng_module_registration';
++import * as hostBindingSecurity from '../../sanitization/host_binding_security';
+ import * as sanitization from '../../sanitization/sanitization';
+ import * as r3 from '../index';
+ 
+@@ -187,6 +188,8 @@ export const angularCoreEnv: {[name: string]: unknown} = (() => ({
+   'ɵɵinterpolateV': r3.ɵɵinterpolateV,
+ 
+   'ɵɵsanitizeHtml': sanitization.ɵɵsanitizeHtml,
++  'ɵɵsanitizeHostBindingHtml': hostBindingSecurity.ɵɵsanitizeHostBindingHtml,
++  'ɵɵvalidateHostBindingAttribute': hostBindingSecurity.ɵɵvalidateHostBindingAttribute,
+   'ɵɵsanitizeStyle': sanitization.ɵɵsanitizeStyle,
+   'ɵɵsanitizeResourceUrl': sanitization.ɵɵsanitizeResourceUrl,
+   'ɵɵsanitizeScript': sanitization.ɵɵsanitizeScript,
+diff --git a/packages/core/src/sanitization/host_binding_security.ts b/packages/core/src/sanitization/host_binding_security.ts
+new file mode 100644
+index 0000000..f09cc59
+--- /dev/null
++++ b/packages/core/src/sanitization/host_binding_security.ts
+@@ -0,0 +1,169 @@
++/**
++ * @license
++ * Copyright Google LLC All Rights Reserved.
++ *
++ * Use of this source code is governed by an MIT-style license that can be
++ * found in the LICENSE file at https://angular.dev/license
++ */
++
++import {RuntimeError, RuntimeErrorCode} from '../errors';
++import {getTemplateLocationDetails} from '../render3/instructions/element_validation';
++import {TNode, TNodeType} from '../render3/interfaces/node';
++import {RElement} from '../render3/interfaces/renderer_dom';
++import {getLView, getSelectedIndex, getSelectedTNode} from '../render3/state';
++import {getNativeByTNode} from '../render3/util/view_utils';
++
++import {enforceIframeSecurity} from './iframe_attrs_validation';
++import {ɵɵsanitizeHtml} from './sanitization';
++
++/**
++ * Attributes that are security-sensitive only for certain host elements.
++ *
++ * @remarks Keep this in sync with the security schema.
++ */
++const HOST_HTML_ATTRIBUTES: Record<string, Record<string, true | undefined> | undefined> = {
++  'iframe': {'srcdoc': true},
++  '*': {'innerhtml': true, 'outerhtml': true},
++};
++
++const SECURITY_SENSITIVE_ATTRIBUTE_NAMES: ReadonlySet<string> = new Set(['href', 'xlink:href']);
++
++/**
++ * Attributes that can only be applied as static attributes on certain host elements.
++ *
++ * @remarks Keep this in sync with the security schema.
++ */
++const HOST_SENSITIVE_ATTRIBUTES: Record<
++  string,
++  Record<string, true | undefined | ReadonlySet<string>> | undefined
++> = {
++  'iframe': {
++    'sandbox': true,
++    'allow': true,
++    'allowfullscreen': true,
++    'referrerpolicy': true,
++    'csp': true,
++    'fetchpriority': true,
++    'credentialless': true,
++  },
++  'animate': {
++    'attributename': true,
++    'to': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
++    'values': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
++    'from': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
++  },
++  'set': {'attributename': true, 'to': SECURITY_SENSITIVE_ATTRIBUTE_NAMES},
++  'animatemotion': {'attributename': true},
++  'animatetransform': {'attributename': true},
++};
++
++function getHostBindingTagName(tagName: string): string {
++  return tagName.toLowerCase();
++}
++
++/**
++ * Sanitizes the value of a host binding whose attribute may be an HTML sink on some host
++ * elements only.
++ *
++ * @codeGenApi
++ */
++export function ɵɵsanitizeHostBindingHtml(
++  unsafeHtml: any,
++  tagName: string,
++  propName: string,
++): any {
++  const tag = getHostBindingTagName(tagName);
++  const prop = propName.toLowerCase();
++  const isHtmlSink =
++    HOST_HTML_ATTRIBUTES[tag]?.[prop] === true || HOST_HTML_ATTRIBUTES['*']?.[prop] === true;
++
++  return isHtmlSink ? ɵɵsanitizeHtml(unsafeHtml) : unsafeHtml;
++}
++
++/**
++ * Validates that a host binding does not apply an attribute that can only be static on the
++ * concrete host element.
++ *
++ * @codeGenApi
++ */
++export function ɵɵvalidateHostBindingAttribute<T = any>(
++  value: T,
++  tagName: string,
++  attributeName: string,
++): T {
++  const tag = getHostBindingTagName(tagName);
++  const lowerCaseAttrName = attributeName.toLowerCase();
++
++  const index = getSelectedIndex();
++  const tNode: TNode | null = index === -1 ? null : getSelectedTNode();
++  if (tNode && tNode.type !== TNodeType.Element) {
++    return value;
++  }
++
++  const validationConfig = HOST_SENSITIVE_ATTRIBUTES[tag]?.[lowerCaseAttrName];
++  if (!validationConfig) {
++    return value;
++  }
++
++  const lView = getLView();
++  if (tNode && tag === 'iframe') {
++    const element = getNativeByTNode(tNode, lView) as RElement;
++    enforceIframeSecurity(element as HTMLIFrameElement);
++  }
++
++  if (typeof validationConfig !== 'boolean') {
++    if (!tNode) {
++      const errorMessage =
++        ngDevMode &&
++        `Angular has detected that the \`${attributeName}\` was applied ` +
++          `as a binding to the <${tag}> element. ` +
++          `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
++          `as a static attribute only. \n` +
++          `To fix this, switch the \`${attributeName}\` binding to a static attribute ` +
++          `in a template or in host bindings section.`;
++      throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
++    }
++
++    const element = getNativeByTNode(tNode, lView) as SVGAnimateElement;
++    const attributeNameValue = getSensitiveSVGAnimationAttributeName(element, validationConfig);
++    if (attributeNameValue) {
++      const errorMessage =
++        ngDevMode &&
++        `Angular has detected that the \`${attributeName}\` was applied ` +
++          `as a binding to the <${tag}> element${getTemplateLocationDetails(lView)}. ` +
++          `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
++          `as a static attribute only when the "attributeName" is set to \'${attributeNameValue}\'. \n` +
++          `To fix this, switch the \`${attributeNameValue}\` binding to a static attribute ` +
++          `in a template or in host bindings section.`;
++      throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
++    }
++
++    return value;
++  }
++
++  const errorMessage =
++    ngDevMode &&
++    `Angular has detected that the \`${attributeName}\` was applied ` +
++      `as a binding to the <${tag}> element${tNode ? getTemplateLocationDetails(lView) : ''}. ` +
++      `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
++      `as a static attribute only. \n` +
++      `To fix this, switch the \`${attributeName}\` binding to a static attribute ` +
++      `in a template or in host bindings section.`;
++  throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
++}
++
++function getSensitiveSVGAnimationAttributeName(
++  element: SVGAnimateElement,
++  validationConfig: ReadonlySet<string>,
++): string | null {
++  for (const attributeName of element.getAttributeNames()) {
++    if (attributeName.toLowerCase() !== 'attributename') {
++      continue;
++    }
++    const attributeNameValue = element.getAttribute(attributeName);
++    if (attributeNameValue !== null && validationConfig.has(attributeNameValue.toLowerCase())) {
++      return attributeNameValue;
++    }
++  }
++  return null;
++}

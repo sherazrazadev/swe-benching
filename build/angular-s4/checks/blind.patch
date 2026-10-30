@@ -1,0 +1,577 @@
+diff -ruN a/packages/compiler/src/template/pipeline/src/ingest.ts b/packages/compiler/src/template/pipeline/src/ingest.ts
+--- a/packages/compiler/src/template/pipeline/src/ingest.ts	2026-10-30 15:29:32.000000000 +0000
++++ b/packages/compiler/src/template/pipeline/src/ingest.ts	2026-10-30 16:00:48.411011437 +0000
+@@ -21,7 +21,10 @@
+ } from '../../../render3/view/api';
+ import {icuFromI18nMessage} from '../../../render3/view/i18n/util';
+ import {DomElementSchemaRegistry} from '../../../schema/dom_element_schema_registry';
+-import {BindingParser} from '../../../template_parser/binding_parser';
++import {
++  BindingParser,
++  calcPossibleSecurityContexts,
++} from '../../../template_parser/binding_parser';
+ import * as ir from '../ir';
+ 
+ import {
+@@ -125,19 +128,14 @@
+     if (property.isAnimation) {
+       bindingKind = ir.BindingKind.Animation;
+     }
+-    const securityContexts = bindingParser
+-      .calcPossibleSecurityContexts(
+-        input.componentSelector,
+-        property.name,
+-        bindingKind === ir.BindingKind.Attribute,
+-      )
+-      .filter((context) => context !== SecurityContext.NONE);
++    const securityContexts = calcHostBindingSecurityContexts(
++      property.name,
++      bindingKind === ir.BindingKind.Attribute,
++    );
+     ingestDomProperty(job, property, bindingKind, securityContexts);
+   }
+   for (const [name, expr] of Object.entries(input.attributes) ?? []) {
+-    const securityContexts = bindingParser
+-      .calcPossibleSecurityContexts(input.componentSelector, name, true)
+-      .filter((context) => context !== SecurityContext.NONE);
++    const securityContexts = calcHostBindingSecurityContexts(name, true);
+     ingestHostAttribute(job, name, expr, securityContexts);
+   }
+   for (const event of input.events ?? []) {
+@@ -146,6 +144,28 @@
+   return job;
+ }
+ 
++/**
++ * Computes the security contexts that may apply to a name used in a host binding.
++ *
++ * A host binding is not attached to a known template element: the same directive or component
++ * declaration can end up on any element, either directly, through a host directive, or on a
++ * dynamically created root component. The compile-time selector therefore says nothing about the
++ * concrete host. Instead of guessing from the selector, record every context the name can have on
++ * any element (including `NONE`) and let the runtime resolve the concrete element when the binding
++ * actually executes. This is the same decision a template binding on that element would get.
++ */
++function calcHostBindingSecurityContexts(
++  name: string,
++  isAttribute: boolean,
++): SecurityContext[] {
++  return calcPossibleSecurityContexts(
++    domSchema,
++    null,
++    domSchema.getMappedPropName(name),
++    isAttribute,
++  );
++}
++
+ // TODO: We should refactor the parser to use the same types and structures for host bindings as
+ // with ordinary components. This would allow us to share a lot more ingestion code.
+ export function ingestDomProperty(
+diff -ruN a/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts b/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts
+--- a/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts	2026-10-30 15:29:41.000000000 +0000
++++ b/packages/compiler/src/template/pipeline/src/phases/resolve_sanitizers.ts	2026-10-30 16:00:55.207023899 +0000
+@@ -58,29 +58,15 @@
+         case ir.OpKind.DomProperty:
+         case ir.OpKind.TwoWayProperty:
+           let sanitizerFn: o.ExternalReference | null = null;
+-          if (
+-            Array.isArray(op.securityContext) &&
+-            op.securityContext.length === 2 &&
+-            op.securityContext.includes(SecurityContext.URL) &&
+-            op.securityContext.includes(SecurityContext.RESOURCE_URL)
+-          ) {
+-            // When the host element isn't known, some URL attributes (such as "src" and "href") may
+-            // be part of multiple different security contexts. In this case we use special
+-            // sanitization function and select the actual sanitizer at runtime based on a tag name
+-            // that is provided while invoking sanitization function.
++          if (needsRuntimeUrlSelection(op.securityContext)) {
++            // The concrete element is only known at runtime (host bindings can run on any
++            // element), and the same URL-ish name can be a plain URL, a resource URL, or not
++            // security-sensitive at all depending on that element. Select the behaviour, and
++            // whether anything has to happen, from the concrete host when the binding runs.
+             sanitizerFn = Identifiers.sanitizeUrlOrResourceUrl;
+           } else {
+             const securityContext = getOnlySecurityContext(op.securityContext);
+-            if (job.kind === CompilationJobKind.Host && securityContext === SecurityContext.HTML) {
+-              sanitizerFn = Identifiers.sanitizeHostBindingHtml;
+-            } else if (
+-              job.kind === CompilationJobKind.Host &&
+-              securityContext === SecurityContext.ATTRIBUTE_NO_BINDING
+-            ) {
+-              sanitizerFn = Identifiers.validateHostBindingAttribute;
+-            } else {
+-              sanitizerFn = sanitizerFns.get(securityContext) ?? null;
+-            }
++            sanitizerFn = sanitizerFns.get(securityContext) ?? null;
+           }
+ 
+           op.sanitizer = sanitizerFn !== null ? o.importExpr(sanitizerFn) : null;
+@@ -92,20 +78,62 @@
+ }
+ 
+ /**
+- * Asserts that there is only a single security context and returns it.
++ * Returns true when a binding's possible security contexts can only be narrowed down against the
++ * concrete element at runtime: it may be a URL, a resource URL, or nothing at all depending on
++ * which element the binding ends up on.
++ */
++function needsRuntimeUrlSelection(
++  securityContext: SecurityContext | SecurityContext[],
++): boolean {
++  if (!Array.isArray(securityContext)) {
++    return false;
++  }
++
++  let hasNone = false;
++  let hasUrl = false;
++  let hasResourceUrl = false;
++  for (const context of securityContext) {
++    switch (context) {
++      case SecurityContext.NONE:
++        hasNone = true;
++        break;
++      case SecurityContext.URL:
++        hasUrl = true;
++        break;
++      case SecurityContext.RESOURCE_URL:
++        hasResourceUrl = true;
++        break;
++      default:
++        return false;
++    }
++  }
++
++  return (hasNone && (hasUrl || hasResourceUrl)) || (hasUrl && hasResourceUrl);
++}
++
++/**
++ * Asserts that there is only a single non-NONE security context and returns it.
+  */
+ function getOnlySecurityContext(
+   securityContext: SecurityContext | SecurityContext[],
+ ): SecurityContext {
+-  if (Array.isArray(securityContext)) {
+-    if (securityContext.length > 1) {
++  if (!Array.isArray(securityContext)) {
++    return securityContext;
++  }
++
++  let result = SecurityContext.NONE;
++  for (const context of securityContext) {
++    if (context === SecurityContext.NONE) {
++      continue;
++    }
++    if (result !== SecurityContext.NONE && result !== context) {
+       // TODO: What should we do here? TDB just took the first one, but this feels like something we
+       // would want to know about and create a special case for like we did for Url/ResourceUrl. My
+       // guess is that, outside of the Url/ResourceUrl case, this never actually happens. If there
+       // do turn out to be other cases, throwing an error until we can address it feels safer.
+       throw Error(`AssertionError: Ambiguous security context`);
+     }
+-    return securityContext[0] || SecurityContext.NONE;
++    result = context;
+   }
+-  return securityContext;
++  return result;
+ }
+diff -ruN a/packages/core/src/sanitization/host_binding_security.ts b/packages/core/src/sanitization/host_binding_security.ts
+--- a/packages/core/src/sanitization/host_binding_security.ts	2026-10-30 15:29:41.000000000 +0000
++++ b/packages/core/src/sanitization/host_binding_security.ts	2026-10-30 16:01:36.417267031 +0000
+@@ -6,65 +6,16 @@
+  * found in the LICENSE file at https://angular.dev/license
+  */
+ 
+-import {RuntimeError, RuntimeErrorCode} from '../errors';
+-import {getTemplateLocationDetails} from '../render3/instructions/element_validation';
+-import {TNode, TNodeType} from '../render3/interfaces/node';
+-import {RElement} from '../render3/interfaces/renderer_dom';
+-import {getLView, getSelectedIndex, getSelectedTNode} from '../render3/state';
+-import {getNativeByTNode} from '../render3/util/view_utils';
+-
+-import {enforceIframeSecurity} from './iframe_attrs_validation';
+-import {ɵɵsanitizeHtml} from './sanitization';
+-
+-/**
+- * Attributes that are security-sensitive only for certain host elements.
+- *
+- * @remarks Keep this in sync with the security schema.
+- */
+-const HOST_HTML_ATTRIBUTES: Record<string, Record<string, true | undefined> | undefined> = {
+-  'iframe': {'srcdoc': true},
+-  '*': {'innerhtml': true, 'outerhtml': true},
+-};
+-
+-const SECURITY_SENSITIVE_ATTRIBUTE_NAMES: ReadonlySet<string> = new Set(['href', 'xlink:href']);
+-
+-/**
+- * Attributes that can only be applied as static attributes on certain host elements.
+- *
+- * @remarks Keep this in sync with the security schema.
+- */
+-const HOST_SENSITIVE_ATTRIBUTES: Record<
+-  string,
+-  Record<string, true | undefined | ReadonlySet<string>> | undefined
+-> = {
+-  'iframe': {
+-    'sandbox': true,
+-    'allow': true,
+-    'allowfullscreen': true,
+-    'referrerpolicy': true,
+-    'csp': true,
+-    'fetchpriority': true,
+-    'credentialless': true,
+-  },
+-  'animate': {
+-    'attributename': true,
+-    'to': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
+-    'values': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
+-    'from': SECURITY_SENSITIVE_ATTRIBUTE_NAMES,
+-  },
+-  'set': {'attributename': true, 'to': SECURITY_SENSITIVE_ATTRIBUTE_NAMES},
+-  'animatemotion': {'attributename': true},
+-  'animatetransform': {'attributename': true},
+-};
+-
+-function getHostBindingTagName(tagName: string): string {
+-  return tagName.toLowerCase();
+-}
++import {ɵɵsanitizeHtml, ɵɵvalidateAttribute} from './sanitization';
+ 
+ /**
+  * Sanitizes the value of a host binding whose attribute may be an HTML sink on some host
+  * elements only.
+  *
++ * The decision is delegated to the shared sanitizer, which resolves the concrete host element.
++ * This keeps host bindings and template bindings on the same rule instead of maintaining a
++ * separate tag/attribute table here.
++ *
+  * @codeGenApi
+  */
+ export function ɵɵsanitizeHostBindingHtml(
+@@ -72,18 +23,16 @@
+   tagName: string,
+   propName: string,
+ ): any {
+-  const tag = getHostBindingTagName(tagName);
+-  const prop = propName.toLowerCase();
+-  const isHtmlSink =
+-    HOST_HTML_ATTRIBUTES[tag]?.[prop] === true || HOST_HTML_ATTRIBUTES['*']?.[prop] === true;
+-
+-  return isHtmlSink ? ɵɵsanitizeHtml(unsafeHtml) : unsafeHtml;
++  return ɵɵsanitizeHtml(unsafeHtml, tagName, propName);
+ }
+ 
+ /**
+  * Validates that a host binding does not apply an attribute that can only be static on the
+  * concrete host element.
+  *
++ * The decision is delegated to the shared attribute validator, which resolves the concrete host
++ * element (including its namespace).
++ *
+  * @codeGenApi
+  */
+ export function ɵɵvalidateHostBindingAttribute<T = any>(
+@@ -91,79 +40,5 @@
+   tagName: string,
+   attributeName: string,
+ ): T {
+-  const tag = getHostBindingTagName(tagName);
+-  const lowerCaseAttrName = attributeName.toLowerCase();
+-
+-  const index = getSelectedIndex();
+-  const tNode: TNode | null = index === -1 ? null : getSelectedTNode();
+-  if (tNode && tNode.type !== TNodeType.Element) {
+-    return value;
+-  }
+-
+-  const validationConfig = HOST_SENSITIVE_ATTRIBUTES[tag]?.[lowerCaseAttrName];
+-  if (!validationConfig) {
+-    return value;
+-  }
+-
+-  const lView = getLView();
+-  if (tNode && tag === 'iframe') {
+-    const element = getNativeByTNode(tNode, lView) as RElement;
+-    enforceIframeSecurity(element as HTMLIFrameElement);
+-  }
+-
+-  if (typeof validationConfig !== 'boolean') {
+-    if (!tNode) {
+-      const errorMessage =
+-        ngDevMode &&
+-        `Angular has detected that the \`${attributeName}\` was applied ` +
+-          `as a binding to the <${tag}> element. ` +
+-          `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
+-          `as a static attribute only. \n` +
+-          `To fix this, switch the \`${attributeName}\` binding to a static attribute ` +
+-          `in a template or in host bindings section.`;
+-      throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
+-    }
+-
+-    const element = getNativeByTNode(tNode, lView) as SVGAnimateElement;
+-    const attributeNameValue = getSensitiveSVGAnimationAttributeName(element, validationConfig);
+-    if (attributeNameValue) {
+-      const errorMessage =
+-        ngDevMode &&
+-        `Angular has detected that the \`${attributeName}\` was applied ` +
+-          `as a binding to the <${tag}> element${getTemplateLocationDetails(lView)}. ` +
+-          `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
+-          `as a static attribute only when the "attributeName" is set to \'${attributeNameValue}\'. \n` +
+-          `To fix this, switch the \`${attributeNameValue}\` binding to a static attribute ` +
+-          `in a template or in host bindings section.`;
+-      throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
+-    }
+-
+-    return value;
+-  }
+-
+-  const errorMessage =
+-    ngDevMode &&
+-    `Angular has detected that the \`${attributeName}\` was applied ` +
+-      `as a binding to the <${tag}> element${tNode ? getTemplateLocationDetails(lView) : ''}. ` +
+-      `For security reasons, the \`${attributeName}\` can be set on the <${tag}> element ` +
+-      `as a static attribute only. \n` +
+-      `To fix this, switch the \`${attributeName}\` binding to a static attribute ` +
+-      `in a template or in host bindings section.`;
+-  throw new RuntimeError(RuntimeErrorCode.UNSAFE_ATTRIBUTE_BINDING, errorMessage);
+-}
+-
+-function getSensitiveSVGAnimationAttributeName(
+-  element: SVGAnimateElement,
+-  validationConfig: ReadonlySet<string>,
+-): string | null {
+-  for (const attributeName of element.getAttributeNames()) {
+-    if (attributeName.toLowerCase() !== 'attributename') {
+-      continue;
+-    }
+-    const attributeNameValue = element.getAttribute(attributeName);
+-    if (attributeNameValue !== null && validationConfig.has(attributeNameValue.toLowerCase())) {
+-      return attributeNameValue;
+-    }
+-  }
+-  return null;
++  return ɵɵvalidateAttribute(value, tagName, attributeName);
+ }
+diff -ruN a/packages/core/src/sanitization/sanitization.ts b/packages/core/src/sanitization/sanitization.ts
+--- a/packages/core/src/sanitization/sanitization.ts	2026-10-30 15:29:32.000000000 +0000
++++ b/packages/core/src/sanitization/sanitization.ts	2026-10-30 16:08:37.728642266 +0000
+@@ -28,10 +28,77 @@
+ import {_sanitizeHtml} from './html_sanitizer';
+ import {enforceIframeSecurity} from './iframe_attrs_validation';
+ import {Sanitizer} from './sanitizer';
+-import {SecurityContext} from './dom_security_schema';
++import {checkSecurityContext, SecurityContext} from './dom_security_schema';
+ import {_sanitizeUrl} from './url_sanitizer';
+ 
+ /**
++ * Tag name that Angular uses internally for the root host `TNode` of a component that is created
++ * over an existing host element. The real tag name has to be read from the native element.
++ */
++const DYNAMIC_HOST_TAG_NAME = '#host';
++
++/** Maps the DOM `namespaceURI` of a concrete element to the short namespace key of the schema. */
++const NAMESPACE_BY_URI: Record<string, string | undefined> = {
++  'http://www.w3.org/2000/svg': 'svg',
++  'http://www.w3.org/1998/Math/MathML': 'math',
++};
++
++/**
++ * Splits a tag name of the form `:namespace:name` into its namespace and local name. A tag without
++ * a namespace prefix yields a `null` namespace.
++ */
++function splitNamespacedTagName(tagName: string): [string | null, string] {
++  if (tagName.charCodeAt(0) !== 58 /* ':' */) {
++    return [null, tagName];
++  }
++  const separatorIndex = tagName.indexOf(':', 1);
++  if (separatorIndex === -1) {
++    return [null, tagName];
++  }
++  return [tagName.slice(1, separatorIndex), tagName.slice(separatorIndex + 1)];
++}
++
++/**
++ * Resolves the tag name and namespace of the concrete element the current binding is applied to.
++ *
++ * Host bindings carry the name of the element from the template, or the internal dynamic-host
++ * marker when a component was created over an existing element. In the latter case the native
++ * element is the only source of truth for both the tag name and the namespace (`#host` can stand
++ * for an iframe, an SVG animation element, a MathML element, ...).
++ */
++function resolveBindingTarget(declaredTagName: string): [tagName: string, namespace: string | null] {
++  const tagName = declaredTagName.toLowerCase();
++  const [prefixedNamespace, prefixedName] = splitNamespacedTagName(tagName);
++  if (prefixedNamespace !== null) {
++    return [prefixedName, prefixedNamespace];
++  }
++
++  const selectedTNode = getSelectedIndex() === -1 ? null : getSelectedTNode();
++  if (selectedTNode === null || (selectedTNode.type & TNodeType.Element) === 0) {
++    return [tagName, null];
++  }
++
++  if (tagName === DYNAMIC_HOST_TAG_NAME) {
++    const element = getNativeByTNode(selectedTNode, getLView()) as
++      | (RElement & {namespaceURI?: string | null})
++      | null;
++    const concreteTagName = element?.tagName ? element.tagName.toLowerCase() : tagName;
++    const namespaceUri = element?.namespaceURI ?? null;
++    return [concreteTagName, (namespaceUri && NAMESPACE_BY_URI[namespaceUri]) || null];
++  }
++
++  return [tagName, selectedTNode.namespace ?? null];
++}
++
++/**
++ * Computes the security context of a binding for the concrete element it is applied to.
++ */
++function resolveSecurityContext(tagName: string, propName: string): SecurityContext {
++  const [resolvedTagName, namespace] = resolveBindingTarget(tagName);
++  return checkSecurityContext(resolvedTagName, propName, namespace);
++}
++
++/**
+  * An `html` sanitizer which converts untrusted `html` **string** into trusted string by removing
+  * dangerous content.
+  *
+@@ -41,12 +108,30 @@
+  * It is possible to mark a string as trusted by calling {@link bypassSanitizationTrustHtml}.
+  *
+  * @param unsafeHtml untrusted `html`, typically from the user.
++ * @param tagName Optional tag name of the concrete element the binding is applied to. When
++ *     provided together with `propName`, no sanitization is performed if the value is not an HTML
++ *     sink on that element (e.g. `srcdoc` on a `div`).
++ * @param propName Optional name of the property or attribute being bound.
+  * @returns `html` string which is safe to display to user, because all of the dangerous javascript
+  * and urls have been removed.
+  *
+  * @codeGenApi
+  */
+-export function ɵɵsanitizeHtml(unsafeHtml: any): TrustedHTML | string {
++export function ɵɵsanitizeHtml(
++  unsafeHtml: any,
++  tagName?: string,
++  propName?: string,
++): TrustedHTML | string {
++  if (
++    tagName &&
++    propName &&
++    resolveSecurityContext(tagName, propName) !== SecurityContext.HTML
++  ) {
++    // The name is only an HTML sink on some elements; on this one it is inert and must be written
++    // exactly as supplied.
++    return unsafeHtml;
++  }
++
+   const sanitizer = getSanitizer();
+   if (sanitizer) {
+     return trustedHTMLFromStringBypass(sanitizer.sanitize(SecurityContext.HTML, unsafeHtml) || '');
+@@ -213,33 +298,28 @@
+   return trustedScriptURLFromString(url[0]);
+ }
+ 
+-// Define sets outside the function for O(1) lookups and memory efficiency
+-const RESOURCE_MAP: Record<string, Record<string, true | undefined> | undefined> = {
+-  'embed': {'src': true},
+-  'frame': {'src': true},
+-  'iframe': {'src': true},
+-  'media': {'src': true},
+-
+-  'base': {'href': true},
+-  'link': {'href': true},
+-  'object': {'data': true, 'codebase': true},
+-};
+-
+ /**
+- * Detects which sanitizer to use for URL property, based on tag name and prop name.
++ * Detects which sanitizer to use for URL properties, based on the concrete element and the
++ * property name.
+  *
+- * The rules are based on the RESOURCE_URL context config from
++ * The rules are based on the URL and RESOURCE_URL context config from
+  * `packages/compiler/src/schema/dom_security_schema.ts`.
+- * If tag and prop names don't match Resource URL schema, use URL sanitizer.
++ * Returns `null` when the name is not URL-sensitive on the element the binding runs on (for
++ * example a `data` attribute on a `div`), in which case the value must be written unchanged.
+  */
+-export function getUrlSanitizer(tag: string, prop: string) {
+-  const isResource = RESOURCE_MAP[tag.toLowerCase()]?.[prop.toLowerCase()] === true;
+-
+-  return isResource ? ɵɵsanitizeResourceUrl : ɵɵsanitizeUrl;
++export function getUrlSanitizer(tag: string, prop: string): ((value: any) => any) | null {
++  switch (resolveSecurityContext(tag, prop)) {
++    case SecurityContext.RESOURCE_URL:
++      return ɵɵsanitizeResourceUrl;
++    case SecurityContext.URL:
++      return ɵɵsanitizeUrl;
++    default:
++      return null;
++  }
+ }
+ 
+ /**
+- * Sanitizes URL, selecting sanitizer function based on tag and property names.
++ * Sanitizes URL, selecting sanitizer function based on the concrete element and property names.
+  *
+  * This function is used in case we can't define security context at compile time, when only prop
+  * name is available. This happens when we generate host bindings for Directives/Components. The
+@@ -247,14 +327,16 @@
+  * runtime.
+  *
+  * @param unsafeUrl untrusted `url`, typically from the user.
+- * @param tag target element tag name.
++ * @param tag target element tag name (or the dynamic-host marker).
+  * @param prop name of the property that contains the value.
+- * @returns `url` string which is safe to bind.
++ * @returns `url` string which is safe to bind, or the value unchanged when the concrete element is
++ *     not URL-sensitive for this property.
+  *
+  * @codeGenApi
+  */
+ export function ɵɵsanitizeUrlOrResourceUrl(unsafeUrl: any, tag: string, prop: string): any {
+-  return getUrlSanitizer(tag, prop)(unsafeUrl);
++  const sanitizer = getUrlSanitizer(tag, prop);
++  return sanitizer === null ? unsafeUrl : sanitizer(unsafeUrl);
+ }
+ 
+ export function validateAgainstEventProperties(name: string) {
+@@ -314,7 +396,6 @@
+  * @param attributeName The name of the attribute.
+  */
+ export function ɵɵvalidateAttribute<T = any>(value: T, tagName: string, attributeName: string): T {
+-  const lowerCaseTagName = tagName.toLowerCase();
+   const lowerCaseAttrName = attributeName.toLowerCase();
+ 
+   const index = getSelectedIndex();
+@@ -323,11 +404,11 @@
+     return value;
+   }
+ 
+-  // Leverage tNode.namespace if active, otherwise check both namespaced and base variants.
+-  const fullTagName =
+-    lowerCaseTagName[0] !== ':' && tNode?.namespace
+-      ? `:${tNode.namespace}:${lowerCaseTagName}`
+-      : lowerCaseTagName;
++  // The concrete element decides whether the attribute can only be static here. This is what makes
++  // the check work for host bindings, including dynamically created root hosts, where the compile
++  // time tag name is just the `#host` marker.
++  const [resolvedTagName, namespace] = resolveBindingTarget(tagName);
++  const fullTagName = namespace ? `:${namespace}:${resolvedTagName}` : resolvedTagName;
+ 
+   const validationConfig = SECURITY_SENSITIVE_ELEMENTS[fullTagName]?.[lowerCaseAttrName];
+ 
+@@ -336,12 +417,12 @@
+   }
+ 
+   const lView = getLView();
+-  if (tNode && lowerCaseTagName === 'iframe') {
++  if (tNode && namespace === null && resolvedTagName === 'iframe') {
+     const element = getNativeByTNode(tNode, lView) as RElement;
+     enforceIframeSecurity(element as HTMLIFrameElement);
+   }
+ 
+-  const displayTagName = tagName[0] === ':' ? tagName.split(':').pop()! : tagName;
++  const displayTagName = resolvedTagName;
+ 
+   if (typeof validationConfig !== 'boolean') {
+     if (!tNode) {

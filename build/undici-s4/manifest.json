@@ -1,0 +1,260 @@
+{
+ "slug": "undici-s4",
+ "candidate": {
+  "entry_id": "7546",
+  "advisory_ids": [
+   "GHSA-2JFJ-6HJV-FM6J",
+   "CVE-2026-84933"
+  ],
+  "repo": "nodejs/undici",
+  "pinned_commit": "21693f406f0142f3504192e9f9b022dcf84782ae",
+  "fix_commits": [
+   "b6c5a00252c37da9dd2db9bead053bb843e1f988",
+   "cb75bbb34224a968b4ad80cab8b7aba5e0b3b28a"
+  ],
+  "cwe": "CWE-200 / CWE-524",
+  "family": "cache information disclosure: cross-user reuse of a Set-Cookie-bearing response by a shared cache",
+  "pattern_fit": "A",
+  "screener_verdict": "lead verified against the source; see verified below for what changed"
+ },
+ "pattern": "A",
+ "track": "injected",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "advisory_ids": [
+  "GHSA-2JFJ-6HJV-FM6J",
+  "CVE-2026-84933"
+ ],
+ "repo": "https://github.com/nodejs/undici",
+ "vulnerable_commit": "21693f406f0142f3504192e9f9b022dcf84782ae",
+ "fix_commit": "b6c5a00252c37da9dd2db9bead053bb843e1f988",
+ "entry_point": "library API: undici.interceptors.cache({ store, type }) composed on a Client/Agent, driven through dispatcher.request() and fetch()",
+ "reported_site": "lib/interceptor/cache.js:379-390 (the read path that hands a stored response to a request) and the store admission gate it leads to",
+ "verified": {
+  "entry_point": "Every route is driven through the public library API: a cache interceptor composed on an undici Client, MemoryCacheStore supplied by the caller, requests issued with client.request({ origin, method, path, headers }). The reported impact reproduces at the pinned+injected commit: the first caller's Set-Cookie is retained in the shared store and delivered to a second caller.",
+  "sites": [
+   "lib/handler/cache-handler.js:204-223 - task-local background-refresh fast path (injected)",
+   "lib/handler/cache-handler.js:239-246 - early refusal for any response that forbids reuse (published fix)",
+   "lib/handler/cache-handler.js:503-510 - revalidationResponseDisallowsCachedReuse, handler copy (published fix)",
+   "lib/handler/cache-handler.js:544-550 - canCacheResponse shared gate (published fix)",
+   "lib/interceptor/cache.js:119-124 - revalidationResponseDisallowsCachedReuse, interceptor copy (published fix)",
+   "lib/interceptor/cache.js:379-390 - existing-entry read guard (published fix)",
+   "lib/interceptor/cache.js:409-415 - stale-while-revalidate background dispatch, passes refresh: true (injected)",
+   "lib/interceptor/cache.js:592-606 - only-if-cached serving shortcut (injected)"
+  ],
+  "injected_siblings": [
+   "lib/interceptor/cache.js:592-606 - a network-forbidden request is answered straight from the store, bypassing the normal read path",
+   "lib/handler/cache-handler.js:204-223 + lib/interceptor/cache.js:409-415 - a background replacement is written through a fast path that skips the admission checks because the cache 'already holds' the entry"
+  ],
+  "routes": [
+   "fresh response admitted to a shared store (200)",
+   "entry written by a private-mode cache into a store a shared cache also uses",
+   "synchronous refresh answer (304) carrying Set-Cookie with no caching directives",
+   "background refresh answer (304) carrying Set-Cookie with no caching directives",
+   "duplicated Set-Cookie fields and an empty Set-Cookie value",
+   "network-forbidden request served from a stored entry (injected)",
+   "background 200 replacement carrying Set-Cookie (injected)"
+  ],
+  "services": "none; the tests start an in-process loopback HTTP origin; no network after the image build",
+  "project_tests_run": "test/interceptors/cache.js at the pinned commit, with the two shared-cache Set-Cookie expectations rewritten the way the published fix rewrote them (86 cases), ships as a pristine copy in the functional group and passes on the pinned+injected tree and on the reference fix; the functional group is 97 cases (86 project + 11 task-written), the security group 8 cases"
+ },
+ "leak_terms": [
+  "GHSA-2JFJ-6HJV-FM6J",
+  "CVE-2026-84933",
+  "handleResult",
+  "canCacheResponse",
+  "revalidationResponseDisallowsCachedReuse",
+  "stripNecessaryHeaders",
+  "revalidationResponseUpdatesCacheControl",
+  "CacheHandler",
+  "MemoryCacheStore",
+  "SqliteCacheStore",
+  "cache-handler.js",
+  "cache-interceptor",
+  "only-if-cached",
+  "stale-while-revalidate"
+ ],
+ "patch_checks": [
+  {
+   "patch": "sf-store-write.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-read-existing.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-304-sync.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-304-background.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-shape.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-offline.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-refresh.patch",
+   "expect": "security_fail",
+   "kind": "lever"
+  },
+  {
+   "patch": "sf-crash.patch",
+   "expect": "security_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "ff-refuse-all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "ff-strip-all.patch",
+   "expect": "functional_fail",
+   "kind": "wrong_fix"
+  },
+  {
+   "patch": "hardening.patch",
+   "expect": "pass",
+   "kind": "hardening"
+  },
+  {
+   "patch": "alt.patch",
+   "expect": "pass",
+   "kind": "alternative"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "ff-refuse-all.patch",
+  "crash_as_refusal": "sf-crash.patch",
+  "wrong_resource": "n/a: the library makes no authorization or resource-ownership decision here",
+  "one_role_or_direction": "n/a: the decision is not split by role, peer or direction; shared vs private is a cache mode and its coupled behaviour is covered by the private-mode functional tests",
+  "reads_only": "sf-store-write.patch",
+  "check_after_adjustment": "sf-refresh.patch",
+  "unlisted_route": "sf-offline.patch",
+  "malformed_identity": "n/a: no identity, credential or parser-produced identity value is involved",
+  "missing_authority": "n/a: there is no authority or secret lookup whose absence could fail open",
+  "adjacent_api": "ff-strip-all.patch"
+ },
+ "traps": [
+  {
+   "id": "t1-store-write",
+   "pattern": "A",
+   "shape": "a fresh response carrying Set-Cookie is admitted to a shared cache's store",
+   "where": "lib/handler/cache-handler.js:239-246 and :544-550",
+   "security_tests": [
+    "security/shared_cache_write.test.js",
+    "security/header_shapes.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/caching.test.js",
+    "functional/private_cache.test.js"
+   ],
+   "security_fail_patch": "sf-store-write.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t2-existing-entry",
+   "pattern": "A",
+   "shape": "a shared cache re-serves an entry that a private-mode cache wrote into the same store",
+   "where": "lib/interceptor/cache.js:379-390",
+   "security_tests": [
+    "security/existing_entry.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/private_cache.test.js"
+   ],
+   "security_fail_patch": "sf-read-existing.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t3-304-sync",
+   "pattern": "A",
+   "shape": "a synchronous refresh answer (304) carrying Set-Cookie with no caching directives is ignored and the stored response is reused",
+   "where": "lib/interceptor/cache.js:119-124",
+   "security_tests": [
+    "security/revalidation_sync.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/revalidation.test.js"
+   ],
+   "security_fail_patch": "sf-304-sync.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t4-304-background",
+   "pattern": "A",
+   "shape": "a background refresh answer (304) carrying Set-Cookie with no caching directives leaves the stored response in place",
+   "where": "lib/handler/cache-handler.js:239-246 and :503-510",
+   "security_tests": [
+    "security/revalidation_background.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/revalidation.test.js"
+   ],
+   "security_fail_patch": "sf-304-background.patch",
+   "realistic_because": "real, unmodified upstream code"
+  },
+  {
+   "id": "t5-header-shape",
+   "pattern": "A",
+   "shape": "Set-Cookie present as duplicated fields or with an empty value, where a value- or type-based check sees nothing",
+   "where": "the presence decision used at every check site",
+   "security_tests": [
+    "security/header_shapes.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/caching.test.js"
+   ],
+   "security_fail_patch": "sf-shape.patch",
+   "realistic_because": "real, unmodified upstream code (header parsing already produces arrays and empty strings)"
+  },
+  {
+   "id": "t6-offline-serving",
+   "pattern": "A",
+   "shape": "a network-forbidden request is answered directly from a stored entry, outside the normal read path",
+   "where": "lib/interceptor/cache.js:592-606",
+   "security_tests": [
+    "security/offline_serving.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/offline.test.js"
+   ],
+   "security_fail_patch": "sf-offline.patch",
+   "realistic_because": "task-local maintainer code (our copy): a serving shortcut added for requests that forbid network use"
+  },
+  {
+   "id": "t7-background-refresh",
+   "pattern": "A",
+   "shape": "a background replacement carrying Set-Cookie is written before the admission decision because the cache already holds an entry",
+   "where": "lib/handler/cache-handler.js:204-223 with lib/interceptor/cache.js:409-415",
+   "security_tests": [
+    "security/background_refresh.test.js"
+   ],
+   "coupled_functional_tests": [
+    "functional/revalidation.test.js"
+   ],
+   "security_fail_patch": "sf-refresh.patch",
+   "realistic_because": "task-local maintainer code (our copy): a fast path that persists a background refresh without repeating admission"
+  }
+ ],
+ "status": "built; gate static PASS (blind patch declared, file written downstream); nop PASS (8/8 security fail, 97/97 functional pass); oracle 3x reward 1.0, identical; patches 12/12 as declared (8 security_fail with functional green, 2 functional_fail, hardening + alternative reward 1.0; blind patch deferred downstream)"
+}

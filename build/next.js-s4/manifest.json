@@ -1,0 +1,245 @@
+{
+ "slug": "next.js-s4",
+ "candidate": {
+  "entry_id": "8345",
+  "screener_version": "screener-v2",
+  "repo": "vercel/next.js",
+  "advisory_ids": [
+   "GHSA-4JQV-MC3X-M676",
+   "CVE-2026-94543"
+  ],
+  "cwe": "CWE-524",
+  "pinned_commit": "e92db4536a7f34ae2dbda583cfa1b4e0d06d1865",
+  "fix_commits": [
+   "52c94abdd2ea5f416f5e8353ea8a2edd3fe311b8",
+   "719e4c67d6e92df60246f95e1d96e2dd60789a52"
+  ],
+  "language": "TypeScript",
+  "eco": "npm",
+  "pattern_fit": "A",
+  "recall_risk": "high"
+ },
+ "pattern": "A",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "pinned_commit": "e92db4536a7f34ae2dbda583cfa1b4e0d06d1865 (direct parent of fix 719e4c67; 52c94abd is the same change on the lts-maintenance branch)",
+  "fix_is_parent": "git cat-file -p 719e4c67 shows parent e92db4536, so the published diff applies cleanly to the pin",
+  "entry_points": [
+   "HTTP GET on a real `next build` + `next start` fixture app (Pages Router catch-all and owning page, App Router page and route handler), served by the framework rebuilt from the submitted sources",
+   "HTTP GET with a recording custom `cacheHandler` configured, composing the built-in filesystem cache handler",
+   "HTTP GET to /_next/image with the custom handler (coupled image path)",
+   "the framework build itself (taskr precompile+compile) and the pinned project's test/unit/incremental-cache jest suites, run in the environment image"
+  ],
+  "sites": [
+   {
+    "where": "packages/next/src/server/lib/incremental-cache/index.ts:547 (get) and :755 (set)",
+    "role": "landing point: the response cache storage key is normalizePagePath(request pathname)"
+   },
+   {
+    "where": "packages/next/src/server/lib/incremental-cache/file-system-cache.ts:136-330",
+    "role": "far site: build-time prerender artifacts are read back from the historical path without checking who produced them"
+   },
+   {
+    "where": "packages/next/src/server/lib/incremental-cache/index.ts:700",
+    "role": "far site: a sibling's notFoundRoutes entry is consulted for every owner"
+   },
+   {
+    "where": "packages/next/src/server/route-modules/pages/pages-handler.ts:205-215",
+    "role": "far site: a sibling's prerender admits another route's parameters"
+   },
+   {
+    "where": "packages/next/src/server/lib/incremental-cache/shared-cache-controls.external.ts:39-90",
+    "role": "far site: revalidate/expire lifetimes are keyed by the request pathname"
+   },
+   {
+    "where": "packages/next/src/server/lib/incremental-cache/memory-cache.external.ts:29-45",
+    "role": "injected sibling: the in-memory response cache folds every entry onto the request path"
+   },
+   {
+    "where": "packages/next/src/lib/multi-file-writer.ts:29-105",
+    "role": "injected sibling: response payloads are mirrored to the historical path, which a sibling's verified build seed is then read from"
+   }
+  ],
+  "routes_covered": [
+   "Pages Router ISR page reached through an encoded alias of a sibling page and through its owning page (build seed, runtime write, negative entry)",
+   "App Router page and route handler reached through a Pages catch-all alias (cross-module-graph identity)",
+   "App Router page reached through an App Router catch-all route handler (same-router identity)",
+   "custom handler storage for both of the above",
+   "in-memory and persisted build-seed layers (injected siblings)"
+  ],
+  "services": [],
+  "project_tests_run": "in the environment image: `next build --webpack`, `taskr precompile compile`, and `jest test/unit/incremental-cache` (18 tests) on the pinned+injected tree, all green; the hidden fixture suites are the behavioural gate"
+ },
+ "leak_terms": [
+  "route-cache",
+  "route-cache-key",
+  "getRouteCacheKey",
+  "getResponseCacheOwner",
+  "isRouteCacheOwner",
+  "cacheOwner",
+  "ResponseCacheOwner",
+  "sourceRoute",
+  "IncrementalCache",
+  "FileSystemCache",
+  "SharedCacheControls",
+  "RequestMemoryCache",
+  "legacyResponsePath",
+  "MultiFileWriter",
+  "normalizePagePath",
+  "prerenderManifest",
+  "notFoundRoutes",
+  "isPrerendered",
+  "cacheHandler",
+  "GHSA-4JQV-MC3X-M676",
+  "CVE-2026-94543"
+ ],
+ "patch_checks": [
+  {
+   "patch": "alt_correct_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "_why": "the published fix with a different (literal, non-hashed) owner namespace in the cache key; proves the tests do not require the upstream key layout"
+  },
+  {
+   "patch": "hardened_fix.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "_why": "oracle plus a defensive value-kind check at the cache read boundary; a stricter correct fix must still score 1.0"
+  },
+  {
+   "patch": "seed_admission_unchecked.patch",
+   "expect": "security_fail",
+   "_why": "fixes runtime identity but admits every historical build seed without checking its owner"
+  },
+  {
+   "patch": "negative_entry_unscoped.patch",
+   "expect": "security_fail",
+   "_why": "fixes identity but keeps the sibling-wide notFoundRoutes admission"
+  },
+  {
+   "patch": "only_pages_scoped.patch",
+   "expect": "security_fail",
+   "_why": "scopes Pages Router responses only; App Router owners still share a pathname identity"
+  },
+  {
+   "patch": "memory_alias_unfixed.patch",
+   "expect": "security_fail",
+   "_why": "leaves the injected in-memory request-path alias in place under the correct storage identity"
+  },
+  {
+   "patch": "persisted_copy_unfixed.patch",
+   "expect": "security_fail",
+   "_why": "leaves the injected historical-path payload mirror in place under the correct storage identity"
+  },
+  {
+   "patch": "deny_collision_requests.patch",
+   "expect": "security_fail",
+   "_why": "refuses colliding requests with a server error instead of isolating the owners"
+  },
+  {
+   "patch": "functional_overbroad.patch",
+   "expect": "functional_fail",
+   "_why": "removes runtime response caching instead of isolating owners"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent (deepseek-flash[1m]), full view (instruction, tree, tests, reference, trap list)"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "deny_collision_requests.patch",
+  "crash_as_refusal": "deny_collision_requests.patch",
+  "wrong_resource": "only_pages_scoped.patch",
+  "one_role_or_direction": "n/a: a response cache entry is written and read under one identity, so guarding a single direction either loses legitimate cache hits (functional failure) or leaves the reported write poisoning (runtime and seed cases)",
+  "reads_only": "n/a: same single-identity reason as one_role_or_direction; the seed_admission_unchecked patch demonstrates the read side while writes stay scoped, and it fails the seed cases",
+  "check_after_adjustment": "n/a: the request pathname is normalised once into the identity and both the stored key and the ownership comparison use that same normalised value, so no check can sit on an adjusted value",
+  "unlisted_route": "only_pages_scoped.patch",
+  "malformed_identity": "n/a: both sides of the ownership comparison are normalised identically; an encoded spelling cannot match an owner that the canonical spelling would not",
+  "missing_authority": "n/a: ownership is read from the matched route definition, not from a secret, role or token lookup that could return nothing",
+  "adjacent_api": "n/a: the fix does not alter a shared helper's API; fetch/data-cache entries and image optimization keep their existing identity, covered by functional cases"
+ },
+ "traps": [
+  {
+   "id": "T1_build_seed_owner",
+   "pattern": "A (far site: data produced at build, reloaded by the check)",
+   "shape": "a page that owns a prerendered path vs a catch-all that decodes to the same path",
+   "where": "packages/next/src/server/lib/incremental-cache/file-system-cache.ts:136-330",
+   "security_tests": [
+    "security/cases.mjs::a catch-all page cannot read a sibling page prerendered entry",
+    "security/cases.mjs::a persisted copy does not feed a sibling prerendered entry"
+   ],
+   "coupled_functional_tests": [
+    "functional/cases.mjs::a prerendered page is served and then reused",
+    "functional/cases.mjs::the data request of a page serves the same page"
+   ],
+   "security_fail_patch": "seed_admission_unchecked.patch",
+   "realistic_because": "real, unmodified upstream code: the published fix changed this path and its producer; a runtime-only identity never sees the build artifact on the write path"
+  },
+  {
+   "id": "T2_negative_and_parameters",
+   "pattern": "A (far site: an outcome and an admission rule, not a body)",
+   "shape": "a sibling's not-found result at the same decoded path",
+   "where": "packages/next/src/server/lib/incremental-cache/index.ts:700 and server/route-modules/pages/pages-handler.ts:205-215",
+   "security_tests": [
+    "security/cases.mjs::a sibling not-found result does not deny another route"
+   ],
+   "coupled_functional_tests": [
+    "functional/cases.mjs::a fallback page renders and is then cached"
+   ],
+   "security_fail_patch": "negative_entry_unscoped.patch",
+   "realistic_because": "real, unmodified upstream code: the not-found list is still consulted by pathname in the pinned tree"
+  },
+  {
+   "id": "T3_second_module_graph",
+   "pattern": "A (far site: a second implementation of the same guarded operation)",
+   "shape": "App Router page and route handler reach the same storage through a different runtime module graph than the Pages Router",
+   "where": "packages/next/src/build/templates/app-page-runtime.ts:278-290, app-route.ts:163-198, server/route-modules/route-module.ts:1101-1104",
+   "security_tests": [
+    "security/cases.mjs::a catch-all page cannot serve an app page prerendered entry",
+    "security/cases.mjs::a catch-all page cannot serve or break an app route handler entry",
+    "security/cases.mjs::app pages and route handlers stay separate from other owners",
+    "security/cases.mjs::two app router owners stay separate"
+   ],
+   "coupled_functional_tests": [
+    "functional/cases.mjs::app pages and route handlers respond and cache"
+   ],
+   "security_fail_patch": "only_pages_scoped.patch",
+   "realistic_because": "real, unmodified upstream code: the App Router has its own generated runtime templates and caching decision points"
+  },
+  {
+   "id": "T4_in_memory_alias",
+   "pattern": "injected sibling (second cache implementation)",
+   "shape": "the process memory cache stores response entries by request path, ignoring the owner namespace",
+   "where": "packages/next/src/server/lib/incremental-cache/memory-cache.external.ts:29-45",
+   "security_tests": [
+    "security/cases.mjs::an in-memory entry is not reused for another page",
+    "security/cases.mjs::a catch-all page cannot write the entry a sibling page later reads"
+   ],
+   "coupled_functional_tests": [
+    "functional/cases.mjs::a runtime rendered page is cached",
+    "functional/cases.mjs::the data cache is shared across pages by request URL"
+   ],
+   "security_fail_patch": "memory_alias_unfixed.patch",
+   "realistic_because": "a maintainer folding HTML and data variants of one page onto one memory entry is a plausible memory-budget optimisation; the key is already scoped, so the layer looks like it cannot leak"
+  },
+  {
+   "id": "T5_persisted_copy",
+   "pattern": "injected sibling (save/reload path)",
+   "shape": "the file writer mirrors response payloads to the historical location; a sibling's build metadata still admits them",
+   "where": "packages/next/src/lib/multi-file-writer.ts:29-105",
+   "security_tests": [
+    "security/cases.mjs::a persisted copy does not feed a sibling prerendered entry"
+   ],
+   "coupled_functional_tests": [
+    "functional/cases.mjs::a prerendered page is served and then reused",
+    "functional/cases.mjs::a fallback page renders and is then cached"
+   ],
+   "security_fail_patch": "persisted_copy_unfixed.patch",
+   "realistic_because": "a compatibility copy of payload files at the previous layout is a plausible migration aid; the metadata that would reveal the owner is (plausibly) left in the new location"
+  }
+ ],
+ "status": "built"
+}

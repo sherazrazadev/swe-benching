@@ -1,0 +1,104 @@
+diff --git a/internal/bodyprocessors/multipart.go b/internal/bodyprocessors/multipart.go
+index fab9075..01dd9fb 100644
+--- a/internal/bodyprocessors/multipart.go
++++ b/internal/bodyprocessors/multipart.go
+@@ -98,6 +98,10 @@ func (mbp *multipartBodyProcessor) ProcessRequest(reader io.Reader, v plugintype
+ 			totalSize += size
+ 			filesCol.Add("", filename)
+ 			fileSizesCol.SetIndex(filename, 0, fmt.Sprintf("%d", size))
++			if alt := extendedFilename(p); alt != "" && alt != filename {
++				filesCol.Add("", alt)
++				fileSizesCol.SetIndex(alt, 0, fmt.Sprintf("%d", size))
++			}
+ 			filesNamesCol.Add("", p.FormName())
+ 			filesCombinedSizeCol.(*collections.Single).Set(fmt.Sprintf("%d", totalSize))
+ 			if seenUnexpectedEOF {
+diff --git a/internal/bodyprocessors/multipart_partial.go b/internal/bodyprocessors/multipart_partial.go
+new file mode 100644
+index 0000000..3c3e67e
+--- /dev/null
++++ b/internal/bodyprocessors/multipart_partial.go
+@@ -0,0 +1,83 @@
++// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package bodyprocessors
++
++import (
++	"mime/multipart"
++	"strings"
++)
++
++// partialParam returns the raw value of a Content-Disposition parameter.
++func partialParam(s, key string) (string, bool) {
++	inQuotes := false
++	start := 0
++	check := func(seg string) (string, bool) {
++		k, v, ok := strings.Cut(seg, "=")
++		if !ok || !strings.EqualFold(strings.TrimSpace(k), key) {
++			return "", false
++		}
++		v = strings.TrimSpace(v)
++		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
++			v = v[1 : len(v)-1]
++		}
++		return v, true
++	}
++	for i := 0; i < len(s); i++ {
++		switch {
++		case s[i] == '\\' && inQuotes:
++			i++
++		case s[i] == '"':
++			inQuotes = !inQuotes
++		case s[i] == ';' && !inQuotes:
++			if v, ok := check(s[start:i]); ok {
++				return v, true
++			}
++			start = i + 1
++		}
++	}
++	return check(s[start:])
++}
++
++func partialDecode(s string) string {
++	var b strings.Builder
++	for i := 0; i < len(s); i++ {
++		if s[i] == '%' && i+2 < len(s) {
++			hi, ok1 := partialHex(s[i+1])
++			lo, ok2 := partialHex(s[i+2])
++			if ok1 && ok2 {
++				b.WriteByte(hi<<4 | lo)
++				i += 2
++				continue
++			}
++		}
++		b.WriteByte(s[i])
++	}
++	return b.String()
++}
++
++func partialHex(b byte) (byte, bool) {
++	switch {
++	case b >= '0' && b <= '9':
++		return b - '0', true
++	case b >= 'a' && b <= 'f':
++		return b - 'a' + 10, true
++	case b >= 'A' && b <= 'F':
++		return b - 'A' + 10, true
++	}
++	return 0, false
++}
++
++// extendedFilename returns the RFC 5987 reading of the part's filename* when
++// one is present.
++func extendedFilename(p *multipart.Part) string {
++	raw, ok := partialParam(p.Header.Get("Content-Disposition"), "filename*")
++	if !ok {
++		return ""
++	}
++	parts := strings.SplitN(raw, "'", 3)
++	if len(parts) != 3 {
++		return ""
++	}
++	return partialDecode(parts[2])
++}

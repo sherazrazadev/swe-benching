@@ -1,0 +1,204 @@
+diff -ruN a/lib/handler/cache-handler.js b/lib/handler/cache-handler.js
+--- a/lib/handler/cache-handler.js	2026-10-30 15:26:09.000000000 +0000
++++ b/lib/handler/cache-handler.js	2026-10-30 15:51:01.610290098 +0000
+@@ -4,6 +4,7 @@
+ const {
+   parseCacheControlHeader,
+   hasInvalidCacheControlDirective,
++  hasSetCookieHeader,
+   parseVaryHeader,
+   hasVaryStar,
+   isInvalidOrWildcardVaryHeader,
+@@ -201,6 +202,26 @@
+       )
+     const handler = this
+ 
++    if (
++      !arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) &&
++      statusCode >= 200 &&
++      statusCode <= 399
++    ) {
++      // Successful response to an unsafe method, delete it from cache
++      //  https://www.rfc-editor.org/rfc/rfc9111.html#name-invalidating-stored-response
++      invalidateUnsafeRequest(this.#store, this.#cacheKey, resHeaders)
++      return downstreamOnHeaders()
++    }
++
++    // A shared cache may never keep a response carrying Set-Cookie: it must not
++    //  admit it, merge it into an entry, or leave an older entry behind that a
++    //  later request could be answered from. The caller that made this request
++    //  still receives the origin's own response.
++    if (this.#cacheType === 'shared' && hasSetCookieHeader(resHeaders)) {
++      deleteCachedValue(this.#store, this.#cacheKey)
++      return downstreamOnHeaders()
++    }
++
+     // A background refresh replaces a representation this cache already holds.
+     //  Persist what the origin sent without repeating the admission checks.
+     if (this.#refresh && statusCode === 200) {
+@@ -222,17 +243,6 @@
+       return
+     }
+ 
+-    if (
+-      !arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) &&
+-      statusCode >= 200 &&
+-      statusCode <= 399
+-    ) {
+-      // Successful response to an unsafe method, delete it from cache
+-      //  https://www.rfc-editor.org/rfc/rfc9111.html#name-invalidating-stored-response
+-      invalidateUnsafeRequest(this.#store, this.#cacheKey, resHeaders)
+-      return downstreamOnHeaders()
+-    }
+-
+     const cacheControlHeader = resHeaders['cache-control']
+     const heuristicallyCacheable = resHeaders['last-modified'] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode)
+     if (
+@@ -492,7 +502,10 @@
+  */
+ function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheControlDirectives) {
+   return cacheControlDirectives['no-store'] === true ||
+-    (cacheType === 'shared' && cacheControlDirectives.private === true) ||
++    (cacheType === 'shared' && (
++      cacheControlDirectives.private === true ||
++      hasSetCookieHeader(resHeaders)
++    )) ||
+     (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : false)
+ }
+ 
+@@ -530,7 +543,10 @@
+     return false
+   }
+ 
+-  if (cacheType === 'shared' && cacheControlDirectives.private === true) {
++  if (cacheType === 'shared' && (
++    cacheControlDirectives.private === true ||
++    hasSetCookieHeader(resHeaders)
++  )) {
+     return false
+   }
+ 
+diff -ruN a/lib/interceptor/cache.js b/lib/interceptor/cache.js
+--- a/lib/interceptor/cache.js	2026-10-30 15:26:09.000000000 +0000
++++ b/lib/interceptor/cache.js	2026-10-30 15:51:13.601247994 +0000
+@@ -6,7 +6,7 @@
+ const CacheHandler = require('../handler/cache-handler')
+ const MemoryCacheStore = require('../cache/memory-cache-store')
+ const CacheRevalidationHandler = require('../handler/cache-revalidation-handler')
+-const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = require('../util/cache.js')
++const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader, hasSetCookieHeader } = require('../util/cache.js')
+ const { AbortError } = require('../core/errors.js')
+ const { parseHttpDate } = require('../util/date.js')
+ 
+@@ -117,7 +117,10 @@
+  * @returns {boolean}
+  */
+ function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
+-  if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) {
++  if (
++    (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) ||
++    (cacheType === 'shared' && hasSetCookieHeader(headers))
++  ) {
+     return true
+   }
+ 
+@@ -143,6 +146,23 @@
+   }
+ }
+ 
++/**
++ * A stored entry a shared cache may not reuse: release its body (it may be a
++ * stream owned by the store) and evict it so no later request can be answered
++ * from it.
++ *
++ * @param {import('../../types/cache-interceptor.d.ts').default.CacheStore} store
++ * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} cacheKey
++ * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
++ */
++function discardCachedValue (store, cacheKey, result) {
++  if (util.isStream(result.body)) {
++    result.body.on('error', nop).destroy()
++  }
++
++  deleteCachedValue(store, cacheKey)
++}
++
+ function getUsableLastModified (headers) {
+   const lastModified = headers?.['last-modified']
+   if (typeof lastModified === 'string' && parseHttpDate(lastModified)) {
+@@ -376,6 +396,14 @@
+     return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
+   }
+ 
++  // A shared store may hold entries written by other clients (for example a
++  //  private cache). Never answer with one that carries Set-Cookie: evict it
++  //  and satisfy this request from the origin instead.
++  if (globalOpts.type === 'shared' && hasSetCookieHeader(result.headers)) {
++    discardCachedValue(globalOpts.store, cacheKey, result)
++    return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
++  }
++
+   const now = Date.now()
+   if (now > result.deleteAt) {
+     // Response is expired, cache store shouldn't have given this to us
+@@ -595,6 +623,11 @@
+         // A request that forbids network use can be answered from the store
+         //  without going through the revalidation machinery.
+         if (result && reqCacheControl?.['only-if-cached']) {
++          if (globalOpts.type === 'shared' && hasSetCookieHeader(result.headers)) {
++            discardCachedValue(globalOpts.store, cacheKey, result)
++            return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
++          }
++
+           const age = Math.round((Date.now() - result.cachedAt) / 1000)
+           sendCachedValue(handler, opts, result, age, null, false)
+           return
+diff -ruN a/lib/util/cache.js b/lib/util/cache.js
+--- a/lib/util/cache.js	2026-10-30 15:26:06.000000000 +0000
++++ b/lib/util/cache.js	2026-10-30 15:50:50.077334352 +0000
+@@ -563,6 +563,37 @@
+ }
+ 
+ /**
++ * Whether a response header list carries a `Set-Cookie` field.
++ *
++ * A shared cache must never retain or replay this field, so presence is the
++ * only thing that matters: the value may be empty, the field may be repeated
++ * (an array), and a cache store may hand back any casing.
++ *
++ * @param {Record<string, string | string[] | undefined> | null | undefined} headers
++ * @returns {boolean}
++ */
++function hasSetCookieHeader (headers) {
++  if (headers == null || typeof headers !== 'object') {
++    return false
++  }
++
++  if (Object.hasOwn(headers, 'set-cookie')) {
++    return true
++  }
++
++  // Parsed headers are lower-cased, but a public cache store is free to hand
++  //  back a name in another casing.
++  const names = Object.keys(headers)
++  for (let i = 0; i < names.length; i++) {
++    if (names[i].toLowerCase() === 'set-cookie') {
++      return true
++    }
++  }
++
++  return false
++}
++
++/**
+  * Note: this deviates from the spec a little. Empty etags ("", W/"") are valid,
+  *  however, including them in cached resposnes serves little to no purpose.
+  *
+@@ -666,6 +697,7 @@
+   assertCacheValue,
+   parseCacheControlHeader,
+   hasInvalidCacheControlDirective,
++  hasSetCookieHeader,
+   parseVaryHeader,
+   hasVaryStar,
+   isInvalidOrWildcardVaryHeader,

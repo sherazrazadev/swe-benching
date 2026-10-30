@@ -1,0 +1,133 @@
+diff --git a/core/kapp/accounts/accounts.go b/core/kapp/accounts/accounts.go
+index 1749285..20a44f2 100644
+--- a/core/kapp/accounts/accounts.go
++++ b/core/kapp/accounts/accounts.go
+@@ -288,6 +288,11 @@ func (a *accountsKapp) computeSplitRoyalties(address string, assetID []byte, ass
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++	if splitToPay > *royaltiesToPay {
++		splitCtx := a.KAppController.GetCurrentKAppContext()
++		splitCtx.Receipts().AddError(splitCtx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, assetID, a.forkController.EnableSmartContracts())
+@@ -328,7 +333,7 @@ func (a *accountsKapp) computeFixedSplitRoyalties(address string, acntSrc state.
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+-	if splitToPay > fixedValue {
++	if splitToPay > *royaltiesToPay {
+ 		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+ 	}
+ 	*royaltiesToPay -= splitToPay
+@@ -469,6 +474,12 @@ func (a *accountsKapp) processPercentageRoyaltiesTransfer(tc *transaction.Transf
+ 	}
+ 
+ 	royaltiesToPay := royaltyAmount
++
++	err = acntSrc.SubFromBalance(royaltyAmount, assetID, a.forkController.EnableSmartContracts())
++	if err != nil {
++		return transaction.Transaction_BalanceError, err
++	}
++
+ 	for key, value := range kda.Royalties.SplitRoyalties {
+ 		status, err := a.computeSplitRoyalties(key, assetID, kda.AssetType, acntSrc, royaltyAmount, int64(value.PercentTransferPercentage), &royaltiesToPay)
+ 		if err != nil {
+@@ -485,11 +496,6 @@ func (a *accountsKapp) processPercentageRoyaltiesTransfer(tc *transaction.Transf
+ 		return transaction.Transaction_LoadAccountError, err
+ 	}
+ 
+-	err = acntSrc.SubFromBalance(royaltyAmount, assetID, a.forkController.EnableSmartContracts())
+-	if err != nil {
+-		return transaction.Transaction_BalanceError, err
+-	}
+-
+ 	err = royaltyReceiver.AddToBalance(royaltiesToPay, assetID, a.forkController.EnableSmartContracts())
+ 	if err != nil {
+ 		return transaction.Transaction_BalanceError, err
+diff --git a/core/kapp/ito/ito.go b/core/kapp/ito/ito.go
+index f4fc8cf..8c93fab 100644
+--- a/core/kapp/ito/ito.go
++++ b/core/kapp/ito/ito.go
+@@ -551,6 +551,9 @@ func (i *itoKapp) computeFixedSplitRoyalties(ctx kapp.KappContext, address strin
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++	if splitToPay > *royaltiesToPay {
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, kdautils.KLVIdentifier, i.forkController.EnableSmartContracts())
+@@ -601,6 +604,10 @@ func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, as
+ 	if err != nil {
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
++	if splitToPay > *royaltiesToPay {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
++		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
++	}
+ 	*royaltiesToPay -= splitToPay
+ 
+ 	err = splitRoyalty.AddToBalance(splitToPay, assetID, i.forkController.EnableSmartContracts())
+diff --git a/core/kapp/kda/create.go b/core/kapp/kda/create.go
+index 4db0953..dbe9576 100644
+--- a/core/kapp/kda/create.go
++++ b/core/kapp/kda/create.go
+@@ -83,6 +83,11 @@ func (k *kdaKapp) Create(sender []byte, tc *transaction.CreateAssetContract) (tr
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+ 
++	if err := validateSplitRoyaltyPercentages(tc.GetRoyalties()); err != nil {
++		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, err.Error())
++		return transaction.Transaction_ParameterInvalid, err
++	}
++
+ 	switch asset.AssetType {
+ 	case kapps.KDAData_NonFungible,
+ 		kapps.KDAData_SemiFungible:
+diff --git a/core/kapp/kda/kda.go b/core/kapp/kda/kda.go
+index adbf51f..166f4b2 100644
+--- a/core/kapp/kda/kda.go
++++ b/core/kapp/kda/kda.go
+@@ -600,3 +600,22 @@ func validateRoyaltiesTransferLimit(royaltiesInfo *transaction.RoyaltiesInfo) er
+ 
+ 	return nil
+ }
++
++func validateSplitRoyaltyPercentages(royaltiesInfo *transaction.RoyaltiesInfo) error {
++	if royaltiesInfo == nil {
++		return nil
++	}
++
++	for _, split := range royaltiesInfo.GetSplitRoyalties() {
++		if split.GetPercentTransferPercentage() > core.HundredPercent ||
++			split.GetPercentTransferFixed() > core.HundredPercent ||
++			split.GetPercentMarketPercentage() > core.HundredPercent ||
++			split.GetPercentMarketFixed() > core.HundredPercent ||
++			split.GetPercentITOPercentage() > core.HundredPercent ||
++			split.GetPercentITOFixed() > core.HundredPercent {
++			return common.ErrInvalidValue
++		}
++	}
++
++	return nil
++}
+diff --git a/core/kapp/kda/trigger.go b/core/kapp/kda/trigger.go
+index dab82a6..10bce71 100644
+--- a/core/kapp/kda/trigger.go
++++ b/core/kapp/kda/trigger.go
+@@ -589,6 +589,10 @@ func (k *kdaKapp) updateRoyalties(sender []byte, tc *transaction.AssetTriggerCon
+ 		return transaction.Transaction_ParameterInvalid, err
+ 	}
+ 
++	if err := validateSplitRoyaltyPercentages(tc.GetRoyalties()); err != nil {
++		return transaction.Transaction_ParameterInvalid, err
++	}
++
+ 	switch asset.AssetType {
+ 	case kapps.KDAData_NonFungible,
+ 		kapps.KDAData_SemiFungible:

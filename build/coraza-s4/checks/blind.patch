@@ -1,0 +1,560 @@
+diff -ruN a/internal/bodyprocessors/multipart.go b/internal/bodyprocessors/multipart.go
+--- a/internal/bodyprocessors/multipart.go	2026-10-30 15:19:58.000000000 +0000
++++ b/internal/bodyprocessors/multipart.go	2026-10-30 15:43:42.845054584 +0000
+@@ -39,6 +39,7 @@
+ 	filesCombinedSizeCol := v.FilesCombinedSize()
+ 	filesNamesCol := v.FilesNames()
+ 	headersNames := v.MultipartPartHeaders()
++	multipartFilenameCol := v.MultipartFilename()
+ 	for {
+ 		p, err := mr.NextPart()
+ 		if err == io.EOF {
+@@ -48,15 +49,23 @@
+ 			v.MultipartStrictError().(*collections.Single).Set("1")
+ 			return err
+ 		}
+-		partName := p.FormName()
++		// Report every name reading the part's own header declares, not just
++		// the one the standard library happens to resolve.
++		names := readPartDisposition(p)
++		if names.inconsistent {
++			v.MultipartStrictError().(*collections.Single).Set("1")
++		}
++		fieldNames := names.fieldReadings(p.FormName())
+ 		for key, values := range p.Header {
+ 			for _, value := range values {
+-				headersNames.Add(partName, fmt.Sprintf("%s: %s", key, value))
++				header := fmt.Sprintf("%s: %s", key, value)
++				for _, partName := range fieldNames {
++					headersNames.Add(partName, header)
++				}
+ 			}
+ 		}
+ 		// if is a file
+-		filename := originFileName(p)
+-		if filename != "" {
++		if fileNames := names.fileReadings(); len(fileNames) > 0 {
+ 			var size int64
+ 			seenUnexpectedEOF := false
+ 			if environment.HasAccessToFS {
+@@ -96,9 +105,18 @@
+ 				size = sz
+ 			}
+ 			totalSize += size
+-			filesCol.Add("", filename)
+-			fileSizesCol.SetIndex(filename, 0, fmt.Sprintf("%d", size))
+-			filesNamesCol.Add("", p.FormName())
++			sizeStr := fmt.Sprintf("%d", size)
++			for _, fileReading := range fileNames {
++				// One part, one size: every reading shares the same bytes, so
++				// the combined size counts the part once even though each
++				// reading is listed separately.
++				filesCol.Add("", fileReading)
++				fileSizesCol.SetIndex(fileReading, 0, sizeStr)
++				multipartFilenameCol.Add(fieldNames[0], fileReading)
++			}
++			for _, partName := range fieldNames {
++				filesNamesCol.Add("", partName)
++			}
+ 			filesCombinedSizeCol.(*collections.Single).Set(fmt.Sprintf("%d", totalSize))
+ 			if seenUnexpectedEOF {
+ 				break
+@@ -119,7 +137,9 @@
+ 				v.MultipartStrictError().(*collections.Single).Set("1")
+ 			}
+ 			totalSize += int64(len(data))
+-			postCol.Add(p.FormName(), string(data))
++			for _, partName := range fieldNames {
++				postCol.Add(partName, string(data))
++			}
+ 			filesCombinedSizeCol.(*collections.Single).Set(fmt.Sprintf("%d", totalSize))
+ 			if errors.Is(err, io.ErrUnexpectedEOF) {
+ 				break
+@@ -137,21 +157,6 @@
+ 	_ plugintypes.BodyProcessor = (*multipartBodyProcessor)(nil)
+ )
+ 
+-// OriginFileName returns the filename parameter of the Part's Content-Disposition header.
+-// This function is based on (multipart.Part).parseContentDisposition,
+-// See https://go.googlesource.com/go/+/refs/tags/go1.17.9/src/mime/multipart/multipart.go#87
+-// for the current implementation and also notice this function hasn't change since go1.4, as in
+-// https://go.googlesource.com/go/+/refs/tags/go1.4/src/mime/multipart/multipart.go#75
+-func originFileName(p *multipart.Part) string {
+-	v := p.Header.Get("Content-Disposition")
+-	_, dispositionParams, err := mime.ParseMediaType(v)
+-	if err != nil {
+-		return ""
+-	}
+-
+-	return dispositionParams["filename"]
+-}
+-
+ func init() {
+ 	RegisterBodyProcessor("multipart", func() plugintypes.BodyProcessor {
+ 		return &multipartBodyProcessor{}
+diff -ruN a/internal/bodyprocessors/multipart_names.go b/internal/bodyprocessors/multipart_names.go
+--- a/internal/bodyprocessors/multipart_names.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/bodyprocessors/multipart_names.go	2026-10-30 15:43:13.449014472 +0000
+@@ -0,0 +1,393 @@
++// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package bodyprocessors
++
++import (
++	"mime"
++	"mime/multipart"
++	"strconv"
++	"strings"
++)
++
++// The engine's rule variables describe a multipart part by the names its
++// Content-Disposition header spells out. Two families of spellings exist for
++// both the form-field name and the uploaded file name:
++//
++//   - name="x" / filename="x", the plain parameter; and
++//   - name*=charset'lang'x / filename*=charset'lang'x, the RFC 5987
++//     extended parameter (whose value is percent-encoded).
++//
++// A receiving application may key the part by either one: some backends give
++// the extended parameter precedence, others read the plain one, and the Go
++// standard library only decodes the extended parameter when the declared
++// charset is us-ascii or utf-8, silently leaving every other charset
++// undecoded. Reporting a single reading therefore loses a name an application
++// can act on, which is exactly the gap this file closes: every reading is
++// collected and handed to the caller, and a header that cannot be resolved
++// consistently is flagged so the processor can raise MULTIPART_STRICT_ERROR.
++
++// dispositionParam is one parameter of a Content-Disposition header, with the
++// parameter name lower-cased and the value already unquoted.
++type dispositionParam struct {
++	name  string
++	value string
++}
++
++// partDisposition collects every reading a part's Content-Disposition header
++// declares. Empty string means "the header did not declare that reading";
++// presence of the parameter itself is tracked separately where it matters,
++// because an extended parameter may legitimately decode to the empty name.
++type partDisposition struct {
++	fieldPlain string
++	fieldExt   string
++	fieldCont  string
++
++	filePlain string
++	fileExt   string
++	fileCont  string
++
++	// inconsistent reports that the header offers readings the engine cannot
++	// reconcile into one interpretation: a repeated parameter, an extended
++	// value that does not have the required charset'lang'value shape, a
++	// percent escape that cannot be decoded, an RFC 2231 continuation that is
++	// incomplete, a repeated Content-Disposition header, or a header the
++	// standard library rejects outright. The initial reading is still
++	// collected so rules see something, but the caller must report the
++	// request as malformed as well.
++	inconsistent bool
++}
++
++// readPartDisposition parses the part's Content-Disposition header.
++func readPartDisposition(p *multipart.Part) partDisposition {
++	raw := p.Header.Get("Content-Disposition")
++	var d partDisposition
++
++	params, duplicate := splitDispositionParams(raw)
++	if duplicate {
++		d.inconsistent = true
++	}
++	// A second Content-Disposition header is a second, independent claim about
++	// the part's names; which one applies is backend-dependent.
++	if len(p.Header.Values("Content-Disposition")) > 1 {
++		d.inconsistent = true
++	}
++	// Only a header that is present but unparseable is worth surfacing: a
++	// part with no Content-Disposition at all simply has no names.
++	if raw != "" {
++		if _, _, err := mime.ParseMediaType(raw); err != nil {
++			d.inconsistent = true
++		}
++	}
++
++	d.fieldPlain, _ = firstParam(params, "name")
++	d.filePlain, _ = firstParam(params, "filename")
++
++	if v, ok := firstParam(params, "name*"); ok {
++		decoded, shapeOK, badEscape := decodeExtended(v)
++		if !shapeOK || badEscape {
++			d.inconsistent = true
++		}
++		if shapeOK {
++			d.fieldExt = decoded
++		}
++	}
++	if v, ok := firstParam(params, "filename*"); ok {
++		decoded, shapeOK, badEscape := decodeExtended(v)
++		if !shapeOK || badEscape {
++			d.inconsistent = true
++		}
++		if shapeOK {
++			d.fileExt = decoded
++		}
++	}
++
++	if assembled, present, complete, badEscape := assembleContinuation(params, "name"); present {
++		if complete {
++			d.fieldCont = assembled
++		}
++		// A continuation whose pieces do not form one name cannot be resolved
++		// into a single reading.
++		if !complete || badEscape {
++			d.inconsistent = true
++		}
++	}
++	if assembled, present, complete, badEscape := assembleContinuation(params, "filename"); present {
++		if complete {
++			d.fileCont = assembled
++		}
++		if !complete || badEscape {
++			d.inconsistent = true
++		}
++	}
++
++	return d
++}
++
++// fieldReadings returns every form-field name the part can be submitted under,
++// the most authoritative reading first. fallback is used when the header
++// declares no name of its own (the stdlib's own reading, which keeps the
++// historical keying for parts the raw header does not name).
++func (d partDisposition) fieldReadings(fallback string) []string {
++	primary := firstNonEmpty(d.fieldExt, d.fieldCont, d.fieldPlain, fallback)
++	readings := distinctNonEmpty(primary, d.fieldPlain, d.fieldExt, d.fieldCont)
++	if len(readings) == 0 {
++		// A part the header does not name keeps its historical empty key
++		// rather than disappearing from the form-field collections.
++		readings = []string{fallback}
++	}
++	return readings
++}
++
++// fileReadings returns every uploaded-file name the part can be identified by,
++// the most authoritative reading first. A part is an upload exactly when this
++// is non-empty.
++func (d partDisposition) fileReadings() []string {
++	primary := firstNonEmpty(d.fileExt, d.fileCont, d.filePlain)
++	if primary == "" {
++		return nil
++	}
++	return distinctNonEmpty(primary, d.filePlain, d.fileExt, d.fileCont)
++}
++
++// splitDispositionParams splits a Content-Disposition header into its
++// parameters, skipping the leading media type. Quoted strings are honored, so
++// a ';' or '=' inside a value never splits it. duplicate reports a parameter
++// name that occurred more than once, which is how two competing plain names
++// for one part present themselves.
++func splitDispositionParams(raw string) (params []dispositionParam, duplicate bool) {
++	seen := make(map[string]struct{})
++	inQuote := false
++	segStart := 0
++	segIndex := 0
++
++	emit := func(segment string) {
++		// The first segment is the media type, not a parameter.
++		if segIndex == 0 {
++			segIndex++
++			return
++		}
++		segIndex++
++		segment = strings.TrimSpace(segment)
++		if segment == "" {
++			return
++		}
++		eq := strings.IndexByte(segment, '=')
++		if eq < 0 {
++			return
++		}
++		name := strings.ToLower(strings.TrimSpace(segment[:eq]))
++		value := strings.TrimSpace(segment[eq+1:])
++		if _, ok := seen[name]; ok {
++			duplicate = true
++		}
++		seen[name] = struct{}{}
++		params = append(params, dispositionParam{name: name, value: unquoteParameter(value)})
++	}
++
++	for i := 0; i < len(raw); i++ {
++		switch raw[i] {
++		case '\\':
++			// An escaped character inside a quoted-string is never a boundary.
++			if inQuote && i+1 < len(raw) {
++				i++
++			}
++		case '"':
++			inQuote = !inQuote
++		case ';':
++			if !inQuote {
++				emit(raw[segStart:i])
++				segStart = i + 1
++			}
++		}
++	}
++	emit(raw[segStart:])
++	return params, duplicate
++}
++
++// unquoteParameter strips an RFC 2045 quoted-string and unescapes it. A value
++// that is not quoted is returned unchanged.
++func unquoteParameter(value string) string {
++	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
++		return value
++	}
++	inner := value[1 : len(value)-1]
++	var b strings.Builder
++	b.Grow(len(inner))
++	for i := 0; i < len(inner); i++ {
++		if inner[i] == '\\' && i+1 < len(inner) {
++			i++
++		}
++		b.WriteByte(inner[i])
++	}
++	return b.String()
++}
++
++// firstParam returns the value of the first parameter named name.
++func firstParam(params []dispositionParam, name string) (string, bool) {
++	for _, p := range params {
++		if p.name == name {
++			return p.value, true
++		}
++	}
++	return "", false
++}
++
++// decodeExtended decodes an RFC 5987 ext-value of the form
++// charset'[language]'percent-encoded-value. shapeOK is false when the value
++// does not carry the two apostrophes at all; badEscape reports a percent
++// escape that could not be decoded, in which case the offending bytes are
++// kept verbatim (still visible to rules) rather than the whole reading being
++// dropped.
++func decodeExtended(value string) (decoded string, shapeOK bool, badEscape bool) {
++	pieces := strings.SplitN(value, "'", 3)
++	if len(pieces) != 3 || pieces[0] == "" {
++		return "", false, false
++	}
++	decoded, badEscape = percentDecodeLenient(pieces[2])
++	return decoded, true, badEscape
++}
++
++// assembleContinuation reassembles an RFC 2231 numbered continuation
++// ("filename*0=", "filename*1*=", ...) for the given base parameter name.
++// complete reports that every piece from 0 through the highest index was
++// present; badEscape reports a piece whose percent escapes could not be
++// decoded, or a piece 0 that declared a charset-tag with the wrong shape.
++func assembleContinuation(params []dispositionParam, base string) (assembled string, present bool, complete bool, badEscape bool) {
++	pieces := make(map[int]dispositionParam)
++	highest := -1
++	for _, p := range params {
++		rest, ok := strings.CutPrefix(p.name, base+"*")
++		if !ok || rest == "" {
++			continue
++		}
++		encoded := strings.HasSuffix(rest, "*")
++		if encoded {
++			rest = rest[:len(rest)-1]
++		}
++		if rest == "" || !allDigits(rest) {
++			continue
++		}
++		index, err := strconv.Atoi(rest)
++		if err != nil {
++			continue
++		}
++		pieces[index] = p
++		if index > highest {
++			highest = index
++		}
++	}
++	if highest < 0 {
++		return "", false, false, false
++	}
++
++	var b strings.Builder
++	for index := 0; index <= highest; index++ {
++		piece, ok := pieces[index]
++		if !ok {
++			// A hole: the continuation cannot be resolved as one name.
++			return "", true, false, badEscape
++		}
++		if strings.HasSuffix(piece.name, "*") {
++			if index == 0 {
++				decoded, shapeOK, bad := decodeExtended(piece.value)
++				if bad {
++					badEscape = true
++				}
++				if !shapeOK {
++					return "", true, false, true
++				}
++				b.WriteString(decoded)
++				continue
++			}
++			decoded, bad := percentDecodeLenient(piece.value)
++			if bad {
++				badEscape = true
++			}
++			b.WriteString(decoded)
++			continue
++		}
++		b.WriteString(piece.value)
++	}
++	return b.String(), true, true, badEscape
++}
++
++// percentDecodeLenient decodes %XX escapes, leaving an escape it cannot
++// resolve in place. badEscape reports that such an escape was seen. The result
++// is a rule-matching string, never a filesystem path, so showing the raw bytes
++// beats hiding the reading behind an error.
++func percentDecodeLenient(value string) (decoded string, badEscape bool) {
++	if !strings.Contains(value, "%") {
++		return value, false
++	}
++	var b strings.Builder
++	b.Grow(len(value))
++	for i := 0; i < len(value); i++ {
++		if value[i] == '%' && i+2 < len(value) {
++			hi, okHi := hexValue(value[i+1])
++			lo, okLo := hexValue(value[i+2])
++			if okHi && okLo {
++				b.WriteByte(hi<<4 | lo)
++				i += 2
++				continue
++			}
++		}
++		if value[i] == '%' {
++			badEscape = true
++		}
++		b.WriteByte(value[i])
++	}
++	return b.String(), badEscape
++}
++
++func hexValue(b byte) (byte, bool) {
++	switch {
++	case b >= '0' && b <= '9':
++		return b - '0', true
++	case b >= 'a' && b <= 'f':
++		return b - 'a' + 10, true
++	case b >= 'A' && b <= 'F':
++		return b - 'A' + 10, true
++	}
++	return 0, false
++}
++
++func allDigits(s string) bool {
++	for _, c := range s {
++		if c < '0' || c > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++func firstNonEmpty(values ...string) string {
++	for _, v := range values {
++		if v != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++// distinctNonEmpty returns the arguments in order, with empty and repeated
++// values removed. Repeated spellings of one name must stay one reading.
++func distinctNonEmpty(values ...string) []string {
++	var out []string
++	for _, v := range values {
++		if v == "" {
++			continue
++		}
++		repeated := false
++		for _, seen := range out {
++			if seen == v {
++				repeated = true
++				break
++			}
++		}
++		if !repeated {
++			out = append(out, v)
++		}
++	}
++	return out
++}
+diff -ruN a/internal/bodyprocessors/multipart_nested.go b/internal/bodyprocessors/multipart_nested.go
+--- a/internal/bodyprocessors/multipart_nested.go	2026-10-30 15:19:58.000000000 +0000
++++ b/internal/bodyprocessors/multipart_nested.go	2026-10-30 15:43:36.878052872 +0000
+@@ -34,6 +34,7 @@
+ 	postCol := v.ArgsPost()
+ 	filesCombinedSizeCol := v.FilesCombinedSize()
+ 	filesNamesCol := v.FilesNames()
++	multipartFilenameCol := v.MultipartFilename()
+ 
+ 	totalSize := int64(0)
+ 	for {
+@@ -45,8 +46,15 @@
+ 			v.MultipartStrictError().(*collections.Single).Set("1")
+ 			return true, err
+ 		}
+-		partName := np.FormName()
+-		filename := nestedOriginFileName(np)
++		// A nested part gets the same name treatment as a flat one: its
++		// container simply changes where the bytes come from, not how a
++		// receiving application reads the names in its header.
++		names := readPartDisposition(np)
++		if names.inconsistent {
++			v.MultipartStrictError().(*collections.Single).Set("1")
++		}
++		fieldNames := names.fieldReadings(np.FormName())
++		fileNames := names.fileReadings()
+ 		data, err := io.ReadAll(np)
+ 		if err != nil {
+ 			if !errors.Is(err, io.ErrUnexpectedEOF) {
+@@ -56,12 +64,20 @@
+ 			v.MultipartStrictError().(*collections.Single).Set("1")
+ 		}
+ 		totalSize += int64(len(data))
+-		if filename != "" {
+-			filesCol.Add("", filename)
+-			fileSizesCol.SetIndex(filename, 0, fmt.Sprintf("%d", len(data)))
+-			filesNamesCol.Add("", partName)
++		if len(fileNames) > 0 {
++			sizeStr := fmt.Sprintf("%d", len(data))
++			for _, fileReading := range fileNames {
++				filesCol.Add("", fileReading)
++				fileSizesCol.SetIndex(fileReading, 0, sizeStr)
++				multipartFilenameCol.Add(fieldNames[0], fileReading)
++			}
++			for _, partName := range fieldNames {
++				filesNamesCol.Add("", partName)
++			}
+ 		} else {
+-			postCol.Add(partName, string(data))
++			for _, partName := range fieldNames {
++				postCol.Add(partName, string(data))
++			}
+ 		}
+ 		if errors.Is(err, io.ErrUnexpectedEOF) {
+ 			break
+@@ -74,13 +90,3 @@
+ 	}
+ 	return true, nil
+ }
+-
+-// nestedOriginFileName returns the filename parameter of a nested part's
+-// Content-Disposition header.
+-func nestedOriginFileName(p *multipart.Part) string {
+-	_, dispositionParams, err := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
+-	if err != nil {
+-		return ""
+-	}
+-	return dispositionParams["filename"]
+-}

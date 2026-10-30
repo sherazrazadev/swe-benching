@@ -1,0 +1,79 @@
+diff --git a/packages/next/src/lib/multi-file-writer.ts b/packages/next/src/lib/multi-file-writer.ts
+index a1959ec..2c0553d 100644
+--- a/packages/next/src/lib/multi-file-writer.ts
++++ b/packages/next/src/lib/multi-file-writer.ts
+@@ -21,6 +21,21 @@ type Task = [
+    */
+   writeFile: Promise<unknown>[],
+ ]
++const ROUTE_CACHE_SEGMENT = '/route-cache/'
++
++/**
++ * Map a namespaced response file back to the location older tooling reads.
++ */
++function legacyResponsePath(filePath: string): string | undefined {
++  const marker = filePath.indexOf(ROUTE_CACHE_SEGMENT)
++  if (marker === -1) return undefined
++  const parts = filePath
++    .slice(marker + ROUTE_CACHE_SEGMENT.length)
++    .split('/')
++  if (parts.length < 4 || parts[3] !== '$') return undefined
++  return `${filePath.slice(0, marker)}/${parts.slice(4).join('/')}`
++}
++
+ /**
+  * MultiFileWriter is a utility for writing multiple files in parallel that
+  * guarantees that all files will be written after their containing directory
+@@ -77,6 +92,18 @@ export class MultiFileWriter {
+    * @param data - The data to write to the file.
+    */
+   public append(filePath: string, data: Buffer | string): void {
++    this.appendFile(filePath, data)
++
++    // Keep a copy at the historical location so external tooling that reads the
++    // previous layout keeps finding the response payloads. Metadata stays in
++    // the namespaced directory.
++    if (!filePath.endsWith('.meta')) {
++      const legacy = legacyResponsePath(filePath)
++      if (legacy) this.appendFile(legacy, data)
++    }
++  }
++
++  private appendFile(filePath: string, data: Buffer | string): void {
+     // Find or create a task for the directory that contains the file.
+     const task = this.findOrCreateTask(path.dirname(filePath))
+ 
+diff --git a/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts b/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
+index d9f66ba..5c97677 100644
+--- a/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
++++ b/packages/next/src/server/lib/incremental-cache/memory-cache.external.ts
+@@ -22,9 +22,28 @@ function getSegmentDataSize(segmentData: Map<string, Buffer> | undefined) {
+   return size
+ }
+ 
++/**
++ * The same page is requested both as HTML and as data. Keep one in-memory copy
++ * per request path so those variants do not each occupy the memory budget.
++ */
++class RequestMemoryCache extends LRUCache<CacheHandlerValue> {
++  private requestPath(cacheKey: string): string {
++    const separator = cacheKey.lastIndexOf('/$/')
++    return separator === -1 ? cacheKey : cacheKey.slice(separator + 3)
++  }
++
++  public get(key: string): CacheHandlerValue | undefined {
++    return super.get(key) ?? super.get(this.requestPath(key))
++  }
++
++  public set(key: string, value: CacheHandlerValue): boolean {
++    return super.set(this.requestPath(key), value)
++  }
++}
++
+ export function getMemoryCache(maxMemoryCacheSize: number) {
+   if (!memoryCache) {
+-    memoryCache = new LRUCache(maxMemoryCacheSize, function length(
++    memoryCache = new RequestMemoryCache(maxMemoryCacheSize, function length(
+       { value },
+       cacheKey
+     ) {
