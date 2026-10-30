@@ -6,7 +6,7 @@ Started 2026-10-29T12:52Z. [run 40876820128](https://github.com/sherazrazadev/sw
 |---|---|---|---|---|
 | `hsweb-framework-s4` | sound | 0.9412 | 1 | **REJECTED** |
 | `headroom-s4` | sound | 1 | 1 | **REJECTED** |
-| `infracost-s4` | sound | 0.7778 0.7778 0.7778 | 0.7778 0.7778 0 | **in final checks** |
+| `infracost-s4` | sound | 0.5 0.75 1 | 0 0 0.9167 | **REJECTED** |
 | `middleware-s4` | sound | 1 | 1 | **REJECTED** |
 | `nodemailer-s4` | sound | 0.9091 1 0.9091 | 0 | **REJECTED** |
 | `yard-s4` | sound | 1 | 1 | **REJECTED** |
