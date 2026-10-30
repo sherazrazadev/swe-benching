@@ -176,6 +176,10 @@ def verdict(slug):
     elif decision == "DROP":
         why = next((l.split(":", 1)[1].strip() for l in hd.read_text().splitlines() if l.startswith("WHY:")), "")
         state, reason = "REJECTED", "dropped by the owner" + (f": {why.rstrip('.')}" if why else "")
+    elif decision == "KEEP" and not fv.startswith("ERROR") and all(
+            sum(a["model"] == m for a in audits) >= 3 for m in MODELS):
+        # owner rule (2026-10-30): the owner decides from the fairness review and how the runs failed; no audit needed
+        state, reason = "ACCEPTED", "owner decision KEEP on the fairness review and the failing runs"
     elif missing or fv.startswith("ERROR"):
         state, reason = "pending", "an audit or the fairness review is missing"
     elif (fv.startswith("NOT_READY") and decision != "KEEP") or fault:
