@@ -1,0 +1,29 @@
+# Post-run audit: infracost-s4__x2qbo3s
+
+Auditor: sub-agent, Claude Opus 5.5, effort high; grading audited: original; reward 0.7778.
+
+**Trustworthy:** True  **Attribution:** model-failed  **Confidence:** medium
+
+The model fixed the reported landing point and three of the four extra routes: the remote-variables loader (via an AuthedAPIClient.SetHost that refuses a host the token does not belong to), the remote-plan run URL host in dir_provider (terraformCloudTokenForHost), the in-tree tfr:// TerraformRegistryGetter (now wired in and host-scoped), and the CredentialsSource.ForHost fallback to the base token. All 9 functional tests and 7 of 9 security tests pass. Both failures come from one route the model never touched: internal/hcl/modules/registry.go, where fetchModuleVersions and Disco.DownloadLocation attach the credential looked up for the registry host to whatever host the registry's service-discovery document names. The model read registry.go at the start (transcript.md:21) but changed nothing in it. The instruction's required behaviour covers this case in plain words: a credential 'may only be sent to the host or hosts that credential belongs to ... No other host may receive it', and it says to fix 'close variants'. The reference fix guards exactly these two sends, so a fix that meets the stated property passes. One thing makes this less clear-cut, which is why confidence is medium rather than high: the attacker for this route would have to control a trusted registry's discovery document, and upstream Terraform itself sends registry credentials to the discovered service URL. The task author's build notes call this a deliberate trap with a plausible reason to skip it. Still, the instruction states the host-scoping property without exceptions and explicitly allows continuing without the credential, so the test demands nothing beyond the instruction. No harness problems: the results are complete and there were no tool calls during the grading window. There is no sign the model read the hidden tests or looked up the upstream fix.
+
+| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |
+|---|---|---|---|---|
+| github.com/infracost/infracost/internal/hcl/modules::TestSecZZModuleVersionsDiscoveryHost | fail | genuine-fail | True | True |
+| github.com/infracost/infracost/internal/hcl/modules::TestSecZZModuleDownloadDiscoveryHost | fail | genuine-fail | True | True |
+
+**Lookup or leak:** None found. The transcript shows only reads of /workspace and the Go module cache (/go/pkg/mod/github.com/infracost/terragrunt, used to compare the vendored getter). There is one curl to the public Terraform service-discovery endpoints app.terraform.io and registry.terraform.io (/.well-known/terraform.json, transcript.md:184); that is not a code host and gives no fix content. There are no reads of the tests directory or zz_tfc test files, no WebFetch/WebSearch, and no access to GitHub or the advisory. No netguard.log is present.
+
+**Evidence:**
+- grading/results.json:10-11: TestSecZZModuleVersionsDiscoveryHost and TestSecZZModuleDownloadDiscoveryHost fail; every other security and functional test passes
+- instruction.md:16-19: 'may only be sent to the host or hosts that credential belongs to ... No other host may receive it.'
+- instruction.md:20-22: 'The operation may return an error or continue without the credential'
+- instruction.md:34: 'Fix the problem and its close variants.'
+- tests/security/modules/zz_tfc_sec_test.go:37-78: both failing tests check that no Authorization header goes to the host named by discovery or Location
+- solution/fix.patch:58-84: the reference adds a sameCredentialHost guard to DownloadLocation and fetchModuleVersions in registry.go
+- final-code/changes.patch: no hunk touches internal/hcl/modules/registry.go
+- transcript.md:21: the model read /workspace/internal/hcl/modules/registry.go
+- build-notes.md:61-69: T4 is a real upstream route; the notes admit the plausible dismissal ('discovery document is part of the protocol Terraform itself follows')
+- run.json timing: tool_calls_during_grading = [], agent_events_after_end = 0
+- grading/test-stdout.tail.txt is empty, but results.json lists all 18 test outcomes
+
+**Recommended action:** Accept the 0.7778 reward as a fair measure. Optionally note in task docs that the service-discovery route (T4) is a strict reading of the host-scoping property that goes beyond upstream Terraform behaviour. If reviewers find it too strict, consider adding one sentence to the instruction (e.g. that hosts reached through a registry's service discovery count as other hosts). A side observation that did not affect grading: the model's canUseRegistryToken also sends TG_TF_REGISTRY_TOKEN to any host that has its own Terraform CLI credential. That is a mild widening of trust, but it does not let a host named by the project receive the token.
