@@ -11,7 +11,9 @@ import com.izforge.izpack.util.Platform;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Properties;
 
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -24,6 +26,11 @@ import static org.mockito.Mockito.when;
  * <p>The writer is constructed exactly as the installer constructs it, with the compiled
  * installer's information and variables; the test supplies the values it wants the metadata to
  * carry and asserts on the files that appear on disk.</p>
+ *
+ * <p>Values are admitted through the real interfaces while the fixture is populated, and the
+ * values the test wants the compiled metadata to carry are installed directly in the metadata
+ * objects just before the writer runs, exactly as deserialised metadata arrives. This models a
+ * crafted installer without forcing a particular layer to be the one that refuses the value.</p>
  */
 public class WriterFixture
 {
@@ -32,11 +39,19 @@ public class WriterFixture
      */
     public static final String LOG_PATH_VARIABLE = "InstallerFrame.logfilePath";
 
+    private static final String DECLARED_UNINSTALLER_PATH = "${INSTALL_PATH}/Uninstaller";
+    private static final String DECLARED_UNINSTALLER_NAME = "uninstaller.jar";
+
     private final File root;
     private final File installDir;
     private final Info info = new Info();
+    private final DefaultVariables variables = new DefaultVariables();
     private final AutomatedInstallData installData;
     private final UninstallData uninstallData = new UninstallData();
+
+    private String craftedUninstallerPath;
+    private String craftedUninstallerName;
+    private String craftedLogPath;
 
     public WriterFixture(File root) throws IOException
     {
@@ -46,10 +61,11 @@ public class WriterFixture
         {
             throw new IOException("cannot create install directory");
         }
-        DefaultVariables variables = new DefaultVariables();
         installData = new AutomatedInstallData(variables, mock(Platform.class));
         installData.setInfo(info);
         installData.setInstallPath(installDir.getAbsolutePath());
+        info.setUninstallerPath(DECLARED_UNINSTALLER_PATH);
+        info.setUninstallerName(DECLARED_UNINSTALLER_NAME);
     }
 
     public File root()
@@ -62,24 +78,32 @@ public class WriterFixture
         return installDir;
     }
 
-    /** Sets the directory the uninstaller data is written to, as the compiled metadata carries it. */
+    /** Declares the directory the uninstaller data is written to. */
     public WriterFixture uninstallerPath(String path)
     {
-        info.setUninstallerPath(path);
+        craftedUninstallerPath = path;
         return this;
     }
 
-    /** Sets the uninstaller file name, as the compiled metadata carries it. */
+    /** Declares the uninstaller file name. */
     public WriterFixture uninstallerName(String name)
     {
-        info.setUninstallerName(name);
+        craftedUninstallerName = name;
         return this;
     }
 
     /** Registers a variable value, as the compiler's defaults or the user's properties supply it. */
     public WriterFixture variable(String name, String value)
     {
-        installData.setVariable(name, value);
+        if (LOG_PATH_VARIABLE.equals(name))
+        {
+            craftedLogPath = value;
+            installData.setVariable(name, "");
+        }
+        else
+        {
+            installData.setVariable(name, value);
+        }
         return this;
     }
 
@@ -91,12 +115,52 @@ public class WriterFixture
     }
 
     /** Runs the writer and returns its result. */
-    public boolean write()
+    public boolean write() throws Exception
     {
+        applyCraftedMetadata();
         PathResolver resolver = mock(PathResolver.class);
         when(resolver.getMergeableFromPath(anyString())).thenReturn(new ArrayList<>());
         UninstallDataWriter writer = new UninstallDataWriter(uninstallData, installData, resolver,
                                                             mock(RulesEngine.class));
         return writer.write();
+    }
+
+    /**
+     * Installs the declared values directly in the metadata objects, as a crafted compiled
+     * installer delivers them through deserialisation or configuration.
+     */
+    private void applyCraftedMetadata() throws Exception
+    {
+        if (craftedUninstallerPath != null)
+        {
+            InstallerFixture.field(info, "uninstallerPath", craftedUninstallerPath);
+        }
+        if (craftedUninstallerName != null)
+        {
+            InstallerFixture.field(info, "uninstallerName", craftedUninstallerName);
+        }
+        if (craftedLogPath != null)
+        {
+            ((Properties) readField(variables, "properties")).setProperty(LOG_PATH_VARIABLE, craftedLogPath);
+        }
+    }
+
+    private static Object readField(Object object, String name) throws Exception
+    {
+        Class<?> type = object.getClass();
+        while (type != null)
+        {
+            try
+            {
+                Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.get(object);
+            }
+            catch (NoSuchFieldException exception)
+            {
+                type = type.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
     }
 }

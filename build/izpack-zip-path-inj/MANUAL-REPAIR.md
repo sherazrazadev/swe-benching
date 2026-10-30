@@ -1,0 +1,1 @@
+Manual repair (2026-10-30, owner-delegated): WriterFixture now admits benign values through the setters and installs the crafted uninstaller path/name/log value reflectively just before write() (a setter-side or use-site refusal both pass); one instruction sentence states that both separators count. Nothing else changed.

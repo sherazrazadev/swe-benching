@@ -27,6 +27,8 @@ the user had chosen.
 - A refused location must be surfaced as an installation failure and must produce no
   side effect for that entry. Refusing one entry must not stop other legitimate
   entries from installing.
+- A parent-directory segment counts whichever separator the location uses, forward
+  slash or backslash.
 - Locations that are absolute and free of parent-directory segments remain
   legitimate, including targets outside the installation directory. Those must
   install exactly as they do today, as must ordinary nested targets inside the
