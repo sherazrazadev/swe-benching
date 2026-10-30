@@ -1,0 +1,125 @@
+diff --git a/packages/argv-parser/src/config/detect-config-action.ts b/packages/argv-parser/src/config/detect-config-action.ts
+index 3277520..bdd62cb 100644
+--- a/packages/argv-parser/src/config/detect-config-action.ts
++++ b/packages/argv-parser/src/config/detect-config-action.ts
+@@ -10,6 +10,10 @@ import {
+ 
+ export function detectConfigAction(flags: Flag[], positionals: string[]): ConfigOperation | null {
+    for (const { name } of scopedFlags(flags, 'task')) {
++      if (name === '--rename-section') {
++         // a rename creates the destination section, so that name is the one being written
++         return configOperation(true, positionals.slice(1));
++      }
+       if (CONFIG_WRITE_FLAGS.has(name)) {
+          return configOperation(true, positionals);
+       }
+@@ -24,6 +28,10 @@ export function detectConfigAction(flags: Flag[], positionals: string[]): Config
+       return null;
+    }
+ 
++   if (verb === 'rename-section') {
++      return configOperation(true, positionals.slice(2));
++   }
++
+    if (CONFIG_WRITE_VERBS.has(verb)) {
+       return configOperation(true, positionals.slice(1));
+    }
+diff --git a/packages/argv-parser/src/env/parse-env.ts b/packages/argv-parser/src/env/parse-env.ts
+index 5c7fa5e..fed1820 100644
+--- a/packages/argv-parser/src/env/parse-env.ts
++++ b/packages/argv-parser/src/env/parse-env.ts
+@@ -28,6 +28,32 @@ type GitEnv = Record<string, string> & {
+    git_config_count?: string;
+ };
+ 
++const quotedParameter = /'((?:[^'\\]|\\.)*)'='((?:[^'\\]|\\.)*)'/g;
++
++function unquote(value: string): string {
++   return value.replace(/\\(.)/g, '$1');
++}
++
++/**
++ * Git hands configuration down to child processes in GIT_CONFIG_PARAMETERS as a
++ * space-separated list of shell-quoted 'key'='value' pairs. The keys are configuration
++ * being set for the invocation, so they are subject to the same checks as any other.
++ */
++function* collectConfigByParameters(env: GitEnv): Generator<ConfigWrite> {
++   const parameters = env.git_config_parameters;
++   if (!parameters) {
++      return;
++   }
++
++   for (const match of parameters.matchAll(quotedParameter)) {
++      yield {
++         key: unquote(match[1]).toLowerCase().trim(),
++         value: unquote(match[2]),
++         scope: 'env',
++      };
++   }
++}
++
+ function* collectConfigByCount(env: GitEnv): Generator<ConfigWrite> {
+    const count = parseInt(env.git_config_count ?? '0', 10);
+    for (let index = 0; index < count; index++) {
+@@ -71,7 +97,7 @@ export function parseEnv(raw: Record<string, unknown>) {
+    const env = prepareEnv(raw);
+    const config: ParsedConfigActivity = {
+       read: [],
+-      write: [...collectConfigByCount(env)],
++      write: [...collectConfigByCount(env), ...collectConfigByParameters(env)],
+    };
+    const vulnerabilities = [
+       ...collectConfigVulnerabilities(env),
+diff --git a/packages/argv-parser/src/tokens/flag-specs.ts b/packages/argv-parser/src/tokens/flag-specs.ts
+index 5c53edd..7b3a592 100644
+--- a/packages/argv-parser/src/tokens/flag-specs.ts
++++ b/packages/argv-parser/src/tokens/flag-specs.ts
+@@ -88,6 +88,22 @@ const COMMANDS: Record<string, FlagSpec> = {
+       short: new Map(),
+       long: new Set(['exec', 'receive-pack']),
+    },
++   rebase: {
++      short: new Map([
++         ['X', true], // -X <option>   strategy option
++         ['f', false], // -f force-rebase
++         ['i', false], // -i interactive
++         ['k', false], // -k keep-base
++         ['m', false], // -m merge
++         ['n', false], // -n no-stat
++         ['q', false], // -q quiet
++         ['r', false], // -r rebase-merges
++         ['s', true], // -s <strategy>
++         ['v', false], // -v verbose
++         ['x', true], // -x <cmd>      exec
++      ]),
++      long: new Set(['exec', 'onto', 'strategy', 'strategy-option']),
++   },
+ };
+ 
+ const EMPTY: FlagSpec = { short: new Map(), long: new Set() };
+diff --git a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts
+index d10ec4b..14916f4 100644
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts
+@@ -68,5 +68,7 @@ const preventUnsafeConfig = [
+    preventConfigBuilder('sequence.editor', 'allowUnsafeEditor'),
+    preventExpandedConfigBuilder('submodule.update', 'allowUnsafeSubmodule'),
+    preventExpandedConfigBuilder('tar.command', 'allowUnsafeCommandBinaries'),
++   preventExpandedConfigBuilder('trailer.cmd', 'allowUnsafeCommandBinaries'),
++   preventExpandedConfigBuilder('trailer.command', 'allowUnsafeCommandBinaries'),
+    preventExpandedConfigBuilder('url.insteadOf', 'allowUnsafeUrlRewrite'),
+ ];
+diff --git a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts
+index e691e3a..3edcedd 100644
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts
+@@ -69,6 +69,9 @@ const preventUnsafeFlags = [
+    preventFlagBuilder('clone', /^-\w*u/, 'allowUnsafePack'),
+    preventFlagBuilder('clone', '--u', 'allowUnsafePack'),
+    preventFlagBuilder('push', /^--exec$/, 'allowUnsafePack', { name: '--exec' }),
++   // `git` accepts unambiguous abbreviations of long options, so `--ex` and `--exe` are `--exec`
++   preventFlagBuilder('rebase', /^(-x|--ex(ec?)?)$/, 'allowUnsafeExec', { name: '-x or --exec' }),
++   preventFlagBuilder('filter-branch', /^--(tree|index|msg|commit|env|parent|tag-name)-filter$/, 'allowUnsafeExec', { name: '--*-filter' }),
+    preventFlagBuilder(null, '--template', 'allowUnsafeTemplateDir'),
+    preventFlagBuilder(null, '--exec-path', 'allowUnsafeExec', pathTakingGlobal),
+    // `git` reads the configuration of whichever repository these name, so the
