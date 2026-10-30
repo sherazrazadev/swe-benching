@@ -7,6 +7,6 @@ Started 2026-10-30T00:13Z. [run 40978274281](https://github.com/sherazrazadev/sw
 | `mariadb-connector-j-s4` | - | - | - | **build failed** |
 | `mail-s4` | sound | 0.8571 | 1 | **REJECTED** |
 | `next-auth-s4` | sound | 0 0 0 | 0 0 1 | **REJECTED** |
-| `cryptography-s4` | sound | 0.6667 0.6667 0.6667 | 0.6667 0.6667 0.6667 | **in final checks** |
+| `cryptography-s4` | sound | 1 | 1 | **REJECTED** |
 | `frontend-s4` | sound | 0.6667 0.6667 0.6667 | 0.6667 0.6667 0.5556 | **REJECTED** |
 | `appium-s4` | sound | 1 | 0.963 | **REJECTED** |
